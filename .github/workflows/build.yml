@@ -46,19 +46,26 @@ jobs:
       release_tag: ${{ steps.release_tag.outputs.release_tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
 
-  build_friendlywrt:
+  build:
     needs: prepare_release
     runs-on: ubuntu-22.04
-    if: |
-      github.event.repository.owner.id == github.event.sender.id &&
-      (github.event_name != 'workflow_dispatch' ||
-       (matrix.VERSION == github.event.inputs.version && matrix.SET == github.event.inputs.set))
+    if: github.event.repository.owner.id == github.event.sender.id
     strategy:
       matrix:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
 
     steps:
+    # ====== 检查是否需要构建此组合 ======
+    - name: Check if this combination should be built
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        if [ "${{ matrix.VERSION }}" != "${{ github.event.inputs.version }}" ] || [ "${{ matrix.SET }}" != "${{ github.event.inputs.set }}" ]; then
+          echo "Skipping this combination (VERSION=${{ matrix.VERSION }}, SET=${{ matrix.SET }})"
+          exit 1
+        fi
+      continue-on-error: true
+
     - name: Checkout
       uses: actions/checkout@v4
 
@@ -83,6 +90,7 @@ jobs:
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
         echo "cores: $(nproc)"
 
+    # ---- 构建 RootFS (原 build_friendlywrt 步骤) ----
     - name: Download source
       run: |
         mkdir project
@@ -207,61 +215,8 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  build_img:
-    needs: [prepare_release, build_friendlywrt]
-    runs-on: ubuntu-22.04
-    if: |
-      github.event.repository.owner.id == github.event.sender.id &&
-      (github.event_name != 'workflow_dispatch' ||
-       (matrix.VERSION == github.event.inputs.version && matrix.SET == github.event.inputs.set))
-    strategy:
-      matrix:
-        VERSION: ['24.10', '25.12']
-        CPU: [rk3568]
-        SET: [docker, non-docker]
-
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo rm -rf /etc/apt/sources.list.d
-        wget https://raw.githubusercontent.com/friendlyarm/build-env-on-ubuntu-bionic/master/install.sh
-        sed -i -e 's/^apt-get -y install openjdk-8-jdk/# apt-get -y install openjdk-8-jdk/g' install.sh
-        sed -i -e 's/^\[ -d fa-toolchain \]/# [ -d fa-toolchain ]/g' install.sh
-        sed -i -e 's/^(cat fa-toolchain/# (cat fa-toolchain/g' install.sh
-        sed -i -e 's/^(tar xf fa-toolchain/# (tar xf fa-toolchain/g' install.sh
-        sudo -E bash ./install.sh
-        git config --global user.name 'GitHub Actions'
-        git config --global user.email 'noreply@github.com'
-        git config --global color.ui false
-        git clone https://github.com/friendlyarm/repo
-        sudo -E cp repo/repo /usr/bin/
-        mkdir -p ./artifact
-        sudo swapoff -a || true
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
-        echo "cores: $(nproc)"
-
-    - name: Download source
-      run: |
-        mkdir project
-        cd project
-        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
-                -m ${{ matrix.CPU }}.xml --repo-url=https://github.com/friendlyarm/repo  --no-clone-bundle
-
-        repo sync -c kernel --no-clone-bundle
-        repo sync -c u-boot --no-clone-bundle
-        repo sync -c rkbin --no-clone-bundle
-        repo sync -c configs --no-clone-bundle
-        repo sync -c device/common --no-clone-bundle
-        repo sync -c device/friendlyelec --no-clone-bundle
-        repo sync -c scripts --no-clone-bundle
-        repo sync -c scripts/sd-fuse  --no-clone-bundle
-        repo sync -c toolchain  --no-clone-bundle
-
+    # ---- 构建 SD 镜像 (原 build_img 步骤) ----
+    # 注意：此部分需要 rootfs 包，因此已在上方生成并上传，现在下载并继续
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -292,7 +247,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         fileName: "host-pm-${{ matrix.VERSION }}.tgz"
 
-    - name: Prepare config
+    - name: Prepare config for img
       id: config
       run: |
         cd project
@@ -393,7 +348,7 @@ jobs:
         overwrite: true
 
   cleanup_intermediate_assets:
-    needs: [prepare_release, build_img]
+    needs: [prepare_release, build]
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     steps:
