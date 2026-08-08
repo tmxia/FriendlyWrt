@@ -36,7 +36,7 @@ jobs:
     strategy:
       matrix:
         VERSION: ['24.10']
-        SET: [docker, non-docker]                     # 恢复 docker 支持
+        SET: [docker]
 
     steps:
     - name: Checkout
@@ -96,12 +96,10 @@ jobs:
         EOL
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
-    # ======== 新增：动态添加 Clashoo ========
-    - name: Add Clashoo packages
+    - name: Add customize packages
       run: |
         cd project
         bash ../scripts/add_packages.sh
-    # =======================================
 
     - name: Download package
       run: |
@@ -198,7 +196,7 @@ jobs:
       matrix:
         VERSION: ['24.10']
         CPU: [rk3568]
-        SET: [docker, non-docker]                     # 恢复 docker 支持
+        SET: [docker]
 
     steps:
     - name: Checkout
