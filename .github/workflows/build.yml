@@ -13,6 +13,7 @@ on:
         options:
           - '24.10'
           - '25.12'
+          - 'both'          # 新增：同时编译两个版本
       set:
         description: 'Build type'
         required: true
@@ -21,6 +22,7 @@ on:
         options:
           - docker
           - non-docker
+          - both           # 新增：同时编译两种类型
 
 jobs:
   prepare_release:
@@ -46,20 +48,21 @@ jobs:
       release_tag: ${{ steps.release_tag.outputs.release_tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
 
-  # ==================== 手动触发：仅编译选中的单个组合 ====================
+  # ==================== 手动触发：动态矩阵 ====================
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
     if: |
       github.event.repository.owner.id == github.event.sender.id &&
       github.event_name == 'workflow_dispatch'
-    env:
-      VERSION: ${{ github.event.inputs.version }}
-      SET: ${{ github.event.inputs.set }}
+    strategy:
+      matrix:
+        VERSION: ${{ fromJSON(github.event.inputs.version == 'both' && '["24.10","25.12"]' || format('["{0}"]', github.event.inputs.version)) }}
+        SET: ${{ fromJSON(github.event.inputs.set == 'both' && '["docker","non-docker"]' || format('["{0}"]', github.event.inputs.set)) }}
     steps:
     - name: Show build configuration
       run: |
-        echo "Building version: ${{ env.VERSION }}, type: ${{ env.SET }}"
+        echo "Building version: ${{ matrix.VERSION }}, type: ${{ matrix.SET }}"
 
     - name: Checkout
       uses: actions/checkout@v4
@@ -89,7 +92,7 @@ jobs:
       run: |
         mkdir project
         cd project
-        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ env.VERSION }} \
+        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
                 -m rk3568.xml --repo-url=https://github.com/friendlyarm/repo  --no-clone-bundle
 
         repo sync -c friendlywrt --no-clone-bundle
@@ -108,8 +111,8 @@ jobs:
     - name: Prepare dot config and feeds
       run: |
         cd project
-        [ "${{ env.SET }}" == "docker" ] && SUFFIX="-docker"
-        DIST_DIR=friendlywrt$(echo ${{ env.VERSION }}|awk -F . '{print $1}')${SUFFIX}
+        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
+        DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
         CONFIG=rockchip${SUFFIX}
         cat > .current_config.mk <<EOL
         . device/friendlyelec/rk3568/base.mk
@@ -151,15 +154,15 @@ jobs:
       run: |
         cd project
         source .current_config.mk
-        [ "${{ env.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-${{ env.VERSION }}${SUFFIX}.tgz"
+        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
+        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
         tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
               ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
 
     - name: Create host package-manager bundle
       id: create_host_pm_package
-      if: env.SET == 'non-docker'
+      if: matrix.SET == 'non-docker'
       run: |
         cd project
         source .current_config.mk
@@ -186,7 +189,7 @@ jobs:
           fi
         fi
 
-        host_pm_filename="host-pm-${{ env.VERSION }}.tgz"
+        host_pm_filename="host-pm-${{ matrix.VERSION }}.tgz"
         tar czf ../artifact/${host_pm_filename} "$PM_BIN"
         echo "host_pm_filename=$host_pm_filename" >> $GITHUB_OUTPUT
 
@@ -200,7 +203,7 @@ jobs:
         overwrite: true
 
     - name: Upload host package-manager bundle
-      if: env.SET == 'non-docker'
+      if: matrix.SET == 'non-docker'
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -211,34 +214,34 @@ jobs:
 
     # ---------- 构建 SD 镜像 ----------
     - name: Download friendlywrt rootfs (non-docker)
-      if: env.SET == 'non-docker'
+      if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ env.VERSION }}.tgz"
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
 
     - name: Download friendlywrt rootfs (docker)
-      if: env.SET == 'docker'
+      if: matrix.SET == 'docker'
       uses: robinraju/release-downloader@v1.6
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ env.VERSION }}-docker.tgz"
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker.tgz"
 
     - name: Download host package-manager bundle
-      if: env.SET == 'non-docker'
+      if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "host-pm-${{ env.VERSION }}.tgz"
+        fileName: "host-pm-${{ matrix.VERSION }}.tgz"
 
     - name: Prepare config for img
       id: config
@@ -254,10 +257,10 @@ jobs:
           exit 1
           ;;
         esac
-        [ "${{ env.SET }}" == "docker" ] && SUFFIX="-docker"
-        IMG_FILE=${MODEL}-FriendlyWrt-${{ env.VERSION }}${SUFFIX}.img
-        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ env.VERSION }}${SUFFIX}.tgz
-        DIST_DIR=friendlywrt$(echo ${{ env.VERSION }}|awk -F . '{print $1}')${SUFFIX}
+        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
+        IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.img
+        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.tgz
+        DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
 
         CONFIG=rockchip${SUFFIX}
         cat > .current_config.mk <<EOL
@@ -276,13 +279,13 @@ jobs:
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-${{ env.VERSION }}${SUFFIX}.tgz"
+        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
 
     - name: Unpack host package-manager bundle
-      if: env.SET == 'non-docker'
+      if: matrix.SET == 'non-docker'
       run: |
         cd project
-        tar xzf "../host-pm-${{ env.VERSION }}.tgz"
+        tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
     - name: Compile uboot and kernel
       run: |
@@ -611,7 +614,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ==================== 清理中间产物（始终运行） ====================
+  # ==================== 清理中间产物 ====================
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
