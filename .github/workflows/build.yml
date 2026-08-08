@@ -13,7 +13,7 @@ on:
         options:
           - '24.10'
           - '25.12'
-          - 'both'          # 新增：同时编译两个版本
+          - 'both'
       set:
         description: 'Build type'
         required: true
@@ -22,7 +22,7 @@ on:
         options:
           - docker
           - non-docker
-          - both           # 新增：同时编译两种类型
+          - both
 
 jobs:
   prepare_release:
@@ -121,6 +121,7 @@ jobs:
         EOL
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
+    # ====== 保持原样，不传参 ======
     - name: Add customize packages
       run: |
         cd project
@@ -148,6 +149,15 @@ jobs:
       run: |
         cd project/friendlywrt
         make -j1 V=s
+
+    # ====== 新增：编译失败时上传日志 ======
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: logs-manual-${{ matrix.VERSION }}-${{ matrix.SET }}
+        path: project/friendlywrt/logs/
+        retention-days: 7
 
     - name: Create rootfs package
       id: create_rootfs_package
@@ -403,6 +413,7 @@ jobs:
         EOL
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
+    # ====== 保持原样，不传参 ======
     - name: Add customize packages
       run: |
         cd project
@@ -430,6 +441,15 @@ jobs:
       run: |
         cd project/friendlywrt
         make -j1 V=s
+
+    # ====== 新增：编译失败时上传日志 ======
+    - name: Upload build logs on failure
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: logs-auto-${{ matrix.VERSION }}-${{ matrix.SET }}
+        path: project/friendlywrt/logs/
+        retention-days: 7
 
     - name: Create rootfs package
       id: create_rootfs_package
