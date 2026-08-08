@@ -49,15 +49,23 @@ jobs:
   build_friendlywrt:
     needs: prepare_release
     runs-on: ubuntu-22.04
-    if: |
-      (github.event_name == 'workflow_dispatch' && matrix.VERSION == github.event.inputs.version && matrix.SET == github.event.inputs.set) ||
-      (github.event_name != 'workflow_dispatch')
+    if: github.event.repository.owner.id == github.event.sender.id
     strategy:
       matrix:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
 
     steps:
+    # ====== 新增：检查是否需要构建此组合 ======
+    - name: Check if this combination should be built
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        if [ "${{ matrix.VERSION }}" != "${{ github.event.inputs.version }}" ] || [ "${{ matrix.SET }}" != "${{ github.event.inputs.set }}" ]; then
+          echo "Skipping this combination (VERSION=${{ matrix.VERSION }}, SET=${{ matrix.SET }})"
+          exit 1
+        fi
+      continue-on-error: true
+
     - name: Checkout
       uses: actions/checkout@v4
 
@@ -209,9 +217,8 @@ jobs:
   build_img:
     needs: [prepare_release, build_friendlywrt]
     runs-on: ubuntu-22.04
-    if: |
-      (github.event_name == 'workflow_dispatch' && matrix.VERSION == github.event.inputs.version && matrix.SET == github.event.inputs.set) ||
-      (github.event_name != 'workflow_dispatch')
+    if: github.event.repository.owner.id == github.event.sender.id
+
     strategy:
       matrix:
         VERSION: ['24.10', '25.12']
@@ -219,6 +226,16 @@ jobs:
         SET: [docker, non-docker]
 
     steps:
+    # ====== 新增：检查是否需要构建此组合 ======
+    - name: Check if this combination should be built
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        if [ "${{ matrix.VERSION }}" != "${{ github.event.inputs.version }}" ] || [ "${{ matrix.SET }}" != "${{ github.event.inputs.set }}" ]; then
+          echo "Skipping this combination (VERSION=${{ matrix.VERSION }}, SET=${{ matrix.SET }})"
+          exit 1
+        fi
+      continue-on-error: true
+
     - name: Checkout
       uses: actions/checkout@v4
 
