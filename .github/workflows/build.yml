@@ -36,7 +36,7 @@ jobs:
     strategy:
       matrix:
         VERSION: ['24.10']
-        SET: [docker]
+        SET: [docker]                          # 可改为 [docker, non-docker] 以同时构建
 
     steps:
     - name: Checkout
@@ -188,7 +188,7 @@ jobs:
         overwrite: true
 
   build_img:
-    needs: [prepare_release,build_friendlywrt]
+    needs: [prepare_release, build_friendlywrt]
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
 
@@ -196,7 +196,7 @@ jobs:
       matrix:
         VERSION: ['24.10']
         CPU: [rk3568]
-        SET: [docker]
+        SET: [docker]                          # 与 build_friendlywrt 保持一致
 
     steps:
     - name: Checkout
@@ -261,6 +261,7 @@ jobs:
         fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker.tgz"
 
     - name: Download host package-manager bundle
+      if: matrix.SET == 'non-docker'           # 关键修复：仅 non-docker 需要
       uses: robinraju/release-downloader@v1.6
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -307,6 +308,7 @@ jobs:
         tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
 
     - name: Unpack host package-manager bundle
+      if: matrix.SET == 'non-docker'           # 关键修复：仅 non-docker 需要
       run: |
         cd project
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
@@ -314,13 +316,13 @@ jobs:
     - name: Compile uboot and kernel
       run: |
         cd project
-        ## If you need to modify the kernel configuration, please edit the script below
+        # If you need to modify the kernel configuration, please edit the script below
         # source ../scripts/custome_kernel_config.sh
 
         ./build.sh uboot
         ./build.sh kernel
 
-        ## If you want to compile a driver from source, here is an example
+        # If you want to compile a driver from source, here is an example
         # case ${{ matrix.CPU }} in
         # rk3568)
         #     ../scripts/3rd/add_r8125.sh
