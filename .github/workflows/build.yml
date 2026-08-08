@@ -4,6 +4,23 @@ on:
   watch:
     types: started
   workflow_dispatch:
+    inputs:
+      version:
+        description: 'OpenWrt version'
+        required: true
+        default: '24.10'
+        type: choice
+        options:
+          - '24.10'
+          - '25.12'
+      set:
+        description: 'Build type'
+        required: true
+        default: 'docker'
+        type: choice
+        options:
+          - docker
+          - non-docker
 
 jobs:
   prepare_release:
@@ -32,11 +49,13 @@ jobs:
   build_friendlywrt:
     needs: prepare_release
     runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
+    if: |
+      (github.event_name == 'workflow_dispatch' && matrix.VERSION == github.event.inputs.version && matrix.SET == github.event.inputs.set) ||
+      (github.event_name != 'workflow_dispatch')
     strategy:
       matrix:
-        VERSION: ['24.10']
-        SET: [docker]                          # 可改为 [docker, non-docker] 以同时构建
+        VERSION: ['24.10', '25.12']
+        SET: [docker, non-docker]
 
     steps:
     - name: Checkout
@@ -190,13 +209,14 @@ jobs:
   build_img:
     needs: [prepare_release, build_friendlywrt]
     runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
-
+    if: |
+      (github.event_name == 'workflow_dispatch' && matrix.VERSION == github.event.inputs.version && matrix.SET == github.event.inputs.set) ||
+      (github.event_name != 'workflow_dispatch')
     strategy:
       matrix:
-        VERSION: ['24.10']
+        VERSION: ['24.10', '25.12']
         CPU: [rk3568]
-        SET: [docker]                          # 与 build_friendlywrt 保持一致
+        SET: [docker, non-docker]
 
     steps:
     - name: Checkout
@@ -261,7 +281,7 @@ jobs:
         fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker.tgz"
 
     - name: Download host package-manager bundle
-      if: matrix.SET == 'non-docker'           # 关键修复：仅 non-docker 需要
+      if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -308,7 +328,7 @@ jobs:
         tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
 
     - name: Unpack host package-manager bundle
-      if: matrix.SET == 'non-docker'           # 关键修复：仅 non-docker 需要
+      if: matrix.SET == 'non-docker'
       run: |
         cd project
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
