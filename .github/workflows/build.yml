@@ -1,14 +1,16 @@
-name: Auto Build FriendlyWrt
+name: Build FriendlyWrt R5S
 
 on:
+  schedule:
+    - cron: '0 0 * * *'          # 每天 UTC 0:00 自动触发（北京时间 8:00）
   watch:
-    types: started
-  workflow_dispatch:
+    types: started               # 手动 Star 仓库触发
+  workflow_dispatch:             # 手动触发（完全可控）
     inputs:
       version:
         description: 'OpenWrt version'
         required: true
-        default: 'both'
+        default: '24.10'
         type: choice
         options:
           - '24.10'
@@ -43,19 +45,30 @@ jobs:
     - name: Check kernel update
       id: check
       run: |
+        # 手动触发强制构建
         if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "Manual trigger, forcing build"
           echo "update_available=true" >> $GITHUB_OUTPUT
           echo "true" > /tmp/update_flag
           exit 0
         fi
-        # 获取内核仓库最新 commit（根据 FriendlyWrt 实际内核仓库调整）
-        LATEST_COMMIT=$(git ls-remote https://github.com/friendlyarm/linux master | awk '{print $1}')
+        # 获取 friendlyarm/kernel 仓库最新 commit
+        KERNEL_REPO="https://github.com/friendlyarm/kernel"
+        LATEST_COMMIT=$(git ls-remote "$KERNEL_REPO" master | awk '{print $1}')
         CACHED_COMMIT=$(cat /tmp/kernel-commit 2>/dev/null || echo "")
+        echo "Latest commit: $LATEST_COMMIT"
+        echo "Cached commit: $CACHED_COMMIT"
+        if [ -z "$LATEST_COMMIT" ]; then
+          echo "ERROR: Failed to fetch kernel commit"
+          exit 1
+        fi
         if [ "$LATEST_COMMIT" != "$CACHED_COMMIT" ]; then
+          echo "Kernel update detected!"
           echo "update_available=true" >> $GITHUB_OUTPUT
           echo "$LATEST_COMMIT" > /tmp/kernel-commit
           echo "true" > /tmp/update_flag
         else
+          echo "No kernel update, skipping build"
           echo "update_available=false" >> $GITHUB_OUTPUT
           echo "false" > /tmp/update_flag
         fi
@@ -85,7 +98,7 @@ jobs:
         draft: false
         prerelease: false
 
-  # ==================== 手动触发 ====================
+  # ==================== 手动触发（无条件执行） ====================
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -397,13 +410,13 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ==================== 自动触发（watch）仅当内核更新 ====================
+  # ==================== 自动触发（schedule + watch）仅当内核更新 ====================
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
     if: |
       github.event.repository.owner.id == github.event.sender.id &&
-      github.event_name == 'watch' &&
+      (github.event_name == 'schedule' || github.event_name == 'watch') &&
       needs.prepare_release.outputs.update_available == 'true'
     strategy:
       matrix:
@@ -709,7 +722,9 @@ jobs:
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
+    if: |
+      github.event.repository.owner.id == github.event.sender.id &&
+      (github.event_name == 'workflow_dispatch' || needs.prepare_release.outputs.update_available == 'true')
     steps:
     - name: Delete intermediate assets from release
       env:
