@@ -1,4 +1,4 @@
-name: Build FriendlyWrt
+name: Build FriendlyWrt R5S
 
 on:
   watch:
