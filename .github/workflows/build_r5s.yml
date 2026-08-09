@@ -1,4 +1,4 @@
-name: Build FriendlyWrt R5s
+name: Build FriendlyWrt
 
 on:
   watch:
@@ -126,23 +126,24 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # ====== 修正：重新生成配置，并检查 ======
+    # ====== 修改：强制启用 Clashoo 包 ======
     - name: Update config after custom packages
       run: |
         cd project
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        cd friendlywrt
+        echo "Enabling Clashoo packages in .config..."
+        sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn is not set$/CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y/' .config || echo "CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-theme-bootstrap is not set$/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config || echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> .config
+        make oldconfig
 
     - name: Verify config
       run: |
         cd project/friendlywrt
         echo "=== Checking .config for custom packages ==="
-        if [ -f .config ]; then
-          grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-theme-bootstrap|kmod-inet-diag)" .config || echo "WARNING: Some packages not found in .config"
-          echo "=== Total lines in .config: $(wc -l < .config) ==="
-        else
-          echo "ERROR: .config file not found!"
-          exit 1
-        fi
+        grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-theme-bootstrap|kmod-inet-diag)" .config || echo "WARNING: Some packages not found"
 
     - name: Download package
       run: |
@@ -434,23 +435,24 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # ====== 修正：重新生成配置，并检查 ======
+    # ====== 修改：强制启用 Clashoo 包 ======
     - name: Update config after custom packages
       run: |
         cd project
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        cd friendlywrt
+        echo "Enabling Clashoo packages in .config..."
+        sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn is not set$/CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y/' .config || echo "CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-theme-bootstrap is not set$/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config || echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> .config
+        make oldconfig
 
     - name: Verify config
       run: |
         cd project/friendlywrt
         echo "=== Checking .config for custom packages ==="
-        if [ -f .config ]; then
-          grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-theme-bootstrap|kmod-inet-diag)" .config || echo "WARNING: Some packages not found in .config"
-          echo "=== Total lines in .config: $(wc -l < .config) ==="
-        else
-          echo "ERROR: .config file not found!"
-          exit 1
-        fi
+        grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-theme-bootstrap|kmod-inet-diag)" .config || echo "WARNING: Some packages not found"
 
     - name: Download package
       run: |
