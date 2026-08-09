@@ -24,17 +24,39 @@ EOF
     echo "Added Clashoo config to $CONFIG_FILE"
 fi
 
-# ---- 3. 设置默认主题为 Bootstrap ----
+# ---- 3. 添加额外软件包（用户指定的 13 个工具） ----
+EXTRA_PKGS="
+bc
+vsftpd
+openssh-sftp-server
+wget-ssl
+busybox
+sudo
+unzip
+file
+procd
+logrotate
+coreutils-stat
+lsof
+"
+for pkg in $EXTRA_PKGS; do
+    if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
+        echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
+        echo "Added CONFIG_PACKAGE_${pkg}=y to $CONFIG_FILE"
+    fi
+done
+
+# ---- 4. 设置默认主题为 Bootstrap ----
 if ! grep -q "CONFIG_PACKAGE_luci-theme-bootstrap=y" "$CONFIG_FILE"; then
     echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> "$CONFIG_FILE"
     echo "Added CONFIG_PACKAGE_luci-theme-bootstrap=y to $CONFIG_FILE"
 fi
 
-# ---- 4. 更新 feeds 并安装 Clashoo 相关包 ----
+# ---- 5. 更新 feeds 并安装 Clashoo 相关包 ----
 (cd friendlywrt && ./scripts/feeds update clashoo)
 (cd friendlywrt && ./scripts/feeds install -a -p clashoo)
 
-# ---- 5. 修改 Clashoo Makefile，移除 kmod-inet-diag 依赖 ----
+# ---- 6. 修改 Clashoo Makefile，移除 kmod-inet-diag 依赖 ----
 if [ -d friendlywrt/feeds/clashoo ]; then
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
     echo "Removed kmod-inet-diag dependency from Clashoo Makefile(s)"
@@ -42,7 +64,7 @@ else
     echo "Warning: Clashoo feed directory not found, skip dependency fix"
 fi
 
-# ---- 6. 植入旁路由预配置 + 主题切换 ----
+# ---- 7. 植入旁路由预配置 + 增强的主题切换 ----
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -59,11 +81,16 @@ uci commit dhcp
 # 更改 root 密码为 tony
 echo -e "tony\ntony" | passwd root > /dev/null 2>&1
 
-# 强制设置 LuCI 主题为 Bootstrap
+# ==== 强制设置 LuCI 主题为 Bootstrap（防止被 Argon 覆盖） ====
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
+# 删除可能存在的其他主题默认配置
+uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
+
+# 清除 LuCI 缓存，确保主题立即生效
+rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null || true
 
 exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
-echo "Added custom uci-defaults for preset configuration, password, and Bootstrap theme"
+echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
