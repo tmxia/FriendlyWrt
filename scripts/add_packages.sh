@@ -2,6 +2,12 @@
 
 set -e
 
+# ---- 0. 确保 feeds.conf 存在（初始化） ----
+(cd friendlywrt && {
+    [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
+    echo "feeds.conf initialized"
+})
+
 # ---- 1. 添加 Clashoo feed ----
 FEED_CONF="friendlywrt/feeds.conf"
 if ! grep -q "src-git clashoo" "$FEED_CONF"; then
@@ -18,7 +24,6 @@ if ! grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE"; then
 CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
 CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
-# 强制编译内核模块（内核已支持，生成包避免依赖缺失）
 CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
     echo "Added Clashoo config to $CONFIG_FILE"
@@ -52,7 +57,7 @@ else
     echo "Warning: Clashoo feed directory not found, skip dependency fix"
 fi
 
-# ---- 7. 植入旁路由预配置 + 增强的主题切换 ----
+# ---- 7. 植入旁路由预配置 + 主题切换 ----
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -69,7 +74,7 @@ uci commit dhcp
 # 更改 root 密码为 tony
 echo -e "tony\ntony" | passwd root > /dev/null 2>&1
 
-# ==== 强制设置 LuCI 主题为 Bootstrap（防止被 Argon 覆盖） ====
+# 强制设置 LuCI 主题为 Bootstrap
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 # 删除可能存在的其他主题默认配置
 uci delete luci.themes.Argon 2>/dev/null || true
