@@ -41,7 +41,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Kernel updated, triggering build..."
-          gh workflow run build_r5s.yml -f version=both -f set=both
+          gh workflow run build_r5s.yml -f version=both -f set=both --repo ${{ github.repository }}
 
       - name: Update recorded SHA
         if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
