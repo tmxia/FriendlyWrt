@@ -24,7 +24,7 @@ EOF
     echo "Added Clashoo config to $CONFIG_FILE"
 fi
 
-# ---- 3. 添加额外软件包（用户指定的 13 个工具） ----
+# ---- 3. 添加额外软件包 ----
 EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof"
 
 for pkg in $EXTRA_PKGS; do
