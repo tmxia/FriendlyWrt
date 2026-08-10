@@ -25,20 +25,8 @@ EOF
 fi
 
 # ---- 3. 添加额外软件包（用户指定的 13 个工具） ----
-EXTRA_PKGS="
-bc
-vsftpd
-openssh-sftp-server
-wget-ssl
-busybox
-sudo
-unzip
-file
-procd
-logrotate
-coreutils-stat
-lsof
-"
+EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof"
+
 for pkg in $EXTRA_PKGS; do
     if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
         echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
