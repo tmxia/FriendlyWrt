@@ -55,7 +55,7 @@ if ! grep -q "CONFIG_PACKAGE_luci-theme-bootstrap=y" "$CONFIG_FILE"; then
     echo "Added CONFIG_PACKAGE_luci-theme-bootstrap=y to $CONFIG_FILE"
 fi
 
-# ---- 4.1 启用非自由证书包（解决 ca-certificates 更新警告） ----
+# ---- 4.1 启用非自由证书包 ----
 if ! grep -q "CONFIG_CA_CERTIFICATES_NONFREE=y" "$CONFIG_FILE"; then
     echo "CONFIG_CA_CERTIFICATES_NONFREE=y" >> "$CONFIG_FILE"
     echo "Added CONFIG_CA_CERTIFICATES_NONFREE=y to $CONFIG_FILE"
