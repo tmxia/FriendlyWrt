@@ -48,7 +48,6 @@ jobs:
       release_tag: ${{ steps.release_tag.outputs.release_tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
 
-  # ==================== 手动触发 ====================
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -126,7 +125,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # ====== 修改：强制启用 Clashoo 包 ======
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
         cd project
@@ -239,7 +238,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # ---------- 构建 SD 镜像 ----------
+    # 构建SD镜像
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -360,7 +359,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ==================== 自动触发 ====================
+  # 自动触发
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -435,7 +434,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # ====== 修改：强制启用 Clashoo 包 ======
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
         cd project
@@ -548,7 +547,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # ---------- 构建 SD 镜像 ----------
+    # 构建SD镜像
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -668,7 +667,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ==================== 清理中间产物 ====================
+  # 清理中间产物
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
