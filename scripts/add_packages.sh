@@ -39,10 +39,26 @@ for pkg in $EXTRA_PKGS; do
     fi
 done
 
+# ---- 3.1 添加 luci-app-cpufreq 和 luci-app-netdata 的依赖包 ----
+if ! grep -q "CONFIG_PACKAGE_cpufrequtils=y" "$CONFIG_FILE"; then
+    echo "CONFIG_PACKAGE_cpufrequtils=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_PACKAGE_cpufrequtils=y to $CONFIG_FILE"
+fi
+if ! grep -q "CONFIG_PACKAGE_netdata=y" "$CONFIG_FILE"; then
+    echo "CONFIG_PACKAGE_netdata=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_PACKAGE_netdata=y to $CONFIG_FILE"
+fi
+
 # ---- 4. 设置默认主题为 Bootstrap ----
 if ! grep -q "CONFIG_PACKAGE_luci-theme-bootstrap=y" "$CONFIG_FILE"; then
     echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> "$CONFIG_FILE"
     echo "Added CONFIG_PACKAGE_luci-theme-bootstrap=y to $CONFIG_FILE"
+fi
+
+# ---- 4.1 启用非自由证书包（解决 ca-certificates 更新警告） ----
+if ! grep -q "CONFIG_CA_CERTIFICATES_NONFREE=y" "$CONFIG_FILE"; then
+    echo "CONFIG_CA_CERTIFICATES_NONFREE=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_CA_CERTIFICATES_NONFREE=y to $CONFIG_FILE"
 fi
 
 # ---- 5. 更新 feeds 并安装 Clashoo 相关包 ----
