@@ -1,11 +1,9 @@
-name: Auto Build FriendlyWrt
+name: Build FriendlyWrt R5S
 
 on:
-  schedule:
-    - cron: '0 0 * * *'          # 每天 UTC 0:00 自动触发（北京时间 8:00）
   watch:
-    types: started               # 手动 Star 仓库触发
-  workflow_dispatch:             # 手动触发（完全可控）
+    types: started
+  workflow_dispatch:
     inputs:
       version:
         description: 'OpenWrt version'
@@ -30,57 +28,9 @@ jobs:
   prepare_release:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
-    outputs:
-      release_tag: ${{ steps.release_tag.outputs.release_tag }}
-      upload_url: ${{ steps.release.outputs.upload_url }}
-      update_available: ${{ steps.check.outputs.update_available }}
     steps:
-    - name: Restore kernel commit cache
-      uses: actions/cache/restore@v4
-      id: restore-cache
-      with:
-        path: /tmp/kernel-commit
-        key: kernel-commit
-
-    - name: Check kernel update
-      id: check
-      run: |
-        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-          echo "Manual trigger, forcing build"
-          echo "update_available=true" >> $GITHUB_OUTPUT
-          echo "true" > /tmp/update_flag
-          exit 0
-        fi
-        KERNEL_REPO="https://github.com/friendlyarm/kernel"
-        LATEST_COMMIT=$(git ls-remote "$KERNEL_REPO" master | awk '{print $1}')
-        CACHED_COMMIT=$(cat /tmp/kernel-commit 2>/dev/null || echo "")
-        echo "Latest commit: $LATEST_COMMIT"
-        echo "Cached commit: $CACHED_COMMIT"
-        if [ -z "$LATEST_COMMIT" ]; then
-          echo "ERROR: Failed to fetch kernel commit"
-          exit 1
-        fi
-        if [ "$LATEST_COMMIT" != "$CACHED_COMMIT" ]; then
-          echo "Kernel update detected!"
-          echo "update_available=true" >> $GITHUB_OUTPUT
-          echo "$LATEST_COMMIT" > /tmp/kernel-commit
-          echo "true" > /tmp/update_flag
-        else
-          echo "No kernel update, skipping build"
-          echo "update_available=false" >> $GITHUB_OUTPUT
-          echo "false" > /tmp/update_flag
-        fi
-
-    - name: Save kernel commit cache
-      uses: actions/cache/save@v4
-      if: steps.check.outputs.update_available == 'true' || github.event_name == 'workflow_dispatch'
-      with:
-        path: /tmp/kernel-commit
-        key: kernel-commit
-
     - name: Get release tag
       id: release_tag
-      if: steps.check.outputs.update_available == 'true' || github.event_name == 'workflow_dispatch'
       run: |
         release_tag="FriendlyWrt-$(date +%Y-%m-%d)"
         echo "release_tag=$release_tag" >> $GITHUB_OUTPUT
@@ -88,15 +38,17 @@ jobs:
     - name: Create empty release
       id: release
       uses: softprops/action-gh-release@v1
-      if: steps.check.outputs.update_available == 'true' || github.event_name == 'workflow_dispatch'
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         tag_name: ${{ steps.release_tag.outputs.release_tag }}
         draft: false
         prerelease: false
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.release_tag }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
 
-  # ==================== 手动触发（无条件执行） ====================
+  # ==================== 手动触发 ====================
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -174,7 +126,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # ====== 强制启用 Clashoo 包 ======
+    # ====== 修改：强制启用 Clashoo 包 ======
     - name: Update config after custom packages
       run: |
         cd project
@@ -408,18 +360,17 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ==================== 自动触发（schedule + watch）仅当内核更新，且仅构建 docker 类型 ====================
+  # ==================== 自动触发 ====================
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
     if: |
       github.event.repository.owner.id == github.event.sender.id &&
-      (github.event_name == 'schedule' || github.event_name == 'watch') &&
-      needs.prepare_release.outputs.update_available == 'true'
+      github.event_name == 'watch'
     strategy:
       matrix:
         VERSION: ['24.10', '25.12']
-        SET: ['docker']   # 自动构建仅编译 docker 类型
+        SET: [docker, non-docker]
 
     steps:
     - name: Checkout
@@ -484,6 +435,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
+    # ====== 修改：强制启用 Clashoo 包 ======
     - name: Update config after custom packages
       run: |
         cd project
@@ -544,7 +496,38 @@ jobs:
               ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
 
-    # 自动构建仅 docker，无需 host package-manager bundle
+    - name: Create host package-manager bundle
+      id: create_host_pm_package
+      if: matrix.SET == 'non-docker'
+      run: |
+        cd project
+        source .current_config.mk
+        PM_BIN=
+        [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk ]  && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk
+        [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg ] && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg
+        if [ -z "$PM_BIN" ]; then
+          echo "ERROR: neither apk nor opkg found under ${FRIENDLYWRT_SRC}/staging_dir/host/bin/"
+          exit 1
+        fi
+        echo "Detected host package manager: $PM_BIN"
+
+        ldd_out=$(ldd "$PM_BIN" 2>&1 || true)
+        echo "$ldd_out"
+        if ! echo "$ldd_out" | grep -q "not a dynamic executable"; then
+          bad_paths=$(echo "$ldd_out" | grep -oE '=> /[^ ]+' | sed 's|=> ||' \
+                       | grep -vE '^/(lib|lib64|usr/lib)/' || true)
+          not_found=$(echo "$ldd_out" | grep -F "not found" || true)
+          if [ -n "$bad_paths" ] || [ -n "$not_found" ]; then
+            echo "ERROR: $PM_BIN has non-portable dynamic dependencies:"
+            [ -n "$bad_paths" ] && { echo "non-system paths:"; echo "$bad_paths"; }
+            [ -n "$not_found" ] && { echo "unresolved:"; echo "$not_found"; }
+            exit 1
+          fi
+        fi
+
+        host_pm_filename="host-pm-${{ matrix.VERSION }}.tgz"
+        tar czf ../artifact/${host_pm_filename} "$PM_BIN"
+        echo "host_pm_filename=$host_pm_filename" >> $GITHUB_OUTPUT
 
     - name: Upload rootfs package
       uses: svenstaro/upload-release-action@v2
@@ -555,8 +538,29 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
+    - name: Upload host package-manager bundle
+      if: matrix.SET == 'non-docker'
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/${{ steps.create_host_pm_package.outputs.host_pm_filename }}
+        asset_name: ${{ steps.create_host_pm_package.outputs.host_pm_filename }}
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
     # ---------- 构建 SD 镜像 ----------
+    - name: Download friendlywrt rootfs (non-docker)
+      if: matrix.SET == 'non-docker'
+      uses: robinraju/release-downloader@v1.6
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        repository: ${{ github.repository }}
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
+
     - name: Download friendlywrt rootfs (docker)
+      if: matrix.SET == 'docker'
       uses: robinraju/release-downloader@v1.6
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -565,12 +569,21 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker.tgz"
 
+    - name: Download host package-manager bundle
+      if: matrix.SET == 'non-docker'
+      uses: robinraju/release-downloader@v1.6
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        repository: ${{ github.repository }}
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        fileName: "host-pm-${{ matrix.VERSION }}.tgz"
+
     - name: Prepare config for img
       id: config
       run: |
         cd project
-        CPU=rk3568
-        case $CPU in
+        case ${{ matrix.CPU }} in
         rk3568)
           MODEL=R5S-R5C-Series
           ;;
@@ -579,14 +592,14 @@ jobs:
           exit 1
           ;;
         esac
-        SUFFIX="-docker"
+        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
         IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.img
         TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.tgz
         DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
 
         CONFIG=rockchip${SUFFIX}
         cat > .current_config.mk <<EOL
-        . device/friendlyelec/$CPU/base.mk
+        . device/friendlyelec/${{ matrix.CPU }}/base.mk
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         TARGET_SD_RAW_FILENAME=${IMG_FILE}
@@ -602,6 +615,12 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+
+    - name: Unpack host package-manager bundle
+      if: matrix.SET == 'non-docker'
+      run: |
+        cd project
+        tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
     - name: Compile uboot and kernel
       run: |
@@ -622,7 +641,7 @@ jobs:
             ls -la
             exit 1
         fi
-        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
+        archive_dir="${{ steps.config.outputs.dist_dir }}-${{ matrix.CPU }}"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
         mv ${{ steps.config.outputs.archive_filename }} ../../../artifact/
@@ -653,9 +672,7 @@ jobs:
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
-    if: |
-      github.event.repository.owner.id == github.event.sender.id &&
-      (github.event_name == 'workflow_dispatch' || needs.prepare_release.outputs.update_available == 'true')
+    if: github.event.repository.owner.id == github.event.sender.id
     steps:
     - name: Delete intermediate assets from release
       env:
@@ -671,22 +688,3 @@ jobs:
             echo "Deleting asset: $asset"
             gh release delete-asset "$RELEASE_TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY"
           done
-
-  # ==================== 清理工作流历史记录（保留最近一次运行） ====================
-  cleanup_self:
-    name: Cleanup Workflow History
-    runs-on: ubuntu-22.04
-    needs: [prepare_release, build_manual, build_auto, cleanup_intermediate_assets]
-    if: always()  # 无论前面的作业是否成功都执行
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Delete old runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          keep_minimum_runs: 1            # 保留最近一次运行（包括当前运行）
-          retain_days: 0                  # 不按天数保留（全部删除）
-          delete_workflow_pattern: "Auto Build FriendlyWrt R5S"
-          repository: ${{ github.repository }}
