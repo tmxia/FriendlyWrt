@@ -52,3 +52,21 @@ jobs:
           git add .kernel-version
           git commit -m "Update kernel SHA"
           git push
+
+  cleanup_self:
+    name: Cleanup Self Workflow History
+    runs-on: ubuntu-latest
+    needs: [check_kernel]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 0
+          retain_days: 0
+          delete_workflow_pattern: "Kernel Watcher"
+          repository: ${{ github.repository }}
