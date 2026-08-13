@@ -246,5 +246,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build OpenWrt Mainline"
+          delete_workflow_pattern: "Build OpenWrt Mainline (Kernel 6.18)"
           repository: ${{ github.repository }}
