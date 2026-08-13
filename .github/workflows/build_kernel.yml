@@ -51,9 +51,7 @@ jobs:
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
-    if: |
-      github.event.repository.owner.id == github.event.sender.id &&
-      github.event_name == 'workflow_dispatch'
+    if: github.event.repository.owner.id == github.event.sender.id && github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         VERSION: ${{ fromJSON(github.event.inputs.version == 'both' && '["24.10","25.12"]' || format('["{0}"]', github.event.inputs.version)) }}
@@ -186,9 +184,7 @@ jobs:
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
-    if: |
-      github.event.repository.owner.id == github.event.sender.id &&
-      github.event_name == 'watch'
+    if: github.event.repository.owner.id == github.event.sender.id && github.event_name == 'watch'
     strategy:
       matrix:
         VERSION: ['24.10', '25.12']
