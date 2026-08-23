@@ -71,45 +71,6 @@ if ! grep -q "CONFIG_CA_CERTIFICATES_NONFREE=y" "$CONFIG_FILE"; then
     echo "Added CONFIG_CA_CERTIFICATES_NONFREE=y to $CONFIG_FILE"
 fi
 
-# 禁用旁路由不需要的功能包
-echo "Disabling unnecessary packages for side-router..."
-
-# 定义禁用函数
-disable_pkg() {
-    local pkg="$1"
-    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CONFIG_FILE"
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CONFIG_FILE"
-    echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CONFIG_FILE"
-    echo "Disabled CONFIG_PACKAGE_${pkg}"
-}
-
-# 关闭 Adblock 和 Aria2
-disable_pkg "adblock"
-disable_pkg "luci-app-adblock"
-disable_pkg "aria2"
-disable_pkg "aria2-openssl"
-disable_pkg "luci-app-aria2"
-
-# 关闭其他不必要功能
-DISABLE_LIST="
-    sqm-scripts luci-app-sqm
-    ddns-scripts luci-app-ddns
-    miniupnpd miniupnpd-nftables luci-app-upnp
-    samba4-libs samba4-server luci-app-samba4
-    minidlna luci-app-minidlna
-    comgt luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official wwan
-    iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 rtl8822be-firmware rtl8822ce-firmware mt76x2-firmware mt792x-firmware
-    luci-app-diskman
-    collectd luci-app-statistics
-    ppp ppp-mod-pppoe luci-proto-ppp
-    luci-app-watchcat
-    # 若不需 IPv6 可取消注释以下三行
-    # odhcp6c odhcpd-ipv6only luci-proto-ipv6
-"
-for pkg in $DISABLE_LIST; do
-    disable_pkg "$pkg"
-done
-
 # ---- 5.更新 feeds（必须先更新，才能修改 Makefile） ----
 (cd friendlywrt && ./scripts/feeds update clashoo)
 (cd friendlywrt && ./scripts/feeds install -a -p clashoo)
@@ -162,7 +123,86 @@ EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
 
-# ==================== 新增：执行 make defconfig 应用所有配置修改 ====================
-echo "Running make defconfig to apply all package selections (including disabled ones)..."
-(cd friendlywrt && make defconfig)
-echo "All configurations applied."
+# ================== 新增：强制禁用不需要的包（确保生效） ==================
+cd friendlywrt
+
+# 1. 先禁用全局选项，防止它们拉入不需要的包
+./scripts/config --disable CONFIG_ALL_KMODS
+./scripts/config --disable CONFIG_ALL_NONSHARED
+./scripts/config --disable CONFIG_DEVEL
+./scripts/config --disable CONFIG_BUILDBOT
+
+# 2. 生成初始配置（此时全局开关已禁用）
+make defconfig
+
+# 3. 定义需要禁用的具体包列表（只包含有效包名，不含注释）
+DISABLE_PKGS="
+    adblock
+    luci-app-adblock
+    aria2
+    aria2-openssl
+    luci-app-aria2
+    sqm-scripts
+    luci-app-sqm
+    ddns-scripts
+    luci-app-ddns
+    miniupnpd
+    miniupnpd-nftables
+    luci-app-upnp
+    samba4-libs
+    samba4-server
+    luci-app-samba4
+    minidlna
+    luci-app-minidlna
+    comgt
+    luci-proto-3g
+    luci-proto-qmi
+    qmi-utils
+    uqmi
+    umbim
+    usb-modeswitch-official
+    wwan
+    iwlwifi-firmware-ax200
+    iwlwifi-firmware-ax210
+    rtl8822be-firmware
+    rtl8822ce-firmware
+    mt76x2-firmware
+    mt792x-firmware
+    luci-app-diskman
+    collectd
+    luci-app-statistics
+    kmod-wireguard
+    wireguard-tools
+    luci-proto-wireguard
+    ppp
+    ppp-mod-pppoe
+    luci-proto-ppp
+    luci-app-watchcat
+    # 若需保留 IPv6，请删除以下三行
+    odhcp6c
+    odhcpd-ipv6only
+    luci-proto-ipv6
+"
+
+# 4. 执行禁用操作并重复两次，确保依赖被覆盖
+for i in 1 2; do
+    for pkg in $DISABLE_PKGS; do
+        ./scripts/config --disable "CONFIG_PACKAGE_${pkg}"
+    done
+    # 运行 oldconfig 应用修改
+    make oldconfig
+done
+
+# 5. 再次检查并强制禁用（以防万一）
+for pkg in $DISABLE_PKGS; do
+    ./scripts/config --disable "CONFIG_PACKAGE_${pkg}"
+done
+make oldconfig
+
+# 6. 打印一些关键包的状态（便于调试）
+echo "=== Final package status ==="
+grep -E "CONFIG_PACKAGE_(adblock|aria2|sqm-scripts|ddns-scripts|miniupnpd|samba4|minidlna|ppp|odhcp6c)" .config || echo "All disabled packages are not set."
+
+cd ..
+
+echo "All unwanted packages have been forcefully disabled."
