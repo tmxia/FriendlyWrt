@@ -30,7 +30,7 @@ EOF
 fi
 
 # ---- 3.添加软件包 ----
-EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools"
+EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light"
 
 for pkg in $EXTRA_PKGS; do
     if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
