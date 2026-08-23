@@ -123,7 +123,7 @@ EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
 
-# ================== 新增：强制禁用不需要的包（直接修改 .config） ==================
+# ================== 强制禁用不需要的包 ==================
 cd friendlywrt
 
 # 1. 先禁用全局选项，防止它们拉入不需要的包
@@ -132,10 +132,10 @@ sed -i 's/^CONFIG_ALL_NONSHARED=.*/# CONFIG_ALL_NONSHARED is not set/' .config |
 sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG_DEVEL is not set" >> .config
 sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
 
-# 2. 生成初始配置（此时全局开关已禁用）
+# 2. 生成初始配置
 make defconfig
 
-# 3. 定义需要禁用的具体包列表（只包含有效包名）
+# 3. 定义需要禁用的具体包列表
 DISABLE_PKGS="
     adblock
     luci-app-adblock
@@ -192,7 +192,7 @@ done
 # 5. 运行 oldconfig 应用修改
 make oldconfig
 
-# 6. 再次检查并强制禁用（防止依赖重新启用）
+# 6. 再次检查并强制禁用
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
