@@ -1,8 +1,10 @@
 #!/bin/bash
 set -e
 
-# 进入 friendlywrt 源码目录
-cd friendlywrt || { echo "friendlywrt directory not found"; exit 1; }
+# 自动获取脚本所在目录的上级目录（即仓库根目录）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR/../project"
+cd "$PROJECT_DIR/friendlywrt" || { echo "friendlywrt directory not found at $PROJECT_DIR/friendlywrt"; exit 1; }
 
 # ========== 1. 确保 feeds.conf 包含 Clashoo ==========
 FEED_CONF="feeds.conf"
