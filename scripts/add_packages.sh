@@ -1,64 +1,96 @@
 #!/bin/bash
+
 set -e
 
-# ---- 1. 定位并进入 project/ 目录 ----
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$SCRIPT_DIR/../project"
-cd "$PROJECT_DIR" || { echo "project directory not found at $PROJECT_DIR"; exit 1; }
+# ---- 0.确保 feeds.conf  ----
+(cd friendlywrt && {
+    [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
+    echo "feeds.conf initialized"
+})
 
-# ---- 2. 定义自定义配置文件（不修改 01-nanopi） ----
-CUSTOM_CONFIG="configs/rockchip/03-custom"
-# 清空或创建该文件
-> "$CUSTOM_CONFIG"
+# ---- 1.添加 Clashoo feed ----
+FEED_CONF="friendlywrt/feeds.conf"
+if ! grep -q "src-git clashoo" "$FEED_CONF"; then
+    echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
+    echo "Added Clashoo feed to feeds.conf"
+fi
 
-# ---- 3. 辅助函数：启用包 ----
-add_pkg() {
-    local pkg="$1"
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CUSTOM_CONFIG"
-    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CUSTOM_CONFIG"
-    echo "CONFIG_PACKAGE_${pkg}=y" >> "$CUSTOM_CONFIG"
-    echo "Enabled CONFIG_PACKAGE_${pkg}"
-}
+# ---- 2.添加Clashoo编译配置 ----
+CONFIG_FILE="configs/rockchip/01-nanopi"
+if ! grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE"; then
+    cat >> "$CONFIG_FILE" << EOF
 
-# ---- 4. 辅助函数：禁用包 ----
+# Clashoo packages
+CONFIG_PACKAGE_clashoo=y
+CONFIG_PACKAGE_luci-app-clashoo=y
+CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
+CONFIG_PACKAGE_kmod-inet-diag=y
+EOF
+    echo "Added Clashoo config to $CONFIG_FILE"
+fi
+
+# ---- 3.添加软件包 ----
+EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof"
+
+for pkg in $EXTRA_PKGS; do
+    if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
+        echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
+        echo "Added CONFIG_PACKAGE_${pkg}=y to $CONFIG_FILE"
+    fi
+done
+
+# 添加 cpufrequtils 和 netdata（为 luci-app-cpufreq / luci-app-netdata 提供底层依赖）
+if ! grep -q "CONFIG_PACKAGE_cpufrequtils=y" "$CONFIG_FILE"; then
+    echo "CONFIG_PACKAGE_cpufrequtils=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_PACKAGE_cpufrequtils=y to $CONFIG_FILE"
+fi
+if ! grep -q "CONFIG_PACKAGE_netdata=y" "$CONFIG_FILE"; then
+    echo "CONFIG_PACKAGE_netdata=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_PACKAGE_netdata=y to $CONFIG_FILE"
+fi
+
+# 添加 luci-app-cpufreq 和 luci-app-netdata 本身的配置（若需要）
+if ! grep -q "CONFIG_PACKAGE_luci-app-cpufreq=y" "$CONFIG_FILE"; then
+    echo "CONFIG_PACKAGE_luci-app-cpufreq=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_PACKAGE_luci-app-cpufreq=y to $CONFIG_FILE"
+fi
+if ! grep -q "CONFIG_PACKAGE_luci-app-netdata=y" "$CONFIG_FILE"; then
+    echo "CONFIG_PACKAGE_luci-app-netdata=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_PACKAGE_luci-app-netdata=y to $CONFIG_FILE"
+fi
+
+# ---- 4.设置默认主题 ----
+if ! grep -q "CONFIG_PACKAGE_luci-theme-bootstrap=y" "$CONFIG_FILE"; then
+    echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_PACKAGE_luci-theme-bootstrap=y to $CONFIG_FILE"
+fi
+
+# 启用非自由证书包（netdata 可能需要）
+if ! grep -q "CONFIG_CA_CERTIFICATES_NONFREE=y" "$CONFIG_FILE"; then
+    echo "CONFIG_CA_CERTIFICATES_NONFREE=y" >> "$CONFIG_FILE"
+    echo "Added CONFIG_CA_CERTIFICATES_NONFREE=y to $CONFIG_FILE"
+fi
+
+# ==================== 新增：禁用旁路由不需要的功能包 ====================
+echo "Disabling unnecessary packages for side-router..."
+
+# 定义禁用函数：先删除已有配置，再追加禁用行
 disable_pkg() {
     local pkg="$1"
-    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CUSTOM_CONFIG"
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CUSTOM_CONFIG"
-    echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CUSTOM_CONFIG"
+    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CONFIG_FILE"
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CONFIG_FILE"
+    echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CONFIG_FILE"
     echo "Disabled CONFIG_PACKAGE_${pkg}"
 }
 
-# ========== 5. 添加 Clashoo 相关配置 ==========
-add_pkg "clashoo"
-add_pkg "luci-app-clashoo"
-add_pkg "luci-i18n-clashoo-zh-cn"
-add_pkg "kmod-inet-diag"
-
-# ========== 6. 添加额外软件包 ==========
-EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof"
-for pkg in $EXTRA_PKGS; do
-    add_pkg "$pkg"
-done
-
-add_pkg "cpufrequtils"
-add_pkg "netdata"
-add_pkg "luci-app-cpufreq"
-add_pkg "luci-app-netdata"
-add_pkg "ca-certificates-nonfree"
-add_pkg "luci-theme-bootstrap"
-
-# ========== 7. 禁用旁路由不需要的功能包 ==========
-echo "Disabling unnecessary packages for side-router..."
-
-# 按用户要求关闭 Adblock 和 Aria2
+# 关闭 Adblock 和 Aria2（按您要求）
 disable_pkg "adblock"
 disable_pkg "luci-app-adblock"
 disable_pkg "aria2"
 disable_pkg "aria2-openssl"
 disable_pkg "luci-app-aria2"
 
-# 其他不必要功能
+# 关闭其他不必要功能（可根据需要增删）
 DISABLE_LIST="
     sqm-scripts luci-app-sqm
     ddns-scripts luci-app-ddns
@@ -74,55 +106,37 @@ DISABLE_LIST="
     # 若不需 IPv6 可取消注释以下三行
     # odhcp6c odhcpd-ipv6only luci-proto-ipv6
 "
-
 for pkg in $DISABLE_LIST; do
     disable_pkg "$pkg"
 done
+# ==================== 新增结束 ====================
 
-# ========== 8. 进入 friendlywrt 目录进行后续操作 ==========
-cd friendlywrt || { echo "friendlywrt directory not found"; exit 1; }
+# ---- 5.更新 feeds（必须先更新，才能修改 Makefile） ----
+(cd friendlywrt && ./scripts/feeds update clashoo)
+(cd friendlywrt && ./scripts/feeds install -a -p clashoo)
 
-# ---- 8.1 确保 feeds.conf 包含 Clashoo ----
-FEED_CONF="feeds.conf"
-if ! grep -q "src-git clashoo" "$FEED_CONF"; then
-    echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
-    echo "Added Clashoo feed to feeds.conf"
-fi
-
-# ---- 8.2 更新所有 feeds ----
-echo "Updating all feeds..."
-./scripts/feeds update -a
-./scripts/feeds install -a
-
-# ---- 8.3 修复依赖问题 ----
-# 移除 kmod-inet-diag 依赖（Clashoo）
-if [ -d feeds/clashoo ]; then
-    find feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
+# ---- 6.移除 kmod-inet-diag 依赖（Clashoo） ----
+if [ -d friendlywrt/feeds/clashoo ]; then
+    find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
     echo "Removed kmod-inet-diag dependency from Clashoo Makefile(s)"
 else
     echo "Warning: Clashoo feed directory not found, skip dependency fix"
 fi
 
-# 修正 luci-app-cpufreq 依赖 (cpufreq -> cpufrequtils)
-if [ -d feeds/luci/applications/luci-app-cpufreq ]; then
-    sed -i 's/+cpufreq/+cpufrequtils/g' feeds/luci/applications/luci-app-cpufreq/Makefile
+# ---- 7.修正 luci-app-cpufreq 和 luci-app-netdata 的依赖 ----
+if [ -d friendlywrt/feeds/luci/applications/luci-app-cpufreq ]; then
+    sed -i 's/+cpufreq/+cpufrequtils/g' friendlywrt/feeds/luci/applications/luci-app-cpufreq/Makefile
     echo "Fixed luci-app-cpufreq dependency (cpufreq -> cpufrequtils)"
 fi
 
-# 修正 luci-app-netdata 依赖 (netdata-ssl -> netdata)
-if [ -d feeds/luci/applications/luci-app-netdata ]; then
-    sed -i 's/+netdata-ssl/+netdata/g' feeds/luci/applications/luci-app-netdata/Makefile
+if [ -d friendlywrt/feeds/luci/applications/luci-app-netdata ]; then
+    sed -i 's/+netdata-ssl/+netdata/g' friendlywrt/feeds/luci/applications/luci-app-netdata/Makefile
     echo "Fixed luci-app-netdata dependency (netdata-ssl -> netdata)"
 fi
 
-# ---- 8.4 重新生成 .config 以合并所有配置修改 ----
-echo "Running make defconfig to merge configurations..."
-make defconfig
-make oldconfig
-
-# ---- 8.5 植入旁路由预配置及主题切换（uci-defaults） ----
-mkdir -p files/etc/uci-defaults
-cat > files/etc/uci-defaults/99-custom << 'EOF'
+# ---- 8.植入旁路由预配置及主题切换 ----
+mkdir -p friendlywrt/files/etc/uci-defaults
+cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 # 旁路由固定IP配置
 uci set network.lan.ipaddr='192.168.3.3'
@@ -146,7 +160,10 @@ rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null || true
 
 exit 0
 EOF
-chmod +x files/etc/uci-defaults/99-custom
+chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
 
-echo "All package configurations and customizations applied successfully."
+# ==================== 新增：执行 make defconfig 应用所有配置修改 ====================
+echo "Running make defconfig to apply all package selections (including disabled ones)..."
+(cd friendlywrt && make defconfig)
+echo "All configurations applied."
