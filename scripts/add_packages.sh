@@ -123,19 +123,19 @@ EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
 
-# ================== 新增：强制禁用不需要的包（确保生效） ==================
+# ================== 新增：强制禁用不需要的包（直接修改 .config） ==================
 cd friendlywrt
 
 # 1. 先禁用全局选项，防止它们拉入不需要的包
-./scripts/config --disable CONFIG_ALL_KMODS
-./scripts/config --disable CONFIG_ALL_NONSHARED
-./scripts/config --disable CONFIG_DEVEL
-./scripts/config --disable CONFIG_BUILDBOT
+sed -i 's/^CONFIG_ALL_KMODS=.*/# CONFIG_ALL_KMODS is not set/' .config || echo "# CONFIG_ALL_KMODS is not set" >> .config
+sed -i 's/^CONFIG_ALL_NONSHARED=.*/# CONFIG_ALL_NONSHARED is not set/' .config || echo "# CONFIG_ALL_NONSHARED is not set" >> .config
+sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG_DEVEL is not set" >> .config
+sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
 
 # 2. 生成初始配置（此时全局开关已禁用）
 make defconfig
 
-# 3. 定义需要禁用的具体包列表（只包含有效包名，不含注释）
+# 3. 定义需要禁用的具体包列表（只包含有效包名）
 DISABLE_PKGS="
     adblock
     luci-app-adblock
@@ -181,22 +181,25 @@ DISABLE_PKGS="
     luci-proto-ipv6
 "
 
-# 4. 执行禁用操作并重复两次，确保依赖被覆盖
-for i in 1 2; do
-    for pkg in $DISABLE_PKGS; do
-        ./scripts/config --disable "CONFIG_PACKAGE_${pkg}"
-    done
-    # 运行 oldconfig 应用修改
-    make oldconfig
+# 4. 使用 sed 直接禁用每个包
+for pkg in $DISABLE_PKGS; do
+    # 将任何可能的启用行或禁用行替换为明确的禁用行
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+    # 如果该行不存在，则追加
+    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# 5. 再次检查并强制禁用（以防万一）
+# 5. 运行 oldconfig 应用修改
+make oldconfig
+
+# 6. 再次检查并强制禁用（防止依赖重新启用）
 for pkg in $DISABLE_PKGS; do
-    ./scripts/config --disable "CONFIG_PACKAGE_${pkg}"
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 make oldconfig
 
-# 6. 打印一些关键包的状态（便于调试）
+# 打印关键包状态
 echo "=== Final package status ==="
 grep -E "CONFIG_PACKAGE_(adblock|aria2|sqm-scripts|ddns-scripts|miniupnpd|samba4|minidlna|ppp|odhcp6c)" .config || echo "All disabled packages are not set."
 
