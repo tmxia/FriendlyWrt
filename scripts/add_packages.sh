@@ -71,10 +71,10 @@ if ! grep -q "CONFIG_CA_CERTIFICATES_NONFREE=y" "$CONFIG_FILE"; then
     echo "Added CONFIG_CA_CERTIFICATES_NONFREE=y to $CONFIG_FILE"
 fi
 
-# ==================== 新增：禁用旁路由不需要的功能包 ====================
+# 禁用旁路由不需要的功能包
 echo "Disabling unnecessary packages for side-router..."
 
-# 定义禁用函数：先删除已有配置，再追加禁用行
+# 定义禁用函数
 disable_pkg() {
     local pkg="$1"
     sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CONFIG_FILE"
@@ -83,14 +83,14 @@ disable_pkg() {
     echo "Disabled CONFIG_PACKAGE_${pkg}"
 }
 
-# 关闭 Adblock 和 Aria2（按您要求）
+# 关闭 Adblock 和 Aria2
 disable_pkg "adblock"
 disable_pkg "luci-app-adblock"
 disable_pkg "aria2"
 disable_pkg "aria2-openssl"
 disable_pkg "luci-app-aria2"
 
-# 关闭其他不必要功能（可根据需要增删）
+# 关闭其他不必要功能
 DISABLE_LIST="
     sqm-scripts luci-app-sqm
     ddns-scripts luci-app-ddns
@@ -109,7 +109,6 @@ DISABLE_LIST="
 for pkg in $DISABLE_LIST; do
     disable_pkg "$pkg"
 done
-# ==================== 新增结束 ====================
 
 # ---- 5.更新 feeds（必须先更新，才能修改 Makefile） ----
 (cd friendlywrt && ./scripts/feeds update clashoo)
