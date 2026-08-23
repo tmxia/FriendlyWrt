@@ -123,7 +123,7 @@ EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
 
-# ================== 强制禁用不需要的包 ==================
+# ================== 强制禁用功能包 ==================
 cd friendlywrt
 
 # 1. 先禁用全局选项，防止它们拉入不需要的包
