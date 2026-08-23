@@ -171,9 +171,6 @@ DISABLE_PKGS="
     luci-app-diskman
     collectd
     luci-app-statistics
-    kmod-wireguard
-    wireguard-tools
-    luci-proto-wireguard
     ppp
     ppp-mod-pppoe
     luci-proto-ppp
