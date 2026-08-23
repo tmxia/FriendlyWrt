@@ -142,6 +142,8 @@ DISABLE_PKGS="
     aria2
     aria2-openssl
     luci-app-aria2
+    nft-qos
+    luci-app-nft-qos
     sqm-scripts
     luci-app-sqm
     ddns-scripts
