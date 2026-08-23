@@ -2,7 +2,7 @@
 set -e
 
 # 进入 friendlywrt 源码目录
-cd project/friendlywrt || { echo "friendlywrt directory not found"; exit 1; }
+cd friendlywrt || { echo "friendlywrt directory not found"; exit 1; }
 
 # ========== 1. 确保 feeds.conf 包含 Clashoo ==========
 FEED_CONF="feeds.conf"
