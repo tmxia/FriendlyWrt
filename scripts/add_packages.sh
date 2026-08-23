@@ -113,7 +113,6 @@ DISABLE_LIST="
     iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 rtl8822be-firmware rtl8822ce-firmware mt76x2-firmware mt792x-firmware
     luci-app-diskman
     collectd luci-app-statistics
-    kmod-wireguard wireguard-tools luci-proto-wireguard
     ppp ppp-mod-pppoe luci-proto-ppp
     luci-app-watchcat
     # 若不需 IPv6 可取消注释以下三行
