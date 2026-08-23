@@ -1,49 +1,41 @@
 #!/bin/bash
 set -e
 
-# ---- 1. 定位仓库根目录和 project 目录 ----
+# ---- 1. 定位并进入 project/ 目录 ----
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR/../project"
-
-# ---- 2. 进入 project/ 目录（这里存放 configs/ 等） ----
 cd "$PROJECT_DIR" || { echo "project directory not found at $PROJECT_DIR"; exit 1; }
 
-# ---- 3. 定义配置文件路径（相对于 project/） ----
-CONFIG_FILE="configs/rockchip/01-nanopi"
+# ---- 2. 定义自定义配置文件（不修改 01-nanopi） ----
+CUSTOM_CONFIG="configs/rockchip/03-custom"
+# 清空或创建该文件
+> "$CUSTOM_CONFIG"
 
-# ---- 4. 辅助函数：启用包 ----
+# ---- 3. 辅助函数：启用包 ----
 add_pkg() {
     local pkg="$1"
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CONFIG_FILE"
-    if ! grep -q "^CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
-        echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
-        echo "Enabled CONFIG_PACKAGE_${pkg}"
-    fi
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CUSTOM_CONFIG"
+    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CUSTOM_CONFIG"
+    echo "CONFIG_PACKAGE_${pkg}=y" >> "$CUSTOM_CONFIG"
+    echo "Enabled CONFIG_PACKAGE_${pkg}"
 }
 
-# ---- 5. 辅助函数：禁用包 ----
+# ---- 4. 辅助函数：禁用包 ----
 disable_pkg() {
     local pkg="$1"
-    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CONFIG_FILE"
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CONFIG_FILE"
-    echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CONFIG_FILE"
+    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" "$CUSTOM_CONFIG"
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" "$CUSTOM_CONFIG"
+    echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CUSTOM_CONFIG"
     echo "Disabled CONFIG_PACKAGE_${pkg}"
 }
 
-# ========== 6. 添加 Clashoo 相关配置 ==========
-if ! grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE"; then
-    cat >> "$CONFIG_FILE" << 'EOF'
+# ========== 5. 添加 Clashoo 相关配置 ==========
+add_pkg "clashoo"
+add_pkg "luci-app-clashoo"
+add_pkg "luci-i18n-clashoo-zh-cn"
+add_pkg "kmod-inet-diag"
 
-# Clashoo packages
-CONFIG_PACKAGE_clashoo=y
-CONFIG_PACKAGE_luci-app-clashoo=y
-CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
-CONFIG_PACKAGE_kmod-inet-diag=y
-EOF
-    echo "Added Clashoo config to $CONFIG_FILE"
-fi
-
-# ========== 7. 添加额外软件包（保留原 EXTRA_PKGS 等） ==========
+# ========== 6. 添加额外软件包 ==========
 EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof"
 for pkg in $EXTRA_PKGS; do
     add_pkg "$pkg"
@@ -56,7 +48,7 @@ add_pkg "luci-app-netdata"
 add_pkg "ca-certificates-nonfree"
 add_pkg "luci-theme-bootstrap"
 
-# ========== 8. 禁用旁路由不需要的功能包 ==========
+# ========== 7. 禁用旁路由不需要的功能包 ==========
 echo "Disabling unnecessary packages for side-router..."
 
 # 按用户要求关闭 Adblock 和 Aria2
@@ -87,22 +79,22 @@ for pkg in $DISABLE_LIST; do
     disable_pkg "$pkg"
 done
 
-# ========== 9. 进入 friendlywrt 目录进行后续操作 ==========
+# ========== 8. 进入 friendlywrt 目录进行后续操作 ==========
 cd friendlywrt || { echo "friendlywrt directory not found"; exit 1; }
 
-# ---- 9.1 确保 feeds.conf 包含 Clashoo ----
+# ---- 8.1 确保 feeds.conf 包含 Clashoo ----
 FEED_CONF="feeds.conf"
 if ! grep -q "src-git clashoo" "$FEED_CONF"; then
     echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
     echo "Added Clashoo feed to feeds.conf"
 fi
 
-# ---- 9.2 更新所有 feeds ----
+# ---- 8.2 更新所有 feeds ----
 echo "Updating all feeds..."
 ./scripts/feeds update -a
 ./scripts/feeds install -a
 
-# ---- 9.3 修复依赖问题 ----
+# ---- 8.3 修复依赖问题 ----
 # 移除 kmod-inet-diag 依赖（Clashoo）
 if [ -d feeds/clashoo ]; then
     find feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
@@ -123,12 +115,12 @@ if [ -d feeds/luci/applications/luci-app-netdata ]; then
     echo "Fixed luci-app-netdata dependency (netdata-ssl -> netdata)"
 fi
 
-# ---- 9.4 重新生成 .config 以合并所有配置修改 ----
+# ---- 8.4 重新生成 .config 以合并所有配置修改 ----
 echo "Running make defconfig to merge configurations..."
 make defconfig
 make oldconfig
 
-# ---- 9.5 植入旁路由预配置及主题切换（uci-defaults） ----
+# ---- 8.5 植入旁路由预配置及主题切换（uci-defaults） ----
 mkdir -p files/etc/uci-defaults
 cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
