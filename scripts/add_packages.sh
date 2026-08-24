@@ -52,7 +52,7 @@ ENSURE_PKGS="
     luci-app-netdata
     luci-theme-bootstrap
 "
-# 如需增加其他包，直接在上面列表中添加即可，脚本会自动处理。
+# 如需增加其他包，直接在上面列表中添加即可。
 
 # ---- 3.将上述包写入 configs/rockchip/01-nanopi ----
 for pkg in $ENSURE_PKGS; do
