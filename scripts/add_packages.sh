@@ -75,18 +75,7 @@ else
     echo "Warning: Clashoo feed directory not found, skip dependency fix"
 fi
 
-# ---- 6.修正 luci-app-cpufreq 和 luci-app-netdata 的依赖 ----
-if [ -d friendlywrt/feeds/luci/applications/luci-app-cpufreq ]; then
-    sed -i 's/+cpufreq/+cpufrequtils/g' friendlywrt/feeds/luci/applications/luci-app-cpufreq/Makefile
-    echo "Fixed luci-app-cpufreq dependency (cpufreq -> cpufrequtils)"
-fi
-
-if [ -d friendlywrt/feeds/luci/applications/luci-app-netdata ]; then
-    sed -i 's/+netdata-ssl/+netdata/g' friendlywrt/feeds/luci/applications/luci-app-netdata/Makefile
-    echo "Fixed luci-app-netdata dependency (netdata-ssl -> netdata)"
-fi
-
-# ---- 7.植入旁路由预配置及主题切换 ----
+# ---- 6.植入旁路由预配置及主题切换 ----
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -118,16 +107,16 @@ echo "Added custom uci-defaults for preset configuration, password, Bootstrap th
 # ================== 统一处理：禁用不需要的 + 强制启用必需的 ==================
 cd friendlywrt
 
-# ---- 8. 禁用全局选项 ----
+# ---- 7. 禁用全局选项 ----
 sed -i 's/^CONFIG_ALL_KMODS=.*/# CONFIG_ALL_KMODS is not set/' .config || echo "# CONFIG_ALL_KMODS is not set" >> .config
 sed -i 's/^CONFIG_ALL_NONSHARED=.*/# CONFIG_ALL_NONSHARED is not set/' .config || echo "# CONFIG_ALL_NONSHARED is not set" >> .config
 sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG_DEVEL is not set" >> .config
 sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
 
-# ---- 9. 生成初始配置 ----
+# ---- 8. 生成初始配置 ----
 make defconfig
 
-# ---- 10. 定义需要禁用的包列表 ----
+# ---- 9. 定义需要禁用的包列表 ----
 DISABLE_PKGS="
     adblock luci-app-adblock
     aria2 aria2-openssl luci-app-aria2
@@ -146,23 +135,23 @@ DISABLE_PKGS="
 "
 # 如需保留 IPv6，请删除 odhcp6c odhcpd-ipv6only luci-proto-ipv6
 
-# ---- 11. 禁用所有不需要的包 ----
+# ---- 10. 禁用所有不需要的包 ----
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# ---- 12. 强制启用所有需要的包（直接使用 ENSURE_PKGS，与步骤3一致） ----
+# ---- 11. 强制启用所有需要的包（直接使用 ENSURE_PKGS） ----
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# ---- 13. 应用所有修改 ----
+# ---- 12. 应用所有修改 ----
 make oldconfig
 
-# ---- 14. 自动打印所有定义的包状态（无需手动维护） ----
+# ---- 13. 自动打印所有定义的包状态（无需手动维护） ----
 echo "=== Final package status (auto-generated from lists) ==="
 
 check_pkg() {
