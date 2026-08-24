@@ -50,7 +50,6 @@ ENSURE_PKGS="
     netdata
     luci-app-cpufreq
     luci-app-netdata
-    ca-certificates-nonfree
     luci-theme-bootstrap
 "
 # 如需增加其他包，直接在上面列表中添加即可，脚本会自动处理。
@@ -119,17 +118,17 @@ make defconfig
 # ---- 9. 定义需要禁用的包列表 ----
 DISABLE_PKGS="
     adblock luci-app-adblock
-    aria2 aria2-openssl luci-app-aria2
+    aria2 luci-app-aria2
     sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
     ddns-scripts luci-app-ddns
-    miniupnpd miniupnpd-nftables luci-app-upnp
+    miniupnpd-nftables luci-app-upnp
     samba4-libs samba4-server luci-app-samba4
     minidlna luci-app-minidlna
-    comgt luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official wwan
+    luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official
     iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 rtl8822be-firmware rtl8822ce-firmware mt76x2-firmware mt792x-firmware
     luci-app-diskman
     collectd luci-app-statistics
-    ppp ppp-mod-pppoe luci-proto-ppp
+    ppp luci-proto-ppp
     luci-app-watchcat
 "
 # 如需保留 IPv6，请删除 odhcp6c odhcpd-ipv6only luci-proto-ipv6
