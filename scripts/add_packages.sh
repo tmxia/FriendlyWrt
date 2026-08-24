@@ -46,7 +46,6 @@ ENSURE_PKGS="
     jq
     wireguard-tools
     python3-light
-    cpufrequtils
     netdata
     luci-app-cpufreq
     luci-app-netdata
