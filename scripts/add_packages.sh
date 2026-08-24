@@ -29,53 +29,45 @@ EOF
     echo "Added Clashoo config to $CONFIG_FILE"
 fi
 
-# ---- 3.添加软件包 ----
-EXTRA_PKGS="bc vsftpd openssh-sftp-server wget-ssl busybox sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light"
+# ================== 统一维护的软件包列表（添加/启用） ==================
+ENSURE_PKGS="
+    bc
+    vsftpd
+    openssh-sftp-server
+    wget-ssl
+    busybox
+    sudo
+    unzip
+    file
+    procd
+    logrotate
+    coreutils-stat
+    lsof
+    jq
+    wireguard-tools
+    python3-light
+    cpufrequtils
+    netdata
+    luci-app-cpufreq
+    luci-app-netdata
+    ca-certificates-nonfree
+    luci-theme-bootstrap
+"
+# 如需增加其他包，直接在上面列表中添加即可，脚本会自动处理。
 
-for pkg in $EXTRA_PKGS; do
+# ---- 3.将上述包写入 configs/rockchip/01-nanopi ----
+for pkg in $ENSURE_PKGS; do
     if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
         echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
         echo "Added CONFIG_PACKAGE_${pkg}=y to $CONFIG_FILE"
     fi
 done
 
-# 添加 cpufrequtils 和 netdata（为 luci-app-cpufreq / luci-app-netdata 提供底层依赖）
-if ! grep -q "CONFIG_PACKAGE_cpufrequtils=y" "$CONFIG_FILE"; then
-    echo "CONFIG_PACKAGE_cpufrequtils=y" >> "$CONFIG_FILE"
-    echo "Added CONFIG_PACKAGE_cpufrequtils=y to $CONFIG_FILE"
-fi
-if ! grep -q "CONFIG_PACKAGE_netdata=y" "$CONFIG_FILE"; then
-    echo "CONFIG_PACKAGE_netdata=y" >> "$CONFIG_FILE"
-    echo "Added CONFIG_PACKAGE_netdata=y to $CONFIG_FILE"
-fi
-
-# 添加 luci-app-cpufreq 和 luci-app-netdata 本身的配置
-if ! grep -q "CONFIG_PACKAGE_luci-app-cpufreq=y" "$CONFIG_FILE"; then
-    echo "CONFIG_PACKAGE_luci-app-cpufreq=y" >> "$CONFIG_FILE"
-    echo "Added CONFIG_PACKAGE_luci-app-cpufreq=y to $CONFIG_FILE"
-fi
-if ! grep -q "CONFIG_PACKAGE_luci-app-netdata=y" "$CONFIG_FILE"; then
-    echo "CONFIG_PACKAGE_luci-app-netdata=y" >> "$CONFIG_FILE"
-    echo "Added CONFIG_PACKAGE_luci-app-netdata=y to $CONFIG_FILE"
-fi
-
-# ---- 4.设置默认主题 ----
-if ! grep -q "CONFIG_PACKAGE_luci-theme-bootstrap=y" "$CONFIG_FILE"; then
-    echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> "$CONFIG_FILE"
-    echo "Added CONFIG_PACKAGE_luci-theme-bootstrap=y to $CONFIG_FILE"
-fi
-
-# 启用非自由证书包
-if ! grep -q "CONFIG_CA_CERTIFICATES_NONFREE=y" "$CONFIG_FILE"; then
-    echo "CONFIG_CA_CERTIFICATES_NONFREE=y" >> "$CONFIG_FILE"
-    echo "Added CONFIG_CA_CERTIFICATES_NONFREE=y to $CONFIG_FILE"
-fi
-
-# ---- 5.更新 feeds ----
+# ---- 4.更新 feeds ----
 (cd friendlywrt && ./scripts/feeds update clashoo)
 (cd friendlywrt && ./scripts/feeds install -a -p clashoo)
 
-# ---- 6.移除 kmod-inet-diag 依赖（Clashoo） ----
+# ---- 5.移除 kmod-inet-diag 依赖（Clashoo） ----
 if [ -d friendlywrt/feeds/clashoo ]; then
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
     echo "Removed kmod-inet-diag dependency from Clashoo Makefile(s)"
@@ -83,7 +75,7 @@ else
     echo "Warning: Clashoo feed directory not found, skip dependency fix"
 fi
 
-# ---- 7.修正 luci-app-cpufreq 和 luci-app-netdata 的依赖 ----
+# ---- 6.修正 luci-app-cpufreq 和 luci-app-netdata 的依赖 ----
 if [ -d friendlywrt/feeds/luci/applications/luci-app-cpufreq ]; then
     sed -i 's/+cpufreq/+cpufrequtils/g' friendlywrt/feeds/luci/applications/luci-app-cpufreq/Makefile
     echo "Fixed luci-app-cpufreq dependency (cpufreq -> cpufrequtils)"
@@ -94,7 +86,7 @@ if [ -d friendlywrt/feeds/luci/applications/luci-app-netdata ]; then
     echo "Fixed luci-app-netdata dependency (netdata-ssl -> netdata)"
 fi
 
-# ---- 8.植入旁路由预配置及主题切换 ----
+# ---- 7.植入旁路由预配置及主题切换 ----
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -123,88 +115,77 @@ EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
 
-# ================== 强制禁用功能包 ==================
+# ================== 统一处理：禁用不需要的 + 强制启用必需的 ==================
 cd friendlywrt
 
-# 1. 先禁用全局选项，防止它们拉入不需要的包
+# ---- 8. 禁用全局选项 ----
 sed -i 's/^CONFIG_ALL_KMODS=.*/# CONFIG_ALL_KMODS is not set/' .config || echo "# CONFIG_ALL_KMODS is not set" >> .config
 sed -i 's/^CONFIG_ALL_NONSHARED=.*/# CONFIG_ALL_NONSHARED is not set/' .config || echo "# CONFIG_ALL_NONSHARED is not set" >> .config
 sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG_DEVEL is not set" >> .config
 sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
 
-# 2. 生成初始配置
+# ---- 9. 生成初始配置 ----
 make defconfig
 
-# 3. 定义需要禁用的具体包列表
+# ---- 10. 定义需要禁用的包列表 ----
 DISABLE_PKGS="
-    adblock
-    luci-app-adblock
-    aria2
-    aria2-openssl
-    luci-app-aria2
-    sqm-scripts
-    nft-qos
-    luci-app-nft-qos
-    luci-app-sqm
-    ddns-scripts
-    luci-app-ddns
-    miniupnpd
-    miniupnpd-nftables
-    luci-app-upnp
-    samba4-libs
-    samba4-server
-    luci-app-samba4
-    minidlna
-    luci-app-minidlna
-    comgt
-    luci-proto-3g
-    luci-proto-qmi
-    qmi-utils
-    uqmi
-    umbim
-    usb-modeswitch-official
-    wwan
-    iwlwifi-firmware-ax200
-    iwlwifi-firmware-ax210
-    rtl8822be-firmware
-    rtl8822ce-firmware
-    mt76x2-firmware
-    mt792x-firmware
+    adblock luci-app-adblock
+    aria2 aria2-openssl luci-app-aria2
+    sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
+    ddns-scripts luci-app-ddns
+    miniupnpd miniupnpd-nftables luci-app-upnp
+    samba4-libs samba4-server luci-app-samba4
+    minidlna luci-app-minidlna
+    comgt luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official wwan
+    iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 rtl8822be-firmware rtl8822ce-firmware mt76x2-firmware mt792x-firmware
     luci-app-diskman
-    collectd
-    luci-app-statistics
-    ppp
-    ppp-mod-pppoe
-    luci-proto-ppp
+    collectd luci-app-statistics
+    ppp ppp-mod-pppoe luci-proto-ppp
     luci-app-watchcat
-    # 若需保留 IPv6，请删除以下三行
-    odhcp6c
-    odhcpd-ipv6only
-    luci-proto-ipv6
+    odhcp6c odhcpd-ipv6only luci-proto-ipv6
 "
+# 如需保留 IPv6，请删除 odhcp6c odhcpd-ipv6only luci-proto-ipv6
 
-# 4. 使用 sed 直接禁用每个包
-for pkg in $DISABLE_PKGS; do
-    # 将任何可能的启用行或禁用行替换为明确的禁用行
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-    # 如果该行不存在，则追加
-    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
-done
-
-# 5. 运行 oldconfig 应用修改
-make oldconfig
-
-# 6. 再次检查并强制禁用
+# ---- 11. 禁用所有不需要的包 ----
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
+
+# ---- 12. 强制启用所有需要的包（直接使用 ENSURE_PKGS，与步骤3一致） ----
+for pkg in $ENSURE_PKGS; do
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
+    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+done
+
+# ---- 13. 应用所有修改 ----
 make oldconfig
 
-# 打印关键包状态
-echo "=== Final package status ==="
-grep -E "CONFIG_PACKAGE_(adblock|aria2|sqm-scripts|ddns-scripts|miniupnpd|samba4|minidlna|ppp|odhcp6c)" .config || echo "All disabled packages are not set."
+# ---- 14. 自动打印所有定义的包状态（无需手动维护） ----
+echo "=== Final package status (auto-generated from lists) ==="
+
+check_pkg() {
+    local pkg="$1"
+    if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+        echo "  [ENABLED]  $pkg"
+    elif grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config; then
+        echo "  [DISABLED] $pkg"
+    else
+        echo "  [UNKNOWN]  $pkg (not found)"
+    fi
+}
+
+echo "--- Packages to ENABLE (from ENSURE_PKGS) ---"
+for pkg in $ENSURE_PKGS; do
+    check_pkg "$pkg"
+done
+
+echo "--- Packages to DISABLE (from DISABLE_PKGS) ---"
+for pkg in $DISABLE_PKGS; do
+    check_pkg "$pkg"
+done
 
 cd ..
 
-echo "All unwanted packages have been forcefully disabled."
+echo "All configurations applied in one pass."
