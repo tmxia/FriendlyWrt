@@ -29,7 +29,7 @@ EOF
     echo "Added Clashoo config to $CONFIG_FILE"
 fi
 
-# ================== 统一维护的软件包列表（添加/启用） ==================
+# ================== 添加软件包列表 ==================
 ENSURE_PKGS="
     bc
     vsftpd
@@ -104,7 +104,7 @@ EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 echo "Added custom uci-defaults for preset configuration, password, Bootstrap theme, and extra packages"
 
-# ================== 统一处理：禁用不需要的 + 强制启用必需的 ==================
+# ================== 禁用与强制启用 ==================
 cd friendlywrt
 
 # ---- 7. 禁用全局选项 ----
@@ -131,7 +131,6 @@ DISABLE_PKGS="
     collectd luci-app-statistics
     ppp ppp-mod-pppoe luci-proto-ppp
     luci-app-watchcat
-    odhcp6c odhcpd-ipv6only luci-proto-ipv6
 "
 # 如需保留 IPv6，请删除 odhcp6c odhcpd-ipv6only luci-proto-ipv6
 
@@ -141,7 +140,7 @@ for pkg in $DISABLE_PKGS; do
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# ---- 11. 强制启用所有需要的包（直接使用 ENSURE_PKGS） ----
+# ---- 11. 强制启用所有需要的包 ----
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
@@ -151,7 +150,7 @@ done
 # ---- 12. 应用所有修改 ----
 make oldconfig
 
-# ---- 13. 自动打印所有定义的包状态（无需手动维护） ----
+# ---- 13. 打印所有定义的包状态 ----
 echo "=== Final package status (auto-generated from lists) ==="
 
 check_pkg() {
