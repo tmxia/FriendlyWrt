@@ -25,7 +25,7 @@ CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 fi
 
-# Packages to enable (only those not guaranteed to be present)
+# Packages to enable
 ENSURE_PKGS="
     bc
     vsftpd
@@ -43,7 +43,6 @@ ENSURE_PKGS="
     luci-app-netdata
 "
 
-# Write to config
 for pkg in $ENSURE_PKGS; do
     if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
         echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
@@ -59,21 +58,33 @@ if [ -d friendlywrt/feeds/clashoo ]; then
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
 fi
 
-# uci-defaults presets
+# uci-defaults (enhanced for 25.12)
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
+exec > /tmp/custom-uci-defaults.log 2>&1
+set -x
+
 uci set network.lan.ipaddr='192.168.3.3'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
 uci commit network
+
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
-echo -e "tony\ntony" | passwd root > /dev/null 2>&1
+
+echo "root:tony" | chpasswd
+
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
+
+/etc/init.d/network restart
+/etc/init.d/dnsmasq restart
+/etc/init.d/uhttpd restart
+
 rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null || true
+touch /tmp/uci-defaults-executed
 exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
@@ -87,7 +98,7 @@ sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG
 sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
 make defconfig
 
-# Packages to disable (only verified names)
+# Packages to disable
 DISABLE_PKGS="
     adblock luci-app-adblock
     aria2 luci-app-aria2
@@ -104,30 +115,25 @@ DISABLE_PKGS="
     luci-app-watchcat
 "
 
-# First pass: disable
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# Force enable required
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Apply changes with automatic defaults (for new options)
 yes "" | make oldconfig
 
-# Second pass: re-disable to override any dependencies that may have re-enabled
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 yes "" | make oldconfig
 
-# Final status
 echo "=== Final package status ==="
 check_pkg() {
     local pkg="$1"
