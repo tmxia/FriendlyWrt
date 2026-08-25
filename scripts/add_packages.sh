@@ -58,38 +58,42 @@ if [ -d friendlywrt/feeds/clashoo ]; then
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
 fi
 
-# uci-defaults (enhanced for 25.12)
+# uci-defaults
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 exec > /tmp/custom-uci-defaults.log 2>&1
 set -x
-
 uci set network.lan.ipaddr='192.168.3.3'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
 uci commit network
-
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
-
 echo "root:tony" | chpasswd
-
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
-
 /etc/init.d/network restart
 /etc/init.d/dnsmasq restart
 /etc/init.d/uhttpd restart
-
 rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null || true
 touch /tmp/uci-defaults-executed
 exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
+echo "uci-defaults script created at friendlywrt/files/etc/uci-defaults/99-custom"
+
 cd friendlywrt
+
+# Verify uci-defaults file is present before proceeding
+if [ -f files/etc/uci-defaults/99-custom ]; then
+    echo "[OK] uci-defaults file is present in build root (will be packaged)."
+else
+    echo "[ERROR] uci-defaults file not found!" >&2
+    exit 1
+fi
 
 # Disable global options
 sed -i 's/^CONFIG_ALL_KMODS=.*/# CONFIG_ALL_KMODS is not set/' .config || echo "# CONFIG_ALL_KMODS is not set" >> .config
