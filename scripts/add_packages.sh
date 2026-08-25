@@ -116,7 +116,8 @@ for pkg in $ENSURE_PKGS; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-make oldconfig
+# Apply changes (non-interactive)
+make olddefconfig
 
 # Print final status
 echo "=== Final package status ==="
