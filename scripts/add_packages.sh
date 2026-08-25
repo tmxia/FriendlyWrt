@@ -62,23 +62,30 @@ fi
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
-exec > /tmp/custom-uci-defaults.log 2>&1
-set -x
-uci set network.lan.ipaddr='192.168.3.3'
+uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
 uci commit network
+
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
-echo "root:tony" | chpasswd
+
+printf "tony\ntony\n" | passwd root > /dev/null 2>&1
+
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
-/etc/init.d/network restart
-/etc/init.d/dnsmasq restart
-/etc/init.d/uhttpd restart
+
+sed -i '/net.ipv4.conf.*rp_filter/d' /etc/sysctl.conf
+cat >> /etc/sysctl.conf <<EOF
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.conf.lan.rp_filter=0
+EOF
+sysctl -p >/dev/null 2>&1
+
 rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null || true
-touch /tmp/uci-defaults-executed
+
 exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
