@@ -25,7 +25,7 @@ CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 fi
 
-# Packages to enable
+# Packages to enable (only those not guaranteed to be present)
 ENSURE_PKGS="
     bc
     vsftpd
@@ -78,15 +78,16 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-# Disable global options and regenerate config
 cd friendlywrt
+
+# Disable global options
 sed -i 's/^CONFIG_ALL_KMODS=.*/# CONFIG_ALL_KMODS is not set/' .config || echo "# CONFIG_ALL_KMODS is not set" >> .config
 sed -i 's/^CONFIG_ALL_NONSHARED=.*/# CONFIG_ALL_NONSHARED is not set/' .config || echo "# CONFIG_ALL_NONSHARED is not set" >> .config
 sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG_DEVEL is not set" >> .config
 sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
 make defconfig
 
-# Packages to disable
+# Packages to disable (only verified names)
 DISABLE_PKGS="
     adblock luci-app-adblock
     aria2 luci-app-aria2
@@ -103,23 +104,30 @@ DISABLE_PKGS="
     luci-app-watchcat
 "
 
-# Disable unwanted packages
+# First pass: disable
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# Force enable required packages
+# Force enable required
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Apply changes (non-interactive)
-make olddefconfig
+# Apply changes with automatic defaults (for new options)
+yes "" | make oldconfig
 
-# Print final status
+# Second pass: re-disable to override any dependencies that may have re-enabled
+for pkg in $DISABLE_PKGS; do
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+done
+yes "" | make oldconfig
+
+# Final status
 echo "=== Final package status ==="
 check_pkg() {
     local pkg="$1"
