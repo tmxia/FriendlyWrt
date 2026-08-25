@@ -29,13 +29,9 @@ fi
 ENSURE_PKGS="
     bc
     vsftpd
-    openssh-sftp-server
-    wget-ssl
-    busybox
     sudo
     unzip
     file
-    procd
     logrotate
     coreutils-stat
     lsof
@@ -45,7 +41,6 @@ ENSURE_PKGS="
     netdata
     luci-app-cpufreq
     luci-app-netdata
-    luci-theme-bootstrap
 "
 
 # Write to config
