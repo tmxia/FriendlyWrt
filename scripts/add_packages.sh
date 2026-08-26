@@ -22,8 +22,8 @@ EOF
 # Packages to ensure
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
-netdata luci-app-cpufreq luci-app-netdata
 "
+# netdata luci-app-cpufreq luci-app-netdata
 
 # Write ensure packages to config
 for pkg in $ENSURE_PKGS; do
@@ -80,7 +80,6 @@ samba4-libs samba4-server luci-app-samba4
 minidlna luci-app-minidlna
 luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210  mt76x2-firmware mt792x-firmware
 luci-app-diskman collectd luci-app-statistics
-ppp luci-proto-ppp
 luci-app-watchcat
 "
 
