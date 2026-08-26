@@ -70,63 +70,44 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; d
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
-# 1. 修改内核配置文件（供 defconfig 读取）
-KERNEL_CONFIG="target/linux/rockchip/config-6.1"
-mkdir -p "$(dirname "$KERNEL_CONFIG")"
-cat > "$KERNEL_CONFIG" << EOF
-CONFIG_SOCK_DIAG=y
-CONFIG_INET_DIAG=y
-CONFIG_INET_TCP_DIAG=y
-CONFIG_INET_UDP_DIAG=y
-CONFIG_INET_RAW_DIAG=y
-CONFIG_INET_DIAG_DESTROY=y
-EOF
-
-# 2. 生成初始 .config
+# ---------- 内核选项注入（使用 scripts/config 工具） ----------
 make defconfig
 
-# 3. 强制在 .config 中启用所有 DIAG 选项（删除旧行，写入新行）
-KERNEL_OPTS="
-CONFIG_SOCK_DIAG=y
-CONFIG_INET_DIAG=y
-CONFIG_INET_TCP_DIAG=y
-CONFIG_INET_UDP_DIAG=y
-CONFIG_INET_RAW_DIAG=y
-CONFIG_INET_DIAG_DESTROY=y
-"
-for opt in $KERNEL_OPTS; do
-    key="${opt%=*}"
-    sed -i "/^# $key is not set/d" .config
-    sed -i "/^$key=/d" .config
-    echo "$opt" >> .config
-done
+# 编译 scripts/config 工具
+make scripts/config
 
-# 4. 使用 oldconfig 处理依赖（若失败则忽略，因为我们已经强制写入）
-make oldconfig < /dev/null 2>/dev/null || true
+# 启用所有 DIAG 相关选项
+./scripts/config --file .config --enable CONFIG_SOCK_DIAG
+./scripts/config --file .config --enable CONFIG_INET_DIAG
+./scripts/config --file .config --enable CONFIG_INET_TCP_DIAG
+./scripts/config --file .config --enable CONFIG_INET_UDP_DIAG
+./scripts/config --file .config --enable CONFIG_INET_RAW_DIAG
+./scripts/config --file .config --enable CONFIG_INET_DIAG_DESTROY
 
-# 5. 验证内核选项
+# 同步配置（非交互式）
+make olddefconfig
+
+# 验证内核选项
 echo "=== Kernel config check ==="
-MISSING=0
 for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_DIAG_DESTROY; do
     if grep -q "^$opt=y" .config; then
         echo "  [OK] $opt=y"
     else
-        echo "  [FAIL] $opt not set, retrying..."
-        sed -i "/^# $opt is not set/d" .config
-        sed -i "/^$opt=/d" .config
-        echo "$opt=y" >> .config
-        MISSING=1
+        echo "  [FAIL] $opt not set"
+        # 再次尝试用 scripts/config 强制启用
+        ./scripts/config --file .config --enable "$opt"
     fi
 done
-if [ $MISSING -eq 1 ]; then
-    make oldconfig < /dev/null 2>/dev/null || true
-    echo "=== Re-check ==="
-    for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_DIAG_DESTROY; do
-        grep -q "^$opt=y" .config && echo "  [OK] $opt=y" || echo "  [FAIL] $opt still not set"
-    done
+# 重新同步（如有改动）
+if grep -q "CONFIG_INET_DIAG=y" .config; then
+    make olddefconfig
+    echo "  Kernel options successfully enabled."
+else
+    echo "  WARNING: Kernel options may not be fully enabled, but continuing..."
 fi
+# ------------------------------------------------------------
 
-# 6. 包管理（禁用/启用）
+# Packages to disable
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -140,25 +121,28 @@ luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat
 "
 
+# Force disable unwanted packages
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
+# Force enable required packages
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
+# Ensure Clashoo packages are enabled
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# 最终同步配置
-make oldconfig < /dev/null 2>/dev/null || true
+# Final sync (to capture any dependency changes from package selections)
+make olddefconfig
 
 # Print final status
 echo "=== Final package status ==="
