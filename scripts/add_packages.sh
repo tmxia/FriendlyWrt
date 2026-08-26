@@ -70,13 +70,22 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; d
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
+# Ensure kernel config file exists and add required options
+KERNEL_CONFIG="target/linux/rockchip/config-6.1"
+mkdir -p "$(dirname "$KERNEL_CONFIG")"
+if ! grep -q "CONFIG_INET_DIAG=y" "$KERNEL_CONFIG" 2>/dev/null; then
+    echo "CONFIG_INET_DIAG=y" >> "$KERNEL_CONFIG"
+    echo "CONFIG_INET_DIAG_DESTROY=y" >> "$KERNEL_CONFIG"
+fi
+
 # Generate initial .config from all config files
 make defconfig
 
-# ========== 新增：使用 scripts/config 启用内核选项 ==========
-./scripts/config --file .config --set-val CONFIG_INET_DIAG y
-./scripts/config --file .config --set-val CONFIG_INET_DIAG_DESTROY y
-# =========================================================
+# Force-enable kernel options in .config (in case defconfig didn't pick them up)
+sed -i 's/^# CONFIG_INET_DIAG is not set/CONFIG_INET_DIAG=y/' .config
+sed -i 's/^# CONFIG_INET_DIAG_DESTROY is not set/CONFIG_INET_DIAG_DESTROY=y/' .config
+grep -q "^CONFIG_INET_DIAG=y" .config || echo "CONFIG_INET_DIAG=y" >> .config
+grep -q "^CONFIG_INET_DIAG_DESTROY=y" .config || echo "CONFIG_INET_DIAG_DESTROY=y" >> .config
 
 # Packages to disable
 DISABLE_PKGS="
