@@ -72,16 +72,15 @@ make defconfig
 # Packages to disable
 DISABLE_PKGS="
 adblock luci-app-adblock
-aria2 aria2-openssl luci-app-aria2
+aria2 luci-app-aria2
 sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
 ddns-scripts luci-app-ddns
-miniupnpd miniupnpd-nftables luci-app-upnp
+miniupnpd-nftables luci-app-upnp
 samba4-libs samba4-server luci-app-samba4
 minidlna luci-app-minidlna
-comgt luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official wwan
-iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 rtl8822be-firmware rtl8822ce-firmware mt76x2-firmware mt792x-firmware
+luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210  mt76x2-firmware mt792x-firmware
 luci-app-diskman collectd luci-app-statistics
-ppp ppp-mod-pppoe luci-proto-ppp
+ppp luci-proto-ppp
 luci-app-watchcat
 "
 
