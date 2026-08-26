@@ -33,9 +33,6 @@ fi
 ENSURE_PKGS="
     bc
     vsftpd
-    openssh-sftp-server
-    wget-ssl
-    busybox
     sudo
     unzip
     file
@@ -46,12 +43,9 @@ ENSURE_PKGS="
     jq
     wireguard-tools
     python3-light
-    cpufrequtils
     netdata
     luci-app-cpufreq
     luci-app-netdata
-    ca-certificates-nonfree
-    luci-theme-bootstrap
 "
 # 如需增加其他包，直接在上面列表中添加即可，脚本会自动处理。
 
@@ -142,9 +136,7 @@ DISABLE_PKGS="
     collectd luci-app-statistics
     ppp ppp-mod-pppoe luci-proto-ppp
     luci-app-watchcat
-    odhcp6c odhcpd-ipv6only luci-proto-ipv6
 "
-# 如需保留 IPv6，请删除 odhcp6c odhcpd-ipv6only luci-proto-ipv6
 
 # ---- 11. 禁用所有不需要的包 ----
 for pkg in $DISABLE_PKGS; do
