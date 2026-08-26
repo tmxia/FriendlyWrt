@@ -17,6 +17,9 @@ CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
 CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
+# kernel deps for kmod-inet-diag
+CONFIG_INET_DIAG=y
+CONFIG_INET_DIAG_DESTROY=y
 EOF
 
 # Packages to ensure
@@ -32,11 +35,6 @@ done
 
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
-
-# Remove kmod-inet-diag dependency from Clashoo
-if [ -d friendlywrt/feeds/clashoo ]; then
-    find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
-fi
 
 # UCI defaults for side-router (CIDR format, password, Bootstrap theme)
 mkdir -p friendlywrt/files/etc/uci-defaults
