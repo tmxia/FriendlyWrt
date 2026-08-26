@@ -43,18 +43,22 @@ ENSURE_PKGS="
     luci-app-netdata
 "
 
+echo "Adding enable packages to $CONFIG_FILE..."
 for pkg in $ENSURE_PKGS; do
     if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
         echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
+        echo "  + $pkg"
     fi
 done
 
 # Update feeds
+echo "Updating feeds..."
 (cd friendlywrt && ./scripts/feeds update clashoo)
 (cd friendlywrt && ./scripts/feeds install -a -p clashoo)
 
 # Remove kmod-inet-diag dependency
 if [ -d friendlywrt/feeds/clashoo ]; then
+    echo "Fixing Clashoo dependency..."
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
 fi
 
@@ -90,6 +94,8 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
+echo "uci-defaults script created."
+
 cd friendlywrt
 
 # Verify uci-defaults
@@ -115,23 +121,27 @@ DISABLE_PKGS="
     luci-app-watchcat
 "
 
-# Base config
+# ----------------------------------------------------------------------
+# Config process with progress logs
+# ----------------------------------------------------------------------
+
+echo "Running make defconfig..."
 make defconfig
 
-# Disable global knobs
+echo "Disabling global knobs..."
 for opt in ALL_KMODS ALL_NONSHARED DEVEL BUILDBOT; do
     sed -i "s/^CONFIG_${opt}=.*/# CONFIG_${opt} is not set/" .config
     grep -q "^# CONFIG_${opt} is not set" .config || echo "# CONFIG_${opt} is not set" >> .config
 done
 make oldconfig
 
-# Disable unwanted packages
+echo "Disabling unwanted packages..."
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# Force-enable required packages
+echo "Enabling required packages..."
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
@@ -140,7 +150,7 @@ done
 
 make oldconfig
 
-# Loop to fix packages re-enabled by dependencies
+echo "Fixing packages re-enabled by dependencies..."
 max_retries=5
 for ((i=1; i<=max_retries; i++)); do
     changed=0
