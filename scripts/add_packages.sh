@@ -115,8 +115,6 @@ done
 # Non-interactive resolve dependencies, preserving manually set kernel options
 make olddefconfig
 
-make olddefconfig
-
 # Brief kernel config check
 grep -q "^CONFIG_INET_DIAG=y" .config && echo "KERNEL: CONFIG_INET_DIAG=y" || echo "KERNEL: CONFIG_INET_DIAG not set"
 
