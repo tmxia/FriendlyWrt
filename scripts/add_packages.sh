@@ -8,7 +8,7 @@ set -e
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# Add Clashoo config
+# Add Clashoo package config
 CONFIG_FILE="configs/rockchip/01-nanopi"
 grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
 
@@ -17,16 +17,12 @@ CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
 CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
-# kernel deps for kmod-inet-diag
-CONFIG_INET_DIAG=y
-CONFIG_INET_DIAG_DESTROY=y
 EOF
 
 # Packages to ensure
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
-# netdata luci-app-cpufreq luci-app-netdata
 
 # Write ensure packages to config
 for pkg in $ENSURE_PKGS; do
@@ -36,7 +32,7 @@ done
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# UCI defaults for side-router (CIDR format, password, Bootstrap theme)
+# UCI defaults for side-router
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -68,6 +64,16 @@ chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
 # Enter build dir
 cd friendlywrt
+
+# ---------- 新增：添加内核配置（支持 kmod-inet-diag） ----------
+KERNEL_CONFIG="target/linux/rockchip/config-6.1"
+mkdir -p "$(dirname "$KERNEL_CONFIG")"
+{
+    echo "# Enable inet_diag for kmod-inet-diag"
+    echo "CONFIG_INET_DIAG=y"
+    echo "CONFIG_INET_DIAG_DESTROY=y"
+} >> "$KERNEL_CONFIG"
+# --------------------------------------------------------------
 
 # Disable global options
 for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
@@ -105,7 +111,7 @@ done
 
 make oldconfig
 
-# Print final status (auto-generated)
+# Print final status
 echo "=== Final package status ==="
 check_pkg() {
     grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" && return
