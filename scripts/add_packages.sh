@@ -8,7 +8,7 @@ set -e
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# Add Clashoo packages to config file
+# Add Clashoo config
 CONFIG_FILE="configs/rockchip/01-nanopi"
 grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
 
@@ -24,7 +24,7 @@ ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
 
-# Write ensure packages to config file
+# Write ensure packages to config
 for pkg in $ENSURE_PKGS; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
@@ -70,42 +70,7 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; d
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
-# ---------- 内核配置注入 ----------
-# 1. 修改内核 fragment (供 defconfig 合并)
-KERNEL_CONFIG="target/linux/rockchip/config-6.1"
-mkdir -p "$(dirname "$KERNEL_CONFIG")"
-cat > "$KERNEL_CONFIG" << EOF
-CONFIG_SOCK_DIAG=y
-CONFIG_INET_DIAG=y
-CONFIG_INET_TCP_DIAG=y
-CONFIG_INET_UDP_DIAG=y
-CONFIG_INET_RAW_DIAG=y
-CONFIG_INET_DIAG_DESTROY=y
-EOF
-
-# 2. 生成 .config (自动合并 fragment)
 make defconfig
-
-# 3. 强制在 .config 中启用（防止合并失败）
-for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG CONFIG_INET_DIAG_DESTROY; do
-    sed -i "/^# $opt is not set/d" .config
-    sed -i "/^$opt=/d" .config
-    echo "$opt=y" >> .config
-done
-
-# 4. 非交互式处理依赖 (保留我们的设置)
-yes "" | make oldconfig
-
-# 5. 验证内核选项
-echo "=== Kernel config check ==="
-for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_DIAG_DESTROY; do
-    if grep -q "^$opt=y" .config; then
-        echo "  [OK] $opt=y"
-    else
-        echo "  [FAIL] $opt not set"
-    fi
-done
-# -------------------------------------------
 
 # Packages to disable
 DISABLE_PKGS="
@@ -121,33 +86,32 @@ luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat
 "
 
-# Force disable unwanted packages
+# Disable all unwanted packages
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# Force enable required packages
+# Force-enable required packages
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Ensure Clashoo packages are enabled
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
-    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+# Inject kernel DIAG options (skip oldconfig)
+for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG CONFIG_INET_DIAG_DESTROY; do
+    sed -i "/^# ${opt} is not set/d" .config
+    sed -i "/^${opt}=/d" .config
+    echo "${opt}=y" >> .config
 done
-
-# Final sync (resolve any remaining dependencies)
-yes "" | make oldconfig
 
 # Print final status
 echo "=== Final package status ==="
 check_pkg() {
-    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
+    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" && return
+    grep -q "^# CONFIG_PACKAGE_$1 is not set" .config && echo "  [DISABLED] $1" && return
+    echo "  [UNKNOWN]  $1"
 }
 echo "--- ENABLED ---"
 for pkg in $ENSURE_PKGS; do check_pkg "$pkg"; done
