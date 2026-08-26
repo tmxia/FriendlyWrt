@@ -73,6 +73,11 @@ done
 # Generate initial .config from all config files
 make defconfig
 
+# ========== 新增：使用 scripts/config 启用内核选项 ==========
+./scripts/config --file .config --set-val CONFIG_INET_DIAG y
+./scripts/config --file .config --set-val CONFIG_INET_DIAG_DESTROY y
+# =========================================================
+
 # Packages to disable
 DISABLE_PKGS="
 adblock luci-app-adblock
@@ -107,14 +112,8 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Add kernel options for kmod-inet-diag
-if ! grep -q "CONFIG_INET_DIAG=y" .config; then
-    echo "CONFIG_INET_DIAG=y" >> .config
-    echo "CONFIG_INET_DIAG_DESTROY=y" >> .config
-fi
-
-# Non-interactive oldconfig
-yes "" | make oldconfig
+# Non-interactive resolve dependencies, preserving manually set kernel options
+make olddefconfig
 
 # Print final status
 echo "=== Final package status ==="
