@@ -8,7 +8,7 @@ set -e
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# Add Clashoo config
+# Add Clashoo packages to config file (kernel options will be added later via sed)
 CONFIG_FILE="configs/rockchip/01-nanopi"
 grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
 
@@ -24,27 +24,9 @@ ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
 
-# Write ensure packages to config
+# Write ensure packages to config file
 for pkg in $ENSURE_PKGS; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
-done
-
-# Add disabled packages to config
-DISABLE_PKGS="
-adblock luci-app-adblock
-aria2 luci-app-aria2
-sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
-ddns-scripts luci-app-ddns
-miniupnpd-nftables luci-app-upnp
-samba4-libs samba4-server luci-app-samba4
-minidlna luci-app-minidlna
-luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
-luci-app-diskman collectd luci-app-statistics
-luci-app-watchcat
-"
-
-for pkg in $DISABLE_PKGS; do
-    grep -q "# CONFIG_PACKAGE_${pkg} is not set" "$CONFIG_FILE" || echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CONFIG_FILE"
 done
 
 # Update Clashoo feed
@@ -88,8 +70,51 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; d
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
-# Generate .config from all config files (including 01-nanopi)
+# Generate initial .config from all config files
 make defconfig
+
+# Packages to disable
+DISABLE_PKGS="
+adblock luci-app-adblock
+aria2 luci-app-aria2
+sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
+ddns-scripts luci-app-ddns
+miniupnpd-nftables luci-app-upnp
+samba4-libs samba4-server luci-app-samba4
+minidlna luci-app-minidlna
+luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
+luci-app-diskman collectd luci-app-statistics
+luci-app-watchcat
+"
+
+# Force disable unwanted packages
+for pkg in $DISABLE_PKGS; do
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+done
+
+# Force enable required packages (override any previous disable)
+for pkg in $ENSURE_PKGS; do
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
+    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+done
+
+# Ensure Clashoo packages are enabled (in case 01-nanopi not merged properly)
+for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
+    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+done
+
+# Add kernel options for kmod-inet-diag (directly to .config, not in 01-nanopi)
+if ! grep -q "CONFIG_INET_DIAG=y" .config; then
+    echo "CONFIG_INET_DIAG=y" >> .config
+    echo "CONFIG_INET_DIAG_DESTROY=y" >> .config
+fi
+
+# Run olddefconfig to resolve dependencies (non-interactive)
+make olddefconfig
 
 # Print final status
 echo "=== Final package status ==="
