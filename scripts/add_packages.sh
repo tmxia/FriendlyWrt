@@ -38,7 +38,7 @@ if [ -d friendlywrt/feeds/clashoo ]; then
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
 fi
 
-# UCI defaults for side-router (CIDR format for 24.10+ compatibility)
+# UCI defaults for side-router (CIDR format, password, Bootstrap theme)
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -53,6 +53,15 @@ uci set firewall.@zone[0].network='lan'
 uci commit firewall
 uci set network.wan.clientid=''
 uci commit network
+
+printf "tony\ntony\n" | passwd root
+
+uci set luci.main.mediaurlbase='/luci-static/bootstrap'
+uci delete luci.themes.Argon 2>/dev/null || true
+uci commit luci
+rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null
+/etc/init.d/uhttpd restart
+
 /etc/init.d/network restart
 /etc/init.d/firewall restart
 exit 0
