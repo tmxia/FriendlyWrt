@@ -8,7 +8,7 @@ set -e
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# Add Clashoo packages to config file (kernel options will be added later via sed)
+# Add Clashoo packages to config file (kernel options will be added later)
 CONFIG_FILE="configs/rockchip/01-nanopi"
 grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
 
@@ -107,14 +107,14 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Add kernel options for kmod-inet-diag (directly to .config, not in 01-nanopi)
+# Add kernel options for kmod-inet-diag (directly to .config)
 if ! grep -q "CONFIG_INET_DIAG=y" .config; then
     echo "CONFIG_INET_DIAG=y" >> .config
     echo "CONFIG_INET_DIAG_DESTROY=y" >> .config
 fi
 
-# Run olddefconfig to resolve dependencies (non-interactive)
-make olddefconfig
+# Run oldconfig with yes to auto-accept defaults (non-interactive)
+yes "" | make oldconfig
 
 # Print final status
 echo "=== Final package status ==="
