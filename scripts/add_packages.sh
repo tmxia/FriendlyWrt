@@ -115,8 +115,6 @@ DISABLE_PKGS="
     luci-app-watchcat
 "
 
-# configuration loop
-
 # Base config
 make defconfig
 
