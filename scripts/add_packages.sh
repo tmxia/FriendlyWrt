@@ -23,17 +23,34 @@ EOF
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
-# netdata luci-app-cpufreq luci-app-netdata
 
 # Write ensure packages to config
 for pkg in $ENSURE_PKGS; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
+# Add disabled packages to config
+DISABLE_PKGS="
+adblock luci-app-adblock
+aria2 luci-app-aria2
+sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
+ddns-scripts luci-app-ddns
+miniupnpd-nftables luci-app-upnp
+samba4-libs samba4-server luci-app-samba4
+minidlna luci-app-minidlna
+luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
+luci-app-diskman collectd luci-app-statistics
+luci-app-watchcat
+"
+
+for pkg in $DISABLE_PKGS; do
+    grep -q "# CONFIG_PACKAGE_${pkg} is not set" "$CONFIG_FILE" || echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CONFIG_FILE"
+done
+
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# UCI defaults for side-router (CIDR format, password, Bootstrap theme)
+# UCI defaults for side-router
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -66,57 +83,15 @@ chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 # Enter build dir
 cd friendlywrt
 
-# ---------- Add kernel config for kmod-inet-diag ----------
-KCFG_DIR="target/linux/rockchip"
-KCFG_FILE=$(ls $KCFG_DIR/config-* 2>/dev/null | head -1)
-if [ -z "$KCFG_FILE" ]; then
-    KCFG_FILE="$KCFG_DIR/config-6.1"
-    mkdir -p "$KCFG_DIR"
-    touch "$KCFG_FILE"
-fi
-echo "Using kernel config: $KCFG_FILE"
-
-grep -q "CONFIG_INET_DIAG=y" "$KCFG_FILE" || echo "CONFIG_INET_DIAG=y" >> "$KCFG_FILE"
-grep -q "CONFIG_INET_DIAG_DESTROY=y" "$KCFG_FILE" || echo "CONFIG_INET_DIAG_DESTROY=y" >> "$KCFG_FILE"
-# ----------------------------------------------------------
-
 # Disable global options
 for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
+# Generate full .config from all config files (including 01-nanopi)
 make defconfig
 
-# Packages to disable
-DISABLE_PKGS="
-adblock luci-app-adblock
-aria2 luci-app-aria2
-sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
-ddns-scripts luci-app-ddns
-miniupnpd-nftables luci-app-upnp
-samba4-libs samba4-server luci-app-samba4
-minidlna luci-app-minidlna
-luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210  mt76x2-firmware mt792x-firmware
-luci-app-diskman collectd luci-app-statistics
-luci-app-watchcat
-"
-
-# Disable all unwanted packages
-for pkg in $DISABLE_PKGS; do
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
-done
-
-# Force-enable required packages
-for pkg in $ENSURE_PKGS; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
-    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-done
-
-make oldconfig
-
-# Print final status (auto-generated)
+# Print final status
 echo "=== Final package status ==="
 check_pkg() {
     grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" && return
