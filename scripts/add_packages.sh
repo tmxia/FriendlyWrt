@@ -84,24 +84,36 @@ fi
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
-# 旁路由固定IP配置
-uci set network.lan.ipaddr='192.168.3.3'
+# 旁路由固定IP配置（兼容 OpenWrt 24.10 及 25.x）
+
+# 1. IP 地址改用 CIDR 格式（新版 netifd 强制要求，旧版同样支持）
+uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
 uci commit network
 
-# 禁用LAN口DHCP
+# 2. 禁用 LAN 口 DHCP
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
-# 更改root密码
-echo -e "tony\ntony" | passwd root > /dev/null 2>&1
+# 3. 修改 root 密码（使用 printf 替代 echo -e，兼容性更好）
+printf "tony\ntony\n" | passwd root > /dev/null 2>&1
 
-# 设置主题为Bootstrap
+# 4. 设置 LuCI 主题
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
 
+# 5. 【新增】关闭 rp_filter，解决 25.x 内核拦截旁路由转发的关键问题（对 24.10 无副作用）
+sed -i '/net.ipv4.conf.*rp_filter/d' /etc/sysctl.conf
+cat >> /etc/sysctl.conf <<EOF
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.conf.lan.rp_filter=0
+EOF
+sysctl -p >/dev/null 2>&1
+
+# 6. 清理 LuCI 缓存
 rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null || true
 
 exit 0
