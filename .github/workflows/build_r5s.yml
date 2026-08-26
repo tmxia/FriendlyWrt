@@ -8,7 +8,7 @@ on:
       version:
         description: 'OpenWrt version'
         required: true
-        default: '24.10'
+        default: 'both'
         type: choice
         options:
           - '24.10'
