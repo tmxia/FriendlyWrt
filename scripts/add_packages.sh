@@ -88,8 +88,15 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; d
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
-# Generate full .config from all config files (including 01-nanopi)
+# Generate .config from config files
 make defconfig
+
+# Add kernel options for kmod-inet-diag directly to .config, then run olddefconfig (non-interactive)
+if ! grep -q "CONFIG_INET_DIAG=y" .config; then
+    echo "CONFIG_INET_DIAG=y" >> .config
+    echo "CONFIG_INET_DIAG_DESTROY=y" >> .config
+fi
+make olddefconfig
 
 # Print final status
 echo "=== Final package status ==="
