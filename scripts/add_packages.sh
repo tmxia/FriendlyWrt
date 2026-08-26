@@ -8,7 +8,7 @@ set -e
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# Add Clashoo packages to config file (kernel options will be added later)
+# Add Clashoo packages to config file
 CONFIG_FILE="configs/rockchip/01-nanopi"
 grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
 
@@ -93,27 +93,27 @@ for pkg in $DISABLE_PKGS; do
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# Force enable required packages (override any previous disable)
+# Force enable required packages
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Ensure Clashoo packages are enabled (in case 01-nanopi not merged properly)
+# Ensure Clashoo packages are enabled
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Add kernel options for kmod-inet-diag (directly to .config)
+# Add kernel options for kmod-inet-diag
 if ! grep -q "CONFIG_INET_DIAG=y" .config; then
     echo "CONFIG_INET_DIAG=y" >> .config
     echo "CONFIG_INET_DIAG_DESTROY=y" >> .config
 fi
 
-# Run oldconfig with yes to auto-accept defaults (non-interactive)
+# Non-interactive oldconfig
 yes "" | make oldconfig
 
 # Print final status
