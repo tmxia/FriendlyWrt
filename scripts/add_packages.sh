@@ -58,7 +58,7 @@ if [ -d friendlywrt/feeds/clashoo ]; then
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
 fi
 
-# uci-defaults
+# uci-defaults for side-router setup
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -90,24 +90,13 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-echo "uci-defaults script created at friendlywrt/files/etc/uci-defaults/99-custom"
-
 cd friendlywrt
 
-# Verify uci-defaults file is present before proceeding
-if [ -f files/etc/uci-defaults/99-custom ]; then
-    echo "[OK] uci-defaults file is present in build root (will be packaged)."
-else
+# Verify uci-defaults
+if [ ! -f files/etc/uci-defaults/99-custom ]; then
     echo "[ERROR] uci-defaults file not found!" >&2
     exit 1
 fi
-
-# Disable global options
-sed -i 's/^CONFIG_ALL_KMODS=.*/# CONFIG_ALL_KMODS is not set/' .config || echo "# CONFIG_ALL_KMODS is not set" >> .config
-sed -i 's/^CONFIG_ALL_NONSHARED=.*/# CONFIG_ALL_NONSHARED is not set/' .config || echo "# CONFIG_ALL_NONSHARED is not set" >> .config
-sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG_DEVEL is not set" >> .config
-sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
-make defconfig
 
 # Packages to disable
 DISABLE_PKGS="
@@ -126,25 +115,50 @@ DISABLE_PKGS="
     luci-app-watchcat
 "
 
+# ----------------------------------------------------------------------
+# Optimized configuration loop
+# ----------------------------------------------------------------------
+
+# Base config
+make defconfig
+
+# Disable global knobs
+for opt in ALL_KMODS ALL_NONSHARED DEVEL BUILDBOT; do
+    sed -i "s/^CONFIG_${opt}=.*/# CONFIG_${opt} is not set/" .config
+    grep -q "^# CONFIG_${opt} is not set" .config || echo "# CONFIG_${opt} is not set" >> .config
+done
+make oldconfig
+
+# Disable unwanted packages
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
+# Force-enable required packages
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-yes "" | make oldconfig
+make oldconfig
 
-for pkg in $DISABLE_PKGS; do
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+# Loop to fix packages re-enabled by dependencies
+max_retries=5
+for ((i=1; i<=max_retries; i++)); do
+    changed=0
+    for pkg in $DISABLE_PKGS; do
+        if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+            changed=1
+        fi
+    done
+    [ $changed -eq 0 ] && break
+    make oldconfig
 done
-yes "" | make oldconfig
 
+# Final status report
 echo "=== Final package status ==="
 check_pkg() {
     local pkg="$1"
