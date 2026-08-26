@@ -21,8 +21,8 @@ EOF
 
 # Packages to ensure
 ENSURE_PKGS="
-bc vsftpd sudo unzip file logrotate coreutils-stat lsof jq wireguard-tools python3-light
-# netdata luci-app-cpufreq luci-app-netdata
+bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
+netdata luci-app-cpufreq luci-app-netdata
 "
 
 # Write ensure packages to config
