@@ -43,26 +43,22 @@ ENSURE_PKGS="
     luci-app-netdata
 "
 
-echo "Adding enable packages to $CONFIG_FILE..."
 for pkg in $ENSURE_PKGS; do
     if ! grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE"; then
         echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
-        echo "  + $pkg"
     fi
 done
 
 # Update feeds
-echo "Updating feeds..."
 (cd friendlywrt && ./scripts/feeds update clashoo)
 (cd friendlywrt && ./scripts/feeds install -a -p clashoo)
 
 # Remove kmod-inet-diag dependency
 if [ -d friendlywrt/feeds/clashoo ]; then
-    echo "Fixing Clashoo dependency..."
     find friendlywrt/feeds/clashoo -name "Makefile" -exec sed -i 's/+kmod-inet-diag//g' {} \;
 fi
 
-# uci-defaults for side-router setup
+# uci-defaults
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -94,15 +90,24 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-echo "uci-defaults script created."
+echo "uci-defaults script created at friendlywrt/files/etc/uci-defaults/99-custom"
 
 cd friendlywrt
 
-# Verify uci-defaults
-if [ ! -f files/etc/uci-defaults/99-custom ]; then
+# Verify uci-defaults file is present before proceeding
+if [ -f files/etc/uci-defaults/99-custom ]; then
+    echo "[OK] uci-defaults file is present in build root (will be packaged)."
+else
     echo "[ERROR] uci-defaults file not found!" >&2
     exit 1
 fi
+
+# Disable global options
+sed -i 's/^CONFIG_ALL_KMODS=.*/# CONFIG_ALL_KMODS is not set/' .config || echo "# CONFIG_ALL_KMODS is not set" >> .config
+sed -i 's/^CONFIG_ALL_NONSHARED=.*/# CONFIG_ALL_NONSHARED is not set/' .config || echo "# CONFIG_ALL_NONSHARED is not set" >> .config
+sed -i 's/^CONFIG_DEVEL=.*/# CONFIG_DEVEL is not set/' .config || echo "# CONFIG_DEVEL is not set" >> .config
+sed -i 's/^CONFIG_BUILDBOT=.*/# CONFIG_BUILDBOT is not set/' .config || echo "# CONFIG_BUILDBOT is not set" >> .config
+make defconfig
 
 # Packages to disable
 DISABLE_PKGS="
@@ -121,50 +126,25 @@ DISABLE_PKGS="
     luci-app-watchcat
 "
 
-# ----------------------------------------------------------------------
-# Config process with progress logs
-# ----------------------------------------------------------------------
-
-echo "Running make defconfig..."
-make defconfig
-
-echo "Disabling global knobs..."
-for opt in ALL_KMODS ALL_NONSHARED DEVEL BUILDBOT; do
-    sed -i "s/^CONFIG_${opt}=.*/# CONFIG_${opt} is not set/" .config
-    grep -q "^# CONFIG_${opt} is not set" .config || echo "# CONFIG_${opt} is not set" >> .config
-done
-make oldconfig
-
-echo "Disabling unwanted packages..."
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-echo "Enabling required packages..."
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-make oldconfig
+yes "" | make oldconfig
 
-echo "Fixing packages re-enabled by dependencies..."
-max_retries=5
-for ((i=1; i<=max_retries; i++)); do
-    changed=0
-    for pkg in $DISABLE_PKGS; do
-        if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-            sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-            changed=1
-        fi
-    done
-    [ $changed -eq 0 ] && break
-    make oldconfig
+for pkg in $DISABLE_PKGS; do
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
+yes "" | make oldconfig
 
-# Final status report
 echo "=== Final package status ==="
 check_pkg() {
     local pkg="$1"
