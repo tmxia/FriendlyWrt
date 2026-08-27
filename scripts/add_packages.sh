@@ -29,6 +29,11 @@ for pkg in $ENSURE_PKGS; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
+# Remove build tools to save time/space
+sed -i -e '/CONFIG_MAKE_TOOLCHAIN=y/d' "$CONFIG_FILE"
+sed -i -e 's/CONFIG_IB=y/# CONFIG_IB is not set/g' "$CONFIG_FILE"
+sed -i -e 's/CONFIG_SDK=y/# CONFIG_SDK is not set/g' "$CONFIG_FILE"
+
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
