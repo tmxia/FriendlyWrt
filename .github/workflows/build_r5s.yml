@@ -125,22 +125,18 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 强制启用Clashoo & 内核DIAG (已移除 make oldconfig)
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
-        cd project/friendlywrt
-        echo "Enabling Clashoo packages and kernel DIAG options..."
-        for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag luci-theme-bootstrap; do
-          sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-          sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-          echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-        done
-        for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG CONFIG_INET_DIAG_DESTROY; do
-          sed -i "/^# ${opt} is not set/d" .config
-          sed -i "/^${opt}=/d" .config
-          echo "${opt}=y" >> .config
-        done
-        echo "Forced kernel DIAG and Clashoo packages, skipping oldconfig."
+        cd project
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        cd friendlywrt
+        echo "Enabling Clashoo packages in .config..."
+        sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn is not set$/CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y/' .config || echo "CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-theme-bootstrap is not set$/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config || echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> .config
+        make oldconfig
 
     - name: Verify config
       run: |
@@ -438,22 +434,18 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 强制启用Clashoo & 内核DIAG (已移除 make oldconfig)
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
-        cd project/friendlywrt
-        echo "Enabling Clashoo packages and kernel DIAG options..."
-        for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag luci-theme-bootstrap; do
-          sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-          sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-          echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-        done
-        for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG CONFIG_INET_DIAG_DESTROY; do
-          sed -i "/^# ${opt} is not set/d" .config
-          sed -i "/^${opt}=/d" .config
-          echo "${opt}=y" >> .config
-        done
-        echo "Forced kernel DIAG and Clashoo packages, skipping oldconfig."
+        cd project
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        cd friendlywrt
+        echo "Enabling Clashoo packages in .config..."
+        sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn is not set$/CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y/' .config || echo "CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-theme-bootstrap is not set$/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config || echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> .config
+        make oldconfig
 
     - name: Verify config
       run: |
