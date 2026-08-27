@@ -8,7 +8,7 @@ on:
       version:
         description: 'OpenWrt version'
         required: true
-        default: 'both'
+        default: '25.12'
         type: choice
         options:
           - '24.10'
@@ -85,7 +85,28 @@ jobs:
         mkdir -p ./artifact
         sudo swapoff -a || true
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
+        # Install ccache for faster rebuilds
+        sudo apt-get install -y ccache
+        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
         echo "cores: $(nproc)"
+
+    - name: Cache OpenWrt downloads
+      uses: actions/cache@v3
+      with:
+        path: project/friendlywrt/dl
+        key: dl-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
+        restore-keys: |
+          dl-${{ matrix.VERSION }}-${{ matrix.SET }}-
+          dl-
+
+    - name: Cache ccache
+      uses: actions/cache@v3
+      with:
+        path: ~/.ccache
+        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-
+          ccache-
 
     - name: Download source
       run: |
@@ -118,19 +139,18 @@ jobs:
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         EOL
+        # Only run build.sh once here
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
     - name: Add customize packages
       run: |
         cd project
+        # add_packages.sh internally runs make defconfig/oldconfig
         bash ../scripts/add_packages.sh
 
-    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
-        cd project
-        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
-        cd friendlywrt
+        cd project/friendlywrt
         echo "Enabling Clashoo packages in .config..."
         sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
         sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
@@ -147,7 +167,7 @@ jobs:
     - name: Download package
       run: |
         cd project/friendlywrt
-        make download -j8
+        make download -j$(nproc)
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
@@ -156,7 +176,8 @@ jobs:
       continue-on-error: true
       run: |
         cd project/friendlywrt
-        if ! make -j$(nproc); then
+        # Use -j4 to avoid OOM on GitHub runner (4 cores)
+        if ! make -j4; then
           echo "::warning::parallel build failed, retrying with V=s"
           make -j1 V=s
         fi
@@ -359,7 +380,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # 自动触发
+  # ========== 自动触发（watch） ==========
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -370,7 +391,6 @@ jobs:
       matrix:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
-
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -394,7 +414,27 @@ jobs:
         mkdir -p ./artifact
         sudo swapoff -a || true
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
+        sudo apt-get install -y ccache
+        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
         echo "cores: $(nproc)"
+
+    - name: Cache OpenWrt downloads
+      uses: actions/cache@v3
+      with:
+        path: project/friendlywrt/dl
+        key: dl-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
+        restore-keys: |
+          dl-${{ matrix.VERSION }}-${{ matrix.SET }}-
+          dl-
+
+    - name: Cache ccache
+      uses: actions/cache@v3
+      with:
+        path: ~/.ccache
+        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-
+          ccache-
 
     - name: Download source
       run: |
@@ -434,12 +474,9 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
-        cd project
-        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
-        cd friendlywrt
+        cd project/friendlywrt
         echo "Enabling Clashoo packages in .config..."
         sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
         sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
@@ -456,7 +493,7 @@ jobs:
     - name: Download package
       run: |
         cd project/friendlywrt
-        make download -j8
+        make download -j$(nproc)
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
@@ -465,7 +502,7 @@ jobs:
       continue-on-error: true
       run: |
         cd project/friendlywrt
-        if ! make -j$(nproc); then
+        if ! make -j4; then
           echo "::warning::parallel build failed, retrying with V=s"
           make -j1 V=s
         fi
