@@ -1,14 +1,14 @@
 #!/bin/bash
 set -e
 
-# Ensure feeds.conf exists
+# Init feeds.conf
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 
 # Add Clashoo feed
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# Add Clashoo config
+# Add Clashoo packages to config
 CONFIG_FILE="configs/rockchip/01-nanopi"
 grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
 
@@ -19,12 +19,12 @@ CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 
-# Packages to ensure
+# Packages to enable
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
 
-# Write ensure packages to config
+# Write enable packages to config
 for pkg in $ENSURE_PKGS; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
@@ -32,31 +32,19 @@ done
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# Enable kernel INET_DIAG options
+# Enable kernel INET_DIAG options (required by Clashoo)
 cd friendlywrt
-
-# Get kernel version from Makefile
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
 KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
-
-# Ensure kernel config file exists
 touch "$KERNEL_CONFIG_FILE"
-
-# Remove disabled lines and append enable lines
-sed -i '/^# CONFIG_INET_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-sed -i '/^# CONFIG_INET_TCP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-sed -i '/^# CONFIG_INET_UDP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-sed -i '/^# CONFIG_INET_RAW_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_TCP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_UDP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_RAW_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-
-echo "Kernel config updated: $KERNEL_CONFIG_FILE"
+for opt in CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG; do
+    sed -i "/^# ${opt} is not set/d" "$KERNEL_CONFIG_FILE"
+    echo "${opt}=y" >> "$KERNEL_CONFIG_FILE"
+done
 cd ..
 
-# UCI defaults for side-router
+# UCI defaults for side-router (IP, DHCP, firewall, password, Bootstrap theme)
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -89,7 +77,7 @@ chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 # Enter build dir
 cd friendlywrt
 
-# Disable global options
+# Disable global options that pull many unwanted packages
 for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
@@ -110,7 +98,7 @@ luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat
 "
 
-# Disable all unwanted packages
+# Disable unwanted packages
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
@@ -123,18 +111,13 @@ for pkg in $ENSURE_PKGS; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Force-enable Clashoo packages (first pass)
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
-    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-done
-
-# SECOND PASS: Ensure Clashoo packages are still enabled
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-    echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+# Force-enable Clashoo packages (twice for robustness)
+for pass in 1 2; do
+    for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
 done
 
 # Verify Clashoo packages
@@ -148,12 +131,9 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
         MISSING=1
     fi
 done
-if [ $MISSING -eq 1 ]; then
-    echo "ERROR: Clashoo packages missing, aborting."
-    exit 1
-fi
+[ $MISSING -eq 1 ] && { echo "ERROR: Clashoo packages missing, aborting."; exit 1; }
 
-# Print final package status
+# Print final status
 echo "=== Final package status ==="
 check_pkg() {
     grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
