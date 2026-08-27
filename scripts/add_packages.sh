@@ -99,6 +99,13 @@ for pkg in $ENSURE_PKGS; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
+# Force-enable Clashoo packages (first pass)
+for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
+    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+done
+
 # Inject kernel DIAG options (skip oldconfig)
 for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG CONFIG_INET_DIAG_DESTROY; do
     sed -i "/^# ${opt} is not set/d" .config
@@ -106,15 +113,12 @@ for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UD
     echo "${opt}=y" >> .config
 done
 
-# Print final package status
-echo "=== Final package status ==="
-check_pkg() {
-    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
-}
-echo "--- ENABLED ---"
-for pkg in $ENSURE_PKGS; do check_pkg "$pkg"; done
-echo "--- DISABLED ---"
-for pkg in $DISABLE_PKGS; do check_pkg "$pkg"; done
+# SECOND PASS: Ensure Clashoo packages are still enabled (in case previous steps removed them)
+for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+    echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+done
 
 # Verify kernel DIAG options
 echo "=== Verifying kernel DIAG options ==="
@@ -134,6 +138,7 @@ fi
 
 # Verify Clashoo packages
 echo "=== Verifying Clashoo packages ==="
+MISSING=0
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
         echo "[OK] CONFIG_PACKAGE_${pkg}=y"
@@ -146,6 +151,16 @@ if [ $MISSING -eq 1 ]; then
     echo "ERROR: Clashoo packages missing, aborting."
     exit 1
 fi
+
+# Print final package status (optional)
+echo "=== Final package status ==="
+check_pkg() {
+    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
+}
+echo "--- ENABLED ---"
+for pkg in $ENSURE_PKGS; do check_pkg "$pkg"; done
+echo "--- DISABLED ---"
+for pkg in $DISABLE_PKGS; do check_pkg "$pkg"; done
 
 cd ..
 echo "All configurations applied and verified."
