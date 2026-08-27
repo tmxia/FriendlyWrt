@@ -106,17 +106,46 @@ for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UD
     echo "${opt}=y" >> .config
 done
 
-# Print final status
+# Print final package status
 echo "=== Final package status ==="
 check_pkg() {
-    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" && return
-    grep -q "^# CONFIG_PACKAGE_$1 is not set" .config && echo "  [DISABLED] $1" && return
-    echo "  [UNKNOWN]  $1"
+    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
 }
 echo "--- ENABLED ---"
 for pkg in $ENSURE_PKGS; do check_pkg "$pkg"; done
 echo "--- DISABLED ---"
 for pkg in $DISABLE_PKGS; do check_pkg "$pkg"; done
 
+# Verify kernel DIAG options
+echo "=== Verifying kernel DIAG options ==="
+MISSING=0
+for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_DIAG_DESTROY; do
+    if grep -q "^$opt=y" .config; then
+        echo "[OK] $opt=y"
+    else
+        echo "[FAIL] $opt not set"
+        MISSING=1
+    fi
+done
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Kernel DIAG options missing, aborting."
+    exit 1
+fi
+
+# Verify Clashoo packages
+echo "=== Verifying Clashoo packages ==="
+for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+    if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+        echo "[OK] CONFIG_PACKAGE_${pkg}=y"
+    else
+        echo "[FAIL] CONFIG_PACKAGE_${pkg} not enabled"
+        MISSING=1
+    fi
+done
+if [ $MISSING -eq 1 ]; then
+    echo "ERROR: Clashoo packages missing, aborting."
+    exit 1
+fi
+
 cd ..
-echo "All configurations applied."
+echo "All configurations applied and verified."
