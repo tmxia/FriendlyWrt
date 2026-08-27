@@ -32,18 +32,18 @@ done
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# ========== 修改内核配置，启用 INET_DIAG 依赖 ==========
+# Enable kernel INET_DIAG options
 cd friendlywrt
 
-# 获取内核版本（例如 6.1）
+# Get kernel version from Makefile
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
 KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
 
-# 确保内核配置文件存在（若不存在则创建空文件）
+# Ensure kernel config file exists
 touch "$KERNEL_CONFIG_FILE"
 
-# 删除可能存在的禁用行，然后追加启用行
+# Remove disabled lines and append enable lines
 sed -i '/^# CONFIG_INET_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
 sed -i '/^# CONFIG_INET_TCP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
 sed -i '/^# CONFIG_INET_UDP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
@@ -56,7 +56,7 @@ echo "CONFIG_INET_RAW_DIAG=y" >> "$KERNEL_CONFIG_FILE"
 echo "Kernel config updated: $KERNEL_CONFIG_FILE"
 cd ..
 
-# ========== UCI defaults for side-router ==========
+# UCI defaults for side-router
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
