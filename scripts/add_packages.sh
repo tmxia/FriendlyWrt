@@ -32,28 +32,28 @@ done
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# ========== 方案一：修改内核配置文件，启用 INET_DIAG 依赖 ==========
+# ========== 修改内核配置，启用 INET_DIAG 依赖 ==========
 cd friendlywrt
 
-# 查找当前使用的内核版本配置文件（例如 config-6.1, config-5.15 等）
-KERNEL_CONFIG_FILE=$(ls target/linux/rockchip/config-* 2>/dev/null | head -n1)
-if [ -n "$KERNEL_CONFIG_FILE" ]; then
-    echo "Modifying kernel config: $KERNEL_CONFIG_FILE"
-    # 删除可能存在的禁用行
-    sed -i '/^# CONFIG_INET_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-    sed -i '/^# CONFIG_INET_TCP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-    sed -i '/^# CONFIG_INET_UDP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-    sed -i '/^# CONFIG_INET_RAW_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-    # 追加启用行
-    echo "CONFIG_INET_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-    echo "CONFIG_INET_TCP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-    echo "CONFIG_INET_UDP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-    echo "CONFIG_INET_RAW_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-    # CONFIG_INET_DIAG_DESTROY 通常不需要，保持默认
-else
-    echo "WARNING: Kernel config file not found, kernel DIAG options may not be enabled."
-fi
+# 获取内核版本（例如 6.1）
+KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
+[ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
+KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
 
+# 确保内核配置文件存在（若不存在则创建空文件）
+touch "$KERNEL_CONFIG_FILE"
+
+# 删除可能存在的禁用行，然后追加启用行
+sed -i '/^# CONFIG_INET_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+sed -i '/^# CONFIG_INET_TCP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+sed -i '/^# CONFIG_INET_UDP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+sed -i '/^# CONFIG_INET_RAW_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+echo "CONFIG_INET_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+echo "CONFIG_INET_TCP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+echo "CONFIG_INET_UDP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+echo "CONFIG_INET_RAW_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+
+echo "Kernel config updated: $KERNEL_CONFIG_FILE"
 cd ..
 
 # ========== UCI defaults for side-router ==========
@@ -136,8 +136,6 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
     echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
-
-# No manual kernel option injection - handled by modifying kernel config file above
 
 # Verify Clashoo packages
 echo "=== Verifying Clashoo packages ==="
