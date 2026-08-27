@@ -125,6 +125,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
+    # 强制启用Clashoo & 内核DIAG (已移除 make oldconfig)
     - name: Update config after custom packages
       run: |
         cd project/friendlywrt
@@ -437,6 +438,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
+    # 强制启用Clashoo & 内核DIAG (已移除 make oldconfig)
     - name: Update config after custom packages
       run: |
         cd project/friendlywrt
