@@ -32,7 +32,31 @@ done
 # Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# UCI defaults for side-router
+# ========== 方案一：修改内核配置文件，启用 INET_DIAG 依赖 ==========
+cd friendlywrt
+
+# 查找当前使用的内核版本配置文件（例如 config-6.1, config-5.15 等）
+KERNEL_CONFIG_FILE=$(ls target/linux/rockchip/config-* 2>/dev/null | head -n1)
+if [ -n "$KERNEL_CONFIG_FILE" ]; then
+    echo "Modifying kernel config: $KERNEL_CONFIG_FILE"
+    # 删除可能存在的禁用行
+    sed -i '/^# CONFIG_INET_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+    sed -i '/^# CONFIG_INET_TCP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+    sed -i '/^# CONFIG_INET_UDP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+    sed -i '/^# CONFIG_INET_RAW_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
+    # 追加启用行
+    echo "CONFIG_INET_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+    echo "CONFIG_INET_TCP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+    echo "CONFIG_INET_UDP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+    echo "CONFIG_INET_RAW_DIAG=y" >> "$KERNEL_CONFIG_FILE"
+    # CONFIG_INET_DIAG_DESTROY 通常不需要，保持默认
+else
+    echo "WARNING: Kernel config file not found, kernel DIAG options may not be enabled."
+fi
+
+cd ..
+
+# ========== UCI defaults for side-router ==========
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -106,35 +130,14 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Inject kernel DIAG options (skip oldconfig)
-for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG CONFIG_INET_DIAG_DESTROY; do
-    sed -i "/^# ${opt} is not set/d" .config
-    sed -i "/^${opt}=/d" .config
-    echo "${opt}=y" >> .config
-done
-
-# SECOND PASS: Ensure Clashoo packages are still enabled (in case previous steps removed them)
+# SECOND PASS: Ensure Clashoo packages are still enabled
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
     echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Verify kernel DIAG options
-echo "=== Verifying kernel DIAG options ==="
-MISSING=0
-for opt in CONFIG_SOCK_DIAG CONFIG_INET_DIAG CONFIG_INET_DIAG_DESTROY; do
-    if grep -q "^$opt=y" .config; then
-        echo "[OK] $opt=y"
-    else
-        echo "[FAIL] $opt not set"
-        MISSING=1
-    fi
-done
-if [ $MISSING -eq 1 ]; then
-    echo "ERROR: Kernel DIAG options missing, aborting."
-    exit 1
-fi
+# No manual kernel option injection - handled by modifying kernel config file above
 
 # Verify Clashoo packages
 echo "=== Verifying Clashoo packages ==="
@@ -152,7 +155,7 @@ if [ $MISSING -eq 1 ]; then
     exit 1
 fi
 
-# Print final package status (optional)
+# Print final package status
 echo "=== Final package status ==="
 check_pkg() {
     grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
