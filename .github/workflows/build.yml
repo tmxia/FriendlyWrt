@@ -29,34 +29,17 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     steps:
-    - name: Get current date
-      id: date
-      run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
-
-    - name: Determine unique release tag
-      id: tag
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Get release tag (auto-increment if exists)
+      id: release_tag
       run: |
-        DATE="${{ steps.date.outputs.date }}"
-        BASE_TAG="FriendlyWrt-${DATE}"
-        EXISTING_TAGS=$(gh release list --limit 100 --repo ${{ github.repository }} --json tagName --jq '.[].tagName' | grep "^${BASE_TAG}" || true)
-        if [ -z "$EXISTING_TAGS" ]; then
-          FINAL_TAG="$BASE_TAG"
-        else
-          MAX_SUFFIX=0
-          for tag in $EXISTING_TAGS; do
-            suffix="${tag#$BASE_TAG}"
-            if [[ "$suffix" =~ ^-([0-9]+)$ ]]; then
-              num=${BASH_REMATCH[1]}
-              [ $num -gt $MAX_SUFFIX ] && MAX_SUFFIX=$num
-            fi
-          done
-          NEXT=$((MAX_SUFFIX + 1))
-          FINAL_TAG="${BASE_TAG}-${NEXT}"
-        fi
-        echo "release_tag=$FINAL_TAG" >> $GITHUB_OUTPUT
-        echo "Final release tag: $FINAL_TAG"
+        base_tag="FriendlyWrt-$(date +%Y-%m-%d)"
+        tag="$base_tag"
+        counter=0
+        while gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; do
+          counter=$((counter+1))
+          tag="${base_tag}-${counter}"
+        done
+        echo "release_tag=$tag" >> $GITHUB_OUTPUT
 
     - name: Create empty release
       id: release
@@ -64,11 +47,11 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
+        tag_name: ${{ steps.release_tag.outputs.release_tag }}
         draft: false
         prerelease: false
     outputs:
-      release_tag: ${{ steps.tag.outputs.release_tag }}
+      release_tag: ${{ steps.release_tag.outputs.release_tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
 
   build_manual:
@@ -108,31 +91,10 @@ jobs:
         mkdir -p ./artifact
         sudo swapoff -a || true
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
-        sudo apt-get install -y ccache
-        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
         echo "cores: $(nproc)"
-
-    - name: Cache OpenWrt downloads
-      uses: actions/cache@v3
-      with:
-        path: project/friendlywrt/dl
-        key: dl-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
-        restore-keys: |
-          dl-${{ matrix.VERSION }}-${{ matrix.SET }}-
-          dl-
-
-    - name: Cache ccache
-      uses: actions/cache@v3
-      with:
-        path: ~/.ccache
-        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf', 'scripts/add_packages.sh', 'configs/rockchip/01-nanopi') }}
-        restore-keys: |
-          ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-
-          ccache-
 
     - name: Download source
       run: |
-        rm -rf project
         mkdir project
         cd project
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
@@ -145,6 +107,16 @@ jobs:
         repo sync -c scripts --no-clone-bundle
         repo sync -c scripts/sd-fuse  --no-clone-bundle
         repo sync -c toolchain  --no-clone-bundle
+
+    # 添加缓存（下载的源码包）
+    - name: Cache DL directory
+      uses: actions/cache@v4
+      with:
+        path: project/friendlywrt/dl
+        key: ${{ runner.os }}-dl-${{ matrix.VERSION }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
+        restore-keys: |
+          ${{ runner.os }}-dl-${{ matrix.VERSION }}-
+          ${{ runner.os }}-dl-
 
     - name: Apply customizations
       run: |
@@ -169,9 +141,12 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
-        cd project/friendlywrt
+        cd project
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        cd friendlywrt
         echo "Enabling Clashoo packages in .config..."
         sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
         sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
@@ -188,32 +163,25 @@ jobs:
     - name: Download package
       run: |
         cd project/friendlywrt
-        make download -j$(nproc)
+        make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
-
-    - name: Show ccache stats
-      run: |
-        ccache -s
 
     - name: Compile friendlyWrt
       id: compile
       continue-on-error: true
       run: |
         cd project/friendlywrt
-        # Explicitly enable ccache and use 2 parallel jobs to avoid OOM
-        export CCACHE=1
-        if ! make -j2 CONFIG_DEBUG_INFO=n; then
+        if ! make -j$(nproc); then
           echo "::warning::parallel build failed, retrying with V=s"
-          make -j1 V=s CONFIG_DEBUG_INFO=n
+          make -j1 V=s
         fi
 
     - name: Check the result and try again
       if: steps.compile.outcome == 'failure'
       run: |
         cd project/friendlywrt
-        export CCACHE=1
-        make -j1 V=s CONFIG_DEBUG_INFO=n
+        make -j1 V=s
 
     - name: Upload build logs on failure
       if: failure()
@@ -286,7 +254,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # 构建SD镜像
+    # 构建SD镜像 (保持不变)
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -407,7 +375,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # 自动触发
+  # 自动触发 (build_auto)
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -418,6 +386,7 @@ jobs:
       matrix:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
+
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -441,31 +410,10 @@ jobs:
         mkdir -p ./artifact
         sudo swapoff -a || true
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
-        sudo apt-get install -y ccache
-        echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
         echo "cores: $(nproc)"
-
-    - name: Cache OpenWrt downloads
-      uses: actions/cache@v3
-      with:
-        path: project/friendlywrt/dl
-        key: dl-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
-        restore-keys: |
-          dl-${{ matrix.VERSION }}-${{ matrix.SET }}-
-          dl-
-
-    - name: Cache ccache
-      uses: actions/cache@v3
-      with:
-        path: ~/.ccache
-        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf', 'scripts/add_packages.sh', 'configs/rockchip/01-nanopi') }}
-        restore-keys: |
-          ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-
-          ccache-
 
     - name: Download source
       run: |
-        rm -rf project
         mkdir project
         cd project
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
@@ -478,6 +426,15 @@ jobs:
         repo sync -c scripts --no-clone-bundle
         repo sync -c scripts/sd-fuse  --no-clone-bundle
         repo sync -c toolchain  --no-clone-bundle
+
+    - name: Cache DL directory
+      uses: actions/cache@v4
+      with:
+        path: project/friendlywrt/dl
+        key: ${{ runner.os }}-dl-${{ matrix.VERSION }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
+        restore-keys: |
+          ${{ runner.os }}-dl-${{ matrix.VERSION }}-
+          ${{ runner.os }}-dl-
 
     - name: Apply customizations
       run: |
@@ -502,9 +459,12 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
-        cd project/friendlywrt
+        cd project
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        cd friendlywrt
         echo "Enabling Clashoo packages in .config..."
         sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
         sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
@@ -521,31 +481,25 @@ jobs:
     - name: Download package
       run: |
         cd project/friendlywrt
-        make download -j$(nproc)
+        make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
-
-    - name: Show ccache stats
-      run: |
-        ccache -s
 
     - name: Compile friendlyWrt
       id: compile
       continue-on-error: true
       run: |
         cd project/friendlywrt
-        export CCACHE=1
-        if ! make -j2 CONFIG_DEBUG_INFO=n; then
+        if ! make -j$(nproc); then
           echo "::warning::parallel build failed, retrying with V=s"
-          make -j1 V=s CONFIG_DEBUG_INFO=n
+          make -j1 V=s
         fi
 
     - name: Check the result and try again
       if: steps.compile.outcome == 'failure'
       run: |
         cd project/friendlywrt
-        export CCACHE=1
-        make -j1 V=s CONFIG_DEBUG_INFO=n
+        make -j1 V=s
 
     - name: Upload build logs on failure
       if: failure()
