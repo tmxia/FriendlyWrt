@@ -1,4 +1,4 @@
-name: Build FriendlyWrt
+name: Build FriendlyWrt R5S
 
 on:
   watch:
@@ -29,11 +29,34 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     steps:
-    - name: Get release tag
-      id: release_tag
+    - name: Get current date
+      id: date
+      run: echo "date=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+    - name: Determine unique release tag
+      id: tag
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        release_tag="FriendlyWrt-$(date +%Y-%m-%d)"
-        echo "release_tag=$release_tag" >> $GITHUB_OUTPUT
+        DATE="${{ steps.date.outputs.date }}"
+        BASE_TAG="FriendlyWrt-${DATE}"
+        EXISTING_TAGS=$(gh release list --limit 100 --repo ${{ github.repository }} --json tagName --jq '.[].tagName' | grep "^${BASE_TAG}" || true)
+        if [ -z "$EXISTING_TAGS" ]; then
+          FINAL_TAG="$BASE_TAG"
+        else
+          MAX_SUFFIX=0
+          for tag in $EXISTING_TAGS; do
+            suffix="${tag#$BASE_TAG}"
+            if [[ "$suffix" =~ ^-([0-9]+)$ ]]; then
+              num=${BASH_REMATCH[1]}
+              [ $num -gt $MAX_SUFFIX ] && MAX_SUFFIX=$num
+            fi
+          done
+          NEXT=$((MAX_SUFFIX + 1))
+          FINAL_TAG="${BASE_TAG}-${NEXT}"
+        fi
+        echo "release_tag=$FINAL_TAG" >> $GITHUB_OUTPUT
+        echo "Final release tag: $FINAL_TAG"
 
     - name: Create empty release
       id: release
@@ -41,11 +64,11 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ steps.release_tag.outputs.release_tag }}
+        tag_name: ${{ steps.tag.outputs.release_tag }}
         draft: false
         prerelease: false
     outputs:
-      release_tag: ${{ steps.release_tag.outputs.release_tag }}
+      release_tag: ${{ steps.tag.outputs.release_tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
 
   build_manual:
@@ -85,7 +108,6 @@ jobs:
         mkdir -p ./artifact
         sudo swapoff -a || true
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
-        # Install ccache for faster rebuilds
         sudo apt-get install -y ccache
         echo "PATH=/usr/lib/ccache:$PATH" >> $GITHUB_ENV
         echo "cores: $(nproc)"
@@ -139,13 +161,11 @@ jobs:
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         EOL
-        # Only run build.sh once here
         DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
 
     - name: Add customize packages
       run: |
         cd project
-        # add_packages.sh internally runs make defconfig/oldconfig
         bash ../scripts/add_packages.sh
 
     - name: Update config after custom packages
@@ -176,7 +196,6 @@ jobs:
       continue-on-error: true
       run: |
         cd project/friendlywrt
-        # Use -j4 to avoid OOM on GitHub runner (4 cores)
         if ! make -j4; then
           echo "::warning::parallel build failed, retrying with V=s"
           make -j1 V=s
@@ -380,7 +399,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ========== 自动触发（watch） ==========
+  # 自动触发（watch 事件）
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -740,5 +759,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt"
+          delete_workflow_pattern: "Build FriendlyWrt R5S"
           repository: ${{ github.repository }}
