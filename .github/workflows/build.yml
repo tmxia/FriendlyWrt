@@ -1,4 +1,4 @@
-name: Build FriendlyWrt R5S
+name: Build FriendlyWrt
 
 on:
   watch:
@@ -759,5 +759,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt R5S"
+          delete_workflow_pattern: "Build FriendlyWrt"
           repository: ${{ github.repository }}
