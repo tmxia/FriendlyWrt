@@ -132,6 +132,7 @@ jobs:
 
     - name: Download source
       run: |
+        rm -rf project
         mkdir project
         cd project
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
@@ -399,7 +400,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # 自动触发（watch 事件）
+  # 自动触发
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -457,6 +458,7 @@ jobs:
 
     - name: Download source
       run: |
+        rm -rf project
         mkdir project
         cd project
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
