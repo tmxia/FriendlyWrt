@@ -1,4 +1,4 @@
-name: Build FriendlyWrt
+name: Build FriendlyWrt R5S
 
 on:
   watch:
@@ -125,7 +125,7 @@ jobs:
       uses: actions/cache@v3
       with:
         path: ~/.ccache
-        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ github.run_id }}
+        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf', 'scripts/add_packages.sh', 'configs/rockchip/01-nanopi') }}
         restore-keys: |
           ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-
           ccache-
@@ -192,21 +192,25 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
+    - name: Show ccache stats
+      run: |
+        ccache -s
+
     - name: Compile friendlyWrt
       id: compile
       continue-on-error: true
       run: |
         cd project/friendlywrt
-        if ! make -j4; then
+        if ! make -j4 CONFIG_DEBUG_INFO=n; then
           echo "::warning::parallel build failed, retrying with V=s"
-          make -j1 V=s
+          make -j1 V=s CONFIG_DEBUG_INFO=n
         fi
 
     - name: Check the result and try again
       if: steps.compile.outcome == 'failure'
       run: |
         cd project/friendlywrt
-        make -j1 V=s
+        make -j1 V=s CONFIG_DEBUG_INFO=n
 
     - name: Upload build logs on failure
       if: failure()
@@ -400,7 +404,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # 自动触发
+  # ========== 自动触发（watch） ==========
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -451,7 +455,7 @@ jobs:
       uses: actions/cache@v3
       with:
         path: ~/.ccache
-        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ github.run_id }}
+        key: ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-${{ hashFiles('project/friendlywrt/feeds.conf', 'scripts/add_packages.sh', 'configs/rockchip/01-nanopi') }}
         restore-keys: |
           ccache-${{ matrix.VERSION }}-${{ matrix.SET }}-
           ccache-
@@ -518,21 +522,25 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
+    - name: Show ccache stats
+      run: |
+        ccache -s
+
     - name: Compile friendlyWrt
       id: compile
       continue-on-error: true
       run: |
         cd project/friendlywrt
-        if ! make -j4; then
+        if ! make -j4 CONFIG_DEBUG_INFO=n; then
           echo "::warning::parallel build failed, retrying with V=s"
-          make -j1 V=s
+          make -j1 V=s CONFIG_DEBUG_INFO=n
         fi
 
     - name: Check the result and try again
       if: steps.compile.outcome == 'failure'
       run: |
         cd project/friendlywrt
-        make -j1 V=s
+        make -j1 V=s CONFIG_DEBUG_INFO=n
 
     - name: Upload build logs on failure
       if: failure()
@@ -761,5 +769,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt"
+          delete_workflow_pattern: "Build FriendlyWrt R5S"
           repository: ${{ github.repository }}
