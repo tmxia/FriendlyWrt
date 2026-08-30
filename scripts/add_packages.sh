@@ -1,19 +1,32 @@
 #!/bin/bash
 set -e
 
-# ========== 1. 彻底清理所有 configs/rockchip/* 中的用户空间包 ==========
-echo "=== Cleaning all configs/rockchip/* of non-kmod packages ==="
+# ========== 1. 删除所有多余的配置文件，只保留 01-nanopi ==========
+echo "=== Removing all configs/rockchip/* except 01-nanopi ==="
 for config_file in configs/rockchip/*; do
     [ -f "$config_file" ] || continue
-    # 删除所有非 kmod- 开头的包配置行（=y 或 =m）
-    sed -i -e '/^CONFIG_PACKAGE_kmod-/! { /^CONFIG_PACKAGE_.*=[ym]$/d; }' "$config_file"
-    # 删除所有 # CONFIG_PACKAGE_xxx is not set 行（禁用行不影响大小，但保持整洁）
-    sed -i -e '/^# CONFIG_PACKAGE_.* is not set$/d' "$config_file"
-    echo "  Cleaned $config_file"
+    filename=$(basename "$config_file")
+    if [ "$filename" != "01-nanopi" ]; then
+        rm -f "$config_file"
+        echo "  Removed $config_file"
+    fi
 done
 
-# ========== 2. 添加核心必要组件（写入 01-nanopi） ==========
+# ========== 2. 清空 01-nanopi 并写入基础配置 ==========
 CONFIG_FILE="configs/rockchip/01-nanopi"
+> "$CONFIG_FILE"
+
+# 基础目标配置（硬件支持）
+cat >> "$CONFIG_FILE" << 'EOF'
+# Target platform (required for R5S)
+CONFIG_TARGET_rockchip=y
+CONFIG_TARGET_rockchip_rk3568=y
+CONFIG_TARGET_MULTI_PROFILE=y
+CONFIG_TARGET_DEVICE_rockchip_rk3568_DEVICE_friendlyarm-nanopi-r5s=y
+CONFIG_IPV6=y
+EOF
+
+# ========== 3. 核心必要组件（LuCI、防火墙、证书等） ==========
 CORE_PKGS="
 ca-certificates
 luci
@@ -22,23 +35,19 @@ luci-app-package-manager
 luci-ssl-openssl
 openwrt-keyring
 curl
+luci-i18n-base-zh-cn
 "
 for pkg in $CORE_PKGS; do
-    grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
+    echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# IPv6 支持（旁路由建议保留）
-grep -q "CONFIG_IPV6=y" "$CONFIG_FILE" || echo "CONFIG_IPV6=y" >> "$CONFIG_FILE"
-
-# ========== 3. 添加 Clashoo feed ==========
+# ========== 4. 添加 Clashoo feed ==========
 FEED_CONF="friendlywrt/feeds.conf"
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# ========== 4. 添加 Clashoo 配置 ==========
-grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
-
-# Clashoo packages
+# Clashoo 相关包
+cat >> "$CONFIG_FILE" << 'EOF'
 CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
 CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
@@ -50,7 +59,7 @@ ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
 for pkg in $ENSURE_PKGS; do
-    grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
+    echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
 # ========== 6. 更新 Clashoo feed ==========
@@ -111,14 +120,9 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT CO
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
-echo "=== Running make defconfig ==="
 make defconfig
 
-# 统计清理前后包数量（调试）
-echo "=== Package count before forced enable/disable ==="
-echo "Enabled packages in .config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config || echo 0)"
-
-# ========== 10. 禁用不需要的包 ==========
+# ========== 10. 禁用不需要的包（双重保险） ==========
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -153,11 +157,10 @@ done
 
 make oldconfig
 
-# ========== 12. 最终包数量统计 ==========
+# ========== 12. 最终验证与统计 ==========
 echo "=== Final package count ==="
 echo "Enabled packages in .config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config || echo 0)"
 
-# ========== 13. 验证 ==========
 echo "=== Verifying Clashoo packages ==="
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
