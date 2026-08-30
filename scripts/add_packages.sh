@@ -66,7 +66,7 @@ bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools
 # ------------------------------------------------------------
 DOCKER_PKGS=""
 if [ "$BUILD_TYPE" = "docker" ]; then
-    DOCKER_PKGS="docker-ce dockerd luci-app-dockerman"
+    DOCKER_PKGS="docker-ce dockerd luci-app-dockerman luci-i18n-dockerman-zh-cn docker-compose"
 fi
 
 # ------------------------------------------------------------
