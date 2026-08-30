@@ -12,9 +12,9 @@ for config_file in configs/rockchip/*; do
     fi
 done
 
-# ========== 2. 清理 01-nanopi：删除所有 CONFIG_PACKAGE_* 行，保留其他配置 ==========
+# ========== 2. 清理 01-nanopi 中的包配置行，保留其他配置 ==========
 CONFIG_FILE="configs/rockchip/01-nanopi"
-# 删除所有包配置行（启用和禁用）
+# 删除所有 CONFIG_PACKAGE_* 行（启用和禁用）
 sed -i -e '/^CONFIG_PACKAGE_/d' -e '/^# CONFIG_PACKAGE_.* is not set$/d' "$CONFIG_FILE"
 
 # ========== 3. 添加核心必要组件（LuCI、防火墙等） ==========
@@ -32,7 +32,7 @@ for pkg in $CORE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 4. 添加 Clashoo feed（如果尚未添加） ==========
+# ========== 4. 添加 Clashoo feed ==========
 FEED_CONF="friendlywrt/feeds.conf"
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
@@ -64,7 +64,7 @@ KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
 touch "$KERNEL_CONFIG_FILE"
 for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG; do
     sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
-    echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
+    grep -q "^CONFIG_${opt}=y" "$KERNEL_CONFIG_FILE" || echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
 done
 echo "Kernel config updated: $KERNEL_CONFIG_FILE"
 cd ..
@@ -107,6 +107,7 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT CO
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
+# 确保目标平台配置完整（01-nanopi 中已有，无需额外操作）
 make defconfig
 
 # ========== 11. 禁用不需要的包 ==========
