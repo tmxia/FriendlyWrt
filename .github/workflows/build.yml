@@ -1,4 +1,4 @@
-name: Build FriendlyWrt
+name: Build FriendlyWrt R5S
 
 on:
   watch:
@@ -29,17 +29,11 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     steps:
-    - name: Get release tag (auto-increment if exists)
+    - name: Get release tag
       id: release_tag
       run: |
-        base_tag="FriendlyWrt-$(date +%Y-%m-%d)"
-        tag="$base_tag"
-        counter=0
-        while gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; do
-          counter=$((counter+1))
-          tag="${base_tag}-${counter}"
-        done
-        echo "release_tag=$tag" >> $GITHUB_OUTPUT
+        release_tag="FriendlyWrt-$(date +%Y-%m-%d)"
+        echo "release_tag=$release_tag" >> $GITHUB_OUTPUT
 
     - name: Create empty release
       id: release
@@ -107,16 +101,6 @@ jobs:
         repo sync -c scripts --no-clone-bundle
         repo sync -c scripts/sd-fuse  --no-clone-bundle
         repo sync -c toolchain  --no-clone-bundle
-
-    # 添加缓存（下载的源码包）
-    - name: Cache DL directory
-      uses: actions/cache@v4
-      with:
-        path: project/friendlywrt/dl
-        key: ${{ runner.os }}-dl-${{ matrix.VERSION }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
-        restore-keys: |
-          ${{ runner.os }}-dl-${{ matrix.VERSION }}-
-          ${{ runner.os }}-dl-
 
     - name: Apply customizations
       run: |
@@ -254,7 +238,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # 构建SD镜像 (保持不变)
+    # 构建SD镜像
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -375,7 +359,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # 自动触发 (build_auto)
+  # 自动触发
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -426,15 +410,6 @@ jobs:
         repo sync -c scripts --no-clone-bundle
         repo sync -c scripts/sd-fuse  --no-clone-bundle
         repo sync -c toolchain  --no-clone-bundle
-
-    - name: Cache DL directory
-      uses: actions/cache@v4
-      with:
-        path: project/friendlywrt/dl
-        key: ${{ runner.os }}-dl-${{ matrix.VERSION }}-${{ hashFiles('project/friendlywrt/feeds.conf') }}
-        restore-keys: |
-          ${{ runner.os }}-dl-${{ matrix.VERSION }}-
-          ${{ runner.os }}-dl-
 
     - name: Apply customizations
       run: |
