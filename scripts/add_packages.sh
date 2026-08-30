@@ -14,10 +14,19 @@ done
 
 # ========== 2. 清理 01-nanopi 中的包配置行，保留其他配置 ==========
 CONFIG_FILE="configs/rockchip/01-nanopi"
-# 删除所有 CONFIG_PACKAGE_* 行（启用和禁用）
 sed -i -e '/^CONFIG_PACKAGE_/d' -e '/^# CONFIG_PACKAGE_.* is not set$/d' "$CONFIG_FILE"
 
-# ========== 3. 添加核心必要组件（LuCI、防火墙等） ==========
+# ========== 3. 添加目标平台配置（避免交互式菜单） ==========
+cat >> "$CONFIG_FILE" << 'EOF'
+# Target platform for NanoPi R5S
+CONFIG_TARGET_rockchip=y
+CONFIG_TARGET_rockchip_rk3568=y
+CONFIG_TARGET_MULTI_PROFILE=y
+CONFIG_TARGET_DEVICE_rockchip_rk3568_DEVICE_friendlyarm-nanopi-r5s=y
+CONFIG_IPV6=y
+EOF
+
+# ========== 4. 添加核心必要组件（LuCI、防火墙等） ==========
 CORE_PKGS="
 ca-certificates
 luci
@@ -32,12 +41,12 @@ for pkg in $CORE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 4. 添加 Clashoo feed ==========
+# ========== 5. 添加 Clashoo feed ==========
 FEED_CONF="friendlywrt/feeds.conf"
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# ========== 5. 添加 Clashoo 包 ==========
+# ========== 6. 添加 Clashoo 包 ==========
 cat >> "$CONFIG_FILE" << 'EOF'
 CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
@@ -45,7 +54,7 @@ CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 
-# ========== 6. 您的自定义软件包 ==========
+# ========== 7. 您的自定义软件包 ==========
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
@@ -53,10 +62,10 @@ for pkg in $ENSURE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 7. 更新 Clashoo feed ==========
+# ========== 8. 更新 Clashoo feed ==========
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# ========== 8. 修改内核配置，启用 INET_DIAG ==========
+# ========== 9. 修改内核配置，启用 INET_DIAG ==========
 cd friendlywrt
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
@@ -69,7 +78,7 @@ done
 echo "Kernel config updated: $KERNEL_CONFIG_FILE"
 cd ..
 
-# ========== 9. UCI defaults for side-router ==========
+# ========== 10. UCI defaults for side-router ==========
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -99,7 +108,7 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-# ========== 10. 进入构建目录，执行配置 ==========
+# ========== 11. 进入构建目录，执行配置 ==========
 cd friendlywrt
 
 # 禁用全局选项（防止拉入过多包）
@@ -107,10 +116,9 @@ for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT CO
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
-# 确保目标平台配置完整（01-nanopi 中已有，无需额外操作）
 make defconfig
 
-# ========== 11. 禁用不需要的包 ==========
+# ========== 12. 禁用不需要的包 ==========
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -128,7 +136,7 @@ for pkg in $DISABLE_PKGS; do
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# ========== 12. 强制启用所有需要的包 ==========
+# ========== 13. 强制启用所有需要的包 ==========
 ALL_ENABLE="$CORE_PKGS $ENSURE_PKGS clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag"
 for pkg in $ALL_ENABLE; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -145,7 +153,7 @@ done
 
 make oldconfig
 
-# ========== 13. 验证 ==========
+# ========== 14. 验证 ==========
 echo "=== Final package count ==="
 echo "Enabled packages in .config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config || echo 0)"
 
