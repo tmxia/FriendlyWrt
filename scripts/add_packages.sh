@@ -1,43 +1,81 @@
 #!/bin/bash
 set -e
 
-# Init feeds.conf
+# ================== 1. 清洗所有非 kmod 的软件包 ==================
+for cf in configs/rockchip/*; do
+    [ -f "$cf" ] || continue
+    sed -i -e '/^CONFIG_PACKAGE_kmod-/! { /^CONFIG_PACKAGE_.*=[ym]$/d; }' "$cf"
+done
+
+# ================== 2. 移除构建工具 ==================
+sed -i -e '/CONFIG_MAKE_TOOLCHAIN=y/d' configs/rockchip/01-nanopi 2>/dev/null || true
+sed -i -e 's/CONFIG_IB=y/# CONFIG_IB is not set/g' configs/rockchip/01-nanopi 2>/dev/null || true
+sed -i -e 's/CONFIG_SDK=y/# CONFIG_SDK is not set/g' configs/rockchip/01-nanopi 2>/dev/null || true
+
+# ================== 3. 初始化 feeds.conf ==================
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 
-# Add Clashoo feed
+# ================== 4. 添加 Clashoo feed ==================
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# Add Clashoo packages to config
-CONFIG_FILE="configs/rockchip/01-nanopi"
-grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
+# ================== 5. 定义需要启用的软件包 ==================
+# 核心系统包（Luci、防火墙、IPv6、DNS 等）
+CORE_PKGS="
+luci
+luci-app-firewall
+luci-app-package-manager
+luci-ssl-openssl
+ca-certificates
+openwrt-keyring
+curl
+firewall4
+dnsmasq-full
+dnsmasq_full_dhcpv6
+dnsmasq_full_nftset
+ppp
+ppp-mod-pppoe
+luci-proto-ppp
+odhcp6c
+odhcpd-ipv6only
+luci-proto-ipv6
+zram-swap
+luci-theme-bootstrap
+"
 
-# Clashoo packages
-CONFIG_PACKAGE_clashoo=y
-CONFIG_PACKAGE_luci-app-clashoo=y
-CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
-CONFIG_PACKAGE_kmod-inet-diag=y
-EOF
-
-# Packages to enable
-ENSURE_PKGS="
+# 用户自定义包（来自原 ENSURE_PKGS）
+USER_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
 
-# Write enable packages to config
-for pkg in $ENSURE_PKGS; do
+# Docker（您需要）
+DOCKER_PKGS="
+docker-ce
+dockerd
+luci-app-dockerman
+"
+
+# Clashoo 相关（单独处理）
+CLASHOO_PKGS="
+clashoo
+luci-app-clashoo
+luci-i18n-clashoo-zh-cn
+kmod-inet-diag
+"
+
+# 合并所有需要启用的包
+ALL_ENSURE="$CORE_PKGS $USER_PKGS $DOCKER_PKGS $CLASHOO_PKGS"
+
+# ================== 6. 将上述包写入 configs/rockchip/01-nanopi ==================
+CONFIG_FILE="configs/rockchip/01-nanopi"
+for pkg in $ALL_ENSURE; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# Remove build tools to save time/space
-sed -i -e '/CONFIG_MAKE_TOOLCHAIN=y/d' "$CONFIG_FILE"
-sed -i -e 's/CONFIG_IB=y/# CONFIG_IB is not set/g' "$CONFIG_FILE"
-sed -i -e 's/CONFIG_SDK=y/# CONFIG_SDK is not set/g' "$CONFIG_FILE"
-
-# Update Clashoo feed
+# ================== 7. 更新 Clashoo feed ==================
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# Enable kernel INET_DIAG options (required by Clashoo)
+# ================== 8. 启用内核 INET_DIAG ==================
 cd friendlywrt
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
@@ -49,7 +87,7 @@ for opt in CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INE
 done
 cd ..
 
-# UCI defaults for side-router (IP, DHCP, firewall, password, Bootstrap theme)
+# ================== 9. UCI 预配置（旁路由） ==================
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -79,17 +117,17 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-# Enter build dir
+# ================== 10. 进入构建目录 ==================
 cd friendlywrt
 
-# Disable global options that pull many unwanted packages
+# 禁用全局选项
 for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
 make defconfig
 
-# Packages to disable
+# ================== 11. 禁用不需要的包（双重保险） ==================
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -103,20 +141,20 @@ luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat
 "
 
-# Disable unwanted packages
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# Force-enable required packages
+# ================== 12. 强制启用所有必需包 ==================
+ENSURE_PKGS="$CORE_PKGS $USER_PKGS $DOCKER_PKGS $CLASHOO_PKGS"
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Force-enable Clashoo packages (twice for robustness)
+# ================== 13. 双重确认 Clashoo ==================
 for pass in 1 2; do
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -125,7 +163,7 @@ for pass in 1 2; do
     done
 done
 
-# Verify Clashoo packages
+# ================== 14. 验证 ==================
 echo "=== Verifying Clashoo packages ==="
 MISSING=0
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
@@ -138,7 +176,7 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
 done
 [ $MISSING -eq 1 ] && { echo "ERROR: Clashoo packages missing, aborting."; exit 1; }
 
-# Print final status
+# ================== 15. 打印最终状态 ==================
 echo "=== Final package status ==="
 check_pkg() {
     grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
