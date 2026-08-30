@@ -1,111 +1,48 @@
 #!/bin/bash
 set -e
 
-# ------------------------------------------------------------
-# 1. Clean all non-kmod user-space packages from configs
-#    (keep only kernel modules for board compatibility)
-# ------------------------------------------------------------
-for cf in configs/rockchip/*; do
-    [ -f "$cf" ] || continue
-    sed -i -e '/^CONFIG_PACKAGE_kmod-/! { /^CONFIG_PACKAGE_.*=[ym]$/d; }' "$cf"
-done
-
-# ------------------------------------------------------------
-# 2. Remove build tools from 01-nanopi (if present)
-# ------------------------------------------------------------
-sed -i -e '/CONFIG_MAKE_TOOLCHAIN=y/d' configs/rockchip/01-nanopi 2>/dev/null || true
-sed -i -e 's/CONFIG_IB=y/# CONFIG_IB is not set/g' configs/rockchip/01-nanopi 2>/dev/null || true
-sed -i -e 's/CONFIG_SDK=y/# CONFIG_SDK is not set/g' configs/rockchip/01-nanopi 2>/dev/null || true
-
-# ------------------------------------------------------------
-# 3. Determine build type from .current_config.mk
-# ------------------------------------------------------------
-BUILD_TYPE="non-docker"
-if [ -f .current_config.mk ]; then
-    CONFIG_LINE=$(grep '^TARGET_FRIENDLYWRT_CONFIG=' .current_config.mk || true)
-    if [[ "$CONFIG_LINE" == *"-docker"* ]]; then
-        BUILD_TYPE="docker"
-    fi
-fi
-echo "Build type detected: $BUILD_TYPE"
-
-# ------------------------------------------------------------
-# 4. Define core system packages (always included)
-# ------------------------------------------------------------
-CORE_PKGS="
-luci
-luci-app-firewall
-luci-app-package-manager
-luci-ssl-openssl
-ca-certificates
-openwrt-keyring
-curl
-firewall4
-dnsmasq-full
-dnsmasq_full_dhcpv6
-dnsmasq_full_nftset
-ppp
-ppp-mod-pppoe
-luci-proto-ppp
-odhcp6c
-odhcpd-ipv6only
-luci-proto-ipv6
-zram-swap
-luci-theme-bootstrap
-"
-
-# ------------------------------------------------------------
-# 5. User-defined packages (from original ENSURE_PKGS)
-# ------------------------------------------------------------
-USER_PKGS="
-bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
-"
-
-# ------------------------------------------------------------
-# 6. Docker packages (only if build type is docker)
-# ------------------------------------------------------------
-DOCKER_PKGS=""
-if [ "$BUILD_TYPE" = "docker" ]; then
-    DOCKER_PKGS="docker dockerd luci-app-dockerman luci-i18n-dockerman-zh-cn docker-compose"
-fi
-
-# ------------------------------------------------------------
-# 7. Clashoo packages (always)
-# ------------------------------------------------------------
-CLASHOO_PKGS="
-clashoo
-luci-app-clashoo
-luci-i18n-clashoo-zh-cn
-kmod-inet-diag
-"
-
-# Merge all packages into one list
-ALL_PKGS="$CORE_PKGS $USER_PKGS $DOCKER_PKGS $CLASHOO_PKGS"
-
-# ------------------------------------------------------------
-# 8. Write all packages to configs/rockchip/01-nanopi
-# ------------------------------------------------------------
-CONFIG_FILE="configs/rockchip/01-nanopi"
-for pkg in $ALL_PKGS; do
-    grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
-done
-
-# ------------------------------------------------------------
-# 9. Init feeds.conf and add Clashoo feed
-# ------------------------------------------------------------
+# Init feeds.conf
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 
+# Add Clashoo feed
 FEED_CONF="friendlywrt/feeds.conf"
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# ------------------------------------------------------------
-# 10. Update Clashoo feed
-# ------------------------------------------------------------
+# ====== 新增：对 01-nanopi 进行大清洗，删除所有非内核模块的用户空间包 ======
+CONFIG_FILE="configs/rockchip/01-nanopi"
+# 只保留 kmod- 内核模块的包选择，删除其他所有 CONFIG_PACKAGE_* 行
+sed -i -e '/^CONFIG_PACKAGE_kmod-/! { /^CONFIG_PACKAGE_.*=[ym]$/d; }' "$CONFIG_FILE"
+# 清洗后，再添加我们需要的包（包括 Clashoo 和 ENSURE_PKGS）
+
+# Add Clashoo packages to config (内核模块 kmod-inet-diag 会保留，但用户空间包被清洗了，所以需重新添加)
+cat >> "$CONFIG_FILE" << EOF
+
+# Clashoo packages
+CONFIG_PACKAGE_clashoo=y
+CONFIG_PACKAGE_luci-app-clashoo=y
+CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
+CONFIG_PACKAGE_kmod-inet-diag=y
+EOF
+
+# Packages to enable
+ENSURE_PKGS="
+bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
+"
+
+# Write enable packages to config
+for pkg in $ENSURE_PKGS; do
+    grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
+done
+
+# Remove build tools to save time/space (此操作在原位置，但移到清洗后亦可)
+sed -i -e '/CONFIG_MAKE_TOOLCHAIN=y/d' "$CONFIG_FILE"
+sed -i -e 's/CONFIG_IB=y/# CONFIG_IB is not set/g' "$CONFIG_FILE"
+sed -i -e 's/CONFIG_SDK=y/# CONFIG_SDK is not set/g' "$CONFIG_FILE"
+
+# Update Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# ------------------------------------------------------------
-# 11. Enable kernel INET_DIAG options (required by Clashoo)
-# ------------------------------------------------------------
+# Enable kernel INET_DIAG options (required by Clashoo)
 cd friendlywrt
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
@@ -117,9 +54,7 @@ for opt in CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INE
 done
 cd ..
 
-# ------------------------------------------------------------
-# 12. UCI defaults for side-router
-# ------------------------------------------------------------
+# UCI defaults for side-router (IP, DHCP, firewall, password, Bootstrap theme)
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -149,21 +84,17 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-# ------------------------------------------------------------
-# 13. Enter build directory and configure
-# ------------------------------------------------------------
+# Enter build dir
 cd friendlywrt
 
-# Disable global options that pull unwanted packages
+# Disable global options that pull many unwanted packages
 for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
 make defconfig
 
-# ------------------------------------------------------------
-# 14. Explicitly disable a few specific packages (double safety)
-# ------------------------------------------------------------
+# Packages to disable (这些包在清洗后可能已不存在，但仍保留以确保)
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -177,24 +108,20 @@ luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat
 "
 
+# Disable unwanted packages
 for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# ------------------------------------------------------------
-# 15. Force-enable all required packages
-# ------------------------------------------------------------
-ENSURE_PKGS="$CORE_PKGS $USER_PKGS $DOCKER_PKGS $CLASHOO_PKGS"
+# Force-enable required packages
 for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# ------------------------------------------------------------
-# 16. Double-check Clashoo packages
-# ------------------------------------------------------------
+# Force-enable Clashoo packages (twice for robustness)
 for pass in 1 2; do
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -203,9 +130,7 @@ for pass in 1 2; do
     done
 done
 
-# ------------------------------------------------------------
-# 17. Verify Clashoo packages
-# ------------------------------------------------------------
+# Verify Clashoo packages
 echo "=== Verifying Clashoo packages ==="
 MISSING=0
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
@@ -218,9 +143,7 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
 done
 [ $MISSING -eq 1 ] && { echo "ERROR: Clashoo packages missing, aborting."; exit 1; }
 
-# ------------------------------------------------------------
-# 18. Print final status
-# ------------------------------------------------------------
+# Print final status
 echo "=== Final package status ==="
 check_pkg() {
     grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
