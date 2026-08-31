@@ -59,6 +59,14 @@ jobs:
           fi
 
           if [ "$FORCE_BASE" = "true" ]; then
+            # Delete all existing releases with today's date (both base and suffixed)
+            echo "Force overwrite mode: deleting all existing releases with tag prefix $BASE_TAG"
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            for tag in $EXISTING_TAGS; do
+              echo "Deleting release and tag: $tag"
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+              git push origin --delete "refs/tags/$tag" || true
+            done
             TAG="$BASE_TAG"
             echo "Force using base tag (overwrite mode): $TAG"
           else
