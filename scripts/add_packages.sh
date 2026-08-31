@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# ========== 1. 删除多余的配置文件（除 01-nanopi 外） ==========
+# 1. 删除多余配置文件，仅保留 01-nanopi
 echo "=== Removing all configs/rockchip/* except 01-nanopi ==="
 for config_file in configs/rockchip/*; do
     [ -f "$config_file" ] || continue
@@ -12,11 +12,11 @@ for config_file in configs/rockchip/*; do
     fi
 done
 
-# ========== 2. 清理 01-nanopi 中的包配置行，保留其他配置 ==========
+# 2. 清理 01-nanopi 中的包行，保留其他配置
 CONFIG_FILE="configs/rockchip/01-nanopi"
 sed -i -e '/^CONFIG_PACKAGE_/d' -e '/^# CONFIG_PACKAGE_.* is not set$/d' "$CONFIG_FILE"
 
-# ========== 3. 写入目标平台配置和必要设置 ==========
+# 3. 写入目标平台和核心设置
 cat >> "$CONFIG_FILE" << 'EOF'
 # Target platform (NanoPi R5S)
 CONFIG_TARGET_rockchip=y
@@ -26,7 +26,7 @@ CONFIG_TARGET_DEVICE_rockchip_rk3568_DEVICE_friendlyarm-nanopi-r5s=y
 CONFIG_IPV6=y
 EOF
 
-# 核心包（不包含 Python 相关）
+# 核心包（不含 Python）
 CORE_PKGS="
 ca-certificates
 luci
@@ -41,12 +41,12 @@ for pkg in $CORE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 4. 添加 Clashoo feed ==========
+# 4. 添加 Clashoo feed
 FEED_CONF="friendlywrt/feeds.conf"
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# ========== 5. 添加 Clashoo 包 ==========
+# 5. Clashoo 包
 cat >> "$CONFIG_FILE" << 'EOF'
 CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
@@ -54,18 +54,18 @@ CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 
-# ========== 6. 自定义软件包 ==========
+# 6. 自定义包（包含 libpython3 以解决依赖）
 ENSURE_PKGS="
-bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
+bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light libpython3
 "
 for pkg in $ENSURE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 7. 更新 Clashoo feed ==========
+# 7. 更新 Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# ========== 8. 修改内核配置，启用 INET_DIAG ==========
+# 8. 修改内核配置启用 INET_DIAG
 cd friendlywrt
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
@@ -78,7 +78,7 @@ done
 echo "Kernel config updated: $KERNEL_CONFIG_FILE"
 cd ..
 
-# ========== 9. UCI defaults for side-router ==========
+# 9. UCI 预配置
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -108,31 +108,25 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-# ========== 10. 进入构建目录，执行 defconfig ==========
+# 10. 进入构建目录
 cd friendlywrt
 
-# 禁用全局选项（防止拉入过多包）
+# 禁用全局选项
 for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT CONFIG_ALL; do
-    sed -i "s/^${opt}=.*/# ${opt} is not set/" .config
-    grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
+    sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
 done
 
 make defconfig
 
-# ========== 11. 强制禁用所有 Python 相关包（避免交互） ==========
+# 11. 强制禁用所有 Python 包（除了我们需要的）
 echo "=== Disabling all Python-related packages ==="
-# 删除所有 Python 包可能存在的启用行，改为禁用
+# 先禁用所有 Python 包
 for pkg in $(grep -E '^CONFIG_PACKAGE_(libpython|python|micropython)' .config | cut -d= -f1 | sed 's/^CONFIG_PACKAGE_//'); do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
-# 额外确保几个关键包
-for pkg in libpython3 python3 python3-light; do
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
-done
 
-# ========== 12. 禁用不需要的包 ==========
+# 12. 禁用不需要的包
 echo "=== Disabling unwanted packages ==="
 DISABLE_PKGS="
 adblock luci-app-adblock
@@ -151,7 +145,7 @@ for pkg in $DISABLE_PKGS; do
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# ========== 13. 强制启用所有需要的包 ==========
+# 13. 强制启用所有需要的包（含 libpython3 和 python3-light）
 echo "=== Force-enabling required packages ==="
 ALL_ENABLE="$CORE_PKGS $ENSURE_PKGS clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag"
 for pkg in $ALL_ENABLE; do
@@ -160,17 +154,18 @@ for pkg in $ALL_ENABLE; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# 二次确保 Clashoo 包不被依赖覆盖
+# 二次确保 Clashoo 包
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
     echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# ========== 14. 执行 oldconfig（Python 包已禁用，不再交互） ==========
-make oldconfig
+# 14. 运行 oldconfig，自动接受所有默认值以避免交互
+echo "=== Running make oldconfig (non-interactive) ==="
+yes "" | make oldconfig
 
-# ========== 15. 验证 ==========
+# 15. 验证
 echo "=== Final package count ==="
 echo "Enabled packages in .config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config || echo 0)"
 
