@@ -118,22 +118,10 @@ done
 
 make defconfig
 
-# 11. 使用 scripts/config 精确控制包选项（避免交互）
-echo "=== Setting package options via scripts/config ==="
+# 11. 使用 sed 精确控制包选项（避免交互）
+echo "=== Setting package options via sed ==="
 
-# 禁用所有 Python 包（除了我们需要的）
-# 首先禁用所有 python3-* 和 micropython 包
-for pkg in $(./scripts/config --list | grep -E '^CONFIG_PACKAGE_(python3-|micropython)' | sed 's/=.*//' | sed 's/^CONFIG_PACKAGE_//'); do
-    if [ "$pkg" != "python3-light" ] && [ "$pkg" != "libpython3" ]; then
-        ./scripts/config --disable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
-    fi
-done
-
-# 显式启用需要的 Python 包
-./scripts/config --enable CONFIG_PACKAGE_libpython3
-./scripts/config --enable CONFIG_PACKAGE_python3-light
-
-# 禁用不需要的包
+# 禁用所有不需要的包（包括 Python）
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -146,19 +134,32 @@ luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwif
 luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat
 "
+# 额外禁用所有 python 相关包（除了我们需要的）
+for pkg in $(grep -E '^CONFIG_PACKAGE_(libpython|python|micropython)' .config | cut -d= -f1 | sed 's/^CONFIG_PACKAGE_//'); do
+    if [ "$pkg" != "python3-light" ] && [ "$pkg" != "libpython3" ]; then
+        DISABLE_PKGS="$DISABLE_PKGS $pkg"
+    fi
+done
+
+# 先禁用所有要禁用的包
 for pkg in $DISABLE_PKGS; do
-    ./scripts/config --disable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
 # 强制启用所有需要的包
 ALL_ENABLE="$CORE_PKGS $ENSURE_PKGS clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag"
 for pkg in $ALL_ENABLE; do
-    ./scripts/config --enable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
+    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
 # 二次确保 Clashoo 包
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    ./scripts/config --enable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
+    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+    echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
 # 12. 运行 oldconfig，自动接受所有默认值
