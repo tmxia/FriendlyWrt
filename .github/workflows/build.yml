@@ -23,6 +23,18 @@ on:
           - docker
           - non-docker
           - both
+      replace_existing:
+        description: 'Replace existing release tag (overwrite)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# Environment variable to control auto-trigger (watch) behavior
+env:
+  AUTO_REPLACE_TAG: 'false'   # Set to 'true' to always use base tag (no suffix) on watch events
 
 jobs:
   prepare_release:
@@ -32,32 +44,45 @@ jobs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
     steps:
-      - name: Generate unique release tag with auto-increment
+      - name: Generate unique release tag with auto-increment or overwrite
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BASE_TAG="FriendlyWrt-$(date +%Y-%m-%d)"
-          # Fetch existing tags for today
-          EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-          if [ -z "$EXISTING_TAGS" ]; then
+          # Determine if we should force base tag (overwrite)
+          FORCE_BASE=false
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
+            FORCE_BASE=true
+          elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
+            FORCE_BASE=true
+          fi
+
+          if [ "$FORCE_BASE" = "true" ]; then
             TAG="$BASE_TAG"
+            echo "Force using base tag (overwrite mode): $TAG"
           else
-            # Extract max suffix number
-            MAX_NUM=0
-            for t in $EXISTING_TAGS; do
-              if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
-                NUM=${BASH_REMATCH[1]}
-                [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
-              fi
-            done
-            NEXT=$((MAX_NUM + 1))
-            TAG="${BASE_TAG}-${NEXT}"
+            # Auto-increment logic
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            if [ -z "$EXISTING_TAGS" ]; then
+              TAG="$BASE_TAG"
+            else
+              MAX_NUM=0
+              for t in $EXISTING_TAGS; do
+                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                  NUM=${BASH_REMATCH[1]}
+                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+                fi
+              done
+              NEXT=$((MAX_NUM + 1))
+              TAG="${BASE_TAG}-${NEXT}"
+            fi
+            echo "Auto-incremented tag: $TAG"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Generated release tag: $TAG"
 
-      - name: Create empty release
+      - name: Create or update release
         id: release
         uses: softprops/action-gh-release@v1
         env:
@@ -66,8 +91,10 @@ jobs:
           tag_name: ${{ steps.release_tag.outputs.tag }}
           draft: false
           prerelease: false
+          allow_updates: true      # Allows updating an existing release with same tag
+          overwrite: true          # Overwrite assets if they already exist
 
-  # ---------- 以下 build_manual / build_auto / cleanup 与原流程完全一致 ----------
+  # ---------- Build jobs (unchanged from original) ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -145,7 +172,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 强制启用Clashoo
+    # Force enable Clashoo
     - name: Update config after custom packages
       run: |
         cd project
@@ -258,7 +285,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # 构建SD镜像
+    # Build SD image
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -379,7 +406,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # 自动触发
+  # Auto triggered builds (watch event)
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -454,7 +481,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 强制启用Clashoo
+    # Force enable Clashoo
     - name: Update config after custom packages
       run: |
         cd project
@@ -567,7 +594,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # 构建SD镜像
+    # Build SD image
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -687,7 +714,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # 清理中间产物
+  # Clean up intermediate assets (rootfs and host-pm) from release
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
@@ -708,6 +735,7 @@ jobs:
             gh release delete-asset "$RELEASE_TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY"
           done
 
+  # Cleanup old workflow runs
   cleanup_self:
     name: Cleanup Self Workflow History
     runs-on: ubuntu-latest
