@@ -32,7 +32,6 @@ on:
           - 'false'
           - 'true'
 
-# Environment variable to control auto-trigger (watch) behavior
 env:
   AUTO_REPLACE_TAG: 'false'   # Set to 'true' to always use base tag (no suffix) on watch events
 
@@ -50,7 +49,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BASE_TAG="FriendlyWrt-$(date +%Y-%m-%d)"
-          # Determine if we should force base tag (overwrite)
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -59,7 +57,6 @@ jobs:
           fi
 
           if [ "$FORCE_BASE" = "true" ]; then
-            # Delete all existing releases with today's date (both base and suffixed)
             echo "Force overwrite mode: deleting all existing releases with tag prefix $BASE_TAG"
             EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
             for tag in $EXISTING_TAGS; do
@@ -70,7 +67,6 @@ jobs:
             TAG="$BASE_TAG"
             echo "Force using base tag (overwrite mode): $TAG"
           else
-            # Auto-increment logic
             EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
             if [ -z "$EXISTING_TAGS" ]; then
               TAG="$BASE_TAG"
@@ -99,10 +95,9 @@ jobs:
           tag_name: ${{ steps.release_tag.outputs.tag }}
           draft: false
           prerelease: false
-          allow_updates: true      # Allows updating an existing release with same tag
-          overwrite: true          # Overwrite assets if they already exist
+          allow_updates: true
+          overwrite: true
 
-  # ---------- Build jobs (unchanged from original) ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -208,21 +203,9 @@ jobs:
 
     - name: Compile friendlyWrt
       id: compile
-      continue-on-error: true
       run: |
         cd project/friendlywrt
-        if ! make -j$(nproc); then
-          echo "::warning::parallel build failed, retrying with V=s"
-          make -j1 V=s
-        fi
-
-    - name: Check the result and try again
-      if: steps.compile.outcome == 'failure'
-      run: |
-        cd project/friendlywrt
-        make -j1 V=s
-
-    # Removed upload logs step
+        make -j$(nproc)
 
     - name: Create rootfs package
       id: create_rootfs_package
@@ -408,7 +391,6 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # Auto triggered builds (watch event)
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -511,21 +493,9 @@ jobs:
 
     - name: Compile friendlyWrt
       id: compile
-      continue-on-error: true
       run: |
         cd project/friendlywrt
-        if ! make -j$(nproc); then
-          echo "::warning::parallel build failed, retrying with V=s"
-          make -j1 V=s
-        fi
-
-    - name: Check the result and try again
-      if: steps.compile.outcome == 'failure'
-      run: |
-        cd project/friendlywrt
-        make -j1 V=s
-
-    # Removed upload logs step
+        make -j$(nproc)
 
     - name: Create rootfs package
       id: create_rootfs_package
@@ -710,7 +680,6 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # Clean up intermediate assets (rootfs and host-pm) from release
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
@@ -731,7 +700,6 @@ jobs:
             gh release delete-asset "$RELEASE_TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY"
           done
 
-  # Cleanup old workflow runs
   cleanup_self:
     name: Cleanup Self Workflow History
     runs-on: ubuntu-latest
