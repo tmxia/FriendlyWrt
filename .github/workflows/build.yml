@@ -29,43 +29,45 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     outputs:
-      release_tag: ${{ steps.tag.outputs.release_tag }}
+      release_tag: ${{ steps.release_tag.outputs.tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
     steps:
-    - name: Generate release tag with auto-increment
-      id: tag
-      run: |
-        # Base tag: FriendlyWrt-YYYY-MM-DD
-        BASE_TAG="FriendlyWrt-$(date +%Y-%m-%d)"
-        # List all releases and extract tags matching base
-        EXISTING_TAGS=$(gh release list --limit 100 --repo $GITHUB_REPOSITORY --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-        if [ -z "$EXISTING_TAGS" ]; then
-          RELEASE_TAG="$BASE_TAG"
-        else
-          # Find max suffix number and increment by 1
-          MAX_SUFFIX=$(echo "$EXISTING_TAGS" | sed -E "s/^${BASE_TAG}-([0-9]+)$/\1/" | sort -n | tail -1)
-          if [ -z "$MAX_SUFFIX" ]; then
-            NEXT_SUFFIX=1
+      - name: Generate unique release tag with auto-increment
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_TAG="FriendlyWrt-$(date +%Y-%m-%d)"
+          # Fetch existing tags for today
+          EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+          if [ -z "$EXISTING_TAGS" ]; then
+            TAG="$BASE_TAG"
           else
-            NEXT_SUFFIX=$((MAX_SUFFIX + 1))
+            # Extract max suffix number
+            MAX_NUM=0
+            for t in $EXISTING_TAGS; do
+              if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                NUM=${BASH_REMATCH[1]}
+                [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+              fi
+            done
+            NEXT=$((MAX_NUM + 1))
+            TAG="${BASE_TAG}-${NEXT}"
           fi
-          RELEASE_TAG="${BASE_TAG}-${NEXT_SUFFIX}"
-        fi
-        echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
-        echo "Generated release tag: $RELEASE_TAG"
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated release tag: $TAG"
 
-    - name: Create empty release
-      id: release
-      uses: softprops/action-gh-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        draft: false
-        prerelease: false
+      - name: Create empty release
+        id: release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: false
 
+  # ---------- 以下 build_manual / build_auto / cleanup 与原流程完全一致 ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -143,7 +145,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # Force enable Clashoo packages
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
         cd project
@@ -256,7 +258,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # Build SD card image
+    # 构建SD镜像
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -377,7 +379,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # Auto triggered builds (watch event)
+  # 自动触发
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -452,7 +454,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # Force enable Clashoo packages
+    # 强制启用Clashoo
     - name: Update config after custom packages
       run: |
         cd project
@@ -565,7 +567,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # Build SD card image
+    # 构建SD镜像
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -685,7 +687,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # Clean up intermediate assets (rootfs and host-pm) from release
+  # 清理中间产物
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
@@ -706,7 +708,6 @@ jobs:
             gh release delete-asset "$RELEASE_TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY"
           done
 
-  # Cleanup old workflow runs to keep repository clean
   cleanup_self:
     name: Cleanup Self Workflow History
     runs-on: ubuntu-latest
