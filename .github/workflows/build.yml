@@ -26,7 +26,7 @@ on:
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
-        default: 'false'
+        default: 'true'
         type: choice
         options:
           - 'false'
