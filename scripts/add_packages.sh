@@ -86,7 +86,7 @@ for pkg in $DISABLE_PKGS; do
     echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CONFIG_FILE"
 done
 
-# 9. 额外禁用所有其他 Python 包（保留我们需要的）
+# 9. 额外禁用所有其他 Python 包
 EXTRA_PYTHON_DISABLE="
 micropython-lib micropython-lib-src micropython-lib-unix micropython-lib-unix-src
 micropython-mbedtls micropython-nossl pipx python3-aio-mqtt-mod python3-aiosignal
@@ -179,8 +179,11 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     fi
 done
 
-# ================== 新增：检查自定义启用和禁用包的状态 ==================
+# ================== 自定义包状态显示（增加调试输出） ==================
 echo "=== Custom package status ==="
+echo "ENSURE_PKGS list: $ENSURE_PKGS"
+echo "DISABLE_PKGS list: $DISABLE_PKGS"
+
 echo "--- Packages to ENABLE (from ENSURE_PKGS) ---"
 for pkg in $ENSURE_PKGS; do
     if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
