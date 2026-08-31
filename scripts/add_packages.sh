@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# 1. 删除多余配置文件，仅保留 01-nanopi
+# 1. 删除多余的配置文件，仅保留 01-nanopi
 echo "=== Removing all configs/rockchip/* except 01-nanopi ==="
 for config_file in configs/rockchip/*; do
     [ -f "$config_file" ] || continue
@@ -69,7 +69,7 @@ for pkg in $ENSURE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# 8. 显式禁用常见不需要的包（减少固件体积）
+# 8. 显式禁用常见不需要的包
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -97,7 +97,7 @@ for pkg in $EXTRA_PYTHON_DISABLE; do
     echo "# CONFIG_PACKAGE_${pkg} is not set" >> "$CONFIG_FILE"
 done
 
-# 10. 更新 Clashoo feed 并安装所有包（确保依赖可用）
+# 10. 更新 Clashoo feed 并安装所有包
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a)
 
 # 11. 修改内核配置启用 INET_DIAG
@@ -148,14 +148,14 @@ cd friendlywrt
 echo "=== Running make defconfig ==="
 make defconfig
 
-# 14. 强制启用 Clashoo 包（如果 defconfig 未启用）
+# 14. 强制启用 Clashoo 包
 echo "=== Force-enabling Clashoo packages ==="
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "s/^# CONFIG_PACKAGE_${pkg} is not set$/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# 15. 禁用所有不必要的 Python 包（避免 oldconfig 交互）
+# 15. 禁用所有不必要的 Python 包
 echo "=== Disabling extra Python packages ==="
 for pkg in $(grep -E '^CONFIG_PACKAGE_(libpython|python|micropython)' .config | cut -d= -f1 | sed 's/^CONFIG_PACKAGE_//'); do
     if [ "$pkg" != "python3-light" ] && [ "$pkg" != "libpython3" ]; then
@@ -164,11 +164,11 @@ for pkg in $(grep -E '^CONFIG_PACKAGE_(libpython|python|micropython)' .config | 
     fi
 done
 
-# 16. 运行 oldconfig，自动接受所有默认值（避免交互）
+# 16. 运行 oldconfig，自动接受默认值
 echo "=== Running make oldconfig (non-interactive) ==="
 yes "" | make oldconfig
 
-# 17. 验证 Clashoo 包是否成功启用
+# 17. 验证 Clashoo 包
 echo "=== Verifying Clashoo packages ==="
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
@@ -176,6 +176,30 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     else
         echo "[FAIL] CONFIG_PACKAGE_${pkg} not enabled"
         exit 1
+    fi
+done
+
+# ================== 新增：检查自定义启用和禁用包的状态 ==================
+echo "=== Custom package status ==="
+echo "--- Packages to ENABLE (from ENSURE_PKGS) ---"
+for pkg in $ENSURE_PKGS; do
+    if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+        echo "  [ENABLED]  $pkg"
+    elif grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config; then
+        echo "  [DISABLED] $pkg (should be enabled!)"
+    else
+        echo "  [UNKNOWN]  $pkg"
+    fi
+done
+
+echo "--- Packages to DISABLE (from DISABLE_PKGS) ---"
+for pkg in $DISABLE_PKGS; do
+    if grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config; then
+        echo "  [DISABLED] $pkg"
+    elif grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+        echo "  [ENABLED]  $pkg (should be disabled!)"
+    else
+        echo "  [UNKNOWN]  $pkg"
     fi
 done
 
