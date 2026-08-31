@@ -12,13 +12,14 @@ for config_file in configs/rockchip/*; do
     fi
 done
 
-# ========== 2. 清理 01-nanopi 中的包配置行，保留其他配置 ==========
+# ========== 2. 清理 01-nanopi 中的包配置行，保留目标平台等核心配置 ==========
 CONFIG_FILE="configs/rockchip/01-nanopi"
+# 删除所有 CONFIG_PACKAGE_* 行（启用和禁用）
 sed -i -e '/^CONFIG_PACKAGE_/d' -e '/^# CONFIG_PACKAGE_.* is not set$/d' "$CONFIG_FILE"
 
-# ========== 3. 添加目标平台配置（避免交互式菜单） ==========
+# ========== 3. 写入目标平台配置（避免交互）和核心必要组件 ==========
 cat >> "$CONFIG_FILE" << 'EOF'
-# Target platform for NanoPi R5S
+# Target platform (NanoPi R5S)
 CONFIG_TARGET_rockchip=y
 CONFIG_TARGET_rockchip_rk3568=y
 CONFIG_TARGET_MULTI_PROFILE=y
@@ -26,7 +27,6 @@ CONFIG_TARGET_DEVICE_rockchip_rk3568_DEVICE_friendlyarm-nanopi-r5s=y
 CONFIG_IPV6=y
 EOF
 
-# ========== 4. 添加核心必要组件（LuCI、防火墙等） ==========
 CORE_PKGS="
 ca-certificates
 luci
@@ -41,12 +41,12 @@ for pkg in $CORE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 5. 添加 Clashoo feed ==========
+# ========== 4. 添加 Clashoo feed ==========
 FEED_CONF="friendlywrt/feeds.conf"
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# ========== 6. 添加 Clashoo 包 ==========
+# ========== 5. 添加 Clashoo 包 ==========
 cat >> "$CONFIG_FILE" << 'EOF'
 CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
@@ -54,7 +54,7 @@ CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 
-# ========== 7. 您的自定义软件包 ==========
+# ========== 6. 自定义软件包 ==========
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
@@ -62,10 +62,10 @@ for pkg in $ENSURE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 8. 更新 Clashoo feed ==========
+# ========== 7. 更新 Clashoo feed ==========
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# ========== 9. 修改内核配置，启用 INET_DIAG ==========
+# ========== 8. 修改内核配置，启用 INET_DIAG ==========
 cd friendlywrt
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
@@ -78,7 +78,7 @@ done
 echo "Kernel config updated: $KERNEL_CONFIG_FILE"
 cd ..
 
-# ========== 10. UCI defaults for side-router ==========
+# ========== 9. UCI defaults for side-router ==========
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -108,17 +108,19 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-# ========== 11. 进入构建目录，执行配置 ==========
+# ========== 10. 进入构建目录，执行 defconfig ==========
 cd friendlywrt
 
-# 禁用全局选项（防止拉入过多包）
-for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT CONFIG_ALL; do
-    sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
-done
-
+# 第一次 defconfig（生成初始 .config）
 make defconfig
 
-# ========== 12. 禁用不需要的包 ==========
+# ========== 11. 关键：在 defconfig 之后立即禁用全局选项和不需要的包 ==========
+echo "=== Disabling global options and unwanted packages (after defconfig) ==="
+for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT CONFIG_ALL; do
+    sed -i "s/^${opt}=.*/# ${opt} is not set/" .config
+    grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
+done
+
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -136,7 +138,8 @@ for pkg in $DISABLE_PKGS; do
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# ========== 13. 强制启用所有需要的包 ==========
+# ========== 12. 强制启用所有需要的包 ==========
+echo "=== Force-enabling required packages ==="
 ALL_ENABLE="$CORE_PKGS $ENSURE_PKGS clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag"
 for pkg in $ALL_ENABLE; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -153,7 +156,7 @@ done
 
 make oldconfig
 
-# ========== 14. 验证 ==========
+# ========== 13. 验证 ==========
 echo "=== Final package count ==="
 echo "Enabled packages in .config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config || echo 0)"
 
