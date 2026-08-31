@@ -54,7 +54,7 @@ CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 
-# 6. 自定义包（包含 libpython3 以解决依赖）
+# 6. 自定义包（包含 libpython3 和 python3-light 以满足依赖）
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light libpython3
 "
@@ -118,16 +118,22 @@ done
 
 make defconfig
 
-# 11. 强制禁用所有 Python 包（除了我们需要的）
-echo "=== Disabling all Python-related packages ==="
-# 先禁用所有 Python 包
-for pkg in $(grep -E '^CONFIG_PACKAGE_(libpython|python|micropython)' .config | cut -d= -f1 | sed 's/^CONFIG_PACKAGE_//'); do
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+# 11. 使用 scripts/config 精确控制包选项（避免交互）
+echo "=== Setting package options via scripts/config ==="
+
+# 禁用所有 Python 包（除了我们需要的）
+# 首先禁用所有 python3-* 和 micropython 包
+for pkg in $(./scripts/config --list | grep -E '^CONFIG_PACKAGE_(python3-|micropython)' | sed 's/=.*//' | sed 's/^CONFIG_PACKAGE_//'); do
+    if [ "$pkg" != "python3-light" ] && [ "$pkg" != "libpython3" ]; then
+        ./scripts/config --disable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
+    fi
 done
 
-# 12. 禁用不需要的包
-echo "=== Disabling unwanted packages ==="
+# 显式启用需要的 Python 包
+./scripts/config --enable CONFIG_PACKAGE_libpython3
+./scripts/config --enable CONFIG_PACKAGE_python3-light
+
+# 禁用不需要的包
 DISABLE_PKGS="
 adblock luci-app-adblock
 aria2 luci-app-aria2
@@ -141,31 +147,25 @@ luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat
 "
 for pkg in $DISABLE_PKGS; do
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+    ./scripts/config --disable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
 done
 
-# 13. 强制启用所有需要的包（含 libpython3 和 python3-light）
-echo "=== Force-enabling required packages ==="
+# 强制启用所有需要的包
 ALL_ENABLE="$CORE_PKGS $ENSURE_PKGS clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag"
 for pkg in $ALL_ENABLE; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
-    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    ./scripts/config --enable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
 done
 
 # 二次确保 Clashoo 包
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-    echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    ./scripts/config --enable "CONFIG_PACKAGE_${pkg}" 2>/dev/null || true
 done
 
-# 14. 运行 oldconfig，自动接受所有默认值以避免交互
+# 12. 运行 oldconfig，自动接受所有默认值
 echo "=== Running make oldconfig (non-interactive) ==="
 yes "" | make oldconfig
 
-# 15. 验证
+# 13. 验证
 echo "=== Final package count ==="
 echo "Enabled packages in .config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config || echo 0)"
 
