@@ -12,12 +12,11 @@ for config_file in configs/rockchip/*; do
     fi
 done
 
-# ========== 2. 清理 01-nanopi 中的包配置行，保留目标平台等核心配置 ==========
+# ========== 2. 清理 01-nanopi 中的包配置行，保留其他配置 ==========
 CONFIG_FILE="configs/rockchip/01-nanopi"
-# 删除所有 CONFIG_PACKAGE_* 行（启用和禁用）
 sed -i -e '/^CONFIG_PACKAGE_/d' -e '/^# CONFIG_PACKAGE_.* is not set$/d' "$CONFIG_FILE"
 
-# ========== 3. 写入目标平台配置（避免交互）和核心必要组件 ==========
+# ========== 3. 写入目标平台配置和必要设置 ==========
 cat >> "$CONFIG_FILE" << 'EOF'
 # Target platform (NanoPi R5S)
 CONFIG_TARGET_rockchip=y
@@ -27,6 +26,7 @@ CONFIG_TARGET_DEVICE_rockchip_rk3568_DEVICE_friendlyarm-nanopi-r5s=y
 CONFIG_IPV6=y
 EOF
 
+# 核心包
 CORE_PKGS="
 ca-certificates
 luci
@@ -41,12 +41,26 @@ for pkg in $CORE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 4. 添加 Clashoo feed ==========
+# ========== 4. 添加 Python 相关显式设置以避免交互 ==========
+cat >> "$CONFIG_FILE" << 'EOF'
+# Python packages (set explicitly to avoid prompts)
+CONFIG_PACKAGE_libpython3=y
+CONFIG_PACKAGE_python3=n
+CONFIG_PACKAGE_micropython-lib=n
+CONFIG_PACKAGE_micropython-lib-src=n
+CONFIG_PACKAGE_micropython-lib-unix=n
+CONFIG_PACKAGE_micropython-lib-unix-src=n
+CONFIG_PACKAGE_micropython-mbedtls=n
+CONFIG_PACKAGE_micropython-nossl=n
+CONFIG_PACKAGE_pipx=n
+EOF
+
+# ========== 5. 添加 Clashoo feed ==========
 FEED_CONF="friendlywrt/feeds.conf"
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
 
-# ========== 5. 添加 Clashoo 包 ==========
+# ========== 6. 添加 Clashoo 包 ==========
 cat >> "$CONFIG_FILE" << 'EOF'
 CONFIG_PACKAGE_clashoo=y
 CONFIG_PACKAGE_luci-app-clashoo=y
@@ -54,7 +68,7 @@ CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
 CONFIG_PACKAGE_kmod-inet-diag=y
 EOF
 
-# ========== 6. 自定义软件包 ==========
+# ========== 7. 自定义软件包 ==========
 ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
@@ -62,10 +76,10 @@ for pkg in $ENSURE_PKGS; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
-# ========== 7. 更新 Clashoo feed ==========
+# ========== 8. 更新 Clashoo feed ==========
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
-# ========== 8. 修改内核配置，启用 INET_DIAG ==========
+# ========== 9. 修改内核配置，启用 INET_DIAG ==========
 cd friendlywrt
 KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
@@ -78,7 +92,7 @@ done
 echo "Kernel config updated: $KERNEL_CONFIG_FILE"
 cd ..
 
-# ========== 9. UCI defaults for side-router ==========
+# ========== 10. UCI defaults for side-router ==========
 mkdir -p friendlywrt/files/etc/uci-defaults
 cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -108,13 +122,13 @@ exit 0
 EOF
 chmod +x friendlywrt/files/etc/uci-defaults/99-custom
 
-# ========== 10. 进入构建目录，执行 defconfig ==========
+# ========== 11. 进入构建目录，执行 defconfig ==========
 cd friendlywrt
 
 # 第一次 defconfig（生成初始 .config）
 make defconfig
 
-# ========== 11. 关键：在 defconfig 之后立即禁用全局选项和不需要的包 ==========
+# ========== 12. 禁用全局选项和不需要的包 ==========
 echo "=== Disabling global options and unwanted packages (after defconfig) ==="
 for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT CONFIG_ALL; do
     sed -i "s/^${opt}=.*/# ${opt} is not set/" .config
@@ -138,7 +152,7 @@ for pkg in $DISABLE_PKGS; do
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
 
-# ========== 12. 强制启用所有需要的包 ==========
+# ========== 13. 强制启用所有需要的包 ==========
 echo "=== Force-enabling required packages ==="
 ALL_ENABLE="$CORE_PKGS $ENSURE_PKGS clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag"
 for pkg in $ALL_ENABLE; do
@@ -154,9 +168,10 @@ for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
+# ========== 14. 执行 oldconfig（由于已显式设置 Python 包，不再交互） ==========
 make oldconfig
 
-# ========== 13. 验证 ==========
+# ========== 15. 验证 ==========
 echo "=== Final package count ==="
 echo "Enabled packages in .config: $(grep -c '^CONFIG_PACKAGE_.*=y' .config || echo 0)"
 
