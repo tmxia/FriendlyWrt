@@ -1,4 +1,4 @@
-name: Build FriendlyWrt with flippy kernel
+name: Build FriendlyWrt With Flippy Kernel
 
 on:
   watch:
