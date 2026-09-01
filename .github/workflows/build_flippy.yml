@@ -33,7 +33,7 @@ on:
           - 'true'
 
 env:
-  AUTO_REPLACE_TAG: 'false'   # Set to 'true' to always use base tag (no suffix) on watch events
+  AUTO_REPLACE_TAG: 'false'
 
 jobs:
   prepare_release:
@@ -360,7 +360,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    # ---------- 下载并部署 flippy 内核 ----------
+    # ---------- 下载并部署 flippy 内核（动态目录） ----------
     - name: Download and deploy flippy kernel
       run: |
         cd project
@@ -397,13 +397,17 @@ jobs:
 
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
+        # Use dynamically determined dist_dir from previous step
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        echo "Deploying to scripts/sd-fuse/${DIST_DIR}"
+
         # Deploy boot files (kernel Image, uInitrd, etc.) to sd-fuse boot directory
-        mkdir -p scripts/sd-fuse/friendlywrt25/boot/
-        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/friendlywrt25/boot/ --strip-components=1
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
 
         # Deploy dtb files to sd-fuse dtb/rockchip directory
-        mkdir -p scripts/sd-fuse/friendlywrt25/dtb/rockchip/
-        tar xzf "$DTB_TAR" -C scripts/sd-fuse/friendlywrt25/dtb/rockchip/ --strip-components=1
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+        tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
         # Extract modules to a temporary location for later injection into rootfs
         mkdir -p /tmp/flippy_modules
@@ -733,7 +737,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    # ---------- 下载并部署 flippy 内核 ----------
+    # ---------- 下载并部署 flippy 内核（动态目录） ----------
     - name: Download and deploy flippy kernel
       run: |
         cd project
@@ -767,11 +771,14 @@ jobs:
 
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
-        mkdir -p scripts/sd-fuse/friendlywrt25/boot/
-        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/friendlywrt25/boot/ --strip-components=1
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        echo "Deploying to scripts/sd-fuse/${DIST_DIR}"
 
-        mkdir -p scripts/sd-fuse/friendlywrt25/dtb/rockchip/
-        tar xzf "$DTB_TAR" -C scripts/sd-fuse/friendlywrt25/dtb/rockchip/ --strip-components=1
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+        tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules --strip-components=1
