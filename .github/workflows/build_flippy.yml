@@ -33,7 +33,7 @@ on:
           - 'true'
 
 env:
-  AUTO_REPLACE_TAG: 'false'
+  AUTO_REPLACE_TAG: 'false'   # Set to 'true' to always use base tag (no suffix) on watch events
 
 jobs:
   prepare_release:
@@ -331,17 +331,18 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
+    # ---------- 修正路径：添加 artifact/ ----------
     - name: Unpack friendlywrt rootfs
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        tar xzf "../artifact/rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
       run: |
         cd project
-        tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
+        tar xzf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
 
     # ---------- 自动获取最新 flippy 内核 ----------
     - name: Get latest flippy kernel version
@@ -360,7 +361,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    # ---------- 下载并部署 flippy 内核（动态目录） ----------
+    # ---------- 下载并部署 flippy 内核 ----------
     - name: Download and deploy flippy kernel
       run: |
         cd project
@@ -368,11 +369,9 @@ jobs:
         echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
         wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
 
-        # Extract the outer tarball to a temp directory
         mkdir -p /tmp/flippy_extract
         tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
 
-        # The extracted directory is /tmp/flippy_extract/$KERNEL_VER/
         KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
         if [ ! -d "$KERNEL_DIR" ]; then
           KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
@@ -384,7 +383,6 @@ jobs:
         fi
         echo "Kernel directory: $KERNEL_DIR"
 
-        # Locate the sub-archives
         BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
         MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
@@ -397,19 +395,15 @@ jobs:
 
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
-        # Use dynamically determined dist_dir from previous step
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         echo "Deploying to scripts/sd-fuse/${DIST_DIR}"
 
-        # Deploy boot files (kernel Image, uInitrd, etc.) to sd-fuse boot directory
         mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
         tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
 
-        # Deploy dtb files to sd-fuse dtb/rockchip directory
         mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
         tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
-        # Extract modules to a temporary location for later injection into rootfs
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules --strip-components=1
 
@@ -645,7 +639,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # ---------- SD image build with flippy kernel (auto) ----------
+    # ---------- SD image build with flippy kernel ----------
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -708,17 +702,18 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
+    # ---------- 修正路径：添加 artifact/ ----------
     - name: Unpack friendlywrt rootfs
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        tar xzf "../artifact/rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
       run: |
         cd project
-        tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
+        tar xzf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
 
     # ---------- 自动获取最新 flippy 内核 ----------
     - name: Get latest flippy kernel version
@@ -737,7 +732,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    # ---------- 下载并部署 flippy 内核（动态目录） ----------
+    # ---------- 下载并部署 flippy 内核 ----------
     - name: Download and deploy flippy kernel
       run: |
         cd project
