@@ -1,4 +1,4 @@
-name: Build FriendlyWrt with flippy kernel
+name: Build FriendlyWrt with flippy kernel (auto-latest)
 
 on:
   watch:
@@ -34,7 +34,6 @@ on:
 
 env:
   AUTO_REPLACE_TAG: 'false'   # Set to 'true' to always use base tag (no suffix) on watch events
-  FLIPPY_KERNEL_VERSION: '6.18.46-flippy-95+'  # Flippy kernel version to use
 
 jobs:
   prepare_release:
@@ -49,7 +48,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Use flippy-specific base tag to distinguish from official kernel builds
           BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
@@ -59,7 +57,6 @@ jobs:
           fi
 
           if [ "$FORCE_BASE" = "true" ]; then
-            echo "Force overwrite mode: deleting all existing releases with tag prefix $BASE_TAG"
             EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
             for tag in $EXISTING_TAGS; do
               echo "Deleting release and tag: $tag"
@@ -67,7 +64,6 @@ jobs:
               git push origin --delete "refs/tags/$tag" || true
             done
             TAG="$BASE_TAG"
-            echo "Force using base tag (overwrite mode): $TAG"
           else
             EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
             if [ -z "$EXISTING_TAGS" ]; then
@@ -83,7 +79,6 @@ jobs:
               NEXT=$((MAX_NUM + 1))
               TAG="${BASE_TAG}-${NEXT}"
             fi
-            echo "Auto-incremented tag: $TAG"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Generated release tag: $TAG"
@@ -100,6 +95,7 @@ jobs:
           allow_updates: true
           overwrite: true
 
+  # ---------- build_manual (workflow_dispatch) ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -203,11 +199,10 @@ jobs:
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
-    - name: Compile friendlyWrt (rootfs only, kernel will be replaced)
+    - name: Compile friendlyWrt (rootfs only)
       id: compile
       run: |
         cd project/friendlywrt
-        # Build only the rootfs and packages, skip kernel compilation
         make -j$(nproc) world
 
     - name: Create rootfs package
@@ -273,7 +268,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # Build SD image with flippy kernel
+    # ---------- SD image build with flippy kernel ----------
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -319,7 +314,6 @@ jobs:
           ;;
         esac
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        # Add -flippy suffix to firmware filenames
         IMG_FILE=${MODEL}-FriendlyWrt-flippy-${{ matrix.VERSION }}${SUFFIX}.img
         TGZ_FILE=images-${MODEL}-FriendlyWrt-flippy-${{ matrix.VERSION }}${SUFFIX}.tgz
         DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
@@ -349,52 +343,89 @@ jobs:
         cd project
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
-    # ========== 关键改动：下载 flippy 内核并替换 ==========
+    # ---------- 自动获取最新 flippy 内核 ----------
+    - name: Get latest flippy kernel version
+      id: flippy_version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
+        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
+        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
+        if [ -z "$VERSIONS" ]; then
+          echo "ERROR: No kernel tarballs found in kernel_flippy release"
+          exit 1
+        fi
+        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
+        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        echo "Latest flippy kernel version: $LATEST"
+
+    # ---------- 下载并部署 flippy 内核 ----------
     - name: Download and deploy flippy kernel
       run: |
         cd project
-        KERNEL_VER="${{ env.FLIPPY_KERNEL_VERSION }}"
-        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_${KERNEL_VER}/boot-${KERNEL_VER}.tar.gz -O /tmp/boot.tar.gz
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_${KERNEL_VER}/dtb-rockchip-${KERNEL_VER}.tar.gz -O /tmp/dtb-rockchip.tar.gz
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_${KERNEL_VER}/modules-${KERNEL_VER}.tar.gz -O /tmp/modules.tar.gz
+        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
+        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
+        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
 
-        # Extract boot files (Image, uInitrd, etc.) to the sd-fuse boot directory
+        # Extract the outer tarball to a temp directory
+        mkdir -p /tmp/flippy_extract
+        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
+
+        # The extracted directory is /tmp/flippy_extract/$KERNEL_VER/
+        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
+        if [ ! -d "$KERNEL_DIR" ]; then
+          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
+        fi
+        if [ -z "$KERNEL_DIR" ] || [ ! -d "$KERNEL_DIR" ]; then
+          echo "ERROR: Kernel directory not found"
+          ls -la /tmp/flippy_extract
+          exit 1
+        fi
+        echo "Kernel directory: $KERNEL_DIR"
+
+        # Locate the sub-archives
+        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
+        MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
+
+        if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MODULES_TAR" ]; then
+          echo "ERROR: Could not find boot, dtb, or modules archives. Listing contents:"
+          ls -laR "$KERNEL_DIR"
+          exit 1
+        fi
+
+        echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
+
+        # Deploy boot files (kernel Image, uInitrd, etc.) to sd-fuse boot directory
         mkdir -p scripts/sd-fuse/friendlywrt25/boot/
-        tar xzf /tmp/boot.tar.gz -C scripts/sd-fuse/friendlywrt25/boot/ --strip-components=1
+        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/friendlywrt25/boot/ --strip-components=1
 
-        # Extract dtb files to the sd-fuse dtb directory
+        # Deploy dtb files to sd-fuse dtb/rockchip directory
         mkdir -p scripts/sd-fuse/friendlywrt25/dtb/rockchip/
-        tar xzf /tmp/dtb-rockchip.tar.gz -C scripts/sd-fuse/friendlywrt25/dtb/rockchip/ --strip-components=1
+        tar xzf "$DTB_TAR" -C scripts/sd-fuse/friendlywrt25/dtb/rockchip/ --strip-components=1
 
         # Extract modules to a temporary location for later injection into rootfs
         mkdir -p /tmp/flippy_modules
-        tar xzf /tmp/modules.tar.gz -C /tmp/flippy_modules --strip-components=1
+        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules --strip-components=1
 
-        echo "Flippy kernel deployed to sd-fuse directories. Modules staged for injection."
+        echo "Flippy kernel components deployed."
 
     - name: Inject flippy modules into rootfs
       run: |
         cd project
-        # Rootfs is already unpacked in the current directory (friendlywrt/rootfs)
-        # The rootfs path is defined by FRIENDLYWRT_ROOTFS variable, but we know it's friendlywrt/rootfs
         ROOTFS_DIR="friendlywrt/rootfs"
         if [ -d "$ROOTFS_DIR" ]; then
           echo "Injecting flippy modules into $ROOTFS_DIR/lib/modules/"
-          # Remove existing modules (they belong to official kernel)
           rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
-          # Copy flippy modules
           cp -r /tmp/flippy_modules "$ROOTFS_DIR/lib/"
-          # Ensure correct permissions
           find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
-          echo "Modules injected successfully."
+          echo "Modules injected."
         else
           echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
           exit 1
         fi
 
-    # Note: We skip ./build.sh uboot because uboot is separate and not affected by kernel.
-    # We also skip ./build.sh kernel because we already replaced kernel files.
     - name: Build uboot only (skip kernel compilation)
       run: |
         cd project
@@ -440,7 +471,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # build_auto (identical to build_manual, but with matrix fixed)
+  # ---------- build_auto (watch trigger) ----------
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -610,7 +641,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # Build SD image with flippy kernel
+    # ---------- SD image build with flippy kernel (auto) ----------
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -645,7 +676,8 @@ jobs:
       id: config
       run: |
         cd project
-        case ${{ matrix.CPU }} in
+        CPU=rk3568
+        case $CPU in
         rk3568)
           MODEL=R5S-R5C-Series
           ;;
@@ -661,7 +693,7 @@ jobs:
 
         CONFIG=rockchip${SUFFIX}
         cat > .current_config.mk <<EOL
-        . device/friendlyelec/${{ matrix.CPU }}/base.mk
+        . device/friendlyelec/$CPU/base.mk
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         TARGET_SD_RAW_FILENAME=${IMG_FILE}
@@ -684,29 +716,67 @@ jobs:
         cd project
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
-    # ========== 关键改动：下载 flippy 内核并替换 ==========
+    # ---------- 自动获取最新 flippy 内核 ----------
+    - name: Get latest flippy kernel version
+      id: flippy_version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
+        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
+        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
+        if [ -z "$VERSIONS" ]; then
+          echo "ERROR: No kernel tarballs found in kernel_flippy release"
+          exit 1
+        fi
+        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
+        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        echo "Latest flippy kernel version: $LATEST"
+
+    # ---------- 下载并部署 flippy 内核 ----------
     - name: Download and deploy flippy kernel
       run: |
         cd project
-        KERNEL_VER="${{ env.FLIPPY_KERNEL_VERSION }}"
-        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_${KERNEL_VER}/boot-${KERNEL_VER}.tar.gz -O /tmp/boot.tar.gz
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_${KERNEL_VER}/dtb-rockchip-${KERNEL_VER}.tar.gz -O /tmp/dtb-rockchip.tar.gz
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_${KERNEL_VER}/modules-${KERNEL_VER}.tar.gz -O /tmp/modules.tar.gz
+        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
+        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
+        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
 
-        # Extract boot files to sd-fuse boot directory
+        mkdir -p /tmp/flippy_extract
+        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
+
+        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
+        if [ ! -d "$KERNEL_DIR" ]; then
+          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
+        fi
+        if [ -z "$KERNEL_DIR" ] || [ ! -d "$KERNEL_DIR" ]; then
+          echo "ERROR: Kernel directory not found"
+          ls -la /tmp/flippy_extract
+          exit 1
+        fi
+        echo "Kernel directory: $KERNEL_DIR"
+
+        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
+        MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
+
+        if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MODULES_TAR" ]; then
+          echo "ERROR: Could not find boot, dtb, or modules archives. Listing contents:"
+          ls -laR "$KERNEL_DIR"
+          exit 1
+        fi
+
+        echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
+
         mkdir -p scripts/sd-fuse/friendlywrt25/boot/
-        tar xzf /tmp/boot.tar.gz -C scripts/sd-fuse/friendlywrt25/boot/ --strip-components=1
+        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/friendlywrt25/boot/ --strip-components=1
 
-        # Extract dtb files
         mkdir -p scripts/sd-fuse/friendlywrt25/dtb/rockchip/
-        tar xzf /tmp/dtb-rockchip.tar.gz -C scripts/sd-fuse/friendlywrt25/dtb/rockchip/ --strip-components=1
+        tar xzf "$DTB_TAR" -C scripts/sd-fuse/friendlywrt25/dtb/rockchip/ --strip-components=1
 
-        # Extract modules to temp
         mkdir -p /tmp/flippy_modules
-        tar xzf /tmp/modules.tar.gz -C /tmp/flippy_modules --strip-components=1
+        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules --strip-components=1
 
-        echo "Flippy kernel deployed."
+        echo "Flippy kernel components deployed."
 
     - name: Inject flippy modules into rootfs
       run: |
@@ -741,7 +811,7 @@ jobs:
             ls -la
             exit 1
         fi
-        archive_dir="${{ steps.config.outputs.dist_dir }}-${{ matrix.CPU }}"
+        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
         mv ${{ steps.config.outputs.archive_filename }} ../../../artifact/
@@ -768,6 +838,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
+  # ---------- Cleanup jobs ----------
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
@@ -803,5 +874,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt with flippy kernel"
+          delete_workflow_pattern: "Build FriendlyWrt"
           repository: ${{ github.repository }}
