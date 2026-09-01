@@ -1,4 +1,4 @@
-name: Build FriendlyWrt with flippy kernel (auto-latest)
+name: Build FriendlyWrt with flippy kernel
 
 on:
   watch:
@@ -874,5 +874,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt"
+          delete_workflow_pattern: "Build FriendlyWrt with flippy kernel"
           repository: ${{ github.repository }}
