@@ -330,23 +330,23 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
+    # ---------- 关键修复：解压 rootfs 到独立目录，避免覆盖源码 ----------
     - name: Unpack friendlywrt rootfs
       run: |
         set -x
         cd project
         FILENAME="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
-        echo "Extracting $FILENAME with --strip-components=3"
-        mkdir -p friendlywrt
-        tar xzf "../artifact/$FILENAME" --strip-components=3 -C friendlywrt
-        if [ -d friendlywrt/root-rockchip ]; then
-          mv friendlywrt/root-rockchip friendlywrt/rootfs
+        mkdir -p rootfs
+        tar xzf "../artifact/$FILENAME" --strip-components=3 -C rootfs
+        if [ -d rootfs/root-rockchip ]; then
+          mv rootfs/root-rockchip rootfs/rootfs
         else
           echo "ERROR: root-rockchip not found after extraction"
-          ls -la friendlywrt/
+          ls -la rootfs/
           exit 1
         fi
-        echo "Rootfs extracted to friendlywrt/rootfs"
-        ls -la friendlywrt/rootfs/
+        echo "Rootfs extracted to rootfs/rootfs"
+        ls -la rootfs/rootfs/
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -422,11 +422,11 @@ jobs:
 
         echo "Flippy kernel components deployed."
 
-    # ---------- 修正：正确注入模块 ----------
+    # ---------- 修正：正确注入模块（路径改为 rootfs/rootfs） ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
-        ROOTFS_DIR="friendlywrt/rootfs"
+        ROOTFS_DIR="rootfs/rootfs"
         if [ ! -d "$ROOTFS_DIR" ]; then
           echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
           exit 1
@@ -449,14 +449,14 @@ jobs:
         cd project
         ./build.sh uboot
 
-    # ---------- 关键修复：修改 build.sh 跳过内核检查 ----------
+    # ---------- 修改 build.sh 跳过内核检查 ----------
     - name: Patch build.sh to skip kernel check
       run: |
         cd project
-        # Search for the line that prints "please build kernel first" and make it exit 0
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
         echo "Patched build.sh to skip kernel build check"
 
+    # ---------- 执行 sd-img（现在源码目录完好） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -729,22 +729,22 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
+    # ---------- 关键修复：解压 rootfs 到独立目录 ----------
     - name: Unpack friendlywrt rootfs
       run: |
         set -x
         cd project
         FILENAME="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
-        echo "Extracting $FILENAME with --strip-components=3"
-        mkdir -p friendlywrt
-        tar xzf "../artifact/$FILENAME" --strip-components=3 -C friendlywrt
-        if [ -d friendlywrt/root-rockchip ]; then
-          mv friendlywrt/root-rockchip friendlywrt/rootfs
+        mkdir -p rootfs
+        tar xzf "../artifact/$FILENAME" --strip-components=3 -C rootfs
+        if [ -d rootfs/root-rockchip ]; then
+          mv rootfs/root-rockchip rootfs/rootfs
         else
-          echo "ERROR: root-rockchip not found after extraction"
-          ls -la friendlywrt/
+          echo "ERROR: root-rockchip not found"
+          ls -la rootfs/
           exit 1
         fi
-        echo "Rootfs extracted to friendlywrt/rootfs"
+        echo "Rootfs extracted to rootfs/rootfs"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -819,11 +819,11 @@ jobs:
 
         echo "Flippy kernel components deployed."
 
-    # ---------- 修正：正确注入模块 ----------
+    # ---------- 修正：正确注入模块（路径为 rootfs/rootfs） ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
-        ROOTFS_DIR="friendlywrt/rootfs"
+        ROOTFS_DIR="rootfs/rootfs"
         if [ ! -d "$ROOTFS_DIR" ]; then
           echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
           exit 1
@@ -846,13 +846,14 @@ jobs:
         cd project
         ./build.sh uboot
 
-    # ---------- 关键修复：修改 build.sh 跳过内核检查 ----------
+    # ---------- 修改 build.sh 跳过内核检查 ----------
     - name: Patch build.sh to skip kernel check
       run: |
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
         echo "Patched build.sh to skip kernel build check"
 
+    # ---------- 执行 sd-img ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
