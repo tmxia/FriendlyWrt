@@ -33,7 +33,7 @@ on:
           - 'true'
 
 env:
-  AUTO_REPLACE_TAG: 'false'   # Set to 'true' to always use base tag (no suffix) on watch events
+  AUTO_REPLACE_TAG: 'false'
 
 jobs:
   prepare_release:
@@ -95,7 +95,6 @@ jobs:
           allow_updates: true
           overwrite: true
 
-  # ---------- build_manual (workflow_dispatch) ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -331,18 +330,33 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 修正路径：添加 artifact/ ----------
+    # ---------- 关键修复：正确解包 rootfs ----------
     - name: Unpack friendlywrt rootfs
       run: |
+        set -x
         cd project
-        SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../artifact/rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        FILENAME="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
+        echo "Extracting $FILENAME with --strip-components=3"
+        mkdir -p friendlywrt
+        tar xzf "../artifact/$FILENAME" --strip-components=3 -C friendlywrt
+        # The extracted directory should be root-rockchip
+        if [ -d friendlywrt/root-rockchip ]; then
+          mv friendlywrt/root-rockchip friendlywrt/rootfs
+        else
+          echo "ERROR: root-rockchip not found after extraction"
+          ls -la friendlywrt/
+          exit 1
+        fi
+        echo "Rootfs extracted to friendlywrt/rootfs"
+        ls -la friendlywrt/rootfs/
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
       run: |
+        set -x
         cd project
-        tar xzf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
+        echo "Unpacking host-pm-${{ matrix.VERSION }}.tgz"
+        tar xzvf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
 
     # ---------- 自动获取最新 flippy 内核 ----------
     - name: Get latest flippy kernel version
@@ -404,25 +418,38 @@ jobs:
         mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
         tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
+        # Extract modules to a temporary location
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules --strip-components=1
 
         echo "Flippy kernel components deployed."
 
+    # ---------- 修正：正确注入模块（自动检测目录名） ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
         ROOTFS_DIR="friendlywrt/rootfs"
-        if [ -d "$ROOTFS_DIR" ]; then
-          echo "Injecting flippy modules into $ROOTFS_DIR/lib/modules/"
-          rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
-          cp -r /tmp/flippy_modules "$ROOTFS_DIR/lib/"
-          find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
-          echo "Modules injected."
-        else
+        if [ ! -d "$ROOTFS_DIR" ]; then
           echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
           exit 1
         fi
+        # Determine the kernel version directory name from the modules archive
+        MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
+        if [ -z "$MODULES_DIR_NAME" ]; then
+          echo "ERROR: Could not determine modules directory name"
+          ls -la /tmp/flippy_modules
+          exit 1
+        fi
+        echo "Modules directory name: $MODULES_DIR_NAME"
+        # Remove existing modules if any
+        rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
+        # Create the target modules directory
+        mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
+        # Copy the contents of flippy modules into the target directory
+        cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
+        # Set permissions
+        find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
+        echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
     - name: Build uboot only (skip kernel compilation)
       run: |
@@ -469,7 +496,6 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ---------- build_auto (watch trigger) ----------
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -639,7 +665,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # ---------- SD image build with flippy kernel ----------
+    # ---------- SD image build with flippy kernel (auto) ----------
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -702,18 +728,31 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 修正路径：添加 artifact/ ----------
+    # ---------- 关键修复：正确解包 rootfs ----------
     - name: Unpack friendlywrt rootfs
       run: |
+        set -x
         cd project
-        SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../artifact/rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        FILENAME="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
+        echo "Extracting $FILENAME with --strip-components=3"
+        mkdir -p friendlywrt
+        tar xzf "../artifact/$FILENAME" --strip-components=3 -C friendlywrt
+        if [ -d friendlywrt/root-rockchip ]; then
+          mv friendlywrt/root-rockchip friendlywrt/rootfs
+        else
+          echo "ERROR: root-rockchip not found after extraction"
+          ls -la friendlywrt/
+          exit 1
+        fi
+        echo "Rootfs extracted to friendlywrt/rootfs"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
       run: |
+        set -x
         cd project
-        tar xzf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
+        echo "Unpacking host-pm-${{ matrix.VERSION }}.tgz"
+        tar xzvf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
 
     # ---------- 自动获取最新 flippy 内核 ----------
     - name: Get latest flippy kernel version
@@ -780,20 +819,27 @@ jobs:
 
         echo "Flippy kernel components deployed."
 
+    # ---------- 修正：正确注入模块 ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
         ROOTFS_DIR="friendlywrt/rootfs"
-        if [ -d "$ROOTFS_DIR" ]; then
-          echo "Injecting flippy modules into $ROOTFS_DIR/lib/modules/"
-          rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
-          cp -r /tmp/flippy_modules "$ROOTFS_DIR/lib/"
-          find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
-          echo "Modules injected."
-        else
+        if [ ! -d "$ROOTFS_DIR" ]; then
           echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
           exit 1
         fi
+        MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
+        if [ -z "$MODULES_DIR_NAME" ]; then
+          echo "ERROR: Could not determine modules directory name"
+          ls -la /tmp/flippy_modules
+          exit 1
+        fi
+        echo "Modules directory name: $MODULES_DIR_NAME"
+        rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
+        mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
+        cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
+        find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
+        echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
     - name: Build uboot only (skip kernel compilation)
       run: |
@@ -840,7 +886,6 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ---------- Cleanup jobs ----------
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
