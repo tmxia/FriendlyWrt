@@ -424,7 +424,7 @@ jobs:
 
         echo "Flippy kernel components deployed."
 
-    # ---------- 修正：正确注入模块（自动识别目录名） ----------
+    # ---------- 修正：正确注入模块 ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
@@ -456,10 +456,18 @@ jobs:
         cd project
         ./build.sh uboot
 
+    # ---------- 关键修复：创建内核已编译标记，绕过 sd-img 检查 ----------
+    - name: Create fake kernel build marker
+      run: |
+        cd project
+        mkdir -p friendlywrt/kernel
+        touch friendlywrt/kernel/.built
+
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
+        # Now sd-img will think kernel is built
         ./build.sh sd-img
         mv out/${{ steps.config.outputs.img_filename }} ../artifact/
 
@@ -846,6 +854,13 @@ jobs:
       run: |
         cd project
         ./build.sh uboot
+
+    # ---------- 关键修复：创建内核已编译标记 ----------
+    - name: Create fake kernel build marker
+      run: |
+        cd project
+        mkdir -p friendlywrt/kernel
+        touch friendlywrt/kernel/.built
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
