@@ -418,13 +418,13 @@ jobs:
         mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
         tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
-        # Extract modules to a temporary location
+        # 关键修正：提取 modules 时保留顶层目录（不要 --strip-components）
         mkdir -p /tmp/flippy_modules
-        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules --strip-components=1
+        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules   # 没有 --strip-components
 
         echo "Flippy kernel components deployed."
 
-    # ---------- 修正：正确注入模块（自动检测目录名） ----------
+    # ---------- 修正：正确注入模块（自动识别目录名） ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
@@ -665,7 +665,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # ---------- SD image build with flippy kernel (auto) ----------
+    # ---------- SD image build with flippy kernel ----------
     - name: Download friendlywrt rootfs (non-docker)
       if: matrix.SET == 'non-docker'
       uses: robinraju/release-downloader@v1.6
@@ -814,8 +814,9 @@ jobs:
         mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
         tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
+        # 关键修正：提取 modules 时保留顶层目录
         mkdir -p /tmp/flippy_modules
-        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules --strip-components=1
+        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
         echo "Flippy kernel components deployed."
 
