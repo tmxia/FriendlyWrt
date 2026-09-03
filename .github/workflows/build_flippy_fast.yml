@@ -379,15 +379,18 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：使用绝对路径符号链接 ----------
+    # ---------- 关键修复：彻底清理并递归创建绝对路径符号链接 ----------
     - name: Prepare sd-img environment
       run: |
         set -x
         cd project
         ABS_PATH=$(pwd)
-        # 删除可能存在的旧符号链接（如果有）
-        find scripts/sd-fuse -type l -delete 2>/dev/null || true
-        # 在 scripts/sd-fuse 的每个子目录中创建指向项目根目录的符号链接
+        # 删除所有 device, configs, .current_config.mk, .config（文件和目录）
+        find scripts/sd-fuse -name device -exec rm -rf {} + 2>/dev/null || true
+        find scripts/sd-fuse -name configs -exec rm -rf {} + 2>/dev/null || true
+        find scripts/sd-fuse -name .current_config.mk -exec rm -rf {} + 2>/dev/null || true
+        find scripts/sd-fuse -name .config -exec rm -rf {} + 2>/dev/null || true
+        # 遍历所有目录创建符号链接
         find scripts/sd-fuse -type d | while read -r dir; do
           ln -sf ${ABS_PATH}/device "$dir/device"
           ln -sf ${ABS_PATH}/configs "$dir/configs"
@@ -403,7 +406,7 @@ jobs:
         ls -la scripts/sd-fuse/device/ || echo "device not found"
         echo "=== Listing scripts/sd-fuse/friendlywrt25-docker/device ==="
         ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
-        echo "Prepared sd-img environment with absolute symlinks"
+        echo "Prepared sd-img environment with absolute symlinks (clean first)"
 
     # ---------- 验证 device 目录 ----------
     - name: Verify device directory for sd-img
@@ -424,7 +427,13 @@ jobs:
           ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
           exit 1
         fi
-        echo "All device directories verified."
+        # 额外检查一个深层目录，确保符号链接覆盖到所有可能位置
+        if [ -d "scripts/sd-fuse/prebuilt/firmware/device/friendlyelec" ]; then
+          echo "OK: scripts/sd-fuse/prebuilt/firmware/device/friendlyelec exists"
+        else
+          echo "WARNING: scripts/sd-fuse/prebuilt/firmware/device/friendlyelec not found (may not be needed)"
+        fi
+        echo "All critical device directories verified."
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
@@ -751,7 +760,10 @@ jobs:
         set -x
         cd project
         ABS_PATH=$(pwd)
-        find scripts/sd-fuse -type l -delete 2>/dev/null || true
+        find scripts/sd-fuse -name device -exec rm -rf {} + 2>/dev/null || true
+        find scripts/sd-fuse -name configs -exec rm -rf {} + 2>/dev/null || true
+        find scripts/sd-fuse -name .current_config.mk -exec rm -rf {} + 2>/dev/null || true
+        find scripts/sd-fuse -name .config -exec rm -rf {} + 2>/dev/null || true
         find scripts/sd-fuse -type d | while read -r dir; do
           ln -sf ${ABS_PATH}/device "$dir/device"
           ln -sf ${ABS_PATH}/configs "$dir/configs"
@@ -766,7 +778,7 @@ jobs:
         ls -la scripts/sd-fuse/device/ || echo "device not found"
         echo "=== Listing scripts/sd-fuse/friendlywrt25-docker/device ==="
         ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
-        echo "Prepared sd-img environment with absolute symlinks"
+        echo "Prepared sd-img environment with absolute symlinks (clean first)"
 
     - name: Verify device directory for sd-img
       run: |
