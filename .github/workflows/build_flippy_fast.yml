@@ -379,17 +379,19 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：只复制配置文件到两个位置，避免递归 ----------
+    # ---------- 关键修复：复制配置文件到根目录和 DIST_DIR 的一级子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         # 复制到 sd-fuse 根目录
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        # 复制到 DIST_DIR 目录（仅这一层，不递归到子目录）
+        # 复制到 DIST_DIR 目录
         mkdir -p scripts/sd-fuse/${DIST_DIR}
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
-        echo "Prepared sd-img environment (files copied to scripts/sd-fuse and ${DIST_DIR})"
+        # 复制到 DIST_DIR 的一级子目录（boot, dtb 等）
+        find scripts/sd-fuse/${DIST_DIR} -maxdepth 1 -type d ! -path scripts/sd-fuse/${DIST_DIR} -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
+        echo "Prepared sd-img environment"
         ls -la scripts/sd-fuse/${DIST_DIR}/
 
     - name: Build sd image with flippy kernel
@@ -716,7 +718,7 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 只复制配置文件到两个位置 ----------
+    # ---------- 关键修复：复制到根目录和 DIST_DIR 的一级子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -724,7 +726,8 @@ jobs:
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         mkdir -p scripts/sd-fuse/${DIST_DIR}
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
-        echo "Prepared sd-img environment (files copied to scripts/sd-fuse and ${DIST_DIR})"
+        find scripts/sd-fuse/${DIST_DIR} -maxdepth 1 -type d ! -path scripts/sd-fuse/${DIST_DIR} -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
+        echo "Prepared sd-img environment"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
