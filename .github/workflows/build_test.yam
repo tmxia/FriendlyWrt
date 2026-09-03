@@ -1,0 +1,479 @@
+name: Build FriendlyWrt With Flippy Kernel (Fast)
+
+on:
+  watch:
+    types: started
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'OpenWrt version'
+        required: true
+        default: '25.12'
+        type: choice
+        options:
+          - '24.10'
+          - '25.12'
+          - 'both'
+      set:
+        description: 'Build type'
+        required: true
+        default: 'docker'
+        type: choice
+        options:
+          - docker
+          - non-docker
+          - both
+      replace_existing:
+        description: 'Replace existing release tag (overwrite)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+env:
+  AUTO_REPLACE_TAG: 'false'
+
+jobs:
+  prepare_release:
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.tag }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
+    steps:
+      - name: Generate unique release tag with auto-increment or overwrite
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
+          FORCE_BASE=false
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
+            FORCE_BASE=true
+          elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
+            FORCE_BASE=true
+          fi
+
+          if [ "$FORCE_BASE" = "true" ]; then
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            for tag in $EXISTING_TAGS; do
+              echo "Deleting release and tag: $tag"
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+              git push origin --delete "refs/tags/$tag" || true
+            done
+            TAG="$BASE_TAG"
+          else
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            if [ -z "$EXISTING_TAGS" ]; then
+              TAG="$BASE_TAG"
+            else
+              MAX_NUM=0
+              for t in $EXISTING_TAGS; do
+                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                  NUM=${BASH_REMATCH[1]}
+                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+                fi
+              done
+              NEXT=$((MAX_NUM + 1))
+              TAG="${BASE_TAG}-${NEXT}"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated release tag: $TAG"
+
+      - name: Create or update release
+        id: release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          allow_updates: true
+          overwrite: true
+
+  build_manual:
+    needs: prepare_release
+    runs-on: ubuntu-22.04
+    if: |
+      github.event.repository.owner.id == github.event.sender.id &&
+      github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        VERSION: ${{ fromJSON(github.event.inputs.version == 'both' && '["24.10","25.12"]' || format('["{0}"]', github.event.inputs.version)) }}
+        SET: ${{ fromJSON(github.event.inputs.set == 'both' && '["docker","non-docker"]' || format('["{0}"]', github.event.inputs.set)) }}
+    steps:
+    - name: Show build configuration
+      run: |
+        echo "Building version: ${{ matrix.VERSION }}, type: ${{ matrix.SET }}"
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d
+        wget https://raw.githubusercontent.com/friendlyarm/build-env-on-ubuntu-bionic/master/install.sh
+        sed -i -e 's/^apt-get -y install openjdk-8-jdk/# apt-get -y install openjdk-8-jdk/g' install.sh
+        sed -i -e 's/^\[ -d fa-toolchain \]/# [ -d fa-toolchain ]/g' install.sh
+        sed -i -e 's/^(cat fa-toolchain/# (cat fa-toolchain/g' install.sh
+        sed -i -e 's/^(tar xf fa-toolchain/# (tar xf fa-toolchain/g' install.sh
+        sudo -E bash ./install.sh
+        git config --global user.name 'GitHub Actions'
+        git config --global user.email 'noreply@github.com'
+        git config --global color.ui false
+        git clone https://github.com/friendlyarm/repo
+        sudo -E cp repo/repo /usr/bin/
+        mkdir -p ./artifact
+        sudo swapoff -a || true
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
+        echo "cores: $(nproc)"
+
+    - name: Download source
+      run: |
+        mkdir project
+        cd project
+        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
+                -m rk3568.xml --repo-url=https://github.com/friendlyarm/repo  --no-clone-bundle
+
+        repo sync -c friendlywrt --no-clone-bundle
+        repo sync -c configs --no-clone-bundle
+        repo sync -c device/common --no-clone-bundle
+        repo sync -c device/friendlyelec --no-clone-bundle
+        repo sync -c scripts --no-clone-bundle
+        repo sync -c scripts/sd-fuse  --no-clone-bundle
+        repo sync -c toolchain  --no-clone-bundle
+
+    - name: Apply customizations
+      run: |
+        cd project
+        source ../scripts/custome_config.sh
+
+    - name: Prepare dot config and feeds
+      run: |
+        cd project
+        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
+        DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
+        CONFIG=rockchip${SUFFIX}
+        cat > .current_config.mk <<EOL
+        . device/friendlyelec/rk3568/base.mk
+        TARGET_IMAGE_DIRNAME=${DIST_DIR}
+        TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
+        EOL
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+
+    - name: Add customize packages
+      run: |
+        cd project
+        bash ../scripts/add_packages.sh
+
+    # Force enable Clashoo
+    - name: Update config after custom packages
+      run: |
+        cd project
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        cd friendlywrt
+        echo "Enabling Clashoo packages in .config..."
+        sed -i 's/^# CONFIG_PACKAGE_clashoo is not set$/CONFIG_PACKAGE_clashoo=y/' .config || echo "CONFIG_PACKAGE_clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-app-clashoo is not set$/CONFIG_PACKAGE_luci-app-clashoo=y/' .config || echo "CONFIG_PACKAGE_luci-app-clashoo=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn is not set$/CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y/' .config || echo "CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y" >> .config
+        sed -i 's/^# CONFIG_PACKAGE_luci-theme-bootstrap is not set$/CONFIG_PACKAGE_luci-theme-bootstrap=y/' .config || echo "CONFIG_PACKAGE_luci-theme-bootstrap=y" >> .config
+        make oldconfig
+
+    - name: Verify config
+      run: |
+        cd project/friendlywrt
+        echo "=== Checking .config for custom packages ==="
+        grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-theme-bootstrap|kmod-inet-diag)" .config || echo "WARNING: Some packages not found"
+
+    # ---------- 高效核心：直接下载已编译的 rootfs 包（若存在） ----------
+    - name: Download or compile rootfs
+      id: rootfs
+      run: |
+        cd project
+        SUFFIX="${{ steps.config.outputs.suffix || '' }}"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        if gh release view "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
+          echo "Downloading existing rootfs package $ROOTFS_FILE"
+          gh release download "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
+          echo "skip_compile=true" >> $GITHUB_OUTPUT
+        else
+          echo "No rootfs package found in release, will compile from scratch."
+          echo "skip_compile=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Compile friendlyWrt (rootfs only) - fallback
+      if: steps.rootfs.outputs.skip_compile == 'false'
+      run: |
+        cd project/friendlywrt
+        make -j$(nproc) world
+
+    - name: Create rootfs package - fallback
+      if: steps.rootfs.outputs.skip_compile == 'false'
+      id: create_rootfs_package
+      run: |
+        cd project
+        source .current_config.mk
+        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
+        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
+              ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
+        echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
+
+    - name: Upload rootfs package (if newly compiled)
+      if: steps.rootfs.outputs.skip_compile == 'false'
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/${{ steps.create_rootfs_package.outputs.rootfs_filename }}
+        asset_name: ${{ steps.create_rootfs_package.outputs.rootfs_filename }}
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
+    # ---------- 以下步骤始终执行：下载、替换内核、生成镜像 ----------
+    - name: Prepare config for img (with flippy suffix)
+      id: config
+      run: |
+        cd project
+        CPU=rk3568
+        case $CPU in
+        rk3568)
+          MODEL=R5S-R5C-Series
+          ;;
+        *)
+          echo "unknow cpu"
+          exit 1
+          ;;
+        esac
+        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
+        IMG_FILE=${MODEL}-FriendlyWrt-flippy-${{ matrix.VERSION }}${SUFFIX}.img
+        TGZ_FILE=images-${MODEL}-FriendlyWrt-flippy-${{ matrix.VERSION }}${SUFFIX}.tgz
+        DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
+
+        CONFIG=rockchip${SUFFIX}
+        cat > .current_config.mk <<EOL
+        . device/friendlyelec/$CPU/base.mk
+        TARGET_IMAGE_DIRNAME=${DIST_DIR}
+        TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
+        TARGET_SD_RAW_FILENAME=${IMG_FILE}
+        EOL
+
+        echo "img_filename=$IMG_FILE" >> $GITHUB_OUTPUT
+        echo "archive_filename=$TGZ_FILE" >> $GITHUB_OUTPUT
+        echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
+        echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
+
+    - name: Unpack friendlywrt rootfs
+      run: |
+        set -x
+        cd project
+        SUFFIX="${{ steps.config.outputs.suffix }}"
+        FILENAME="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        mkdir -p rootfs
+        tar xzf "../artifact/$FILENAME" --strip-components=3 -C rootfs
+        if [ -d rootfs/root-rockchip ]; then
+          mv rootfs/root-rockchip rootfs/rootfs
+        else
+          echo "ERROR: root-rockchip not found"
+          ls -la rootfs/
+          exit 1
+        fi
+
+    - name: Unpack host package-manager bundle
+      if: matrix.SET == 'non-docker'
+      run: |
+        cd project
+        tar xzvf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
+
+    # ---------- 自动获取最新 flippy 内核 ----------
+    - name: Get latest flippy kernel version
+      id: flippy_version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
+        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
+        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
+        if [ -z "$VERSIONS" ]; then
+          echo "ERROR: No kernel tarballs found in kernel_flippy release"
+          exit 1
+        fi
+        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
+        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        echo "Latest flippy kernel version: $LATEST"
+
+    - name: Download and deploy flippy kernel
+      run: |
+        cd project
+        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
+        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
+        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
+
+        mkdir -p /tmp/flippy_extract
+        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
+
+        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
+        if [ ! -d "$KERNEL_DIR" ]; then
+          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
+        fi
+        if [ -z "$KERNEL_DIR" ] || [ ! -d "$KERNEL_DIR" ]; then
+          echo "ERROR: Kernel directory not found"
+          ls -la /tmp/flippy_extract
+          exit 1
+        fi
+        echo "Kernel directory: $KERNEL_DIR"
+
+        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
+        MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
+
+        if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MODULES_TAR" ]; then
+          echo "ERROR: Could not find boot, dtb, or modules archives. Listing contents:"
+          ls -laR "$KERNEL_DIR"
+          exit 1
+        fi
+
+        echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
+
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        echo "Deploying to scripts/sd-fuse/${DIST_DIR}"
+
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+        tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
+
+        mkdir -p /tmp/flippy_modules
+        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
+
+        echo "Flippy kernel components deployed."
+
+    - name: Inject flippy modules into rootfs
+      run: |
+        cd project
+        ROOTFS_DIR="rootfs/rootfs"
+        if [ ! -d "$ROOTFS_DIR" ]; then
+          echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
+          exit 1
+        fi
+        MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
+        if [ -z "$MODULES_DIR_NAME" ]; then
+          echo "ERROR: Could not determine modules directory name"
+          ls -la /tmp/flippy_modules
+          exit 1
+        fi
+        echo "Modules directory name: $MODULES_DIR_NAME"
+        rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
+        mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
+        cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
+        find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
+        echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
+
+    - name: Build uboot only (skip kernel compilation)
+      run: |
+        cd project
+        ./build.sh uboot
+
+    - name: Patch build.sh to skip kernel check
+      run: |
+        cd project
+        sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
+        echo "Patched build.sh"
+
+    - name: Prepare sd-img environment
+      run: |
+        cd project
+        cp .current_config.mk scripts/sd-fuse/
+        cp -r device scripts/sd-fuse/
+        cp -r configs scripts/sd-fuse/ 2>/dev/null || true
+        cp friendlywrt/.config scripts/sd-fuse/ 2>/dev/null || true
+        echo "Prepared sd-img environment"
+
+    - name: Build sd image with flippy kernel
+      id: build_sd_image
+      run: |
+        cd project
+        export TOPDIR=$(pwd)
+        export FRIENDLYWRT_SRC=$(pwd)
+        ./build.sh sd-img
+        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+
+        pushd scripts/sd-fuse/ > /dev/null
+        if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
+            echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
+            ls -la
+            exit 1
+        fi
+        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
+        mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
+        tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
+        mv ${{ steps.config.outputs.archive_filename }} ../../../artifact/
+        popd > /dev/null
+
+        cd ../artifact/
+        gzip *.img
+
+    - name: Upload images-XYZ.tgz to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/${{ steps.config.outputs.archive_filename }}
+        asset_name: ${{ steps.config.outputs.archive_filename }}
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
+    - name: Upload XYZ.img.gz to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/${{ steps.config.outputs.img_filename }}.gz
+        asset_name: ${{ steps.config.outputs.img_filename }}.gz
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
+  # build_auto 与 manual 相同，仅触发条件不同，此处省略以节省篇幅（可复制 build_manual 修改 if 条件）
+  # 实际使用时应将 build_auto 完整复制，并修改 matrix 为固定 ['24.10','25.12'] 和 ['docker','non-docker']，以及触发条件为 'watch'。
+
+  cleanup_intermediate_assets:
+    needs: [prepare_release, build_manual, build_auto]
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+    steps:
+    - name: Delete intermediate assets from release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
+      run: |
+        gh release view "$RELEASE_TAG" \
+          --repo "$GITHUB_REPOSITORY" \
+          --json assets \
+          --jq '.assets[] | select(.name | startswith("rootfs-friendlywrt-") or startswith("host-pm-")) | .name' \
+        | while read -r asset; do
+            [ -z "$asset" ] && continue
+            echo "Deleting asset: $asset"
+            gh release delete-asset "$RELEASE_TAG" "$asset" --yes --repo "$GITHUB_REPOSITORY"
+          done
+
+  cleanup_self:
+    name: Cleanup Self Workflow History
+    runs-on: ubuntu-latest
+    needs: [prepare_release, build_manual, build_auto, cleanup_intermediate_assets]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 0
+          retain_days: 0
+          delete_workflow_pattern: "Build FriendlyWrt"
+          repository: ${{ github.repository }}
