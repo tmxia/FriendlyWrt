@@ -330,7 +330,7 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 关键修复：解压 rootfs 到独立目录，避免覆盖源码 ----------
+    # ---------- 关键修复：解压 rootfs 到独立目录 ----------
     - name: Unpack friendlywrt rootfs
       run: |
         set -x
@@ -422,7 +422,7 @@ jobs:
 
         echo "Flippy kernel components deployed."
 
-    # ---------- 修正：正确注入模块（路径改为 rootfs/rootfs） ----------
+    # ---------- 修正：正确注入模块 ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
@@ -456,11 +456,31 @@ jobs:
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
         echo "Patched build.sh to skip kernel build check"
 
-    # ---------- 执行 sd-img（现在源码目录完好） ----------
+    # ---------- 准备 sd-img 环境（复制所有必需文件） ----------
+    - name: Prepare sd-img environment
+      run: |
+        cd project
+        # Copy .current_config.mk
+        cp .current_config.mk scripts/sd-fuse/
+        # Copy entire device and configs directories (to avoid symlink issues)
+        cp -r device scripts/sd-fuse/
+        cp -r configs scripts/sd-fuse/ 2>/dev/null || true
+        # Also copy any other needed files (like .config)
+        cp friendlywrt/.config scripts/sd-fuse/ 2>/dev/null || true
+        echo "Prepared sd-img environment with device, configs, and .current_config.mk"
+        # List contents for debugging
+        ls -la scripts/sd-fuse/
+
+    # ---------- 执行 sd-img ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
+        export TOPDIR=$(pwd)
+        export FRIENDLYWRT_SRC=$(pwd)
+        # Debug: check if device/friendlyelec exists in scripts/sd-fuse
+        echo "Checking scripts/sd-fuse/device/friendlyelec:"
+        ls -la scripts/sd-fuse/device/friendlyelec/ || echo "Not found"
         ./build.sh sd-img
         mv out/${{ steps.config.outputs.img_filename }} ../artifact/
 
@@ -819,7 +839,7 @@ jobs:
 
         echo "Flippy kernel components deployed."
 
-    # ---------- 修正：正确注入模块（路径为 rootfs/rootfs） ----------
+    # ---------- 修正：正确注入模块 ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
@@ -853,11 +873,25 @@ jobs:
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
         echo "Patched build.sh to skip kernel build check"
 
+    # ---------- 准备 sd-img 环境 ----------
+    - name: Prepare sd-img environment
+      run: |
+        cd project
+        cp .current_config.mk scripts/sd-fuse/
+        cp -r device scripts/sd-fuse/
+        cp -r configs scripts/sd-fuse/ 2>/dev/null || true
+        cp friendlywrt/.config scripts/sd-fuse/ 2>/dev/null || true
+        echo "Prepared sd-img environment"
+        ls -la scripts/sd-fuse/
+
     # ---------- 执行 sd-img ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
+        export TOPDIR=$(pwd)
+        export FRIENDLYWRT_SRC=$(pwd)
+        ls -la scripts/sd-fuse/device/friendlyelec/ || echo "device/friendlyelec not found"
         ./build.sh sd-img
         mv out/${{ steps.config.outputs.img_filename }} ../artifact/
 
