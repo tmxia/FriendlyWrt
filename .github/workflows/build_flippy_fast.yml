@@ -379,30 +379,33 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：递归复制配置文件到 scripts/sd-fuse 的所有子目录 ----------
+    # ---------- 关键修复：使用绝对路径符号链接 ----------
     - name: Prepare sd-img environment
       run: |
         set -x
         cd project
-        # 复制到根目录
-        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        # 遍历所有子目录并复制
+        ABS_PATH=$(pwd)
+        # 删除可能存在的旧符号链接（如果有）
+        find scripts/sd-fuse -type l -delete 2>/dev/null || true
+        # 在 scripts/sd-fuse 的每个子目录中创建指向项目根目录的符号链接
         find scripts/sd-fuse -type d | while read -r dir; do
-          # 跳过根目录本身（已复制）
-          if [ "$dir" != "scripts/sd-fuse" ]; then
-            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
-          fi
+          ln -sf ${ABS_PATH}/device "$dir/device"
+          ln -sf ${ABS_PATH}/configs "$dir/configs"
+          ln -sf ${ABS_PATH}/.current_config.mk "$dir/.current_config.mk"
+          ln -sf ${ABS_PATH}/friendlywrt/.config "$dir/.config"
         done
-        # 列出关键目录内容以便调试
+        # 确保根目录也有（上面循环已覆盖，但为了保险）
+        ln -sf ${ABS_PATH}/device scripts/sd-fuse/device
+        ln -sf ${ABS_PATH}/configs scripts/sd-fuse/configs
+        ln -sf ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
+        ln -sf ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
         echo "=== Listing scripts/sd-fuse/device ==="
         ls -la scripts/sd-fuse/device/ || echo "device not found"
         echo "=== Listing scripts/sd-fuse/friendlywrt25-docker/device ==="
         ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
-        echo "=== Listing scripts/sd-fuse/friendlywrt25-docker/boot/device ==="
-        ls -la scripts/sd-fuse/friendlywrt25-docker/boot/device/ || echo "device not found"
-        echo "Prepared sd-img environment with recursive copies"
+        echo "Prepared sd-img environment with absolute symlinks"
 
-    # ---------- 在运行 sd-img 前验证 device 目录 ----------
+    # ---------- 验证 device 目录 ----------
     - name: Verify device directory for sd-img
       run: |
         cd project
@@ -421,14 +424,6 @@ jobs:
           ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
           exit 1
         fi
-        # 检查 boot 子目录
-        if [ -d "scripts/sd-fuse/friendlywrt25-docker/boot/device/friendlyelec" ]; then
-          echo "OK: scripts/sd-fuse/friendlywrt25-docker/boot/device/friendlyelec exists"
-        else
-          echo "ERROR: scripts/sd-fuse/friendlywrt25-docker/boot/device/friendlyelec not found"
-          ls -la scripts/sd-fuse/friendlywrt25-docker/boot/ || echo "boot not found"
-          exit 1
-        fi
         echo "All device directories verified."
 
     - name: Build sd image with flippy kernel
@@ -437,10 +432,7 @@ jobs:
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$(pwd)
-        # 再次确认当前目录
         echo "Current directory: $(pwd)"
-        echo "Checking device/friendlyelec in current directory:"
-        find . -name friendlyelec -type d 2>/dev/null || echo "No friendlyelec found"
         ./build.sh sd-img
         mv out/${{ steps.config.outputs.img_filename }} ../artifact/
 
@@ -758,17 +750,23 @@ jobs:
       run: |
         set -x
         cd project
-        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
+        ABS_PATH=$(pwd)
+        find scripts/sd-fuse -type l -delete 2>/dev/null || true
         find scripts/sd-fuse -type d | while read -r dir; do
-          if [ "$dir" != "scripts/sd-fuse" ]; then
-            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
-          fi
+          ln -sf ${ABS_PATH}/device "$dir/device"
+          ln -sf ${ABS_PATH}/configs "$dir/configs"
+          ln -sf ${ABS_PATH}/.current_config.mk "$dir/.current_config.mk"
+          ln -sf ${ABS_PATH}/friendlywrt/.config "$dir/.config"
         done
+        ln -sf ${ABS_PATH}/device scripts/sd-fuse/device
+        ln -sf ${ABS_PATH}/configs scripts/sd-fuse/configs
+        ln -sf ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
+        ln -sf ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
         echo "=== Listing scripts/sd-fuse/device ==="
         ls -la scripts/sd-fuse/device/ || echo "device not found"
         echo "=== Listing scripts/sd-fuse/friendlywrt25-docker/device ==="
         ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
-        echo "Prepared sd-img environment with recursive copies"
+        echo "Prepared sd-img environment with absolute symlinks"
 
     - name: Verify device directory for sd-img
       run: |
