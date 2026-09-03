@@ -225,9 +225,11 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 核心加速：复用 rootfs 包（支持从其他 release 下载） ----------
+    # ---------- 核心加速：复用 rootfs 包（添加 GH_TOKEN） ----------
     - name: Download or compile rootfs
       id: rootfs
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 关键修正：添加认证令牌
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
@@ -601,9 +603,11 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 复用 rootfs（跨标签） ----------
+    # ---------- 复用 rootfs（添加 GH_TOKEN） ----------
     - name: Download or compile rootfs
       id: rootfs
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 关键修正
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
