@@ -408,13 +408,26 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
+    # ---------- 关键修复：将所需文件复制到 sd-fuse 及其子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        # 复制到 sd-fuse 根目录
         cp .current_config.mk scripts/sd-fuse/
         cp -r device scripts/sd-fuse/
         cp -r configs scripts/sd-fuse/ 2>/dev/null || true
         cp friendlywrt/.config scripts/sd-fuse/ 2>/dev/null || true
+        
+        # 复制到目标镜像子目录（关键！）
+        mkdir -p scripts/sd-fuse/${DIST_DIR}
+        cp .current_config.mk scripts/sd-fuse/${DIST_DIR}/
+        cp -r device scripts/sd-fuse/${DIST_DIR}/
+        cp -r configs scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        cp friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        
+        echo "Prepared sd-img environment (files copied to both root and ${DIST_DIR})"
+        ls -la scripts/sd-fuse/${DIST_DIR}/
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
@@ -588,7 +601,7 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 复用 rootfs（支持跨标签） ----------
+    # ---------- 复用 rootfs（跨标签） ----------
     - name: Download or compile rootfs
       id: rootfs
       run: |
@@ -769,13 +782,22 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
+    # ---------- 复制文件到 sd-fuse 及其子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         cp .current_config.mk scripts/sd-fuse/
         cp -r device scripts/sd-fuse/
         cp -r configs scripts/sd-fuse/ 2>/dev/null || true
         cp friendlywrt/.config scripts/sd-fuse/ 2>/dev/null || true
+        mkdir -p scripts/sd-fuse/${DIST_DIR}
+        cp .current_config.mk scripts/sd-fuse/${DIST_DIR}/
+        cp -r device scripts/sd-fuse/${DIST_DIR}/
+        cp -r configs scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        cp friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        echo "Prepared sd-img environment (files copied to both root and ${DIST_DIR})"
+        ls -la scripts/sd-fuse/${DIST_DIR}/
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
@@ -855,5 +877,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt With Flippy Kernel (Fast)"
+          delete_workflow_pattern: "Build FriendlyWrt"
           repository: ${{ github.repository }}
