@@ -379,20 +379,26 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：复制配置文件到根目录和 DIST_DIR 的一级子目录 ----------
+    # ---------- 关键修复：复制配置文件到所有子目录（不递归） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        # 复制到 sd-fuse 根目录
+        # 复制到根目录
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        # 复制到 DIST_DIR 目录
+        # 复制到 DIST_DIR
         mkdir -p scripts/sd-fuse/${DIST_DIR}
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
-        # 复制到 DIST_DIR 的一级子目录（boot, dtb 等）
-        find scripts/sd-fuse/${DIST_DIR} -maxdepth 1 -type d ! -path scripts/sd-fuse/${DIST_DIR} -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
-        echo "Prepared sd-img environment"
-        ls -la scripts/sd-fuse/${DIST_DIR}/
+        # 收集所有子目录（不包括 DIST_DIR 本身）
+        find scripts/sd-fuse/${DIST_DIR} -mindepth 1 -type d > /tmp/dirs.txt
+        while read -r dir; do
+          # 如果目录包含 "device" 则跳过（避免复制到自身）
+          if [[ "$dir" == *"/device"* ]]; then
+            continue
+          fi
+          cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
+        done < /tmp/dirs.txt
+        echo "Prepared sd-img environment with files copied to all subdirectories"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
@@ -718,7 +724,7 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：复制到根目录和 DIST_DIR 的一级子目录 ----------
+    # ---------- 关键修复：复制配置文件到所有子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -726,7 +732,13 @@ jobs:
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         mkdir -p scripts/sd-fuse/${DIST_DIR}
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
-        find scripts/sd-fuse/${DIST_DIR} -maxdepth 1 -type d ! -path scripts/sd-fuse/${DIST_DIR} -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
+        find scripts/sd-fuse/${DIST_DIR} -mindepth 1 -type d > /tmp/dirs.txt
+        while read -r dir; do
+          if [[ "$dir" == *"/device"* ]]; then
+            continue
+          fi
+          cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
+        done < /tmp/dirs.txt
         echo "Prepared sd-img environment"
 
     - name: Build sd image with flippy kernel
