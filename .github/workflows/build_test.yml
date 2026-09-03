@@ -225,23 +225,21 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 核心加速：复用 rootfs 包（添加 GH_TOKEN） ----------
+    # ---------- 核心加速：复用 rootfs 包（跨标签） ----------
     - name: Download or compile rootfs
       id: rootfs
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 关键修正：添加认证令牌
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
         BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
-        # 首先检查当前 release
         if gh release view "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
           echo "Downloading existing rootfs package $ROOTFS_FILE from current release"
           gh release download "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
           echo "skip_compile=true" >> $GITHUB_OUTPUT
         else
-          # 搜索当天其他 release
           echo "Current release does not have $ROOTFS_FILE, searching other releases with tag prefix $BASE_TAG"
           TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r)
           FOUND=false
@@ -410,25 +408,28 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：将所需文件复制到 sd-fuse 及其子目录 ----------
+    # ---------- 关键修复：使用绝对路径符号链接 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        # 复制到 sd-fuse 根目录
-        cp .current_config.mk scripts/sd-fuse/
-        cp -r device scripts/sd-fuse/
-        cp -r configs scripts/sd-fuse/ 2>/dev/null || true
-        cp friendlywrt/.config scripts/sd-fuse/ 2>/dev/null || true
-        
-        # 复制到目标镜像子目录（关键！）
+        ABS_PATH=$(pwd)
+        # 在 sd-fuse 根目录创建符号链接到项目根目录的绝对路径
+        rm -rf scripts/sd-fuse/device scripts/sd-fuse/configs scripts/sd-fuse/.current_config.mk scripts/sd-fuse/.config
+        ln -s ${ABS_PATH}/device scripts/sd-fuse/device
+        ln -s ${ABS_PATH}/configs scripts/sd-fuse/configs
+        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
+        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
+
+        # 在目标镜像目录下创建同样的符号链接
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp .current_config.mk scripts/sd-fuse/${DIST_DIR}/
-        cp -r device scripts/sd-fuse/${DIST_DIR}/
-        cp -r configs scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
-        cp friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
-        
-        echo "Prepared sd-img environment (files copied to both root and ${DIST_DIR})"
+        rm -rf scripts/sd-fuse/${DIST_DIR}/device scripts/sd-fuse/${DIST_DIR}/configs scripts/sd-fuse/${DIST_DIR}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.config
+        ln -s ${ABS_PATH}/device scripts/sd-fuse/${DIST_DIR}/device
+        ln -s ${ABS_PATH}/configs scripts/sd-fuse/${DIST_DIR}/configs
+        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.current_config.mk
+        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/.config
+
+        echo "Prepared sd-img environment with absolute symlinks"
         ls -la scripts/sd-fuse/${DIST_DIR}/
 
     - name: Build sd image with flippy kernel
@@ -485,7 +486,7 @@ jobs:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
     steps:
-    # 以下步骤与 build_manual 完全相同，仅 matrix 固定
+    # 与 build_manual 完全相同，仅 matrix 固定
     - name: Show build configuration
       run: |
         echo "Auto building version: ${{ matrix.VERSION }}, type: ${{ matrix.SET }}"
@@ -603,11 +604,11 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 复用 rootfs（添加 GH_TOKEN） ----------
+    # ---------- 复用 rootfs ----------
     - name: Download or compile rootfs
       id: rootfs
       env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # 关键修正
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
@@ -668,7 +669,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # ---------- 后续步骤完全相同 ----------
+    # ---------- 后续步骤 ----------
     - name: Unpack friendlywrt rootfs
       run: |
         set -x
@@ -786,22 +787,25 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 复制文件到 sd-fuse 及其子目录 ----------
+    # ---------- 准备 sd-img 环境（绝对路径符号链接） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        cp .current_config.mk scripts/sd-fuse/
-        cp -r device scripts/sd-fuse/
-        cp -r configs scripts/sd-fuse/ 2>/dev/null || true
-        cp friendlywrt/.config scripts/sd-fuse/ 2>/dev/null || true
+        ABS_PATH=$(pwd)
+        rm -rf scripts/sd-fuse/device scripts/sd-fuse/configs scripts/sd-fuse/.current_config.mk scripts/sd-fuse/.config
+        ln -s ${ABS_PATH}/device scripts/sd-fuse/device
+        ln -s ${ABS_PATH}/configs scripts/sd-fuse/configs
+        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
+        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
+
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp .current_config.mk scripts/sd-fuse/${DIST_DIR}/
-        cp -r device scripts/sd-fuse/${DIST_DIR}/
-        cp -r configs scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
-        cp friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
-        echo "Prepared sd-img environment (files copied to both root and ${DIST_DIR})"
-        ls -la scripts/sd-fuse/${DIST_DIR}/
+        rm -rf scripts/sd-fuse/${DIST_DIR}/device scripts/sd-fuse/${DIST_DIR}/configs scripts/sd-fuse/${DIST_DIR}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.config
+        ln -s ${ABS_PATH}/device scripts/sd-fuse/${DIST_DIR}/device
+        ln -s ${ABS_PATH}/configs scripts/sd-fuse/${DIST_DIR}/configs
+        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.current_config.mk
+        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/.config
+        echo "Prepared sd-img environment with absolute symlinks"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
