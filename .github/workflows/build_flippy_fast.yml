@@ -225,8 +225,8 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 核心加速：复用 rootfs 包（跨标签） ----------
-    - name: Download or compile rootfs
+    # ---------- 核心：下载 rootfs 包，若无则报错退出 ----------
+    - name: Download rootfs package (required)
       id: rootfs
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -235,11 +235,12 @@ jobs:
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
         BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
+        # 首先检查当前 release
         if gh release view "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
           echo "Downloading existing rootfs package $ROOTFS_FILE from current release"
           gh release download "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
-          echo "skip_compile=true" >> $GITHUB_OUTPUT
         else
+          # 搜索当天其他 release
           echo "Current release does not have $ROOTFS_FILE, searching other releases with tag prefix $BASE_TAG"
           TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r)
           FOUND=false
@@ -251,59 +252,15 @@ jobs:
             if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
               echo "Found $ROOTFS_FILE in release $tag, downloading..."
               gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
-              echo "skip_compile=true" >> $GITHUB_OUTPUT
               FOUND=true
               break
             fi
           done
           if [ "$FOUND" = "false" ]; then
-            echo "No rootfs package found in any release, will compile from scratch."
-            echo "skip_compile=false" >> $GITHUB_OUTPUT
+            echo "ERROR: No rootfs package found in any release. Please run a full build first to generate rootfs-friendlywrt-*.tgz."
+            exit 1
           fi
         fi
-
-    # ---------- 编译 rootfs（单线程 + keepalive） ----------
-    - name: Compile friendlyWrt (rootfs only) - fallback
-      if: steps.rootfs.outputs.skip_compile == 'false'
-      run: |
-        cd project/friendlywrt
-        echo "Starting compilation with make -j1 world (single-threaded to minimize resource usage)"
-        # 使用 stdbuf 确保输出无缓冲，并后台运行
-        stdbuf -oL -eL make -j1 world 2>&1 &
-        BUILD_PID=$!
-        # 每60秒输出一次状态，防止 runner 断连
-        while kill -0 $BUILD_PID 2>/dev/null; do
-          echo "::debug::Build still running, pid $BUILD_PID, at $(date)"
-          sleep 60
-        done
-        wait $BUILD_PID
-        if [ $? -ne 0 ]; then
-          echo "Compilation failed"
-          exit 1
-        fi
-        echo "Compilation finished successfully."
-
-    - name: Create rootfs package - fallback
-      if: steps.rootfs.outputs.skip_compile == 'false'
-      id: create_rootfs_package
-      run: |
-        cd project
-        source .current_config.mk
-        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
-              ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
-        echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
-
-    - name: Upload rootfs package (if newly compiled)
-      if: steps.rootfs.outputs.skip_compile == 'false'
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        asset_name: ${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
 
     # ---------- 后续步骤：解包、替换内核、生成镜像 ----------
     - name: Unpack friendlywrt rootfs
@@ -609,9 +566,8 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 复用 rootfs ----------
-    - name: Download or compile rootfs
-      id: rootfs
+    # ---------- 下载 rootfs 包 ----------
+    - name: Download rootfs package (required)
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -622,7 +578,6 @@ jobs:
         if gh release view "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
           echo "Downloading existing rootfs package $ROOTFS_FILE from current release"
           gh release download "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
-          echo "skip_compile=true" >> $GITHUB_OUTPUT
         else
           echo "Current release does not have $ROOTFS_FILE, searching other releases with tag prefix $BASE_TAG"
           TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r)
@@ -635,59 +590,17 @@ jobs:
             if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
               echo "Found $ROOTFS_FILE in release $tag, downloading..."
               gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
-              echo "skip_compile=true" >> $GITHUB_OUTPUT
               FOUND=true
               break
             fi
           done
           if [ "$FOUND" = "false" ]; then
-            echo "No rootfs package found in any release, will compile from scratch."
-            echo "skip_compile=false" >> $GITHUB_OUTPUT
+            echo "ERROR: No rootfs package found in any release. Please run a full build first to generate rootfs-friendlywrt-*.tgz."
+            exit 1
           fi
         fi
 
-    # ---------- 编译 rootfs（单线程 + keepalive） ----------
-    - name: Compile friendlyWrt (rootfs only) - fallback
-      if: steps.rootfs.outputs.skip_compile == 'false'
-      run: |
-        cd project/friendlywrt
-        echo "Starting compilation with make -j1 world (single-threaded to minimize resource usage)"
-        stdbuf -oL -eL make -j1 world 2>&1 &
-        BUILD_PID=$!
-        while kill -0 $BUILD_PID 2>/dev/null; do
-          echo "::debug::Build still running, pid $BUILD_PID, at $(date)"
-          sleep 60
-        done
-        wait $BUILD_PID
-        if [ $? -ne 0 ]; then
-          echo "Compilation failed"
-          exit 1
-        fi
-        echo "Compilation finished successfully."
-
-    - name: Create rootfs package - fallback
-      if: steps.rootfs.outputs.skip_compile == 'false'
-      id: create_rootfs_package
-      run: |
-        cd project
-        source .current_config.mk
-        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
-              ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
-        echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
-
-    - name: Upload rootfs package (if newly compiled)
-      if: steps.rootfs.outputs.skip_compile == 'false'
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        asset_name: ${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
-
-    # ---------- 后续步骤 ----------
+    # ---------- 后续步骤完全相同 ----------
     - name: Unpack friendlywrt rootfs
       run: |
         set -x
