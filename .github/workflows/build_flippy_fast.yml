@@ -262,11 +262,29 @@ jobs:
           fi
         fi
 
+    # ---------- 编译 rootfs（带 keepalive 和资源限制） ----------
     - name: Compile friendlyWrt (rootfs only) - fallback
       if: steps.rootfs.outputs.skip_compile == 'false'
       run: |
         cd project/friendlywrt
-        make -j$(nproc) world
+        # 限制并行数为4，避免资源耗尽；同时使用后台运行并定期输出 keepalive
+        echo "Starting compilation with make -j4 world (limited to 4 jobs to avoid resource exhaustion)"
+        {
+          make -j4 world 2>&1
+        } &
+        BUILD_PID=$!
+        # 每5分钟输出一次状态，防止 runner 因无输出而断连
+        while kill -0 $BUILD_PID 2>/dev/null; do
+          echo "::debug::Build in progress, pid $BUILD_PID, still alive at $(date)"
+          sleep 300
+        done
+        wait $BUILD_PID
+        # 检查编译结果
+        if [ $? -ne 0 ]; then
+          echo "Compilation failed"
+          exit 1
+        fi
+        echo "Compilation finished successfully."
 
     - name: Create rootfs package - fallback
       if: steps.rootfs.outputs.skip_compile == 'false'
@@ -631,11 +649,26 @@ jobs:
           fi
         fi
 
+    # ---------- 编译 rootfs（带 keepalive） ----------
     - name: Compile friendlyWrt (rootfs only) - fallback
       if: steps.rootfs.outputs.skip_compile == 'false'
       run: |
         cd project/friendlywrt
-        make -j$(nproc) world
+        echo "Starting compilation with make -j4 world (limited to 4 jobs)"
+        {
+          make -j4 world 2>&1
+        } &
+        BUILD_PID=$!
+        while kill -0 $BUILD_PID 2>/dev/null; do
+          echo "::debug::Build in progress, pid $BUILD_PID, still alive at $(date)"
+          sleep 300
+        done
+        wait $BUILD_PID
+        if [ $? -ne 0 ]; then
+          echo "Compilation failed"
+          exit 1
+        fi
+        echo "Compilation finished successfully."
 
     - name: Create rootfs package - fallback
       if: steps.rootfs.outputs.skip_compile == 'false'
