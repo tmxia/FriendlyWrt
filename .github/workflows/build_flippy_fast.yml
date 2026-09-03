@@ -866,5 +866,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt"
+          delete_workflow_pattern: "Build FriendlyWrt With Flippy Kernel (Fast)"
           repository: ${{ github.repository }}
