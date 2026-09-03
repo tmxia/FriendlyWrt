@@ -408,29 +408,19 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：使用绝对路径符号链接 ----------
+    # ---------- 关键修复：将配置文件递归复制到所有子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ABS_PATH=$(pwd)
-        # 在 sd-fuse 根目录创建符号链接到项目根目录的绝对路径
-        rm -rf scripts/sd-fuse/device scripts/sd-fuse/configs scripts/sd-fuse/.current_config.mk scripts/sd-fuse/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
-
-        # 在目标镜像目录下创建同样的符号链接
+        # 复制到 sd-fuse 根目录
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
+        # 复制到 DIST_DIR 及其所有子目录（包括 boot、dtb 等）
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        rm -rf scripts/sd-fuse/${DIST_DIR}/device scripts/sd-fuse/${DIST_DIR}/configs scripts/sd-fuse/${DIST_DIR}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/${DIST_DIR}/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/${DIST_DIR}/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/.config
-
-        echo "Prepared sd-img environment with absolute symlinks"
-        ls -la scripts/sd-fuse/${DIST_DIR}/
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
+        find scripts/sd-fuse/${DIST_DIR} -type d -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
+        echo "Prepared sd-img environment with files copied to all subdirectories"
+        ls -la scripts/sd-fuse/${DIST_DIR}/boot/
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
@@ -486,7 +476,7 @@ jobs:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
     steps:
-    # 与 build_manual 完全相同，仅 matrix 固定
+    # 与 build_manual 完全相同
     - name: Show build configuration
       run: |
         echo "Auto building version: ${{ matrix.VERSION }}, type: ${{ matrix.SET }}"
@@ -787,25 +777,16 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 准备 sd-img 环境（绝对路径符号链接） ----------
+    # ---------- 准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ABS_PATH=$(pwd)
-        rm -rf scripts/sd-fuse/device scripts/sd-fuse/configs scripts/sd-fuse/.current_config.mk scripts/sd-fuse/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
-
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        rm -rf scripts/sd-fuse/${DIST_DIR}/device scripts/sd-fuse/${DIST_DIR}/configs scripts/sd-fuse/${DIST_DIR}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/${DIST_DIR}/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/${DIST_DIR}/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/.config
-        echo "Prepared sd-img environment with absolute symlinks"
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
+        find scripts/sd-fuse/${DIST_DIR} -type d -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
+        echo "Prepared sd-img environment with files copied to all subdirectories"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
