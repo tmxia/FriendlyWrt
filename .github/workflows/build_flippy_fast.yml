@@ -26,7 +26,7 @@ on:
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
-        default: 'false'
+        default: 'true'
         type: choice
         options:
           - 'false'
@@ -379,36 +379,19 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：使用绝对路径符号链接（替代复制） ----------
+    # ---------- 关键修复：将配置文件实际复制到所有所需目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ABS_PATH=$(pwd)
-        # 在 sd-fuse 根目录创建符号链接
-        rm -rf scripts/sd-fuse/device scripts/sd-fuse/configs scripts/sd-fuse/.current_config.mk scripts/sd-fuse/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
-
-        # 在 DIST_DIR 及其所有一级子目录创建符号链接（避免递归）
+        # 复制到 sd-fuse 根目录
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
+        # 复制到 DIST_DIR
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        rm -rf scripts/sd-fuse/${DIST_DIR}/device scripts/sd-fuse/${DIST_DIR}/configs scripts/sd-fuse/${DIST_DIR}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/${DIST_DIR}/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/${DIST_DIR}/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/.config
-
-        # 在 DIST_DIR 的所有一级子目录（如 boot, dtb）创建符号链接
-        find scripts/sd-fuse/${DIST_DIR} -mindepth 1 -maxdepth 1 -type d | while read -r dir; do
-          rm -rf "$dir/device" "$dir/configs" "$dir/.current_config.mk" "$dir/.config"
-          ln -s ${ABS_PATH}/device "$dir/device"
-          ln -s ${ABS_PATH}/configs "$dir/configs"
-          ln -s ${ABS_PATH}/.current_config.mk "$dir/.current_config.mk"
-          ln -s ${ABS_PATH}/friendlywrt/.config "$dir/.config"
-        done
-        echo "Prepared sd-img environment with absolute symlinks"
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
+        # 复制到 DIST_DIR 的所有一级子目录（boot, dtb 等）
+        find scripts/sd-fuse/${DIST_DIR} -mindepth 1 -maxdepth 1 -type d -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
+        echo "Prepared sd-img environment with files copied to all subdirectories"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
@@ -734,34 +717,16 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：使用绝对路径符号链接 ----------
+    # ---------- 关键修复：将配置文件实际复制到所有所需目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ABS_PATH=$(pwd)
-        rm -rf scripts/sd-fuse/device scripts/sd-fuse/configs scripts/sd-fuse/.current_config.mk scripts/sd-fuse/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/.config
-
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        rm -rf scripts/sd-fuse/${DIST_DIR}/device scripts/sd-fuse/${DIST_DIR}/configs scripts/sd-fuse/${DIST_DIR}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.config
-        ln -s ${ABS_PATH}/device scripts/sd-fuse/${DIST_DIR}/device
-        ln -s ${ABS_PATH}/configs scripts/sd-fuse/${DIST_DIR}/configs
-        ln -s ${ABS_PATH}/.current_config.mk scripts/sd-fuse/${DIST_DIR}/.current_config.mk
-        ln -s ${ABS_PATH}/friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/.config
-
-        # 在 DIST_DIR 的所有一级子目录（如 boot, dtb）创建符号链接
-        find scripts/sd-fuse/${DIST_DIR} -mindepth 1 -maxdepth 1 -type d | while read -r dir; do
-          rm -rf "$dir/device" "$dir/configs" "$dir/.current_config.mk" "$dir/.config"
-          ln -s ${ABS_PATH}/device "$dir/device"
-          ln -s ${ABS_PATH}/configs "$dir/configs"
-          ln -s ${ABS_PATH}/.current_config.mk "$dir/.current_config.mk"
-          ln -s ${ABS_PATH}/friendlywrt/.config "$dir/.config"
-        done
-        echo "Prepared sd-img environment with absolute symlinks"
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
+        find scripts/sd-fuse/${DIST_DIR} -mindepth 1 -maxdepth 1 -type d -exec cp -r device configs .current_config.mk friendlywrt/.config {} \;
+        echo "Prepared sd-img environment with files copied to all subdirectories"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
