@@ -386,7 +386,7 @@ jobs:
           fi
         done < /tmp/sd_fuse_dirs.txt
         
-        # 2. 修改所有 .current_config.mk 文件中的 device/friendlyelec 为绝对路径
+        # 2. 修改所有 .current_config.mk 文件中的 device/friendlyelec 为绝对路径（仅一次）
         find . -name ".current_config.mk" -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
         
         # 3. 在所有脚本中替换相对路径为绝对路径
@@ -413,15 +413,14 @@ jobs:
         fi
         echo "Prepared sd-img environment with absolute path substitutions and cd $TOPDIR in sd-img"
 
-    # ---------- 执行 sd-img（执行前再次替换 .current_config.mk） ----------
+    # ---------- 执行 sd-img（不再重复修改 .current_config.mk） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$(pwd)
-        # 再次确保 .current_config.mk 中的路径是绝对路径
-        find . -name ".current_config.mk" -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
+        # 注意：此处已删除重复的 find 替换命令，避免路径双重拼接
         echo "Current directory: $(pwd)"
         ./build.sh sd-img
         mv out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -761,13 +760,14 @@ jobs:
         fi
         echo "Prepared sd-img environment"
 
+    # ---------- 执行 sd-img（不再重复修改 .current_config.mk） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$(pwd)
-        find . -name ".current_config.mk" -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
+        # 注意：此处已删除重复的 find 替换命令，避免路径双重拼接
         echo "Current directory: $(pwd)"
         ./build.sh sd-img
         mv out/${{ steps.config.outputs.img_filename }} ../artifact/
