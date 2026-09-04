@@ -274,15 +274,21 @@ jobs:
         tar xzf "../artifact/$ROOTFS_FILE" --strip-components=3 -C friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
         # 创建 packages 目录（sd-img 可能需要）
         mkdir -p friendlywrt/bin/targets/rockchip/armv8/packages
-        # 复制 os-release 和 rom-version 等（如果缺失，创建占位）
-        if [ -f friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release ]; then
-          echo "os-release found"
-        else
-          echo "Creating placeholder os-release"
+        # 创建 os-release 占位（如果缺失）
+        if [ ! -f friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release ]; then
           mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib
           echo "ID=openwrt" > friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release
         fi
         echo "Official rootfs prepared at friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+
+    # ---------- 编译 u-boot 并创建内核标志 ----------
+    - name: Compile uboot and fake kernel build
+      run: |
+        cd project
+        ./build.sh uboot
+        mkdir -p friendlywrt/kernel
+        touch friendlywrt/kernel/.built
+        echo "U-boot compiled and fake kernel build marker created."
 
     # ---------- flippy 内核替换 ----------
     - name: Get latest flippy kernel version
@@ -609,6 +615,14 @@ jobs:
           echo "ID=openwrt" > friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release
         fi
         echo "Official rootfs prepared"
+
+    - name: Compile uboot and fake kernel build
+      run: |
+        cd project
+        ./build.sh uboot
+        mkdir -p friendlywrt/kernel
+        touch friendlywrt/kernel/.built
+        echo "U-boot compiled and fake kernel build marker created."
 
     - name: Get latest flippy kernel version
       id: flippy_version
