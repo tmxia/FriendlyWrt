@@ -268,27 +268,29 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        # 创建官方 rootfs 目录
         mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
-        # 解压 rootfs 包到该目录（strip 3 层路径）
         tar xzf "../artifact/$ROOTFS_FILE" --strip-components=3 -C friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
-        # 创建 packages 目录（sd-img 可能需要）
         mkdir -p friendlywrt/bin/targets/rockchip/armv8/packages
-        # 创建 os-release 占位（如果缺失）
         if [ ! -f friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release ]; then
           mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib
           echo "ID=openwrt" > friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release
         fi
-        echo "Official rootfs prepared at friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        echo "Official rootfs prepared"
 
-    # ---------- 编译 u-boot 并创建内核标志 ----------
-    - name: Compile uboot and fake kernel build
+    # ---------- 编译 uboot 并绕过 kernel 检查 ----------
+    - name: Compile uboot and disable kernel check
       run: |
         cd project
         ./build.sh uboot
+        # 查找并修改所有包含 "please build kernel first" 的脚本，强制 exit 0
+        grep -r -l "please build kernel first" . 2>/dev/null | while read -r file; do
+          echo "Patching $file to skip kernel build check"
+          sed -i '/please build kernel first/{ s/exit 1/exit 0/g; }' "$file"
+        done
+        # 创建假的 kernel 目录和标志
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
-        echo "U-boot compiled and fake kernel build marker created."
+        echo "U-boot compiled and kernel check disabled."
 
     # ---------- flippy 内核替换 ----------
     - name: Get latest flippy kernel version
@@ -343,15 +345,12 @@ jobs:
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         echo "Deploying flippy kernel to scripts/sd-fuse/${DIST_DIR}"
 
-        # 覆盖 boot 文件
         mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
         tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
 
-        # 覆盖 dtb 文件
         mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
         tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
-        # 提取 modules 供注入
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
@@ -616,13 +615,17 @@ jobs:
         fi
         echo "Official rootfs prepared"
 
-    - name: Compile uboot and fake kernel build
+    - name: Compile uboot and disable kernel check
       run: |
         cd project
         ./build.sh uboot
+        grep -r -l "please build kernel first" . 2>/dev/null | while read -r file; do
+          echo "Patching $file to skip kernel build check"
+          sed -i '/please build kernel first/{ s/exit 1/exit 0/g; }' "$file"
+        done
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
-        echo "U-boot compiled and fake kernel build marker created."
+        echo "U-boot compiled and kernel check disabled."
 
     - name: Get latest flippy kernel version
       id: flippy_version
