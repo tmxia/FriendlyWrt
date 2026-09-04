@@ -277,20 +277,24 @@ jobs:
         fi
         echo "Official rootfs prepared"
 
-    # ---------- 编译 uboot 并绕过 kernel 检查 ----------
+    # ---------- 编译 uboot 并彻底删除内核检查 ----------
     - name: Compile uboot and disable kernel check
       run: |
         cd project
         ./build.sh uboot
-        # 查找并修改所有包含 "please build kernel first" 的脚本，强制 exit 0
-        grep -r -l "please build kernel first" . 2>/dev/null | while read -r file; do
-          echo "Patching $file to skip kernel build check"
-          sed -i '/please build kernel first/{ s/exit 1/exit 0/g; }' "$file"
-        done
-        # 创建假的 kernel 目录和标志
+        # 直接从 build.sh 中删除所有包含 "please build kernel first" 的行
+        sed -i '/please build kernel first/d' build.sh
+        # 确保删除成功
+        if grep -q "please build kernel first" build.sh; then
+          echo "WARNING: kernel check still exists, trying alternative method"
+          sed -i '/please build kernel first/{ s/exit 1/exit 0/g; }' build.sh
+        else
+          echo "Successfully removed kernel check from build.sh"
+        fi
+        # 创建假的内核目录和标志文件（作为额外保险）
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
-        echo "U-boot compiled and kernel check disabled."
+        echo "U-boot compiled and kernel check completely disabled."
 
     # ---------- flippy 内核替换 ----------
     - name: Get latest flippy kernel version
@@ -377,7 +381,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境（复制 device/configs 等） ----------
+    # ---------- 准备 sd-img 环境（复制 device/configs 等到所有子目录） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -619,13 +623,16 @@ jobs:
       run: |
         cd project
         ./build.sh uboot
-        grep -r -l "please build kernel first" . 2>/dev/null | while read -r file; do
-          echo "Patching $file to skip kernel build check"
-          sed -i '/please build kernel first/{ s/exit 1/exit 0/g; }' "$file"
-        done
+        sed -i '/please build kernel first/d' build.sh
+        if grep -q "please build kernel first" build.sh; then
+          echo "WARNING: kernel check still exists, trying alternative method"
+          sed -i '/please build kernel first/{ s/exit 1/exit 0/g; }' build.sh
+        else
+          echo "Successfully removed kernel check from build.sh"
+        fi
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
-        echo "U-boot compiled and kernel check disabled."
+        echo "U-boot compiled and kernel check completely disabled."
 
     - name: Get latest flippy kernel version
       id: flippy_version
