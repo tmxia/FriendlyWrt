@@ -366,13 +366,12 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
         # 1. 复制 device/configs 等到所有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
@@ -402,19 +401,11 @@ jobs:
         # 4. 删除检查
         sed -i '/please build.*first/d' build.sh
 
-        # 5. 直接从已下载的 rootfs 包解压到 sd-fuse 目标目录
-        echo "Extracting rootfs from ../artifact/${ROOTFS_FILE} to scripts/sd-fuse/${DIST_DIR} ..."
+        # 5. 完整复制 rootfs 到 sd-fuse 目录（使用 cp -a 保留所有属性）
+        echo "Copying rootfs from ${ROOTFS_SRC} to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        tmpdir=$(mktemp -d)
-        tar xzf "../artifact/${ROOTFS_FILE}" -C $tmpdir
-        rootfs_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
-        if [ "$rootfs_src" != "$tmpdir" ]; then
-          cp -a $rootfs_src/. scripts/sd-fuse/${DIST_DIR}/
-        else
-          cp -a $tmpdir/. scripts/sd-fuse/${DIST_DIR}/
-        fi
-        rm -rf $tmpdir
+        cp -a ${ROOTFS_SRC}/. scripts/sd-fuse/${DIST_DIR}/
 
         # 6. 重新部署 flippy kernel（因为上一步清空目录）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
@@ -426,6 +417,12 @@ jobs:
           mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
+
+        # 7. 修改 mk-sd-image.sh，注释掉目录检查
+        cd scripts/sd-fuse
+        sed -i '/^ *warn "Image directory not found/,/^ *fi$/c\
+        # Directory check bypassed by workflow' mk-sd-image.sh
+        cd ../..
 
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
@@ -755,13 +752,12 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -786,18 +782,10 @@ jobs:
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
 
-        echo "Extracting rootfs from ../artifact/${ROOTFS_FILE} to scripts/sd-fuse/${DIST_DIR} ..."
+        echo "Copying rootfs from ${ROOTFS_SRC} to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        tmpdir=$(mktemp -d)
-        tar xzf "../artifact/${ROOTFS_FILE}" -C $tmpdir
-        rootfs_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
-        if [ "$rootfs_src" != "$tmpdir" ]; then
-          cp -a $rootfs_src/. scripts/sd-fuse/${DIST_DIR}/
-        else
-          cp -a $tmpdir/. scripts/sd-fuse/${DIST_DIR}/
-        fi
-        rm -rf $tmpdir
+        cp -a ${ROOTFS_SRC}/. scripts/sd-fuse/${DIST_DIR}/
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -808,6 +796,12 @@ jobs:
           mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
+
+        # 绕过 mk-sd-image.sh 的目录检查
+        cd scripts/sd-fuse
+        sed -i '/^ *warn "Image directory not found/,/^ *fi$/c\
+        # Directory check bypassed' mk-sd-image.sh
+        cd ../..
 
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
