@@ -366,16 +366,13 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修改：替换 build.sh 的 sd-img 函数 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        TGZ_FILE="${{ steps.config.outputs.archive_filename }}"
 
-        # 1. 复制必要的文件到 sd-fuse 子目录
+        # 1. 复制 device/configs 等到所有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -384,7 +381,7 @@ jobs:
           fi
         done < /tmp/sd_fuse_dirs.txt
         
-        # 2. 替换路径
+        # 2. 替换相对路径为绝对路径
         find . -name ".current_config.mk" -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
         grep -l -r "device/friendlyelec" . --include="*.sh" --include="build.sh" --include="*.mk" 2>/dev/null | while read -r file; do
           sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" "$file"
@@ -400,17 +397,16 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # 4. 删除 build.sh 中的检查
+        # 4. 删除检查
         sed -i '/please build.*first/d' build.sh
 
-        # 5. 准备完整的 rootfs
+        # 5. 复制完整的 rootfs 到 sd-fuse（使用 cp -a 保留权限）
         echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        # 使用 cp -a 保留权限和链接
         cp -a friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/. scripts/sd-fuse/${DIST_DIR}/
 
-        # 6. 重新部署 flippy kernel boot/dtb（确保它们存在）
+        # 6. 重新部署 flippy kernel（因为上一步清空目录）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -421,42 +417,27 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 7. 替换 build.sh 中的 sd-img 函数为自定义实现
-        echo "Replacing sd-img function in build.sh with custom implementation..."
-        sed -i '/^sd-img()/,/^}/c\
-sd-img() {\
-    echo "=== Custom sd-img implementation ==="\
-    echo "TOP DIR: $TOPDIR"\
-    echo "DIST_DIR: ${DIST_DIR}"\
-    echo "IMG_FILE: ${IMG_FILE}"\
-    cd ${TOPDIR}/scripts/sd-fuse || { echo "ERROR: Cannot cd to sd-fuse"; exit 1; }\
-    echo "Current dir: $(pwd)"\
-    echo "Checking directory: ${DIST_DIR}"\
-    if [ ! -d "${DIST_DIR}" ]; then\
-        echo "ERROR: Directory ${DIST_DIR} not found, listing..."\
-        ls -la\
-        exit 1\
-    fi\
-    echo "Directory ${DIST_DIR} found, contents:"\
-    ls -la ${DIST_DIR}/\
-    echo "Running mk-sd-image.sh..."\
-    ./mk-sd-image.sh "${DIST_DIR}" "../../out/${IMG_FILE}" || { echo "mk-sd-image.sh failed"; exit 1; }\
-    echo "Image created: out/${IMG_FILE}"\
-    cd ${TOPDIR}\
-}' build.sh
+        echo "Prepared sd-img environment"
 
-        echo "Prepared sd-img environment with custom sd-img function"
-
-    # ---------- 执行 sd-img（现在使用自定义函数） ----------
+    # ---------- 直接调用 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
-        echo "Current directory: $(pwd)"
-        ./build.sh sd-img
-        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        mkdir -p out
+        cd scripts/sd-fuse
+        echo "Running mk-sd-image.sh from sd-fuse directory..."
+        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ../../out/${{ steps.config.outputs.img_filename }}
+        cd ../..
+        if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
+          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        else
+          echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
+          exit 1
+        fi
 
         # 打包 tgz
         cd scripts/sd-fuse
@@ -767,8 +748,6 @@ sd-img() {\
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        TGZ_FILE="${{ steps.config.outputs.archive_filename }}"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -788,7 +767,7 @@ sd-img() {\
         grep -l -r "configs/rockchip" . --include="*.sh" --include="build.sh" --include="*.mk" 2>/dev/null | while read -r file; do
           sed -i "s|configs/rockchip|${TOPDIR}/configs/rockchip|g" "$file"
         done
-
+        
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
@@ -808,41 +787,27 @@ sd-img() {\
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        echo "Replacing sd-img function in build.sh with custom implementation..."
-        sed -i '/^sd-img()/,/^}/c\
-sd-img() {\
-    echo "=== Custom sd-img implementation ==="\
-    echo "TOP DIR: $TOPDIR"\
-    echo "DIST_DIR: ${DIST_DIR}"\
-    echo "IMG_FILE: ${IMG_FILE}"\
-    cd ${TOPDIR}/scripts/sd-fuse || { echo "ERROR: Cannot cd to sd-fuse"; exit 1; }\
-    echo "Current dir: $(pwd)"\
-    echo "Checking directory: ${DIST_DIR}"\
-    if [ ! -d "${DIST_DIR}" ]; then\
-        echo "ERROR: Directory ${DIST_DIR} not found, listing..."\
-        ls -la\
-        exit 1\
-    fi\
-    echo "Directory ${DIST_DIR} found, contents:"\
-    ls -la ${DIST_DIR}/\
-    echo "Running mk-sd-image.sh..."\
-    ./mk-sd-image.sh "${DIST_DIR}" "../../out/${IMG_FILE}" || { echo "mk-sd-image.sh failed"; exit 1; }\
-    echo "Image created: out/${IMG_FILE}"\
-    cd ${TOPDIR}\
-}' build.sh
+        echo "Prepared sd-img environment"
 
-        echo "Prepared sd-img environment with custom sd-img function"
-
-    # ---------- 执行 sd-img ----------
+    # ---------- 直接调用 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
-        echo "Current directory: $(pwd)"
-        ./build.sh sd-img
-        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        mkdir -p out
+        cd scripts/sd-fuse
+        echo "Running mk-sd-image.sh from sd-fuse directory..."
+        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ../../out/${{ steps.config.outputs.img_filename }}
+        cd ../..
+        if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
+          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        else
+          echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
+          exit 1
+        fi
 
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
