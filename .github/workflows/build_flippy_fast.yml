@@ -366,7 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ========== 核心修复：准备 sd-img 环境 ==========
+    # ---------- 准备 sd-img 环境（不再修改 mk-sd-image.sh） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -404,30 +404,11 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 5. 修改 mk-sd-image.sh 彻底消除交互和检查
-        cd scripts/sd-fuse
-        # 备份原脚本
-        cp mk-sd-image.sh mk-sd-image.sh.bak
-        # 注释掉所有 read 命令
-        sed -i 's/^[[:space:]]*read /# read /g' mk-sd-image.sh
-        # 将目录检查从报错改为自动创建目录
-        sed -i 's/if \[ ! -d "\$1" \]/if [ ! -d "$1" ]; then mkdir -p "$1"; fi/g' mk-sd-image.sh
-        # 删除所有包含 "warn" 和 "exit" 的行（小心不要删除重要的 exit）
-        # 但更安全：注释掉所有 warn 和 exit 1
-        sed -i 's/^[[:space:]]*warn /# warn /g' mk-sd-image.sh
-        sed -i 's/^[[:space:]]*exit 1/# exit 1/g' mk-sd-image.sh
-        # 确保脚本非交互
-        sed -i 's/^[[:space:]]*read -p/# read -p/g' mk-sd-image.sh
-        # 将任何询问下载的提示替换为自动同意
-        sed -i 's/Do you want to download it now? (Y\/N):/echo "Y" | /g' mk-sd-image.sh
-        cd ../..
-
-        echo "Modified mk-sd-image.sh to be non-interactive"
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment"
+        echo "Prepared sd-img environment (using build-sd-image.sh directly)"
 
-    # ---------- 直接执行 mk-sd-image.sh（非交互式） ----------
+    # ---------- 直接调用 build-sd-image.sh（绕过 mk-sd-image.sh 检查） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -437,8 +418,8 @@ jobs:
         export DEBIAN_FRONTEND=noninteractive
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running mk-sd-image.sh in non-interactive mode..."
-        yes "" | ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running build-sd-image.sh directly (bypassing mk-sd-image.sh checks)..."
+        ./build-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -753,7 +734,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ========== 核心修复：准备 sd-img 环境 ==========
+    # ---------- 准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -787,23 +768,11 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 修改 mk-sd-image.sh 彻底消除交互
-        cd scripts/sd-fuse
-        cp mk-sd-image.sh mk-sd-image.sh.bak
-        sed -i 's/^[[:space:]]*read /# read /g' mk-sd-image.sh
-        sed -i 's/if \[ ! -d "\$1" \]/if [ ! -d "$1" ]; then mkdir -p "$1"; fi/g' mk-sd-image.sh
-        sed -i 's/^[[:space:]]*warn /# warn /g' mk-sd-image.sh
-        sed -i 's/^[[:space:]]*exit 1/# exit 1/g' mk-sd-image.sh
-        sed -i 's/^[[:space:]]*read -p/# read -p/g' mk-sd-image.sh
-        sed -i 's/Do you want to download it now? (Y\/N):/echo "Y" | /g' mk-sd-image.sh
-        cd ../..
-
-        echo "Modified mk-sd-image.sh to be non-interactive"
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment"
+        echo "Prepared sd-img environment (using build-sd-image.sh directly)"
 
-    # ---------- 直接执行 mk-sd-image.sh（非交互式） ----------
+    # ---------- 直接调用 build-sd-image.sh ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -813,8 +782,8 @@ jobs:
         export DEBIAN_FRONTEND=noninteractive
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running mk-sd-image.sh in non-interactive mode..."
-        yes "" | ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running build-sd-image.sh directly..."
+        ./build-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
