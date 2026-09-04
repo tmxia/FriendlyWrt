@@ -366,7 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境（不再修改 mk-sd-image.sh） ----------
+    # ---------- 准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -406,9 +406,9 @@ jobs:
 
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment (using build-sd-image.sh directly)"
+        echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 build-sd-image.sh（绕过 mk-sd-image.sh 检查） ----------
+    # ---------- 直接调用 build-sd-image.sh（核心脚本，无交互检查） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -770,7 +770,7 @@ jobs:
 
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment (using build-sd-image.sh directly)"
+        echo "Prepared sd-img environment"
 
     # ---------- 直接调用 build-sd-image.sh ----------
     - name: Build sd image with flippy kernel
