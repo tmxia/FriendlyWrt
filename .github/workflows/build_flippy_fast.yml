@@ -380,12 +380,12 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：物理复制并修改 sd-img 脚本 ----------
+    # ---------- 关键修复：物理复制并彻底修改所有相关脚本 ----------
     - name: Prepare sd-img environment
       run: |
         set -x
         cd project
-        # 1. 物理复制 device, configs, .current_config.mk, .config 到所有子目录
+        # 1. 物理复制到所有现有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -394,18 +394,27 @@ jobs:
           fi
         done < /tmp/sd_fuse_dirs.txt
 
-        # 2. 修改 sd-img 脚本，使用绝对路径
-        # 查找所有可能名为 sd-img 的脚本（包括 build.sh 调用的脚本）
-        find scripts -name "sd-img" -type f | while read -r script; do
-          echo "Patching $script"
-          # 将 device/friendlyelec 替换为 ${TOPDIR}/device/friendlyelec
+        # 2. 查找所有可能涉及 device/friendlyelec 或 .current_config.mk 的脚本（包括 build.sh 和 scripts 目录下）
+        grep -l -r "device/friendlyelec" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
+          echo "Patching $script for device/friendlyelec"
           sed -i 's|device/friendlyelec|${TOPDIR}/device/friendlyelec|g' "$script"
-          # 将 .current_config.mk 替换为 ${TOPDIR}/.current_config.mk
+        done
+        grep -l -r "\.current_config\.mk" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
+          echo "Patching $script for .current_config.mk"
           sed -i 's|\.current_config\.mk|${TOPDIR}/.current_config.mk|g' "$script"
-          # 将 configs 替换为 ${TOPDIR}/configs（如果存在）
+        done
+        grep -l -r "configs/rockchip" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
+          echo "Patching $script for configs/rockchip"
           sed -i 's|configs/rockchip|${TOPDIR}/configs/rockchip|g' "$script"
         done
-        echo "Prepared sd-img environment with physical copies and patched scripts"
+
+        # 3. 额外在 build.sh 中插入强制 cd 到 TOPDIR 的代码（在 sd-img 目标前）
+        if grep -q "sd-img)" build.sh; then
+          sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
+          echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
+        fi
+
+        echo "Prepared sd-img environment with physical copies and patched all scripts"
 
     # ---------- 验证关键目录 ----------
     - name: Verify device directory for sd-img
@@ -763,13 +772,24 @@ jobs:
           fi
         done < /tmp/sd_fuse_dirs.txt
 
-        find scripts -name "sd-img" -type f | while read -r script; do
-          echo "Patching $script"
+        grep -l -r "device/friendlyelec" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
+          echo "Patching $script for device/friendlyelec"
           sed -i 's|device/friendlyelec|${TOPDIR}/device/friendlyelec|g' "$script"
+        done
+        grep -l -r "\.current_config\.mk" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
+          echo "Patching $script for .current_config.mk"
           sed -i 's|\.current_config\.mk|${TOPDIR}/.current_config.mk|g' "$script"
+        done
+        grep -l -r "configs/rockchip" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
+          echo "Patching $script for configs/rockchip"
           sed -i 's|configs/rockchip|${TOPDIR}/configs/rockchip|g' "$script"
         done
-        echo "Prepared sd-img environment with physical copies and patched scripts"
+
+        if grep -q "sd-img)" build.sh; then
+          sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
+          echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
+        fi
+        echo "Prepared sd-img environment with physical copies and patched all scripts"
 
     - name: Verify device directory for sd-img
       run: |
