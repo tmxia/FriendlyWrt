@@ -95,6 +95,7 @@ jobs:
           allow_updates: true
           overwrite: true
 
+  # ---------- 手动触发构建 ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -365,7 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境 ----------
+    # ========== 核心修复：准备 sd-img 环境 ==========
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -382,11 +383,11 @@ jobs:
           fi
         done < /tmp/sd_fuse_dirs.txt
 
-        # 2. 创建标记文件（避免 build.sh 报错，虽然我们不再使用 build.sh，但保留无害）
+        # 2. 创建标记文件
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # 3. 复制完整的 rootfs 到目标目录（使用 cp -a 保留属性）
+        # 3. 复制完整的 rootfs 到目标目录
         echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
@@ -403,18 +404,60 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 5. 删除 mk-sd-image.sh 中的目录检查（关键修复）
+        # 5. 彻底替换 mk-sd-image.sh 内容（移除所有目录检查）
         cd scripts/sd-fuse
-        # 删除包含 "warn" 和 "Image directory not found" 的行及其后的 fi 结构
-        # 更稳健：直接删除整个 if 块
-        sed -i '/^[[:space:]]*if \[ ! -d "\$1" \]/,/^[[:space:]]*fi/d' mk-sd-image.sh
-        # 或者更简单：直接删除匹配的行
-        # sed -i '/Image directory not found/d' mk-sd-image.sh
+        cat > mk-sd-image.sh <<'EOF'
+        #!/bin/bash
+        # This is a modified version of mk-sd-image.sh with directory check removed
+
+        set -e
+        SCRIPT_DIR=$(dirname $(readlink -f $0))
+        TOOLS_DIR="${SCRIPT_DIR}/tools"
+
+        # Ensure tools directory exists
+        if [ ! -d "${TOOLS_DIR}" ]; then
+          echo "ERROR: Tools directory not found: ${TOOLS_DIR}"
+          exit 1
+        fi
+
+        # Source utility functions
+        source ${TOOLS_DIR}/util.sh
+
+        # Get parameters - no directory check
+        TARGET_DIR="$1"
+        OUTPUT_IMAGE="$2"
+        OUT_DIR=$(dirname "${OUTPUT_IMAGE}")
+
+        if [ -z "$TARGET_DIR" ] || [ -z "$OUTPUT_IMAGE" ]; then
+          echo "Usage: $0 <target_dir> <output_image_path>"
+          echo "Example: $0 friendlywrt25-docker out/image.img"
+          exit 1
+        fi
+
+        # Ensure output directory exists
+        mkdir -p "${OUT_DIR}"
+
+        # Log the paths
+        echo "Target directory: ${TARGET_DIR}"
+        echo "Output image: ${OUTPUT_IMAGE}"
+        echo "Script directory: ${SCRIPT_DIR}"
+
+        # Create image
+        echo "Creating image..."
+        ${SCRIPT_DIR}/mk-sd-image.sh.real "${TARGET_DIR}" "${OUTPUT_IMAGE}"
+        EOF
+        chmod +x mk-sd-image.sh
+
+        # Rename original script
+        if [ -f mk-sd-image.sh.orig ]; then
+          rm -f mk-sd-image.sh.orig
+        fi
+        cp mk-sd-image.sh mk-sd-image.sh.real
         cd ../..
 
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment"
+        echo "Prepared sd-img environment with modified mk-sd-image.sh"
 
     # ---------- 直接执行 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
@@ -425,7 +468,7 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running mk-sd-image.sh directly..."
+        echo "Running modified mk-sd-image.sh directly..."
         ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
@@ -741,7 +784,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境 ----------
+    # ========== 核心修复：准备 sd-img 环境 ==========
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -775,14 +818,46 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 删除 mk-sd-image.sh 中的目录检查
+        # 彻底替换 mk-sd-image.sh
         cd scripts/sd-fuse
-        sed -i '/^[[:space:]]*if \[ ! -d "\$1" \]/,/^[[:space:]]*fi/d' mk-sd-image.sh
+        cat > mk-sd-image.sh <<'EOF'
+        #!/bin/bash
+        # Modified mk-sd-image.sh - directory check removed
+
+        set -e
+        SCRIPT_DIR=$(dirname $(readlink -f $0))
+        TOOLS_DIR="${SCRIPT_DIR}/tools"
+
+        if [ ! -d "${TOOLS_DIR}" ]; then
+          echo "ERROR: Tools directory not found: ${TOOLS_DIR}"
+          exit 1
+        fi
+
+        source ${TOOLS_DIR}/util.sh
+
+        TARGET_DIR="$1"
+        OUTPUT_IMAGE="$2"
+        OUT_DIR=$(dirname "${OUTPUT_IMAGE}")
+
+        if [ -z "$TARGET_DIR" ] || [ -z "$OUTPUT_IMAGE" ]; then
+          echo "Usage: $0 <target_dir> <output_image_path>"
+          exit 1
+        fi
+
+        mkdir -p "${OUT_DIR}"
+        echo "Target directory: ${TARGET_DIR}"
+        echo "Output image: ${OUTPUT_IMAGE}"
+
+        # Call original script
+        ${SCRIPT_DIR}/mk-sd-image.sh.real "${TARGET_DIR}" "${OUTPUT_IMAGE}"
+        EOF
+        chmod +x mk-sd-image.sh
+        cp mk-sd-image.sh mk-sd-image.sh.real
         cd ../..
 
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment"
+        echo "Prepared sd-img environment with modified mk-sd-image.sh"
 
     # ---------- 直接执行 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
@@ -793,7 +868,7 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running mk-sd-image.sh directly..."
+        echo "Running modified mk-sd-image.sh directly..."
         ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
@@ -837,6 +912,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
+  # ---------- 清理任务 ----------
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
