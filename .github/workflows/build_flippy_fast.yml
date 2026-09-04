@@ -225,7 +225,7 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 核心：下载 rootfs 包（若无则报错退出） ----------
+    # ---------- 核心：下载 rootfs 包（搜索近两天） ----------
     - name: Download rootfs package (required)
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -233,32 +233,36 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
-        # 首先检查当前 release
-        if gh release view "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
-          echo "Downloading existing rootfs package $ROOTFS_FILE from current release"
-          gh release download "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
-        else
-          # 搜索当天其他 release
-          echo "Current release does not have $ROOTFS_FILE, searching other releases with tag prefix $BASE_TAG"
-          TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r)
-          FOUND=false
+        # 生成近两天的日期前缀列表（当天、昨天、前天）
+        DATES=(
+          $(date +%Y-%m-%d)
+          $(date -d "1 day ago" +%Y-%m-%d)
+          $(date -d "2 days ago" +%Y-%m-%d)
+        )
+        FOUND=false
+        for DATE in "${DATES[@]}"; do
+          BASE_TAG="FriendlyWrt-flippy-${DATE}"
+          # 检查当前 release 是否有该前缀
+          if gh release view "$BASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -q "^${ROOTFS_FILE}$"; then
+            echo "Found $ROOTFS_FILE in release $BASE_TAG, downloading..."
+            gh release download "$BASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
+            FOUND=true
+            break
+          fi
+          # 如果精确匹配失败，尝试带后缀的（如 -1, -2）
+          TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r || true)
           for tag in $TAGS; do
-            if [ "$tag" == "${{ needs.prepare_release.outputs.release_tag }}" ]; then
-              continue
-            fi
-            echo "Checking release $tag for $ROOTFS_FILE"
             if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
               echo "Found $ROOTFS_FILE in release $tag, downloading..."
               gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
               FOUND=true
-              break
+              break 2
             fi
           done
-          if [ "$FOUND" = "false" ]; then
-            echo "ERROR: No rootfs package found in any release. Please run a full build first to generate rootfs-friendlywrt-*.tgz."
-            exit 1
-          fi
+        done
+        if [ "$FOUND" = "false" ]; then
+          echo "ERROR: No rootfs package found in any release (checked dates: ${DATES[*]}). Please run a full build first to generate rootfs-friendlywrt-*.tgz."
+          exit 1
         fi
 
     # ---------- 后续步骤：解包、替换内核、生成镜像 ----------
@@ -379,16 +383,13 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：物理复制到所有子目录（先收集列表，避免递归） ----------
+    # ---------- 关键修复：物理复制到所有子目录 ----------
     - name: Prepare sd-img environment
       run: |
         set -x
         cd project
-        # 收集所有子目录列表
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
-        # 复制到根目录
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        # 循环复制到每个子目录（跳过根目录）
         while read -r dir; do
           if [ "$dir" != "scripts/sd-fuse" ]; then
             cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
@@ -413,13 +414,6 @@ jobs:
         else
           echo "ERROR: scripts/sd-fuse/friendlywrt25-docker/device/friendlyelec not found"
           ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
-          exit 1
-        fi
-        if [ -d "scripts/sd-fuse/friendlywrt25-docker/boot/device/friendlyelec" ]; then
-          echo "OK: scripts/sd-fuse/friendlywrt25-docker/boot/device/friendlyelec exists"
-        else
-          echo "ERROR: scripts/sd-fuse/friendlywrt25-docker/boot/device/friendlyelec not found"
-          ls -la scripts/sd-fuse/friendlywrt25-docker/boot/ || echo "boot not found"
           exit 1
         fi
         echo "All critical device directories verified."
@@ -602,30 +596,33 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
-        if gh release view "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
-          echo "Downloading existing rootfs package $ROOTFS_FILE from current release"
-          gh release download "${{ needs.prepare_release.outputs.release_tag }}" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
-        else
-          echo "Current release does not have $ROOTFS_FILE, searching other releases with tag prefix $BASE_TAG"
-          TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r)
-          FOUND=false
+        DATES=(
+          $(date +%Y-%m-%d)
+          $(date -d "1 day ago" +%Y-%m-%d)
+          $(date -d "2 days ago" +%Y-%m-%d)
+        )
+        FOUND=false
+        for DATE in "${DATES[@]}"; do
+          BASE_TAG="FriendlyWrt-flippy-${DATE}"
+          if gh release view "$BASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -q "^${ROOTFS_FILE}$"; then
+            echo "Found $ROOTFS_FILE in release $BASE_TAG, downloading..."
+            gh release download "$BASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
+            FOUND=true
+            break
+          fi
+          TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r || true)
           for tag in $TAGS; do
-            if [ "$tag" == "${{ needs.prepare_release.outputs.release_tag }}" ]; then
-              continue
-            fi
-            echo "Checking release $tag for $ROOTFS_FILE"
             if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
               echo "Found $ROOTFS_FILE in release $tag, downloading..."
               gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
               FOUND=true
-              break
+              break 2
             fi
           done
-          if [ "$FOUND" = "false" ]; then
-            echo "ERROR: No rootfs package found in any release. Please run a full build first to generate rootfs-friendlywrt-*.tgz."
-            exit 1
-          fi
+        done
+        if [ "$FOUND" = "false" ]; then
+          echo "ERROR: No rootfs package found in any release (checked dates: ${DATES[*]}). Please run a full build first to generate rootfs-friendlywrt-*.tgz."
+          exit 1
         fi
 
     - name: Unpack friendlywrt rootfs
