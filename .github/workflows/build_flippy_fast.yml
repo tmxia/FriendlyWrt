@@ -366,6 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
+    # ---------- 关键修复：准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -405,14 +406,28 @@ jobs:
         # 5. 删除所有 "please build" 检查
         sed -i '/please build.*first/d' build.sh
 
-        # 6. 复制完整的 rootfs 到 sd-fuse 目录（强制覆盖）
+        # 6. 复制完整的 rootfs 到 sd-fuse 目录（强制覆盖，使用 . 确保复制所有内容）
         echo "Copying complete rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -rf friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
+        cp -rf friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/. scripts/sd-fuse/${DIST_DIR}/
+
+        # 7. 重新部署 flippy kernel（因为上一步清空了目录，boot/dtb 被删除）
+        BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
+        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
+          echo "Re-deploying flippy kernel boot/dtb..."
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
+        else
+          echo "WARNING: Cannot find boot/dtb tarballs, kernel may be missing"
+        fi
+
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with rootfs copied."
+        echo "Prepared sd-img environment with rootfs copied and kernel re-deployed."
 
     # ---------- 直接调用 mk-sd-image.sh（切换到 sd-fuse 目录内执行） ----------
     - name: Build sd image with flippy kernel (direct)
@@ -423,7 +438,6 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         echo "Current directory: $(pwd)"
         mkdir -p out
-        # 切换到 sd-fuse 目录，使用相对路径参数
         cd scripts/sd-fuse
         echo "Running mk-sd-image.sh from sd-fuse directory..."
         ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ../../out/${{ steps.config.outputs.img_filename }}
@@ -436,7 +450,6 @@ jobs:
           exit 1
         fi
 
-        # 打包 tgz（同样在 sd-fuse 目录内操作）
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -773,12 +786,26 @@ jobs:
         echo "Copying complete rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -rf friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
+        cp -rf friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/. scripts/sd-fuse/${DIST_DIR}/
+
+        # 重新部署 kernel (因为上一步清空了目录)
+        BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
+        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
+          echo "Re-deploying flippy kernel boot/dtb..."
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
+        else
+          echo "WARNING: Cannot find boot/dtb tarballs, kernel may be missing"
+        fi
+
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with rootfs copied."
+        echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh（切换到 sd-fuse 目录内执行） ----------
+    # ---------- 直接调用 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel (direct)
       id: build_sd_image
       run: |
