@@ -95,7 +95,6 @@ jobs:
           allow_updates: true
           overwrite: true
 
-  # ---------- 手动触发构建 ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -366,14 +365,16 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境（保留原始 build.sh 逻辑） ----------
+    # ========== 核心修复：准备 sd-img 环境 ==========
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
-        # 1. 复制 device/configs 等到所有子目录（保留相对路径）
+        # 1. 复制 device/configs 等到所有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -389,20 +390,13 @@ jobs:
         # 3. 删除 build.sh 中的检查
         sed -i '/please build.*first/d' build.sh
 
-        # 4. 在 sd-img 函数开头插入 cd $TOPDIR
-        if grep -q "^sd-img()" build.sh; then
-          sed -i '/^sd-img()/a \\tcd $TOPDIR' build.sh
-        elif grep -q "^sd-img[[:space:]]*()" build.sh; then
-          sed -i '/^sd-img[[:space:]]*()/a \\tcd $TOPDIR' build.sh
-        fi
-
-        # 5. 复制完整的 rootfs 到 sd-fuse 目录
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        # 4. 直接解压 rootfs 包到目标目录（保证结构正确）
+        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/. scripts/sd-fuse/${DIST_DIR}/
+        tar xzf "../artifact/${ROOTFS_FILE}" --strip-components=3 -C scripts/sd-fuse/${DIST_DIR}
 
-        # 6. 重新部署 flippy kernel（boot/dtb）
+        # 5. 重新部署 flippy kernel（boot/dtb）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -413,9 +407,27 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
+        # 6. 生成自定义 sd-img 函数脚本
+        cat > /tmp/my_sdimg.sh <<EOF
+        #!/bin/bash
+        cd ${TOPDIR}/scripts/sd-fuse
+        ./mk-sd-image.sh ${DIST_DIR} ${TOPDIR}/out/${IMG_FILE}
+        EOF
+        chmod +x /tmp/my_sdimg.sh
+
+        # 7. 替换 build.sh 中的 sd-img 函数
+        # 删除原有的 sd-img 函数定义
+        sed -i '/^sd-img()/,/^}/d' build.sh
+        # 在文件末尾追加新函数
+        cat >> build.sh <<EOF
+        sd-img() {
+            source /tmp/my_sdimg.sh
+        }
+        EOF
+
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment (using build.sh sd-img)"
+        echo "Prepared sd-img environment with custom function"
 
     # ---------- 执行 ./build.sh sd-img ----------
     - name: Build sd image with flippy kernel
@@ -428,7 +440,6 @@ jobs:
         ./build.sh sd-img
         mv out/${{ steps.config.outputs.img_filename }} ../artifact/
 
-        # 打包 tgz
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -732,12 +743,14 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境（保留原始 build.sh 逻辑） ----------
+    # ========== 核心修复：准备 sd-img 环境 ==========
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -751,16 +764,10 @@ jobs:
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
 
-        if grep -q "^sd-img()" build.sh; then
-          sed -i '/^sd-img()/a \\tcd $TOPDIR' build.sh
-        elif grep -q "^sd-img[[:space:]]*()" build.sh; then
-          sed -i '/^sd-img[[:space:]]*()/a \\tcd $TOPDIR' build.sh
-        fi
-
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/. scripts/sd-fuse/${DIST_DIR}/
+        tar xzf "../artifact/${ROOTFS_FILE}" --strip-components=3 -C scripts/sd-fuse/${DIST_DIR}
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -772,9 +779,23 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
+        cat > /tmp/my_sdimg.sh <<EOF
+        #!/bin/bash
+        cd ${TOPDIR}/scripts/sd-fuse
+        ./mk-sd-image.sh ${DIST_DIR} ${TOPDIR}/out/${IMG_FILE}
+        EOF
+        chmod +x /tmp/my_sdimg.sh
+
+        sed -i '/^sd-img()/,/^}/d' build.sh
+        cat >> build.sh <<EOF
+        sd-img() {
+            source /tmp/my_sdimg.sh
+        }
+        EOF
+
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment (using build.sh sd-img)"
+        echo "Prepared sd-img environment with custom function"
 
     # ---------- 执行 ./build.sh sd-img ----------
     - name: Build sd image with flippy kernel
