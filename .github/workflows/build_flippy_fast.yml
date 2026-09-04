@@ -403,14 +403,10 @@ jobs:
         # 5. 删除所有 "please build" 检查
         sed -i '/please build.*first/d' build.sh
 
-        # 6. 创建符号链接使 build.sh 能找到 scripts/sd-fuse，并使 mk-sd-image.sh 能找到 tools
-        cd ..
-        rm -rf scripts tools 2>/dev/null || true
-        ln -s project/scripts scripts
-        ln -s project/scripts/sd-fuse/tools tools
-        cd project
+        # 6. 创建 tools 符号链接供 mk-sd-image.sh 使用（在 project 目录内）
+        ln -sf scripts/sd-fuse/tools tools
 
-        echo "Prepared sd-img environment with symlinks for scripts and tools"
+        echo "Prepared sd-img environment with tools symlink"
 
     # ---------- 直接调用 mk-sd-image.sh（绕过 build.sh sd-img） ----------
     - name: Build sd image with flippy kernel (direct)
@@ -420,9 +416,10 @@ jobs:
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
         echo "Current directory: $(pwd)"
+        # 确保 tools 链接存在（双重保险）
+        ln -sf scripts/sd-fuse/tools tools
         echo "Using mk-sd-image.sh to generate image directly..."
         mkdir -p out
-        # 现在 tools 符号链接已存在于 project/ 下，mk-sd-image.sh 可以正确 source tools/util.sh
         scripts/sd-fuse/mk-sd-image.sh \
           -d scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} \
           -o out/ \
@@ -768,11 +765,8 @@ jobs:
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
 
-        cd ..
-        rm -rf scripts tools 2>/dev/null || true
-        ln -s project/scripts scripts
-        ln -s project/scripts/sd-fuse/tools tools
-        cd project
+        # 创建 tools 符号链接（在 project 目录内）
+        ln -sf scripts/sd-fuse/tools tools
 
         echo "Prepared sd-img environment"
 
@@ -784,6 +778,7 @@ jobs:
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
         echo "Current directory: $(pwd)"
+        ln -sf scripts/sd-fuse/tools tools
         echo "Using mk-sd-image.sh to generate image directly..."
         mkdir -p out
         scripts/sd-fuse/mk-sd-image.sh \
