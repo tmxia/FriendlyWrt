@@ -372,9 +372,8 @@ jobs:
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
 
-        # 1. 复制 device/configs 等到所有子目录（保留相对路径，便于在 sd-fuse 内解析）
+        # 1. 复制 device/configs 等到所有子目录（保留相对路径）
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -407,19 +406,11 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 6. 生成自定义脚本（直接调用 mk-sd-image.sh）
-        cat > ${TOPDIR}/custom_sdimg.sh <<'EOF'
-        #!/bin/bash
-        cd ${TOPDIR}/scripts/sd-fuse
-        ./mk-sd-image.sh ${DIST_DIR} ../../out/${IMG_FILE}
-        EOF
-        chmod +x ${TOPDIR}/custom_sdimg.sh
-
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment (no path replacements)"
 
-    # ---------- 直接执行自定义脚本（完全绕过 build.sh） ----------
+    # ---------- 直接调用 mk-sd-image.sh 使用绝对路径 ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -427,9 +418,11 @@ jobs:
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
         echo "Current directory: $(pwd)"
-        # 执行自定义脚本
-        source ${TOPDIR}/custom_sdimg.sh
-        # 检查输出文件
+        mkdir -p out
+        cd scripts/sd-fuse
+        echo "Running mk-sd-image.sh from sd-fuse directory..."
+        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -448,8 +441,8 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
-        cd ../..
+        mv ${{ steps.config.outputs.archive_filename }} ${TOPDIR}/../artifact/
+        cd ${TOPDIR}
         cd ../artifact/
         gzip *.img
 
@@ -748,7 +741,6 @@ jobs:
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -777,18 +769,11 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        cat > ${TOPDIR}/custom_sdimg.sh <<'EOF'
-        #!/bin/bash
-        cd ${TOPDIR}/scripts/sd-fuse
-        ./mk-sd-image.sh ${DIST_DIR} ../../out/${IMG_FILE}
-        EOF
-        chmod +x ${TOPDIR}/custom_sdimg.sh
-
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment (no path replacements)"
 
-    # ---------- 直接执行自定义脚本 ----------
+    # ---------- 直接调用 mk-sd-image.sh 使用绝对路径 ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -796,7 +781,11 @@ jobs:
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
         echo "Current directory: $(pwd)"
-        source ${TOPDIR}/custom_sdimg.sh
+        mkdir -p out
+        cd scripts/sd-fuse
+        echo "Running mk-sd-image.sh from sd-fuse directory..."
+        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -814,8 +803,8 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
-        cd ../..
+        mv ${{ steps.config.outputs.archive_filename }} ${TOPDIR}/../artifact/
+        cd ${TOPDIR}
         cd ../artifact/
         gzip *.img
 
