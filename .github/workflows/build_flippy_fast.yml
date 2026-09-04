@@ -405,11 +405,13 @@ jobs:
         # 5. 删除所有 "please build" 检查
         sed -i '/please build.*first/d' build.sh
 
-        # 6. 将完整的 rootfs 复制到 sd-fuse 目录（关键步骤）
+        # 6. 复制完整的 rootfs 到 sd-fuse 目录（强制覆盖）
         echo "Copying complete rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -r friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
-
+        cp -rf friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
+        echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
+        ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment with rootfs copied."
 
     # ---------- 直接调用 mk-sd-image.sh（切换到 sd-fuse 目录内执行） ----------
@@ -768,11 +770,12 @@ jobs:
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
 
-        # 复制完整的 rootfs 到 sd-fuse 目录
         echo "Copying complete rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -r friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
-
+        cp -rf friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
+        echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
+        ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment with rootfs copied."
 
     # ---------- 直接调用 mk-sd-image.sh（切换到 sd-fuse 目录内执行） ----------
