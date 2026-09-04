@@ -233,7 +233,6 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        # 生成近两天的日期前缀列表（当天、昨天、前天）
         DATES=(
           $(date +%Y-%m-%d)
           $(date -d "1 day ago" +%Y-%m-%d)
@@ -242,14 +241,12 @@ jobs:
         FOUND=false
         for DATE in "${DATES[@]}"; do
           BASE_TAG="FriendlyWrt-flippy-${DATE}"
-          # 检查当前 release 是否有该前缀
           if gh release view "$BASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -q "^${ROOTFS_FILE}$"; then
             echo "Found $ROOTFS_FILE in release $BASE_TAG, downloading..."
             gh release download "$BASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ROOTFS_FILE" --dir ../artifact/
             FOUND=true
             break
           fi
-          # 如果精确匹配失败，尝试带后缀的（如 -1, -2）
           TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" | sort -V -r || true)
           for tag in $TAGS; do
             if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | grep -q "^${ROOTFS_FILE}$"; then
@@ -383,11 +380,12 @@ jobs:
         cd project
         sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
 
-    # ---------- 关键修复：物理复制到所有子目录 ----------
+    # ---------- 关键修复：物理复制并修改 sd-img 脚本 ----------
     - name: Prepare sd-img environment
       run: |
         set -x
         cd project
+        # 1. 物理复制 device, configs, .current_config.mk, .config 到所有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -395,7 +393,19 @@ jobs:
             cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
           fi
         done < /tmp/sd_fuse_dirs.txt
-        echo "Prepared sd-img environment with physical copies to all subdirectories"
+
+        # 2. 修改 sd-img 脚本，使用绝对路径
+        # 查找所有可能名为 sd-img 的脚本（包括 build.sh 调用的脚本）
+        find scripts -name "sd-img" -type f | while read -r script; do
+          echo "Patching $script"
+          # 将 device/friendlyelec 替换为 ${TOPDIR}/device/friendlyelec
+          sed -i 's|device/friendlyelec|${TOPDIR}/device/friendlyelec|g' "$script"
+          # 将 .current_config.mk 替换为 ${TOPDIR}/.current_config.mk
+          sed -i 's|\.current_config\.mk|${TOPDIR}/.current_config.mk|g' "$script"
+          # 将 configs 替换为 ${TOPDIR}/configs（如果存在）
+          sed -i 's|configs/rockchip|${TOPDIR}/configs/rockchip|g' "$script"
+        done
+        echo "Prepared sd-img environment with physical copies and patched scripts"
 
     # ---------- 验证关键目录 ----------
     - name: Verify device directory for sd-img
@@ -752,7 +762,14 @@ jobs:
             cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
           fi
         done < /tmp/sd_fuse_dirs.txt
-        echo "Prepared sd-img environment with physical copies to all subdirectories"
+
+        find scripts -name "sd-img" -type f | while read -r script; do
+          echo "Patching $script"
+          sed -i 's|device/friendlyelec|${TOPDIR}/device/friendlyelec|g' "$script"
+          sed -i 's|\.current_config\.mk|${TOPDIR}/.current_config.mk|g' "$script"
+          sed -i 's|configs/rockchip|${TOPDIR}/configs/rockchip|g' "$script"
+        done
+        echo "Prepared sd-img environment with physical copies and patched scripts"
 
     - name: Verify device directory for sd-img
       run: |
