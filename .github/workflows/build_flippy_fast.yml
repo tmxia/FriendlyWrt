@@ -411,6 +411,13 @@ jobs:
         else
           echo "WARNING: Could not find sd-img function in build.sh"
         fi
+
+        # 5. 创建符号链接使 build.sh 能找到 scripts/sd-fuse（位于父目录）
+        cd ..
+        rm -rf scripts 2>/dev/null || true
+        ln -s project/scripts scripts
+        cd project
+
         echo "Prepared sd-img environment with absolute path substitutions and cd $TOPDIR in sd-img"
 
     # ---------- 执行 sd-img（不再重复修改 .current_config.mk） ----------
@@ -758,6 +765,13 @@ jobs:
         elif grep -q "sd-img)" build.sh; then
           sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
         fi
+
+        # 创建符号链接使 build.sh 能找到 scripts/sd-fuse
+        cd ..
+        rm -rf scripts 2>/dev/null || true
+        ln -s project/scripts scripts
+        cd project
+
         echo "Prepared sd-img environment"
 
     # ---------- 执行 sd-img（不再重复修改 .current_config.mk） ----------
