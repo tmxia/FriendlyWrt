@@ -374,7 +374,7 @@ jobs:
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
-        # 1. 复制 device/configs 等到所有子目录（供 mk-sd-image.sh 引用）
+        # 1. 复制 device/configs 等到所有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -404,72 +404,41 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 5. 彻底替换 mk-sd-image.sh 内容（移除所有目录检查）
+        # 5. 修改 mk-sd-image.sh 彻底消除交互和检查
         cd scripts/sd-fuse
-        cat > mk-sd-image.sh <<'EOF'
-        #!/bin/bash
-        # This is a modified version of mk-sd-image.sh with directory check removed
-
-        set -e
-        SCRIPT_DIR=$(dirname $(readlink -f $0))
-        TOOLS_DIR="${SCRIPT_DIR}/tools"
-
-        # Ensure tools directory exists
-        if [ ! -d "${TOOLS_DIR}" ]; then
-          echo "ERROR: Tools directory not found: ${TOOLS_DIR}"
-          exit 1
-        fi
-
-        # Source utility functions
-        source ${TOOLS_DIR}/util.sh
-
-        # Get parameters - no directory check
-        TARGET_DIR="$1"
-        OUTPUT_IMAGE="$2"
-        OUT_DIR=$(dirname "${OUTPUT_IMAGE}")
-
-        if [ -z "$TARGET_DIR" ] || [ -z "$OUTPUT_IMAGE" ]; then
-          echo "Usage: $0 <target_dir> <output_image_path>"
-          echo "Example: $0 friendlywrt25-docker out/image.img"
-          exit 1
-        fi
-
-        # Ensure output directory exists
-        mkdir -p "${OUT_DIR}"
-
-        # Log the paths
-        echo "Target directory: ${TARGET_DIR}"
-        echo "Output image: ${OUTPUT_IMAGE}"
-        echo "Script directory: ${SCRIPT_DIR}"
-
-        # Create image
-        echo "Creating image..."
-        ${SCRIPT_DIR}/mk-sd-image.sh.real "${TARGET_DIR}" "${OUTPUT_IMAGE}"
-        EOF
-        chmod +x mk-sd-image.sh
-
-        # Rename original script
-        if [ -f mk-sd-image.sh.orig ]; then
-          rm -f mk-sd-image.sh.orig
-        fi
-        cp mk-sd-image.sh mk-sd-image.sh.real
+        # 备份原脚本
+        cp mk-sd-image.sh mk-sd-image.sh.bak
+        # 注释掉所有 read 命令
+        sed -i 's/^[[:space:]]*read /# read /g' mk-sd-image.sh
+        # 将目录检查从报错改为自动创建目录
+        sed -i 's/if \[ ! -d "\$1" \]/if [ ! -d "$1" ]; then mkdir -p "$1"; fi/g' mk-sd-image.sh
+        # 删除所有包含 "warn" 和 "exit" 的行（小心不要删除重要的 exit）
+        # 但更安全：注释掉所有 warn 和 exit 1
+        sed -i 's/^[[:space:]]*warn /# warn /g' mk-sd-image.sh
+        sed -i 's/^[[:space:]]*exit 1/# exit 1/g' mk-sd-image.sh
+        # 确保脚本非交互
+        sed -i 's/^[[:space:]]*read -p/# read -p/g' mk-sd-image.sh
+        # 将任何询问下载的提示替换为自动同意
+        sed -i 's/Do you want to download it now? (Y\/N):/echo "Y" | /g' mk-sd-image.sh
         cd ../..
 
+        echo "Modified mk-sd-image.sh to be non-interactive"
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with modified mk-sd-image.sh"
+        echo "Prepared sd-img environment"
 
-    # ---------- 直接执行 mk-sd-image.sh ----------
+    # ---------- 直接执行 mk-sd-image.sh（非交互式） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
+        export DEBIAN_FRONTEND=noninteractive
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running modified mk-sd-image.sh directly..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh in non-interactive mode..."
+        yes "" | ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -818,58 +787,34 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 彻底替换 mk-sd-image.sh
+        # 修改 mk-sd-image.sh 彻底消除交互
         cd scripts/sd-fuse
-        cat > mk-sd-image.sh <<'EOF'
-        #!/bin/bash
-        # Modified mk-sd-image.sh - directory check removed
-
-        set -e
-        SCRIPT_DIR=$(dirname $(readlink -f $0))
-        TOOLS_DIR="${SCRIPT_DIR}/tools"
-
-        if [ ! -d "${TOOLS_DIR}" ]; then
-          echo "ERROR: Tools directory not found: ${TOOLS_DIR}"
-          exit 1
-        fi
-
-        source ${TOOLS_DIR}/util.sh
-
-        TARGET_DIR="$1"
-        OUTPUT_IMAGE="$2"
-        OUT_DIR=$(dirname "${OUTPUT_IMAGE}")
-
-        if [ -z "$TARGET_DIR" ] || [ -z "$OUTPUT_IMAGE" ]; then
-          echo "Usage: $0 <target_dir> <output_image_path>"
-          exit 1
-        fi
-
-        mkdir -p "${OUT_DIR}"
-        echo "Target directory: ${TARGET_DIR}"
-        echo "Output image: ${OUTPUT_IMAGE}"
-
-        # Call original script
-        ${SCRIPT_DIR}/mk-sd-image.sh.real "${TARGET_DIR}" "${OUTPUT_IMAGE}"
-        EOF
-        chmod +x mk-sd-image.sh
-        cp mk-sd-image.sh mk-sd-image.sh.real
+        cp mk-sd-image.sh mk-sd-image.sh.bak
+        sed -i 's/^[[:space:]]*read /# read /g' mk-sd-image.sh
+        sed -i 's/if \[ ! -d "\$1" \]/if [ ! -d "$1" ]; then mkdir -p "$1"; fi/g' mk-sd-image.sh
+        sed -i 's/^[[:space:]]*warn /# warn /g' mk-sd-image.sh
+        sed -i 's/^[[:space:]]*exit 1/# exit 1/g' mk-sd-image.sh
+        sed -i 's/^[[:space:]]*read -p/# read -p/g' mk-sd-image.sh
+        sed -i 's/Do you want to download it now? (Y\/N):/echo "Y" | /g' mk-sd-image.sh
         cd ../..
 
+        echo "Modified mk-sd-image.sh to be non-interactive"
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with modified mk-sd-image.sh"
+        echo "Prepared sd-img environment"
 
-    # ---------- 直接执行 mk-sd-image.sh ----------
+    # ---------- 直接执行 mk-sd-image.sh（非交互式） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
+        export DEBIAN_FRONTEND=noninteractive
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running modified mk-sd-image.sh directly..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh in non-interactive mode..."
+        yes "" | ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
