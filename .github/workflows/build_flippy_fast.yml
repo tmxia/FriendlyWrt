@@ -400,11 +400,22 @@ jobs:
         # 4. 删除检查
         sed -i '/please build.*first/d' build.sh
 
-        # 5. 复制完整的 rootfs 到 sd-fuse（使用 cp -a 保留权限）
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        # 5. 直接从 rootfs 包解压到 sd-fuse 目标目录（确保完整根文件系统）
+        echo "Extracting rootfs directly to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/. scripts/sd-fuse/${DIST_DIR}/
+        # 先解压到临时目录，然后移动内容以去除可能的顶层目录
+        tmpdir=$(mktemp -d)
+        tar xzf ../artifact/${{ steps.config.outputs.archive_filename }} -C $tmpdir
+        # 查找包含 etc 或 usr 的目录作为根目录
+        rootfs_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
+        # 如果找到了且不是 tmpdir，则移动内容
+        if [ "$rootfs_src" != "$tmpdir" ]; then
+          cp -a $rootfs_src/. scripts/sd-fuse/${DIST_DIR}/
+        else
+          cp -a $tmpdir/. scripts/sd-fuse/${DIST_DIR}/
+        fi
+        rm -rf $tmpdir
 
         # 6. 重新部署 flippy kernel（因为上一步清空目录）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
@@ -417,6 +428,8 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
+        echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
+        ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
     # ---------- 直接调用 mk-sd-image.sh ----------
@@ -772,10 +785,18 @@ jobs:
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
 
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        echo "Extracting rootfs directly to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/. scripts/sd-fuse/${DIST_DIR}/
+        tmpdir=$(mktemp -d)
+        tar xzf ../artifact/${{ steps.config.outputs.archive_filename }} -C $tmpdir
+        rootfs_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
+        if [ "$rootfs_src" != "$tmpdir" ]; then
+          cp -a $rootfs_src/. scripts/sd-fuse/${DIST_DIR}/
+        else
+          cp -a $tmpdir/. scripts/sd-fuse/${DIST_DIR}/
+        fi
+        rm -rf $tmpdir
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -787,6 +808,8 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
+        echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
+        ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
     # ---------- 直接调用 mk-sd-image.sh ----------
