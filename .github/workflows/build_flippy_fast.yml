@@ -408,7 +408,7 @@ jobs:
 
         echo "Prepared sd-img environment with tools symlink"
 
-    # ---------- 直接调用 mk-sd-image.sh（绕过 build.sh sd-img） ----------
+    # ---------- 直接调用 mk-sd-image.sh（修正参数为位置参数） ----------
     - name: Build sd image with flippy kernel (direct)
       id: build_sd_image
       run: |
@@ -420,10 +420,10 @@ jobs:
         ln -sf scripts/sd-fuse/tools tools
         echo "Using mk-sd-image.sh to generate image directly..."
         mkdir -p out
+        # 使用位置参数：第一个是 rootfs 目录，第二个是输出文件路径
         scripts/sd-fuse/mk-sd-image.sh \
-          -d scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} \
-          -o out/ \
-          -f ${{ steps.config.outputs.img_filename }}
+          scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} \
+          out/${{ steps.config.outputs.img_filename }}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -770,7 +770,7 @@ jobs:
 
         echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh ----------
+    # ---------- 直接调用 mk-sd-image.sh（修正参数为位置参数） ----------
     - name: Build sd image with flippy kernel (direct)
       id: build_sd_image
       run: |
@@ -782,9 +782,8 @@ jobs:
         echo "Using mk-sd-image.sh to generate image directly..."
         mkdir -p out
         scripts/sd-fuse/mk-sd-image.sh \
-          -d scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} \
-          -o out/ \
-          -f ${{ steps.config.outputs.img_filename }}
+          scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} \
+          out/${{ steps.config.outputs.img_filename }}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
