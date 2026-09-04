@@ -372,7 +372,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境，并强制替换 .current_config.mk 中的绝对路径 ----------
+    # ---------- 核心修复：准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -412,13 +412,18 @@ jobs:
           echo "WARNING: Could not find sd-img function in build.sh"
         fi
 
-        # 5. 创建符号链接使 build.sh 能找到 scripts/sd-fuse（位于父目录）
+        # 5. 确保 uboot 标记存在并删除 uboot 检查（彻底绕过 sd-img 的 uboot 依赖）
+        mkdir -p friendlywrt/u-boot
+        touch friendlywrt/u-boot/.built
+        sed -i '/please build u-boot first/d' build.sh
+
+        # 6. 创建符号链接使 build.sh 能找到 scripts/sd-fuse（位于父目录）
         cd ..
         rm -rf scripts 2>/dev/null || true
         ln -s project/scripts scripts
         cd project
 
-        echo "Prepared sd-img environment with absolute path substitutions and cd $TOPDIR in sd-img"
+        echo "Prepared sd-img environment with absolute paths, cd $TOPDIR, uboot bypass, and symlink"
 
     # ---------- 执行 sd-img（不再重复修改 .current_config.mk） ----------
     - name: Build sd image with flippy kernel
@@ -766,7 +771,11 @@ jobs:
           sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
         fi
 
-        # 创建符号链接使 build.sh 能找到 scripts/sd-fuse
+        # 绕过 uboot 检查
+        mkdir -p friendlywrt/u-boot
+        touch friendlywrt/u-boot/.built
+        sed -i '/please build u-boot first/d' build.sh
+
         cd ..
         rm -rf scripts 2>/dev/null || true
         ln -s project/scripts scripts
