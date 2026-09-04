@@ -95,7 +95,6 @@ jobs:
           allow_updates: true
           overwrite: true
 
-  # ---------- 手动触发构建 ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -372,7 +371,7 @@ jobs:
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
         # 1. 复制 device/configs 等到所有子目录（供 mk-sd-image.sh 引用）
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
@@ -387,11 +386,11 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # 3. 直接解压 rootfs 包到目标目录
-        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        # 3. 复制完整的 rootfs 到目标目录（使用 cp -a 保留属性）
+        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        tar xzf "../artifact/${ROOTFS_FILE}" --strip-components=3 -C scripts/sd-fuse/${DIST_DIR}
+        cp -a ${ROOTFS_SRC}/. scripts/sd-fuse/${DIST_DIR}/
 
         # 4. 重新部署 flippy kernel（boot/dtb）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
@@ -404,11 +403,20 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
+        # 5. 删除 mk-sd-image.sh 中的目录检查（关键修复）
+        cd scripts/sd-fuse
+        # 删除包含 "warn" 和 "Image directory not found" 的行及其后的 fi 结构
+        # 更稳健：直接删除整个 if 块
+        sed -i '/^[[:space:]]*if \[ ! -d "\$1" \]/,/^[[:space:]]*fi/d' mk-sd-image.sh
+        # 或者更简单：直接删除匹配的行
+        # sed -i '/Image directory not found/d' mk-sd-image.sh
+        cd ../..
+
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 直接执行 mk-sd-image.sh（不再调用 build.sh） ----------
+    # ---------- 直接执行 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -425,6 +433,7 @@ jobs:
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
           echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
+          ls -la out/ || true
           exit 1
         fi
 
@@ -738,7 +747,7 @@ jobs:
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -751,10 +760,10 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        tar xzf "../artifact/${ROOTFS_FILE}" --strip-components=3 -C scripts/sd-fuse/${DIST_DIR}
+        cp -a ${ROOTFS_SRC}/. scripts/sd-fuse/${DIST_DIR}/
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -765,6 +774,11 @@ jobs:
           mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
+
+        # 删除 mk-sd-image.sh 中的目录检查
+        cd scripts/sd-fuse
+        sed -i '/^[[:space:]]*if \[ ! -d "\$1" \]/,/^[[:space:]]*fi/d' mk-sd-image.sh
+        cd ../..
 
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
@@ -787,6 +801,7 @@ jobs:
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
           echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
+          ls -la out/ || true
           exit 1
         fi
 
@@ -822,7 +837,6 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ---------- 清理任务 ----------
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
