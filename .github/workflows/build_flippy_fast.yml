@@ -1,4 +1,4 @@
-name: Build FriendlyWrt With Flippy Kernel (Official Path)
+name: Build FriendlyWrt With Flippy Kernel (Fast)
 
 on:
   watch:
@@ -262,28 +262,27 @@ jobs:
           exit 1
         fi
 
-    # ---------- 后续步骤：解包、替换内核、生成镜像 ----------
-    - name: Unpack friendlywrt rootfs
+    # ---------- 关键修正：将 rootfs 包解压到官方构建目录 ----------
+    - name: Prepare official rootfs for sd-img
       run: |
-        set -x
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        FILENAME="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        mkdir -p rootfs
-        tar xzf "../artifact/$FILENAME" --strip-components=3 -C rootfs
-        if [ -d rootfs/root-rockchip ]; then
-          mv rootfs/root-rockchip rootfs/rootfs
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        # 创建官方 rootfs 目录
+        mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
+        # 解压 rootfs 包到该目录（strip 3 层路径）
+        tar xzf "../artifact/$ROOTFS_FILE" --strip-components=3 -C friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
+        # 创建 packages 目录（sd-img 可能需要）
+        mkdir -p friendlywrt/bin/targets/rockchip/armv8/packages
+        # 复制 os-release 和 rom-version 等（如果缺失，创建占位）
+        if [ -f friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release ]; then
+          echo "os-release found"
         else
-          echo "ERROR: root-rockchip not found"
-          ls -la rootfs/
-          exit 1
+          echo "Creating placeholder os-release"
+          mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib
+          echo "ID=openwrt" > friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release
         fi
-
-    - name: Unpack host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      run: |
-        cd project
-        tar xzvf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
+        echo "Official rootfs prepared at friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
     # ---------- flippy 内核替换 ----------
     - name: Get latest flippy kernel version
@@ -302,15 +301,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    # ---------- 编译官方 uboot 和 kernel（确保环境完整） ----------
-    - name: Compile uboot and kernel (official)
-      run: |
-        cd project
-        ./build.sh uboot
-        ./build.sh kernel
-
-    # ---------- 下载 flippy 内核并覆盖官方内核文件 ----------
-    - name: Download and deploy flippy kernel (overwrite official)
+    - name: Download and deploy flippy kernel
       run: |
         cd project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
@@ -344,7 +335,7 @@ jobs:
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "Overwriting official kernel with flippy kernel in scripts/sd-fuse/${DIST_DIR}"
+        echo "Deploying flippy kernel to scripts/sd-fuse/${DIST_DIR}"
 
         # 覆盖 boot 文件
         mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
@@ -354,19 +345,18 @@ jobs:
         mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
         tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
-        # 提取模块供后续注入（如果还需要的话）
+        # 提取 modules 供注入
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
-        echo "Flippy kernel components deployed, overwriting official kernel."
+        echo "Flippy kernel deployed."
 
-    # ---------- 注入 flippy 模块到 rootfs ----------
-    - name: Inject flippy modules into rootfs
+    - name: Inject flippy modules into official rootfs
       run: |
         cd project
-        ROOTFS_DIR="rootfs/rootfs"
+        ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         if [ ! -d "$ROOTFS_DIR" ]; then
-          echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
+          echo "ERROR: Official rootfs directory $ROOTFS_DIR not found"
           exit 1
         fi
         MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
@@ -382,16 +372,14 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境（复制 device/configs 等，确保 sd-img 能找到） ----------
+    # ---------- 准备 sd-img 环境（复制 device/configs 等） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        # 复制 device/configs 等到 scripts/sd-fuse 根目录和子目录
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         mkdir -p scripts/sd-fuse/${DIST_DIR}
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
-        # 递归复制到所有子目录（确保 sd-img 在任何子目录都能找到）
         find scripts/sd-fuse -type d | while read -r dir; do
           if [ "$dir" != "scripts/sd-fuse" ]; then
             cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
@@ -399,7 +387,7 @@ jobs:
         done
         echo "Prepared sd-img environment with device/configs copies"
 
-    # ---------- 执行 sd-img（官方流程，内核已被替换） ----------
+    # ---------- 执行 sd-img ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -608,27 +596,19 @@ jobs:
           exit 1
         fi
 
-    - name: Unpack friendlywrt rootfs
+    - name: Prepare official rootfs for sd-img
       run: |
-        set -x
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        FILENAME="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        mkdir -p rootfs
-        tar xzf "../artifact/$FILENAME" --strip-components=3 -C rootfs
-        if [ -d rootfs/root-rockchip ]; then
-          mv rootfs/root-rockchip rootfs/rootfs
-        else
-          echo "ERROR: root-rockchip not found"
-          ls -la rootfs/
-          exit 1
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
+        tar xzf "../artifact/$ROOTFS_FILE" --strip-components=3 -C friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
+        mkdir -p friendlywrt/bin/targets/rockchip/armv8/packages
+        if [ ! -f friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release ]; then
+          mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib
+          echo "ID=openwrt" > friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release
         fi
-
-    - name: Unpack host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      run: |
-        cd project
-        tar xzvf "../artifact/host-pm-${{ matrix.VERSION }}.tgz"
+        echo "Official rootfs prepared"
 
     - name: Get latest flippy kernel version
       id: flippy_version
@@ -646,13 +626,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    - name: Compile uboot and kernel (official)
-      run: |
-        cd project
-        ./build.sh uboot
-        ./build.sh kernel
-
-    - name: Download and deploy flippy kernel (overwrite official)
+    - name: Download and deploy flippy kernel
       run: |
         cd project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
@@ -686,7 +660,7 @@ jobs:
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "Overwriting official kernel with flippy kernel in scripts/sd-fuse/${DIST_DIR}"
+        echo "Deploying flippy kernel to scripts/sd-fuse/${DIST_DIR}"
 
         mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
         tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
@@ -697,14 +671,14 @@ jobs:
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
-        echo "Flippy kernel components deployed, overwriting official kernel."
+        echo "Flippy kernel deployed."
 
-    - name: Inject flippy modules into rootfs
+    - name: Inject flippy modules into official rootfs
       run: |
         cd project
-        ROOTFS_DIR="rootfs/rootfs"
+        ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         if [ ! -d "$ROOTFS_DIR" ]; then
-          echo "ERROR: Rootfs directory $ROOTFS_DIR not found"
+          echo "ERROR: Official rootfs directory $ROOTFS_DIR not found"
           exit 1
         fi
         MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
@@ -732,7 +706,7 @@ jobs:
             cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
           fi
         done
-        echo "Prepared sd-img environment with device/configs copies"
+        echo "Prepared sd-img environment"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
