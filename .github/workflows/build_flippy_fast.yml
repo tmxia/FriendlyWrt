@@ -366,11 +366,13 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
+    # ---------- 核心修复：准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
         # 1. 复制 device/configs 等到所有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
@@ -400,16 +402,13 @@ jobs:
         # 4. 删除检查
         sed -i '/please build.*first/d' build.sh
 
-        # 5. 直接从 rootfs 包解压到 sd-fuse 目标目录（确保完整根文件系统）
-        echo "Extracting rootfs directly to scripts/sd-fuse/${DIST_DIR} ..."
+        # 5. 直接从已下载的 rootfs 包解压到 sd-fuse 目标目录
+        echo "Extracting rootfs from ../artifact/${ROOTFS_FILE} to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        # 先解压到临时目录，然后移动内容以去除可能的顶层目录
         tmpdir=$(mktemp -d)
-        tar xzf ../artifact/${{ steps.config.outputs.archive_filename }} -C $tmpdir
-        # 查找包含 etc 或 usr 的目录作为根目录
+        tar xzf "../artifact/${ROOTFS_FILE}" -C $tmpdir
         rootfs_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
-        # 如果找到了且不是 tmpdir，则移动内容
         if [ "$rootfs_src" != "$tmpdir" ]; then
           cp -a $rootfs_src/. scripts/sd-fuse/${DIST_DIR}/
         else
@@ -756,11 +755,13 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
+    # ---------- 核心修复：准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -785,11 +786,11 @@ jobs:
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
 
-        echo "Extracting rootfs directly to scripts/sd-fuse/${DIST_DIR} ..."
+        echo "Extracting rootfs from ../artifact/${ROOTFS_FILE} to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
         tmpdir=$(mktemp -d)
-        tar xzf ../artifact/${{ steps.config.outputs.archive_filename }} -C $tmpdir
+        tar xzf "../artifact/${ROOTFS_FILE}" -C $tmpdir
         rootfs_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
         if [ "$rootfs_src" != "$tmpdir" ]; then
           cp -a $rootfs_src/. scripts/sd-fuse/${DIST_DIR}/
