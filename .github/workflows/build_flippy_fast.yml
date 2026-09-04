@@ -370,6 +370,8 @@ jobs:
       run: |
         cd project
         TOPDIR=$(pwd)
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+
         # 1. 物理复制 device/configs 等到所有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -403,7 +405,12 @@ jobs:
         # 5. 删除所有 "please build" 检查
         sed -i '/please build.*first/d' build.sh
 
-        echo "Prepared sd-img environment with absolute paths and markers"
+        # 6. 将完整的 rootfs 复制到 sd-fuse 目录（关键步骤）
+        echo "Copying complete rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        mkdir -p scripts/sd-fuse/${DIST_DIR}
+        cp -r friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
+
+        echo "Prepared sd-img environment with rootfs copied."
 
     # ---------- 直接调用 mk-sd-image.sh（切换到 sd-fuse 目录内执行） ----------
     - name: Build sd image with flippy kernel (direct)
@@ -735,6 +742,8 @@ jobs:
       run: |
         cd project
         TOPDIR=$(pwd)
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -759,7 +768,12 @@ jobs:
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
         sed -i '/please build.*first/d' build.sh
 
-        echo "Prepared sd-img environment"
+        # 复制完整的 rootfs 到 sd-fuse 目录
+        echo "Copying complete rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        mkdir -p scripts/sd-fuse/${DIST_DIR}
+        cp -r friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/* scripts/sd-fuse/${DIST_DIR}/
+
+        echo "Prepared sd-img environment with rootfs copied."
 
     # ---------- 直接调用 mk-sd-image.sh（切换到 sd-fuse 目录内执行） ----------
     - name: Build sd image with flippy kernel (direct)
