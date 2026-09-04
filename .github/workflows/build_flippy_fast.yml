@@ -225,6 +225,17 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
+    # ---------- 关键修复：将 .current_config.mk 中的路径改为绝对路径 ----------
+    - name: Make .current_config.mk use absolute paths
+      run: |
+        cd project
+        TOPDIR=$(pwd)
+        # 将 "device/friendlyelec" 替换为绝对路径
+        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" .current_config.mk
+        # 如果存在其他变体，也一并替换
+        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" friendlywrt/.current_config.mk 2>/dev/null || true
+        echo "Converted .current_config.mk to absolute paths"
+
     # ---------- 核心：下载 rootfs 包（搜索近两天） ----------
     - name: Download rootfs package (required)
       env:
@@ -385,6 +396,8 @@ jobs:
       run: |
         set -x
         cd project
+        TOPDIR=$(pwd)
+
         # 1. 物理复制到所有现有子目录
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -394,27 +407,32 @@ jobs:
           fi
         done < /tmp/sd_fuse_dirs.txt
 
-        # 2. 查找所有可能涉及 device/friendlyelec 或 .current_config.mk 的脚本（包括 build.sh 和 scripts 目录下）
+        # 2. 修改所有脚本，将相对路径替换为绝对路径（使用 TOPDIR）
         grep -l -r "device/friendlyelec" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
           echo "Patching $script for device/friendlyelec"
-          sed -i 's|device/friendlyelec|${TOPDIR}/device/friendlyelec|g' "$script"
+          sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" "$script"
         done
         grep -l -r "\.current_config\.mk" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
           echo "Patching $script for .current_config.mk"
-          sed -i 's|\.current_config\.mk|${TOPDIR}/.current_config.mk|g' "$script"
+          sed -i "s|\.current_config\.mk|${TOPDIR}/.current_config.mk|g" "$script"
         done
         grep -l -r "configs/rockchip" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
           echo "Patching $script for configs/rockchip"
-          sed -i 's|configs/rockchip|${TOPDIR}/configs/rockchip|g' "$script"
+          sed -i "s|configs/rockchip|${TOPDIR}/configs/rockchip|g" "$script"
         done
 
-        # 3. 额外在 build.sh 中插入强制 cd 到 TOPDIR 的代码（在 sd-img 目标前）
+        # 3. 在 build.sh 的 sd-img 目标前插入 cd $TOPDIR（如果未插入）
         if grep -q "sd-img)" build.sh; then
-          sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
-          echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
+          if ! grep -q "cd \$TOPDIR" build.sh; then
+            sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
+            echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
+          fi
         fi
 
-        echo "Prepared sd-img environment with physical copies and patched all scripts"
+        # 4. 再次确保 .current_config.mk 中的路径是绝对路径（复制后重新修改一次）
+        find scripts/sd-fuse -name .current_config.mk -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
+
+        echo "Prepared sd-img environment with absolute paths in .current_config.mk and patched scripts"
 
     # ---------- 验证关键目录 ----------
     - name: Verify device directory for sd-img
@@ -492,6 +510,7 @@ jobs:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
     steps:
+    # 与 build_manual 完全相同，但矩阵固定
     - name: Show build configuration
       run: |
         echo "Auto building version: ${{ matrix.VERSION }}, type: ${{ matrix.SET }}"
@@ -607,6 +626,14 @@ jobs:
         echo "archive_filename=$TGZ_FILE" >> $GITHUB_OUTPUT
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
+
+    - name: Make .current_config.mk use absolute paths
+      run: |
+        cd project
+        TOPDIR=$(pwd)
+        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" .current_config.mk
+        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" friendlywrt/.current_config.mk 2>/dev/null || true
+        echo "Converted .current_config.mk to absolute paths"
 
     - name: Download rootfs package (required)
       env:
@@ -764,6 +791,8 @@ jobs:
       run: |
         set -x
         cd project
+        TOPDIR=$(pwd)
+
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -774,22 +803,27 @@ jobs:
 
         grep -l -r "device/friendlyelec" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
           echo "Patching $script for device/friendlyelec"
-          sed -i 's|device/friendlyelec|${TOPDIR}/device/friendlyelec|g' "$script"
+          sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" "$script"
         done
         grep -l -r "\.current_config\.mk" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
           echo "Patching $script for .current_config.mk"
-          sed -i 's|\.current_config\.mk|${TOPDIR}/.current_config.mk|g' "$script"
+          sed -i "s|\.current_config\.mk|${TOPDIR}/.current_config.mk|g" "$script"
         done
         grep -l -r "configs/rockchip" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
           echo "Patching $script for configs/rockchip"
-          sed -i 's|configs/rockchip|${TOPDIR}/configs/rockchip|g' "$script"
+          sed -i "s|configs/rockchip|${TOPDIR}/configs/rockchip|g" "$script"
         done
 
         if grep -q "sd-img)" build.sh; then
-          sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
-          echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
+          if ! grep -q "cd \$TOPDIR" build.sh; then
+            sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
+            echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
+          fi
         fi
-        echo "Prepared sd-img environment with physical copies and patched all scripts"
+
+        find scripts/sd-fuse -name .current_config.mk -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
+
+        echo "Prepared sd-img environment with absolute paths in .current_config.mk and patched scripts"
 
     - name: Verify device directory for sd-img
       run: |
