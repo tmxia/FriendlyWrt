@@ -1,4 +1,4 @@
-name: Build FriendlyWrt With Flippy Kernel (Fast)
+name: Build FriendlyWrt With Flippy Kernel (Official Path)
 
 on:
   watch:
@@ -225,17 +225,6 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    # ---------- 关键修复：将 .current_config.mk 中的路径改为绝对路径 ----------
-    - name: Make .current_config.mk use absolute paths
-      run: |
-        cd project
-        TOPDIR=$(pwd)
-        # 将 "device/friendlyelec" 替换为绝对路径
-        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" .current_config.mk
-        # 如果存在其他变体，也一并替换
-        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" friendlywrt/.current_config.mk 2>/dev/null || true
-        echo "Converted .current_config.mk to absolute paths"
-
     # ---------- 核心：下载 rootfs 包（搜索近两天） ----------
     - name: Download rootfs package (required)
       env:
@@ -313,7 +302,15 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    - name: Download and deploy flippy kernel
+    # ---------- 编译官方 uboot 和 kernel（确保环境完整） ----------
+    - name: Compile uboot and kernel (official)
+      run: |
+        cd project
+        ./build.sh uboot
+        ./build.sh kernel
+
+    # ---------- 下载 flippy 内核并覆盖官方内核文件 ----------
+    - name: Download and deploy flippy kernel (overwrite official)
       run: |
         cd project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
@@ -347,19 +344,23 @@ jobs:
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "Deploying to scripts/sd-fuse/${DIST_DIR}"
+        echo "Overwriting official kernel with flippy kernel in scripts/sd-fuse/${DIST_DIR}"
 
+        # 覆盖 boot 文件
         mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
         tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
 
+        # 覆盖 dtb 文件
         mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
         tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
 
+        # 提取模块供后续注入（如果还需要的话）
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
-        echo "Flippy kernel components deployed."
+        echo "Flippy kernel components deployed, overwriting official kernel."
 
+    # ---------- 注入 flippy 模块到 rootfs ----------
     - name: Inject flippy modules into rootfs
       run: |
         cd project
@@ -381,80 +382,24 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    - name: Build uboot only (skip kernel compilation)
-      run: |
-        cd project
-        ./build.sh uboot
-
-    - name: Patch build.sh to skip kernel check
-      run: |
-        cd project
-        sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
-
-    # ---------- 关键修复：物理复制并彻底修改所有相关脚本 ----------
+    # ---------- 准备 sd-img 环境（复制 device/configs 等，确保 sd-img 能找到） ----------
     - name: Prepare sd-img environment
       run: |
-        set -x
         cd project
-        TOPDIR=$(pwd)
-
-        # 1. 物理复制到所有现有子目录
-        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        # 复制 device/configs 等到 scripts/sd-fuse 根目录和子目录
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        while read -r dir; do
+        mkdir -p scripts/sd-fuse/${DIST_DIR}
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
+        # 递归复制到所有子目录（确保 sd-img 在任何子目录都能找到）
+        find scripts/sd-fuse -type d | while read -r dir; do
           if [ "$dir" != "scripts/sd-fuse" ]; then
             cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
           fi
-        done < /tmp/sd_fuse_dirs.txt
-
-        # 2. 修改所有脚本，将相对路径替换为绝对路径（使用 TOPDIR）
-        grep -l -r "device/friendlyelec" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
-          echo "Patching $script for device/friendlyelec"
-          sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" "$script"
         done
-        grep -l -r "\.current_config\.mk" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
-          echo "Patching $script for .current_config.mk"
-          sed -i "s|\.current_config\.mk|${TOPDIR}/.current_config.mk|g" "$script"
-        done
-        grep -l -r "configs/rockchip" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
-          echo "Patching $script for configs/rockchip"
-          sed -i "s|configs/rockchip|${TOPDIR}/configs/rockchip|g" "$script"
-        done
+        echo "Prepared sd-img environment with device/configs copies"
 
-        # 3. 在 build.sh 的 sd-img 目标前插入 cd $TOPDIR（如果未插入）
-        if grep -q "sd-img)" build.sh; then
-          if ! grep -q "cd \$TOPDIR" build.sh; then
-            sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
-            echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
-          fi
-        fi
-
-        # 4. 再次确保 .current_config.mk 中的路径是绝对路径（复制后重新修改一次）
-        find scripts/sd-fuse -name .current_config.mk -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
-
-        echo "Prepared sd-img environment with absolute paths in .current_config.mk and patched scripts"
-
-    # ---------- 验证关键目录 ----------
-    - name: Verify device directory for sd-img
-      run: |
-        cd project
-        echo "=== Verifying device directory in scripts/sd-fuse ==="
-        if [ -d "scripts/sd-fuse/device/friendlyelec" ]; then
-          echo "OK: scripts/sd-fuse/device/friendlyelec exists"
-        else
-          echo "ERROR: scripts/sd-fuse/device/friendlyelec not found"
-          ls -la scripts/sd-fuse/device/ || echo "device not found"
-          exit 1
-        fi
-        if [ -d "scripts/sd-fuse/friendlywrt25-docker/device/friendlyelec" ]; then
-          echo "OK: scripts/sd-fuse/friendlywrt25-docker/device/friendlyelec exists"
-        else
-          echo "ERROR: scripts/sd-fuse/friendlywrt25-docker/device/friendlyelec not found"
-          ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
-          exit 1
-        fi
-        echo "All critical device directories verified."
-
+    # ---------- 执行 sd-img（官方流程，内核已被替换） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -510,7 +455,7 @@ jobs:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
     steps:
-    # 与 build_manual 完全相同，但矩阵固定
+    # 与 build_manual 完全相同，仅矩阵固定
     - name: Show build configuration
       run: |
         echo "Auto building version: ${{ matrix.VERSION }}, type: ${{ matrix.SET }}"
@@ -627,14 +572,6 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    - name: Make .current_config.mk use absolute paths
-      run: |
-        cd project
-        TOPDIR=$(pwd)
-        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" .current_config.mk
-        sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" friendlywrt/.current_config.mk 2>/dev/null || true
-        echo "Converted .current_config.mk to absolute paths"
-
     - name: Download rootfs package (required)
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -709,7 +646,13 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    - name: Download and deploy flippy kernel
+    - name: Compile uboot and kernel (official)
+      run: |
+        cd project
+        ./build.sh uboot
+        ./build.sh kernel
+
+    - name: Download and deploy flippy kernel (overwrite official)
       run: |
         cd project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
@@ -743,7 +686,7 @@ jobs:
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "Deploying to scripts/sd-fuse/${DIST_DIR}"
+        echo "Overwriting official kernel with flippy kernel in scripts/sd-fuse/${DIST_DIR}"
 
         mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
         tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
@@ -754,7 +697,7 @@ jobs:
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
-        echo "Flippy kernel components deployed."
+        echo "Flippy kernel components deployed, overwriting official kernel."
 
     - name: Inject flippy modules into rootfs
       run: |
@@ -777,73 +720,19 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    - name: Build uboot only (skip kernel compilation)
-      run: |
-        cd project
-        ./build.sh uboot
-
-    - name: Patch build.sh to skip kernel check
-      run: |
-        cd project
-        sed -i '/please build kernel first/ { s/exit 1/exit 0/ }' build.sh
-
     - name: Prepare sd-img environment
       run: |
-        set -x
         cd project
-        TOPDIR=$(pwd)
-
-        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        while read -r dir; do
+        mkdir -p scripts/sd-fuse/${DIST_DIR}
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/${DIST_DIR}/
+        find scripts/sd-fuse -type d | while read -r dir; do
           if [ "$dir" != "scripts/sd-fuse" ]; then
             cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
           fi
-        done < /tmp/sd_fuse_dirs.txt
-
-        grep -l -r "device/friendlyelec" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
-          echo "Patching $script for device/friendlyelec"
-          sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" "$script"
         done
-        grep -l -r "\.current_config\.mk" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
-          echo "Patching $script for .current_config.mk"
-          sed -i "s|\.current_config\.mk|${TOPDIR}/.current_config.mk|g" "$script"
-        done
-        grep -l -r "configs/rockchip" . --include="*.sh" --include="build.sh" --include="sd-img" 2>/dev/null | while read -r script; do
-          echo "Patching $script for configs/rockchip"
-          sed -i "s|configs/rockchip|${TOPDIR}/configs/rockchip|g" "$script"
-        done
-
-        if grep -q "sd-img)" build.sh; then
-          if ! grep -q "cd \$TOPDIR" build.sh; then
-            sed -i '/sd-img)/a \\tcd $TOPDIR' build.sh
-            echo "Inserted cd \$TOPDIR before sd-img target in build.sh"
-          fi
-        fi
-
-        find scripts/sd-fuse -name .current_config.mk -exec sed -i "s|device/friendlyelec|${TOPDIR}/device/friendlyelec|g" {} \;
-
-        echo "Prepared sd-img environment with absolute paths in .current_config.mk and patched scripts"
-
-    - name: Verify device directory for sd-img
-      run: |
-        cd project
-        echo "=== Verifying device directory in scripts/sd-fuse ==="
-        if [ -d "scripts/sd-fuse/device/friendlyelec" ]; then
-          echo "OK: scripts/sd-fuse/device/friendlyelec exists"
-        else
-          echo "ERROR: scripts/sd-fuse/device/friendlyelec not found"
-          ls -la scripts/sd-fuse/device/ || echo "device not found"
-          exit 1
-        fi
-        if [ -d "scripts/sd-fuse/friendlywrt25-docker/device/friendlyelec" ]; then
-          echo "OK: scripts/sd-fuse/friendlywrt25-docker/device/friendlyelec exists"
-        else
-          echo "ERROR: scripts/sd-fuse/friendlywrt25-docker/device/friendlyelec not found"
-          ls -la scripts/sd-fuse/friendlywrt25-docker/device/ || echo "device not found"
-          exit 1
-        fi
-        echo "All device directories verified."
+        echo "Prepared sd-img environment with device/configs copies"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
