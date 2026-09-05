@@ -114,7 +114,6 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    # ---------- 精简的初始化环境（移除多余包，仅保留核心） ----------
     - name: Initialization environment (lightweight)
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -367,7 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ========== 核心修复：准备 sd-img 环境 ==========
+    # ---------- 准备 sd-img 环境（不修改路径，保留官方结构） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -375,7 +374,7 @@ jobs:
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
-        # 1. 复制 device/configs 等到所有子目录
+        # 1. 复制 device/configs 等到 scripts/sd-fuse 子目录（满足 sd-img 依赖）
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -388,7 +387,7 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # 3. 复制完整的 rootfs 到目标目录
+        # 3. 复制完整的 rootfs 到 sd-fuse 目录（供 sd-img 使用）
         echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
@@ -405,69 +404,22 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 5. 彻底替换 mk-sd-image.sh（移除目录检查）
-        cd scripts/sd-fuse
-        cat > mk-sd-image.sh <<'EOF'
-        #!/bin/bash
-        # Modified mk-sd-image.sh - directory check removed
-
-        set -e
-        SCRIPT_DIR=$(dirname $(readlink -f $0))
-        TOOLS_DIR="${SCRIPT_DIR}/tools"
-
-        if [ ! -d "${TOOLS_DIR}" ]; then
-          echo "ERROR: Tools directory not found: ${TOOLS_DIR}"
-          exit 1
-        fi
-
-        source ${TOOLS_DIR}/util.sh
-
-        TARGET_DIR="$1"
-        OUTPUT_IMAGE="$2"
-        OUT_DIR=$(dirname "${OUTPUT_IMAGE}")
-
-        if [ -z "$TARGET_DIR" ] || [ -z "$OUTPUT_IMAGE" ]; then
-          echo "Usage: $0 <target_dir> <output_image_path>"
-          exit 1
-        fi
-
-        mkdir -p "${OUT_DIR}"
-        echo "Target directory: ${TARGET_DIR}"
-        echo "Output image: ${OUTPUT_IMAGE}"
-
-        # Call original script
-        ${SCRIPT_DIR}/mk-sd-image.sh.real "${TARGET_DIR}" "${OUTPUT_IMAGE}"
-        EOF
-        chmod +x mk-sd-image.sh
-        cp mk-sd-image.sh mk-sd-image.sh.real
-        cd ../..
-
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with modified mk-sd-image.sh"
+        echo "Prepared sd-img environment (using official build.sh sd-img)"
 
-    # ---------- 直接执行 mk-sd-image.sh ----------
+    # ---------- 执行官方 build.sh sd-img ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
-        mkdir -p out
-        cd scripts/sd-fuse
-        echo "Running modified mk-sd-image.sh directly..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
-        cd ${TOPDIR}
-        if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
-        else
-          echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
-          ls -la out/ || true
-          exit 1
-        fi
+        echo "Current directory: $(pwd)"
+        ./build.sh sd-img
+        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
 
-        # 打包 tgz
+        # 打包 tgz（保留原逻辑）
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -477,8 +429,8 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ${TOPDIR}/../artifact/
-        cd ${TOPDIR}
+        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
+        cd ../..
         cd ../artifact/
         gzip *.img
 
@@ -519,7 +471,6 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    # ---------- 精简的初始化环境 ----------
     - name: Initialization environment (lightweight)
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -772,7 +723,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ========== 核心修复：准备 sd-img 环境 ==========
+    # ---------- 准备 sd-img 环境（不修改路径，保留官方结构） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -806,67 +757,20 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 彻底替换 mk-sd-image.sh
-        cd scripts/sd-fuse
-        cat > mk-sd-image.sh <<'EOF'
-        #!/bin/bash
-        # Modified mk-sd-image.sh - directory check removed
-
-        set -e
-        SCRIPT_DIR=$(dirname $(readlink -f $0))
-        TOOLS_DIR="${SCRIPT_DIR}/tools"
-
-        if [ ! -d "${TOOLS_DIR}" ]; then
-          echo "ERROR: Tools directory not found: ${TOOLS_DIR}"
-          exit 1
-        fi
-
-        source ${TOOLS_DIR}/util.sh
-
-        TARGET_DIR="$1"
-        OUTPUT_IMAGE="$2"
-        OUT_DIR=$(dirname "${OUTPUT_IMAGE}")
-
-        if [ -z "$TARGET_DIR" ] || [ -z "$OUTPUT_IMAGE" ]; then
-          echo "Usage: $0 <target_dir> <output_image_path>"
-          exit 1
-        fi
-
-        mkdir -p "${OUT_DIR}"
-        echo "Target directory: ${TARGET_DIR}"
-        echo "Output image: ${OUTPUT_IMAGE}"
-
-        # Call original script
-        ${SCRIPT_DIR}/mk-sd-image.sh.real "${TARGET_DIR}" "${OUTPUT_IMAGE}"
-        EOF
-        chmod +x mk-sd-image.sh
-        cp mk-sd-image.sh mk-sd-image.sh.real
-        cd ../..
-
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with modified mk-sd-image.sh"
+        echo "Prepared sd-img environment (using official build.sh sd-img)"
 
-    # ---------- 直接执行 mk-sd-image.sh ----------
+    # ---------- 执行官方 build.sh sd-img ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
-        mkdir -p out
-        cd scripts/sd-fuse
-        echo "Running modified mk-sd-image.sh directly..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
-        cd ${TOPDIR}
-        if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
-        else
-          echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
-          ls -la out/ || true
-          exit 1
-        fi
+        echo "Current directory: $(pwd)"
+        ./build.sh sd-img
+        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
 
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
@@ -877,8 +781,8 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ${TOPDIR}/../artifact/
-        cd ${TOPDIR}
+        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
+        cd ../..
         cd ../artifact/
         gzip *.img
 
