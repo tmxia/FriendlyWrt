@@ -366,13 +366,13 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境，正确复制 rootfs ----------
+    # ---------- 核心修复：准备 sd-img 环境，直接解压 rootfs 包 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
         # 1. 复制 device/configs 等到所有子目录（供 mk-sd-image.sh 引用）
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
@@ -387,11 +387,11 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # 3. 正确复制完整的 rootfs 到 sd-fuse 目录（使用 * 避免额外子目录）
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        # 3. 直接解压 rootfs 包到目标目录（剥离前3层路径，确保 bin、etc 等直接在目标目录下）
+        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a ${ROOTFS_SRC}/* scripts/sd-fuse/${DIST_DIR}/
+        tar xzf "../artifact/${ROOTFS_FILE}" --strip-components=3 -C scripts/sd-fuse/${DIST_DIR}
 
         # 4. 重新部署 flippy kernel（boot/dtb）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
@@ -733,13 +733,13 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境，正确复制 rootfs ----------
+    # ---------- 核心修复：准备 sd-img 环境，直接解压 rootfs 包 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -752,10 +752,10 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a ${ROOTFS_SRC}/* scripts/sd-fuse/${DIST_DIR}/
+        tar xzf "../artifact/${ROOTFS_FILE}" --strip-components=3 -C scripts/sd-fuse/${DIST_DIR}
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
