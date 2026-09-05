@@ -309,7 +309,6 @@ jobs:
 
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
-        # 保存 flippy 模块供后续注入
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
@@ -342,7 +341,7 @@ jobs:
           echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
         fi
         
-        # 部署 flippy kernel boot/dtb 到 sd-fuse 目录
+        # 部署 flippy kernel boot/dtb 到 sd-fuse 目录（供 mk-sd-image.sh 使用）
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -356,7 +355,7 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
         
-        # 创建内核构建标记（即使不真正编译）
+        # 创建内核构建标记（跳过编译）
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
@@ -370,13 +369,24 @@ jobs:
         fi
         echo "U-boot ready."
 
-    # ---------- 关键修复：禁用内核检查 ----------
     - name: Disable kernel check in build.sh
       run: |
         cd project
-        # 删除包含 "please build kernel first" 的行
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled in build.sh"
+
+    # ---------- 关键修复：复制必要文件到 sd-fuse 目录 ----------
+    - name: Copy necessary files to sd-fuse directories
+      run: |
+        cd project
+        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
+        while read -r dir; do
+          if [ "$dir" != "scripts/sd-fuse" ]; then
+            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
+          fi
+        done < /tmp/sd_fuse_dirs.txt
+        echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
@@ -704,6 +714,18 @@ jobs:
         cd project
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled in build.sh"
+
+    - name: Copy necessary files to sd-fuse directories
+      run: |
+        cd project
+        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
+        while read -r dir; do
+          if [ "$dir" != "scripts/sd-fuse" ]; then
+            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
+          fi
+        done < /tmp/sd_fuse_dirs.txt
+        echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
