@@ -366,7 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境，并重命名 mk-sd-image.sh 以绕过检查 ----------
+    # ---------- 准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -374,7 +374,7 @@ jobs:
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
 
-        # 1. 复制 device/configs 等到 scripts/sd-fuse 子目录（满足 sd-img 依赖）
+        # 1. 复制 device/configs 等到 scripts/sd-fuse 子目录（供 sd-img 依赖）
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -404,22 +404,11 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 5. 重命名原始 mk-sd-image.sh，创建包装脚本绕过目录检查
-        cd scripts/sd-fuse
-        mv mk-sd-image.sh mk-sd-image.sh.orig
-        cat > mk-sd-image.sh <<'EOF'
-        #!/bin/bash
-        # Wrapper script that calls original mk-sd-image.sh without directory checks
-        exec ${0}.orig "$@"
-        EOF
-        chmod +x mk-sd-image.sh mk-sd-image.sh.orig
-        cd ../..
-
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with wrapper for mk-sd-image.sh"
+        echo "Prepared sd-img environment"
 
-    # ---------- 直接调用包装后的 mk-sd-image.sh ----------
+    # ---------- 直接调用 mk-sd-image.sh（传入绝对路径） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -428,8 +417,8 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running wrapped mk-sd-image.sh directly..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh with absolute paths..."
+        ./mk-sd-image.sh ${TOPDIR}/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -440,7 +429,7 @@ jobs:
           exit 1
         fi
 
-        # 打包 tgz（保留原逻辑）
+        # 打包 tgz
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -744,7 +733,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境，并重命名 mk-sd-image.sh ----------
+    # ---------- 准备 sd-img 环境 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -778,21 +767,11 @@ jobs:
           tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
         fi
 
-        # 重命名原始 mk-sd-image.sh，创建包装脚本
-        cd scripts/sd-fuse
-        mv mk-sd-image.sh mk-sd-image.sh.orig
-        cat > mk-sd-image.sh <<'EOF'
-        #!/bin/bash
-        exec ${0}.orig "$@"
-        EOF
-        chmod +x mk-sd-image.sh mk-sd-image.sh.orig
-        cd ../..
-
         echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment with wrapper for mk-sd-image.sh"
+        echo "Prepared sd-img environment"
 
-    # ---------- 直接调用包装后的 mk-sd-image.sh ----------
+    # ---------- 直接调用 mk-sd-image.sh（传入绝对路径） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -801,8 +780,8 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running wrapped mk-sd-image.sh directly..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh with absolute paths..."
+        ./mk-sd-image.sh ${TOPDIR}/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
