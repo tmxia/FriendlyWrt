@@ -43,7 +43,7 @@ jobs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
     steps:
-      - name: Generate unique release tag with auto-increment or overwrite
+      - name: Generate unique release tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -124,7 +124,8 @@ jobs:
           build-essential libncurses5-dev libncursesw5-dev \
           gawk git rsync wget time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
-          flex bison qemu-user-static debootstrap
+          flex bison qemu-user-static debootstrap \
+          genimage   # 必须安装
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git config --global color.ui false
@@ -366,7 +367,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 修复：使用 rootfs 子目录结构 ----------
+    # ---------- 准备 sd-img 环境（包含 genimage.cfg 复制） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -374,7 +375,7 @@ jobs:
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
-        # 复制辅助文件（供 mk-sd-image.sh 使用）
+        # 复制辅助文件
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -386,16 +387,15 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # 清空并重建目标目录
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
 
-        # 解压 rootfs 到临时目录，智能扁平化
-        echo "Extracting rootfs and preparing rootfs subdirectory..."
+        # 解压 rootfs 到 rootfs 子目录
+        echo "Extracting rootfs..."
         mkdir -p /tmp/rootfs_extract
         tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
 
-        # 如果临时目录中只有一个子目录，则将其内容提升
+        # 扁平化处理（如果只有一个子目录）
         EXTRACTED_ITEMS=(/tmp/rootfs_extract/*)
         if [ ${#EXTRACTED_ITEMS[@]} -eq 1 ] && [ -d "${EXTRACTED_ITEMS[0]}" ]; then
           SUBDIR="${EXTRACTED_ITEMS[0]}"
@@ -403,22 +403,20 @@ jobs:
           rmdir "$SUBDIR"
         fi
 
-        # 将根文件系统内容移入目标目录下的 rootfs 子目录
         mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
         mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
         mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
         rm -rf /tmp/rootfs_extract
 
-        # 验证 rootfs 是否完整
+        # 验证
         if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
           echo "ERROR: /bin not found in rootfs. Extraction failed."
-          echo "Contents of rootfs:"
           ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
           exit 1
         fi
-        echo "Rootfs prepared in rootfs subdirectory."
+        echo "Rootfs prepared."
 
-        # 部署 flippy kernel boot/dtb（覆盖官方内核）
+        # 部署 flippy kernel boot/dtb
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -431,34 +429,63 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-        # 清理无关目录（如 build_dir 可能从其他地方复制而来）
+        # 清理无关目录
         rm -rf scripts/sd-fuse/${DIST_DIR}/build_dir 2>/dev/null || true
         rm -rf scripts/sd-fuse/${DIST_DIR}/tmp 2>/dev/null || true
-        # 确保只有 rootfs、boot、dtb
+
+        # 复制 genimage.cfg（如果不存在）
+        if [ ! -f "scripts/sd-fuse/genimage.cfg" ]; then
+          echo "genimage.cfg not found, searching..."
+          GENIMAGE_CFG=$(find . -name "genimage.cfg" | head -1)
+          if [ -n "$GENIMAGE_CFG" ]; then
+            echo "Found $GENIMAGE_CFG, copying to scripts/sd-fuse/"
+            cp "$GENIMAGE_CFG" scripts/sd-fuse/genimage.cfg
+          else
+            echo "WARNING: genimage.cfg not found."
+          fi
+        fi
+
         echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 调用 mk-sd-image.sh 并捕获输出 ----------
+    # ---------- 构建镜像（带详细调试） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
+        export BOARD=rk3568
+        export TARGET_IMAGE_DIRNAME="${{ steps.config.outputs.dist_dir }}"
+
+        # 调试信息
+        echo "=== Environment ==="
+        env | sort
+        echo "=== Checking genimage ==="
+        which genimage || echo "genimage not found!"
+        genimage --version || echo "genimage version failed"
+        echo "=== Checking target directory ==="
+        ls -la scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}/
+        echo "=== Checking boot contents ==="
+        ls -la scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}/boot/ || echo "boot empty"
+        echo "=== Checking genimage.cfg ==="
+        cat scripts/sd-fuse/genimage.cfg || echo "genimage.cfg missing"
+
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Current directory: $(pwd)"
-        echo "Contents of scripts/sd-fuse:"
-        ls -la
-        echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
-        ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
-        echo "Running mk-sd-image.sh with verbose output..."
-        # 捕获输出和退出码
-        if ! ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}"; then
-          echo "mk-sd-image.sh failed with exit code $?"
+        echo "Running mk-sd-image.sh with bash -x for verbose trace..."
+        if ! bash -x ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}" > /tmp/mk.log 2>&1; then
+          echo "mk-sd-image.sh failed with exit code $?."
+          echo "=== Full output (stdout+stderr) ==="
+          cat /tmp/mk.log
           exit 1
+        else
+          echo "mk-sd-image.sh succeeded."
+          echo "=== Output ==="
+          cat /tmp/mk.log
         fi
+
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -521,7 +548,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Initialization environment (lightweight)
+    - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
@@ -531,7 +558,8 @@ jobs:
           build-essential libncurses5-dev libncursesw5-dev \
           gawk git rsync wget time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
-          flex bison qemu-user-static debootstrap
+          flex bison qemu-user-static debootstrap \
+          genimage
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git config --global color.ui false
@@ -630,7 +658,7 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    - name: Download rootfs package (required)
+    - name: Download rootfs package
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -773,7 +801,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 修复：使用 rootfs 子目录结构 ----------
+    # ---------- 准备 sd-img 环境（自动任务） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -795,7 +823,7 @@ jobs:
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
 
-        echo "Extracting rootfs and preparing rootfs subdirectory..."
+        echo "Extracting rootfs..."
         mkdir -p /tmp/rootfs_extract
         tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
 
@@ -813,11 +841,10 @@ jobs:
 
         if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
           echo "ERROR: /bin not found in rootfs. Extraction failed."
-          echo "Contents of rootfs:"
           ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
           exit 1
         fi
-        echo "Rootfs prepared in rootfs subdirectory."
+        echo "Rootfs prepared."
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -833,29 +860,58 @@ jobs:
 
         rm -rf scripts/sd-fuse/${DIST_DIR}/build_dir 2>/dev/null || true
         rm -rf scripts/sd-fuse/${DIST_DIR}/tmp 2>/dev/null || true
+
+        if [ ! -f "scripts/sd-fuse/genimage.cfg" ]; then
+          echo "genimage.cfg not found, searching..."
+          GENIMAGE_CFG=$(find . -name "genimage.cfg" | head -1)
+          if [ -n "$GENIMAGE_CFG" ]; then
+            echo "Found $GENIMAGE_CFG, copying to scripts/sd-fuse/"
+            cp "$GENIMAGE_CFG" scripts/sd-fuse/genimage.cfg
+          else
+            echo "WARNING: genimage.cfg not found."
+          fi
+        fi
+
         echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 调用 mk-sd-image.sh 并捕获输出 ----------
+    # ---------- 构建镜像（自动任务） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
+        export BOARD=rk3568
+        export TARGET_IMAGE_DIRNAME="${{ steps.config.outputs.dist_dir }}"
+
+        echo "=== Environment ==="
+        env | sort
+        echo "=== Checking genimage ==="
+        which genimage || echo "genimage not found!"
+        genimage --version || echo "genimage version failed"
+        echo "=== Checking target directory ==="
+        ls -la scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}/
+        echo "=== Checking boot contents ==="
+        ls -la scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}/boot/ || echo "boot empty"
+        echo "=== Checking genimage.cfg ==="
+        cat scripts/sd-fuse/genimage.cfg || echo "genimage.cfg missing"
+
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Current directory: $(pwd)"
-        echo "Contents of scripts/sd-fuse:"
-        ls -la
-        echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
-        ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
-        echo "Running mk-sd-image.sh with verbose output..."
-        if ! ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}"; then
-          echo "mk-sd-image.sh failed with exit code $?"
+        echo "Running mk-sd-image.sh with bash -x..."
+        if ! bash -x ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}" > /tmp/mk.log 2>&1; then
+          echo "mk-sd-image.sh failed with exit code $?."
+          echo "=== Full output ==="
+          cat /tmp/mk.log
           exit 1
+        else
+          echo "mk-sd-image.sh succeeded."
+          echo "=== Output ==="
+          cat /tmp/mk.log
         fi
+
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -898,7 +954,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-  # ---------- 清理任务 ----------
+  # ---------- 清理中间产物 ----------
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
