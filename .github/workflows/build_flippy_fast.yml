@@ -366,13 +366,13 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 准备 sd-img 环境 ----------
+    # ---------- 准备 sd-img 环境（使用正确的方法解压 rootfs） ----------
     - name: Prepare sd-img environment
       run: |
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
         # 1. 复制 device/configs 等到 scripts/sd-fuse 子目录（供 sd-img 依赖）
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
@@ -387,11 +387,20 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # 3. 复制完整的 rootfs 到 sd-fuse 目录
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        # 3. 正确解压 rootfs 包到目标目录（自动检测顶层目录）
+        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a ${ROOTFS_SRC}/. scripts/sd-fuse/${DIST_DIR}/
+        tmpdir=$(mktemp -d)
+        tar xzf "../artifact/${ROOTFS_FILE}" -C $tmpdir
+        # 查找包含 etc 或 usr 的目录作为根目录
+        root_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
+        if [ "$root_src" != "$tmpdir" ]; then
+          cp -a $root_src/. scripts/sd-fuse/${DIST_DIR}/
+        else
+          cp -a $tmpdir/. scripts/sd-fuse/${DIST_DIR}/
+        fi
+        rm -rf $tmpdir
 
         # 4. 重新部署 flippy kernel（boot/dtb）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
@@ -408,7 +417,7 @@ jobs:
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh（传入绝对路径） ----------
+    # ---------- 直接调用 mk-sd-image.sh（在 scripts/sd-fuse 目录下执行，使用相对路径） ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -417,8 +426,8 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running mk-sd-image.sh with absolute paths..."
-        ./mk-sd-image.sh ${TOPDIR}/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh in scripts/sd-fuse directory..."
+        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -739,7 +748,7 @@ jobs:
         cd project
         TOPDIR=$(pwd)
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
@@ -752,10 +761,18 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        echo "Copying rootfs to scripts/sd-fuse/${DIST_DIR} ..."
+        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} ..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
-        cp -a ${ROOTFS_SRC}/. scripts/sd-fuse/${DIST_DIR}/
+        tmpdir=$(mktemp -d)
+        tar xzf "../artifact/${ROOTFS_FILE}" -C $tmpdir
+        root_src=$(find $tmpdir -type d -name "etc" -o -name "usr" | head -1 | xargs dirname 2>/dev/null || echo $tmpdir)
+        if [ "$root_src" != "$tmpdir" ]; then
+          cp -a $root_src/. scripts/sd-fuse/${DIST_DIR}/
+        else
+          cp -a $tmpdir/. scripts/sd-fuse/${DIST_DIR}/
+        fi
+        rm -rf $tmpdir
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -771,7 +788,7 @@ jobs:
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh（传入绝对路径） ----------
+    # ---------- 直接调用 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -780,8 +797,8 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Running mk-sd-image.sh with absolute paths..."
-        ./mk-sd-image.sh ${TOPDIR}/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh in scripts/sd-fuse directory..."
+        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
