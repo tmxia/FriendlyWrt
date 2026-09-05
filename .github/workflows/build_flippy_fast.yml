@@ -366,7 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境，智能解压 rootfs ----------
+    # ---------- 核心修复：准备 sd-img 环境，使用 rootfs 子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -386,39 +386,40 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # ====== 修复开始 ======
-        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} with smart flattening..."
+        # 清空并重建目标目录
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
 
-        # 解压到临时目录
+        # 解压 rootfs 到临时目录，智能处理嵌套
+        echo "Extracting rootfs and preparing rootfs subdirectory..."
         mkdir -p /tmp/rootfs_extract
         tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
 
-        # 判断解压后是否只有一个子目录，若是则将其内容提升到顶层
-        EXTRACTED_CONTENT=$(ls -A /tmp/rootfs_extract)
-        if [ $(echo "$EXTRACTED_CONTENT" | wc -l) -eq 1 ] && [ -d "/tmp/rootfs_extract/$EXTRACTED_CONTENT" ]; then
-          echo "Only one subdirectory found ($EXTRACTED_CONTENT), moving its contents to target..."
-          mv /tmp/rootfs_extract/$EXTRACTED_CONTENT/* scripts/sd-fuse/${DIST_DIR}/
-          # 移动可能隐藏的文件（如 .profile）
-          mv /tmp/rootfs_extract/$EXTRACTED_CONTENT/.[!.]* scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
-        else
-          echo "Multiple items or mixed content, moving all to target..."
-          mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/
-          mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        # 如果临时目录中只有一个子目录，则将其内容提升
+        EXTRACTED_ITEMS=(/tmp/rootfs_extract/*)
+        if [ ${#EXTRACTED_ITEMS[@]} -eq 1 ] && [ -d "${EXTRACTED_ITEMS[0]}" ]; then
+          # 只有一个目录，将其内容上移
+          SUBDIR="${EXTRACTED_ITEMS[0]}"
+          mv "$SUBDIR"/* /tmp/rootfs_extract/
+          rmdir "$SUBDIR"
         fi
+
+        # 将根文件系统内容移入目标目录下的 rootfs 子目录
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
+        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
+        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
         rm -rf /tmp/rootfs_extract
 
-        # 验证根文件系统是否完整（检查 bin 目录是否存在）
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/bin" ]; then
-          echo "ERROR: /bin not found in ${DIST_DIR}. Rootfs extraction failed."
-          echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
-          ls -la scripts/sd-fuse/${DIST_DIR}
+        # 验证 rootfs 是否完整（检查 bin）
+        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
+          echo "ERROR: /bin not found in rootfs. Extraction failed."
+          echo "Contents of rootfs:"
+          ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
           exit 1
         fi
-        echo "Rootfs flattened successfully."
+        echo "Rootfs prepared in rootfs subdirectory."
 
-        # 重新部署 flippy kernel boot/dtb（覆盖可能已解压的官方内核）
+        # 部署 flippy kernel boot/dtb（如果尚未部署或覆盖官方内核）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -431,11 +432,11 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-        echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
+        echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh（在 sd-fuse 目录内执行） ----------
+    # ---------- 直接调用 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -444,6 +445,11 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
+        # 调试：列出当前目录内容
+        echo "Current directory: $(pwd)"
+        echo "Contents of scripts/sd-fuse:"
+        ls -la
+        # 运行脚本
         echo "Running mk-sd-image.sh in scripts/sd-fuse directory..."
         ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
@@ -760,7 +766,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境，智能解压 rootfs ----------
+    # ---------- 核心修复：准备 sd-img 环境，使用 rootfs 子目录 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -768,7 +774,6 @@ jobs:
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
 
-        # 复制辅助文件
         find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
         cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
         while read -r dir; do
@@ -780,35 +785,33 @@ jobs:
         mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
         touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
 
-        # ====== 修复开始 ======
-        echo "Extracting rootfs to scripts/sd-fuse/${DIST_DIR} with smart flattening..."
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
 
+        echo "Extracting rootfs and preparing rootfs subdirectory..."
         mkdir -p /tmp/rootfs_extract
         tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
 
-        EXTRACTED_CONTENT=$(ls -A /tmp/rootfs_extract)
-        if [ $(echo "$EXTRACTED_CONTENT" | wc -l) -eq 1 ] && [ -d "/tmp/rootfs_extract/$EXTRACTED_CONTENT" ]; then
-          echo "Only one subdirectory found ($EXTRACTED_CONTENT), moving its contents to target..."
-          mv /tmp/rootfs_extract/$EXTRACTED_CONTENT/* scripts/sd-fuse/${DIST_DIR}/
-          mv /tmp/rootfs_extract/$EXTRACTED_CONTENT/.[!.]* scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
-        else
-          echo "Multiple items or mixed content, moving all to target..."
-          mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/
-          mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        EXTRACTED_ITEMS=(/tmp/rootfs_extract/*)
+        if [ ${#EXTRACTED_ITEMS[@]} -eq 1 ] && [ -d "${EXTRACTED_ITEMS[0]}" ]; then
+          SUBDIR="${EXTRACTED_ITEMS[0]}"
+          mv "$SUBDIR"/* /tmp/rootfs_extract/
+          rmdir "$SUBDIR"
         fi
+
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
+        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
+        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
         rm -rf /tmp/rootfs_extract
 
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/bin" ]; then
-          echo "ERROR: /bin not found in ${DIST_DIR}. Rootfs extraction failed."
-          echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
-          ls -la scripts/sd-fuse/${DIST_DIR}
+        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
+          echo "ERROR: /bin not found in rootfs. Extraction failed."
+          echo "Contents of rootfs:"
+          ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
           exit 1
         fi
-        echo "Rootfs flattened successfully."
+        echo "Rootfs prepared in rootfs subdirectory."
 
-        # 重新部署 flippy kernel boot/dtb
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -821,11 +824,11 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-        echo "Contents of scripts/sd-fuse/${DIST_DIR}:"
+        echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh（在 sd-fuse 目录内执行） ----------
+    # ---------- 直接调用 mk-sd-image.sh ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -834,6 +837,9 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
+        echo "Current directory: $(pwd)"
+        echo "Contents of scripts/sd-fuse:"
+        ls -la
         echo "Running mk-sd-image.sh in scripts/sd-fuse directory..."
         ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
         cd ${TOPDIR}
