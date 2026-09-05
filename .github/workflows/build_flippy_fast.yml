@@ -124,8 +124,14 @@ jobs:
           build-essential libncurses5-dev libncursesw5-dev \
           gawk git rsync wget time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
-          flex bison qemu-user-static debootstrap \
-          genimage   # 必须安装
+          flex bison qemu-user-static debootstrap
+        # 手动安装 genimage（因为 Ubuntu 22.04 官方源没有该包）
+        wget -q https://github.com/pengutronix/genimage/releases/download/v16/genimage-v16-x86_64-linux-gnu.tar.xz
+        tar xf genimage-v16-x86_64-linux-gnu.tar.xz
+        sudo cp genimage /usr/local/bin/
+        rm -rf genimage-v16-x86_64-linux-gnu.tar.xz genimage
+        # 验证安装
+        genimage --version || echo "genimage installation failed"
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git config --global color.ui false
@@ -558,8 +564,13 @@ jobs:
           build-essential libncurses5-dev libncursesw5-dev \
           gawk git rsync wget time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
-          flex bison qemu-user-static debootstrap \
-          genimage
+          flex bison qemu-user-static debootstrap
+        # 手动安装 genimage
+        wget -q https://github.com/pengutronix/genimage/releases/download/v16/genimage-v16-x86_64-linux-gnu.tar.xz
+        tar xf genimage-v16-x86_64-linux-gnu.tar.xz
+        sudo cp genimage /usr/local/bin/
+        rm -rf genimage-v16-x86_64-linux-gnu.tar.xz genimage
+        genimage --version || echo "genimage installation failed"
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git config --global color.ui false
