@@ -366,7 +366,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境，根文件系统直接平铺在顶层 ----------
+    # ---------- 修复：使用 rootfs 子目录结构 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -390,8 +390,8 @@ jobs:
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
 
-        # 解压 rootfs 到临时目录，智能处理嵌套
-        echo "Extracting rootfs and flattening to top-level..."
+        # 解压 rootfs 到临时目录，智能扁平化
+        echo "Extracting rootfs and preparing rootfs subdirectory..."
         mkdir -p /tmp/rootfs_extract
         tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
 
@@ -403,21 +403,22 @@ jobs:
           rmdir "$SUBDIR"
         fi
 
-        # 将根文件系统内容直接移入目标目录（顶层）
-        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/
-        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        # 将根文件系统内容移入目标目录下的 rootfs 子目录
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
+        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
+        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
         rm -rf /tmp/rootfs_extract
 
-        # 验证根文件系统是否完整（检查 bin）
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/bin" ]; then
-          echo "ERROR: /bin not found in ${DIST_DIR}. Extraction failed."
-          echo "Contents of ${DIST_DIR}:"
-          ls -la scripts/sd-fuse/${DIST_DIR} || true
+        # 验证 rootfs 是否完整
+        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
+          echo "ERROR: /bin not found in rootfs. Extraction failed."
+          echo "Contents of rootfs:"
+          ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
           exit 1
         fi
-        echo "Rootfs extracted and flattened successfully."
+        echo "Rootfs prepared in rootfs subdirectory."
 
-        # 部署 flippy kernel boot/dtb（如果尚未部署）
+        # 部署 flippy kernel boot/dtb（覆盖官方内核）
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -430,11 +431,15 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
+        # 清理无关目录（如 build_dir 可能从其他地方复制而来）
+        rm -rf scripts/sd-fuse/${DIST_DIR}/build_dir 2>/dev/null || true
+        rm -rf scripts/sd-fuse/${DIST_DIR}/tmp 2>/dev/null || true
+        # 确保只有 rootfs、boot、dtb
         echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh（增加调试） ----------
+    # ---------- 调用 mk-sd-image.sh 并捕获输出 ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -448,8 +453,12 @@ jobs:
         ls -la
         echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
         ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
-        echo "Running mk-sd-image.sh..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh with verbose output..."
+        # 捕获输出和退出码
+        if ! ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}"; then
+          echo "mk-sd-image.sh failed with exit code $?"
+          exit 1
+        fi
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -764,7 +773,7 @@ jobs:
         find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
         echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
 
-    # ---------- 核心修复：准备 sd-img 环境，根文件系统直接平铺在顶层 ----------
+    # ---------- 修复：使用 rootfs 子目录结构 ----------
     - name: Prepare sd-img environment
       run: |
         cd project
@@ -786,7 +795,7 @@ jobs:
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
 
-        echo "Extracting rootfs and flattening to top-level..."
+        echo "Extracting rootfs and preparing rootfs subdirectory..."
         mkdir -p /tmp/rootfs_extract
         tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
 
@@ -797,17 +806,18 @@ jobs:
           rmdir "$SUBDIR"
         fi
 
-        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/
-        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/ 2>/dev/null || true
+        mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
+        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
+        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
         rm -rf /tmp/rootfs_extract
 
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/bin" ]; then
-          echo "ERROR: /bin not found in ${DIST_DIR}. Extraction failed."
-          echo "Contents of ${DIST_DIR}:"
-          ls -la scripts/sd-fuse/${DIST_DIR} || true
+        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
+          echo "ERROR: /bin not found in rootfs. Extraction failed."
+          echo "Contents of rootfs:"
+          ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
           exit 1
         fi
-        echo "Rootfs extracted and flattened successfully."
+        echo "Rootfs prepared in rootfs subdirectory."
 
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -821,11 +831,13 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
+        rm -rf scripts/sd-fuse/${DIST_DIR}/build_dir 2>/dev/null || true
+        rm -rf scripts/sd-fuse/${DIST_DIR}/tmp 2>/dev/null || true
         echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
         ls -la scripts/sd-fuse/${DIST_DIR} || true
         echo "Prepared sd-img environment"
 
-    # ---------- 直接调用 mk-sd-image.sh（增加调试） ----------
+    # ---------- 调用 mk-sd-image.sh 并捕获输出 ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -839,8 +851,11 @@ jobs:
         ls -la
         echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
         ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
-        echo "Running mk-sd-image.sh..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        echo "Running mk-sd-image.sh with verbose output..."
+        if ! ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}"; then
+          echo "mk-sd-image.sh failed with exit code $?"
+          exit 1
+        fi
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
