@@ -276,7 +276,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    - name: Download and deploy flippy kernel
+    - name: Download and extract flippy kernel (boot, dtb, modules)
       run: |
         cd project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
@@ -309,22 +309,60 @@ jobs:
 
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
+        # 保存 flippy 模块供后续注入
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
+        # 保存 boot 和 dtb 归档路径供后续使用
+        echo "BOOT_TAR=$BOOT_TAR" >> $GITHUB_ENV
+        echo "DTB_TAR=$DTB_TAR" >> $GITHUB_ENV
 
-    - name: Prepare rootfs and inject flippy kernel
+    - name: Extract rootfs to official build directory
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        
         ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         mkdir -p "$ROOTFS_DIR"
-        
         echo "Extracting rootfs to $ROOTFS_DIR ..."
         tar xzf "../artifact/$ROOTFS_FILE" -C "$ROOTFS_DIR"
-        
-        # 注入 flippy 内核模块
+
+    - name: Compile uboot and kernel (official)
+      run: |
+        cd project
+        # 编译 uboot
+        mkdir -p friendlywrt/u-boot
+        if [ ! -f friendlywrt/u-boot/.built ]; then
+          ./build.sh uboot
+          touch friendlywrt/u-boot/.built
+        fi
+        # 编译官方内核（生成必要的标记和目录，以便 sd-img 正常运行）
+        mkdir -p friendlywrt/kernel
+        if [ ! -f friendlywrt/kernel/.built ]; then
+          ./build.sh kernel
+          touch friendlywrt/kernel/.built
+        fi
+        echo "U-boot and official kernel built."
+
+    - name: Override with flippy kernel (boot, dtb, modules)
+      run: |
+        cd project
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        # 覆盖 boot 和 dtb
+        BOOT_TAR="${{ env.BOOT_TAR }}"
+        DTB_TAR="${{ env.DTB_TAR }}"
+        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
+          echo "Overriding boot and dtb with flippy kernel..."
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
+        else
+          echo "ERROR: flippy boot/dtb not found, cannot override."
+          exit 1
+        fi
+
+        # 注入 flippy 模块到 rootfs
+        ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         if [ -d /tmp/flippy_modules ]; then
           MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
           if [ -n "$MODULES_DIR_NAME" ]; then
@@ -340,42 +378,7 @@ jobs:
         else
           echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
         fi
-        
-        # 部署 flippy kernel boot/dtb 到 sd-fuse 目录（供 mk-sd-image.sh 使用）
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
-        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
-          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
-          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
-          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
-        else
-          echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
-        fi
-        
-        # 创建内核构建标记（跳过编译）
-        mkdir -p friendlywrt/kernel
-        touch friendlywrt/kernel/.built
 
-    - name: Compile uboot
-      run: |
-        cd project
-        mkdir -p friendlywrt/u-boot
-        if [ ! -f friendlywrt/u-boot/.built ]; then
-          ./build.sh uboot
-          touch friendlywrt/u-boot/.built
-        fi
-        echo "U-boot ready."
-
-    - name: Disable kernel check in build.sh
-      run: |
-        cd project
-        sed -i '/please build kernel first/d' build.sh
-        echo "Kernel check disabled in build.sh"
-
-    # ---------- 关键修复：复制必要文件到 sd-fuse 目录 ----------
     - name: Copy necessary files to sd-fuse directories
       run: |
         cd project
@@ -619,7 +622,7 @@ jobs:
         echo "version=$LATEST" >> $GITHUB_OUTPUT
         echo "Latest flippy kernel version: $LATEST"
 
-    - name: Download and deploy flippy kernel
+    - name: Download and extract flippy kernel (boot, dtb, modules)
       run: |
         cd project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
@@ -654,19 +657,52 @@ jobs:
 
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
+        echo "BOOT_TAR=$BOOT_TAR" >> $GITHUB_ENV
+        echo "DTB_TAR=$DTB_TAR" >> $GITHUB_ENV
 
-    - name: Prepare rootfs and inject flippy kernel
+    - name: Extract rootfs to official build directory
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        
         ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         mkdir -p "$ROOTFS_DIR"
-        
         echo "Extracting rootfs to $ROOTFS_DIR ..."
         tar xzf "../artifact/$ROOTFS_FILE" -C "$ROOTFS_DIR"
-        
+
+    - name: Compile uboot and kernel (official)
+      run: |
+        cd project
+        mkdir -p friendlywrt/u-boot
+        if [ ! -f friendlywrt/u-boot/.built ]; then
+          ./build.sh uboot
+          touch friendlywrt/u-boot/.built
+        fi
+        mkdir -p friendlywrt/kernel
+        if [ ! -f friendlywrt/kernel/.built ]; then
+          ./build.sh kernel
+          touch friendlywrt/kernel/.built
+        fi
+        echo "U-boot and official kernel built."
+
+    - name: Override with flippy kernel (boot, dtb, modules)
+      run: |
+        cd project
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        BOOT_TAR="${{ env.BOOT_TAR }}"
+        DTB_TAR="${{ env.DTB_TAR }}"
+        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
+          echo "Overriding boot and dtb with flippy kernel..."
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
+        else
+          echo "ERROR: flippy boot/dtb not found, cannot override."
+          exit 1
+        fi
+
+        ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         if [ -d /tmp/flippy_modules ]; then
           MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
           if [ -n "$MODULES_DIR_NAME" ]; then
@@ -682,38 +718,6 @@ jobs:
         else
           echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
         fi
-        
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
-        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
-          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
-          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
-          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
-        else
-          echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
-        fi
-        
-        mkdir -p friendlywrt/kernel
-        touch friendlywrt/kernel/.built
-
-    - name: Compile uboot
-      run: |
-        cd project
-        mkdir -p friendlywrt/u-boot
-        if [ ! -f friendlywrt/u-boot/.built ]; then
-          ./build.sh uboot
-          touch friendlywrt/u-boot/.built
-        fi
-        echo "U-boot ready."
-
-    - name: Disable kernel check in build.sh
-      run: |
-        cd project
-        sed -i '/please build kernel first/d' build.sh
-        echo "Kernel check disabled in build.sh"
 
     - name: Copy necessary files to sd-fuse directories
       run: |
