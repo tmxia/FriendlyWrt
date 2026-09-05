@@ -95,6 +95,7 @@ jobs:
           allow_updates: true
           overwrite: true
 
+  # ---------- 手动触发构建 ----------
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -324,12 +325,11 @@ jobs:
         rm -rf scripts/sd-fuse/${DIST_DIR}
         mkdir -p scripts/sd-fuse/${DIST_DIR}
 
-        # 解压 rootfs 到临时目录并扁平化（去除可能的外层目录）
+        # 解压 rootfs 到临时目录并扁平化
         echo "Extracting rootfs..."
         mkdir -p /tmp/rootfs_extract
         tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
 
-        # 如果只有一个子目录，则提升其内容
         EXTRACTED_ITEMS=(/tmp/rootfs_extract/*)
         if [ ${#EXTRACTED_ITEMS[@]} -eq 1 ] && [ -d "${EXTRACTED_ITEMS[0]}" ]; then
           SUBDIR="${EXTRACTED_ITEMS[0]}"
@@ -337,13 +337,11 @@ jobs:
           rmdir "$SUBDIR"
         fi
 
-        # 创建 rootfs 子目录并移动内容
         mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
         mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
         mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
         rm -rf /tmp/rootfs_extract
 
-        # 验证 rootfs 完整性
         if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
           echo "ERROR: /bin not found in rootfs. Extraction failed."
           echo "Contents of rootfs:"
@@ -351,7 +349,7 @@ jobs:
           exit 1
         fi
 
-        # 注入 flippy 内核模块到 rootfs/lib/modules
+        # 注入 flippy 模块
         if [ -d /tmp/flippy_modules ]; then
           MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
           if [ -n "$MODULES_DIR_NAME" ]; then
@@ -368,7 +366,7 @@ jobs:
           echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
         fi
 
-        # 部署 flippy kernel boot/dtb
+        # 部署 flippy boot/dtb
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -381,7 +379,6 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-        # 清理可能出现的无关目录
         rm -rf scripts/sd-fuse/${DIST_DIR}/build_dir 2>/dev/null || true
         rm -rf scripts/sd-fuse/${DIST_DIR}/tmp 2>/dev/null || true
 
@@ -418,6 +415,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
+    # ---------- 核心修复：使用绝对路径和 .rootfs 标记 ----------
     - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
       run: |
@@ -426,13 +424,15 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Current directory: $(pwd)"
-        echo "Contents of scripts/sd-fuse:"
-        ls -la
-        echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
-        ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
+        # 使用绝对路径
+        TARGET_DIR="$(pwd)/${{ steps.config.outputs.dist_dir }}"
+        echo "Target directory (absolute): $TARGET_DIR"
+        # 创建标记文件，避免脚本误判
+        touch "$TARGET_DIR/.rootfs"
+        echo "Contents of target directory:"
+        ls -la "$TARGET_DIR"
         echo "Running mk-sd-image.sh..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        ./mk-sd-image.sh "$TARGET_DIR" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}"
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -476,6 +476,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
+  # ---------- 自动触发构建（watch 事件） ----------
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -791,6 +792,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
+    # ---------- 核心修复：使用绝对路径和 .rootfs 标记 ----------
     - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
       run: |
@@ -799,13 +801,13 @@ jobs:
         export FRIENDLYWRT_SRC=$TOPDIR
         mkdir -p out
         cd scripts/sd-fuse
-        echo "Current directory: $(pwd)"
-        echo "Contents of scripts/sd-fuse:"
-        ls -la
-        echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
-        ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
+        TARGET_DIR="$(pwd)/${{ steps.config.outputs.dist_dir }}"
+        echo "Target directory (absolute): $TARGET_DIR"
+        touch "$TARGET_DIR/.rootfs"
+        echo "Contents of target directory:"
+        ls -la "$TARGET_DIR"
         echo "Running mk-sd-image.sh..."
-        ./mk-sd-image.sh ${{ steps.config.outputs.dist_dir }} ${TOPDIR}/out/${{ steps.config.outputs.img_filename }}
+        ./mk-sd-image.sh "$TARGET_DIR" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}"
         cd ${TOPDIR}
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -848,6 +850,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
+  # ---------- 清理任务 ----------
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
