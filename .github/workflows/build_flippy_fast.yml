@@ -260,173 +260,30 @@ jobs:
           exit 1
         fi
 
-    - name: Prepare official rootfs for sd-img
+    # ---------- 核心修改：解压 rootfs 到官方构建目录，并替换内核 ----------
+    - name: Prepare rootfs and inject flippy kernel
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
-        tar xzf "../artifact/$ROOTFS_FILE" --strip-components=3 -C friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
-        mkdir -p friendlywrt/bin/targets/rockchip/armv8/packages
-        if [ ! -f friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release ]; then
-          mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib
-          echo "ID=openwrt" > friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release
-        fi
-        echo "Official rootfs prepared"
-
-    - name: Compile uboot and disable kernel check
-      run: |
-        cd project
-        ./build.sh uboot
-        sed -i '/please build kernel first/d' build.sh
-        mkdir -p friendlywrt/kernel
-        touch friendlywrt/kernel/.built
-        echo "U-boot compiled and kernel check completely disabled."
-
-    - name: Get latest flippy kernel version
-      id: flippy_version
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
-        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
-        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
-        if [ -z "$VERSIONS" ]; then
-          echo "ERROR: No kernel tarballs found in kernel_flippy release"
-          exit 1
-        fi
-        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
-        echo "version=$LATEST" >> $GITHUB_OUTPUT
-        echo "Latest flippy kernel version: $LATEST"
-
-    - name: Download and deploy flippy kernel
-      run: |
-        cd project
-        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
-
-        mkdir -p /tmp/flippy_extract
-        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
-
-        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
-        if [ ! -d "$KERNEL_DIR" ]; then
-          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
-        fi
-        if [ -z "$KERNEL_DIR" ] || [ ! -d "$KERNEL_DIR" ]; then
-          echo "ERROR: Kernel directory not found"
-          ls -la /tmp/flippy_extract
-          exit 1
-        fi
-        echo "Kernel directory: $KERNEL_DIR"
-
-        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-        MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
-
-        if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MODULES_TAR" ]; then
-          echo "ERROR: Could not find boot, dtb, or modules archives. Listing contents:"
-          ls -laR "$KERNEL_DIR"
-          exit 1
-        fi
-
-        echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
-
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "Deploying flippy kernel to scripts/sd-fuse/${DIST_DIR}"
-
-        mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
-        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
-
-        mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
-        tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
-
-        mkdir -p /tmp/flippy_modules
-        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
-
-        echo "Flippy kernel deployed."
-
-    - name: Inject flippy modules into official rootfs
-      run: |
-        cd project
+        
+        # 1. 确定官方 rootfs 目录（与 build.sh 一致）
         ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
-        if [ ! -d "$ROOTFS_DIR" ]; then
-          echo "ERROR: Official rootfs directory $ROOTFS_DIR not found"
-          exit 1
-        fi
-        MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
-        if [ -z "$MODULES_DIR_NAME" ]; then
-          echo "ERROR: Could not determine modules directory name"
-          ls -la /tmp/flippy_modules
-          exit 1
-        fi
-        echo "Modules directory name: $MODULES_DIR_NAME"
-        rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
-        mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
-        cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
-        find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
-        echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
-
-    # ---------- 核心修复：准备 sd-img 环境，并注入 flippy 模块到 rootfs ----------
-    - name: Prepare sd-img environment
-      run: |
-        cd project
-        TOPDIR=$(pwd)
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
-
-        # 复制辅助文件（供 mk-sd-image.sh 使用）
-        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
-        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        while read -r dir; do
-          if [ "$dir" != "scripts/sd-fuse" ]; then
-            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
-          fi
-        done < /tmp/sd_fuse_dirs.txt
-
-        mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
-        touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
-
-        # 清空并重建目标目录
-        rm -rf scripts/sd-fuse/${DIST_DIR}
-        mkdir -p scripts/sd-fuse/${DIST_DIR}
-
-        # 解压 rootfs 到临时目录，智能扁平化
-        echo "Extracting rootfs and preparing rootfs subdirectory..."
-        mkdir -p /tmp/rootfs_extract
-        tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
-
-        # 如果临时目录中只有一个子目录，则将其内容提升
-        EXTRACTED_ITEMS=(/tmp/rootfs_extract/*)
-        if [ ${#EXTRACTED_ITEMS[@]} -eq 1 ] && [ -d "${EXTRACTED_ITEMS[0]}" ]; then
-          SUBDIR="${EXTRACTED_ITEMS[0]}"
-          mv "$SUBDIR"/* /tmp/rootfs_extract/
-          rmdir "$SUBDIR"
-        fi
-
-        # 将根文件系统内容移入目标目录下的 rootfs 子目录
-        mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
-        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
-        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
-        rm -rf /tmp/rootfs_extract
-
-        # 验证 rootfs 是否完整
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
-          echo "ERROR: /bin not found in rootfs. Extraction failed."
-          echo "Contents of rootfs:"
-          ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
-          exit 1
-        fi
-
-        # ===== 注入 flippy 内核模块到该 rootfs =====
+        mkdir -p "$ROOTFS_DIR"
+        
+        # 2. 解压 rootfs 到该目录（不带 strip-components，保留完整结构）
+        echo "Extracting rootfs to $ROOTFS_DIR ..."
+        tar xzf "../artifact/$ROOTFS_FILE" -C "$ROOTFS_DIR"
+        
+        # 3. 注入 flippy 内核模块（覆盖官方模块）
         if [ -d /tmp/flippy_modules ]; then
           MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
           if [ -n "$MODULES_DIR_NAME" ]; then
-            echo "Injecting flippy modules to rootfs..."
-            rm -rf scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules
-            mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules/$MODULES_DIR_NAME
-            cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules/$MODULES_DIR_NAME/
-            find scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules -type f -exec chmod 644 {} \;
+            echo "Injecting flippy modules to $ROOTFS_DIR/lib/modules ..."
+            rm -rf "$ROOTFS_DIR/lib/modules"
+            mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
+            cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
+            find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
             echo "Flippy modules injected."
           else
             echo "WARNING: Could not determine modules directory name, skipping injection."
@@ -434,12 +291,13 @@ jobs:
         else
           echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
         fi
-
-        # 部署 flippy kernel boot/dtb（覆盖官方内核）
+        
+        # 4. 部署 flippy kernel boot/dtb 到 sd-fuse 目录
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
-          echo "Deploying flippy kernel boot/dtb..."
+          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
           mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
           tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
           mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
@@ -447,51 +305,33 @@ jobs:
         else
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
+        
+        # 5. 创建 kernel/.built 标记（跳过 kernel 编译）
+        mkdir -p friendlywrt/kernel
+        touch friendlywrt/kernel/.built
 
-        # 清理无关目录
-        rm -rf scripts/sd-fuse/${DIST_DIR}/build_dir 2>/dev/null || true
-        rm -rf scripts/sd-fuse/${DIST_DIR}/tmp 2>/dev/null || true
+    - name: Compile uboot (if needed)
+      run: |
+        cd project
+        # 如果之前没有编译 uboot，这里编译一次
+        if [ ! -f friendlywrt/u-boot/.built ]; then
+          ./build.sh uboot
+          touch friendlywrt/u-boot/.built
+        fi
+        echo "U-boot ready."
 
-        echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
-        ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment"
-
-    # ---------- 调用 mk-sd-image.sh 并详细输出 ----------
+    # ---------- 调用官方 sd-img 构建命令 ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
+        # 确保环境变量
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
-        mkdir -p out
-        cd scripts/sd-fuse
-
-        echo "===== Debug Info ====="
-        echo "Current directory: $(pwd)"
-        echo "Contents of scripts/sd-fuse:"
-        ls -la
-        echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
-        ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
-        echo "======================"
-
-        echo "Running mk-sd-image.sh with verbose tracing..."
-        # 使用 bash -x 跟踪执行，并将输出保存到日志文件
-        set +e  # 暂时允许命令失败
-        bash -x ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}" > /tmp/mk-sd-image.log 2>&1
-        EXIT_CODE=$?
-        set -e
-
-        # 打印完整日志
-        echo "===== mk-sd-image.sh output (stdout+stderr) ====="
-        cat /tmp/mk-sd-image.log
-        echo "================================================"
-
-        if [ $EXIT_CODE -ne 0 ]; then
-          echo "mk-sd-image.sh failed with exit code $EXIT_CODE"
-          exit 1
-        fi
-
-        cd ${TOPDIR}
+        # 运行官方 sd-img 命令
+        ./build.sh sd-img
+        
+        # 检查生成的镜像
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -500,8 +340,8 @@ jobs:
           ls -la out/ || true
           exit 1
         fi
-
-        # 打包 tgz
+        
+        # 打包 tgz（与官方一致）
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -699,167 +539,27 @@ jobs:
           exit 1
         fi
 
-    - name: Prepare official rootfs for sd-img
+    # ---------- 核心修改：解压 rootfs 到官方构建目录，并替换内核 ----------
+    - name: Prepare rootfs and inject flippy kernel
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
-        tar xzf "../artifact/$ROOTFS_FILE" --strip-components=3 -C friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip
-        mkdir -p friendlywrt/bin/targets/rockchip/armv8/packages
-        if [ ! -f friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release ]; then
-          mkdir -p friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib
-          echo "ID=openwrt" > friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip/usr/lib/os-release
-        fi
-        echo "Official rootfs prepared"
-
-    - name: Compile uboot and disable kernel check
-      run: |
-        cd project
-        ./build.sh uboot
-        sed -i '/please build kernel first/d' build.sh
-        mkdir -p friendlywrt/kernel
-        touch friendlywrt/kernel/.built
-        echo "U-boot compiled and kernel check completely disabled."
-
-    - name: Get latest flippy kernel version
-      id: flippy_version
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
-        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
-        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
-        if [ -z "$VERSIONS" ]; then
-          echo "ERROR: No kernel tarballs found in kernel_flippy release"
-          exit 1
-        fi
-        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
-        echo "version=$LATEST" >> $GITHUB_OUTPUT
-        echo "Latest flippy kernel version: $LATEST"
-
-    - name: Download and deploy flippy kernel
-      run: |
-        cd project
-        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
-
-        mkdir -p /tmp/flippy_extract
-        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
-
-        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
-        if [ ! -d "$KERNEL_DIR" ]; then
-          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
-        fi
-        if [ -z "$KERNEL_DIR" ] || [ ! -d "$KERNEL_DIR" ]; then
-          echo "ERROR: Kernel directory not found"
-          ls -la /tmp/flippy_extract
-          exit 1
-        fi
-        echo "Kernel directory: $KERNEL_DIR"
-
-        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-        MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
-
-        if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MODULES_TAR" ]; then
-          echo "ERROR: Could not find boot, dtb, or modules archives. Listing contents:"
-          ls -laR "$KERNEL_DIR"
-          exit 1
-        fi
-
-        echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
-
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "Deploying flippy kernel to scripts/sd-fuse/${DIST_DIR}"
-
-        mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
-        tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
-
-        mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
-        tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
-
-        mkdir -p /tmp/flippy_modules
-        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
-
-        echo "Flippy kernel deployed."
-
-    - name: Inject flippy modules into official rootfs
-      run: |
-        cd project
+        
         ROOTFS_DIR="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
-        if [ ! -d "$ROOTFS_DIR" ]; then
-          echo "ERROR: Official rootfs directory $ROOTFS_DIR not found"
-          exit 1
-        fi
-        MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
-        if [ -z "$MODULES_DIR_NAME" ]; then
-          echo "ERROR: Could not determine modules directory name"
-          ls -la /tmp/flippy_modules
-          exit 1
-        fi
-        echo "Modules directory name: $MODULES_DIR_NAME"
-        rm -rf "$ROOTFS_DIR/lib/modules" 2>/dev/null || true
-        mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
-        cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
-        find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
-        echo "Modules injected to $ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
-
-    # ---------- 核心修复：准备 sd-img 环境，并注入 flippy 模块到 rootfs ----------
-    - name: Prepare sd-img environment
-      run: |
-        cd project
-        TOPDIR=$(pwd)
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${{ steps.config.outputs.suffix }}.tgz"
-
-        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
-        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
-        while read -r dir; do
-          if [ "$dir" != "scripts/sd-fuse" ]; then
-            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
-          fi
-        done < /tmp/sd_fuse_dirs.txt
-
-        mkdir -p friendlywrt/kernel friendlywrt/u-boot friendlywrt/toolchain
-        touch friendlywrt/kernel/.built friendlywrt/u-boot/.built friendlywrt/toolchain/.built
-
-        rm -rf scripts/sd-fuse/${DIST_DIR}
-        mkdir -p scripts/sd-fuse/${DIST_DIR}
-
-        echo "Extracting rootfs and preparing rootfs subdirectory..."
-        mkdir -p /tmp/rootfs_extract
-        tar xzf "../artifact/${ROOTFS_FILE}" -C /tmp/rootfs_extract
-
-        EXTRACTED_ITEMS=(/tmp/rootfs_extract/*)
-        if [ ${#EXTRACTED_ITEMS[@]} -eq 1 ] && [ -d "${EXTRACTED_ITEMS[0]}" ]; then
-          SUBDIR="${EXTRACTED_ITEMS[0]}"
-          mv "$SUBDIR"/* /tmp/rootfs_extract/
-          rmdir "$SUBDIR"
-        fi
-
-        mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs
-        mv /tmp/rootfs_extract/* scripts/sd-fuse/${DIST_DIR}/rootfs/
-        mv /tmp/rootfs_extract/.[!.]* scripts/sd-fuse/${DIST_DIR}/rootfs/ 2>/dev/null || true
-        rm -rf /tmp/rootfs_extract
-
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}/rootfs/bin" ]; then
-          echo "ERROR: /bin not found in rootfs. Extraction failed."
-          echo "Contents of rootfs:"
-          ls -la scripts/sd-fuse/${DIST_DIR}/rootfs || true
-          exit 1
-        fi
-
-        # 注入 flippy 模块
+        mkdir -p "$ROOTFS_DIR"
+        
+        echo "Extracting rootfs to $ROOTFS_DIR ..."
+        tar xzf "../artifact/$ROOTFS_FILE" -C "$ROOTFS_DIR"
+        
         if [ -d /tmp/flippy_modules ]; then
           MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
           if [ -n "$MODULES_DIR_NAME" ]; then
-            echo "Injecting flippy modules to rootfs..."
-            rm -rf scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules
-            mkdir -p scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules/$MODULES_DIR_NAME
-            cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules/$MODULES_DIR_NAME/
-            find scripts/sd-fuse/${DIST_DIR}/rootfs/lib/modules -type f -exec chmod 644 {} \;
+            echo "Injecting flippy modules to $ROOTFS_DIR/lib/modules ..."
+            rm -rf "$ROOTFS_DIR/lib/modules"
+            mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
+            cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
+            find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
             echo "Flippy modules injected."
           else
             echo "WARNING: Could not determine modules directory name, skipping injection."
@@ -867,11 +567,12 @@ jobs:
         else
           echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
         fi
-
+        
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
-          echo "Deploying flippy kernel boot/dtb..."
+          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
           mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
           tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
           mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
@@ -879,47 +580,28 @@ jobs:
         else
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
+        
+        mkdir -p friendlywrt/kernel
+        touch friendlywrt/kernel/.built
 
-        rm -rf scripts/sd-fuse/${DIST_DIR}/build_dir 2>/dev/null || true
-        rm -rf scripts/sd-fuse/${DIST_DIR}/tmp 2>/dev/null || true
-        echo "Final directory structure of scripts/sd-fuse/${DIST_DIR}:"
-        ls -la scripts/sd-fuse/${DIST_DIR} || true
-        echo "Prepared sd-img environment"
+    - name: Compile uboot (if needed)
+      run: |
+        cd project
+        if [ ! -f friendlywrt/u-boot/.built ]; then
+          ./build.sh uboot
+          touch friendlywrt/u-boot/.built
+        fi
+        echo "U-boot ready."
 
-    # ---------- 调用 mk-sd-image.sh 并详细输出 ----------
+    # ---------- 调用官方 sd-img 构建命令 ----------
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
         cd project
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
-        mkdir -p out
-        cd scripts/sd-fuse
-
-        echo "===== Debug Info ====="
-        echo "Current directory: $(pwd)"
-        echo "Contents of scripts/sd-fuse:"
-        ls -la
-        echo "Checking target directory ${{ steps.config.outputs.dist_dir }}:"
-        ls -la "${{ steps.config.outputs.dist_dir }}" || echo "Directory not found!"
-        echo "======================"
-
-        echo "Running mk-sd-image.sh with verbose tracing..."
-        set +e
-        bash -x ./mk-sd-image.sh "${{ steps.config.outputs.dist_dir }}" "${TOPDIR}/out/${{ steps.config.outputs.img_filename }}" > /tmp/mk-sd-image.log 2>&1
-        EXIT_CODE=$?
-        set -e
-
-        echo "===== mk-sd-image.sh output (stdout+stderr) ====="
-        cat /tmp/mk-sd-image.log
-        echo "================================================"
-
-        if [ $EXIT_CODE -ne 0 ]; then
-          echo "mk-sd-image.sh failed with exit code $EXIT_CODE"
-          exit 1
-        fi
-
-        cd ${TOPDIR}
+        ./build.sh sd-img
+        
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -928,7 +610,7 @@ jobs:
           ls -la out/ || true
           exit 1
         fi
-
+        
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
