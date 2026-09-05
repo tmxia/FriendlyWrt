@@ -313,7 +313,6 @@ jobs:
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
-    # ---------- 核心修改：解压 rootfs 到官方构建目录，并替换内核 ----------
     - name: Prepare rootfs and inject flippy kernel
       run: |
         cd project
@@ -326,7 +325,7 @@ jobs:
         echo "Extracting rootfs to $ROOTFS_DIR ..."
         tar xzf "../artifact/$ROOTFS_FILE" -C "$ROOTFS_DIR"
         
-        # 注入 flippy 内核模块（覆盖官方模块）
+        # 注入 flippy 内核模块
         if [ -d /tmp/flippy_modules ]; then
           MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
           if [ -n "$MODULES_DIR_NAME" ]; then
@@ -343,7 +342,7 @@ jobs:
           echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
         fi
         
-        # 部署 flippy kernel boot/dtb 到 sd-fuse 目录（供 mk-sd-image.sh 使用）
+        # 部署 flippy kernel boot/dtb 到 sd-fuse 目录
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_TAR=$(find /tmp/flippy_extract -name "boot-*.tar.gz" | head -1)
         DTB_TAR=$(find /tmp/flippy_extract -name "dtb-rockchip-*.tar.gz" | head -1)
@@ -357,14 +356,13 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
         
-        # 创建 kernel/.built 标记，跳过内核编译
+        # 创建内核构建标记（即使不真正编译）
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-    - name: Compile uboot (if needed)
+    - name: Compile uboot
       run: |
         cd project
-        # 确保 u-boot 目录存在
         mkdir -p friendlywrt/u-boot
         if [ ! -f friendlywrt/u-boot/.built ]; then
           ./build.sh uboot
@@ -372,7 +370,14 @@ jobs:
         fi
         echo "U-boot ready."
 
-    # ---------- 调用官方 sd-img 构建命令 ----------
+    # ---------- 关键修复：禁用内核检查 ----------
+    - name: Disable kernel check in build.sh
+      run: |
+        cd project
+        # 删除包含 "please build kernel first" 的行
+        sed -i '/please build kernel first/d' build.sh
+        echo "Kernel check disabled in build.sh"
+
     - name: Build sd image with flippy kernel
       id: build_sd_image
       run: |
@@ -390,7 +395,7 @@ jobs:
           exit 1
         fi
         
-        # 打包 tgz（与官方一致）
+        # 打包 tgz
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -684,7 +689,7 @@ jobs:
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-    - name: Compile uboot (if needed)
+    - name: Compile uboot
       run: |
         cd project
         mkdir -p friendlywrt/u-boot
@@ -693,6 +698,12 @@ jobs:
           touch friendlywrt/u-boot/.built
         fi
         echo "U-boot ready."
+
+    - name: Disable kernel check in build.sh
+      run: |
+        cd project
+        sed -i '/please build kernel first/d' build.sh
+        echo "Kernel check disabled in build.sh"
 
     - name: Build sd image with flippy kernel
       id: build_sd_image
