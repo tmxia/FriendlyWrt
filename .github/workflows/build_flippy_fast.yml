@@ -397,7 +397,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：彻底修补 build.sh ----------
+    # ---------- 最终构建：修补 build.sh 并执行，带完整调试 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -422,6 +422,7 @@ jobs:
         sed -i '1a set +u' build.sh
         echo "build.sh patched successfully."
         
+        # 导出变量
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -431,10 +432,18 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
+        # 显示当前环境变量（用于调试）
+        echo "=== Environment variables ==="
+        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
+        
+        # 运行构建，记录详细输出
+        echo "=== Starting build.sh sd-img ==="
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
         set +x
+        
+        echo "=== Build finished with exit code: $BUILD_EXIT ==="
         
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== Build failed with exit code $BUILD_EXIT ==="
@@ -443,15 +452,22 @@ jobs:
           exit 1
         fi
         
+        # 检查生成的镜像文件
+        echo "=== Checking for output image ==="
+        ls -la out/ || echo "out/ directory not found"
+        
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
           echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
+          echo "=== Contents of out/ ==="
           ls -la out/ || true
           exit 1
         fi
 
+        # 打包 tgz
+        echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -782,7 +798,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：彻底修补 build.sh ----------
+    # ---------- 最终构建：修补 build.sh 并执行，带完整调试 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -813,10 +829,16 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
+        echo "=== Environment variables ==="
+        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
+        
+        echo "=== Starting build.sh sd-img ==="
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
         set +x
+        
+        echo "=== Build finished with exit code: $BUILD_EXIT ==="
         
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== Build failed with exit code $BUILD_EXIT ==="
@@ -825,15 +847,20 @@ jobs:
           exit 1
         fi
         
+        echo "=== Checking for output image ==="
+        ls -la out/ || echo "out/ directory not found"
+        
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
           echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
+          echo "=== Contents of out/ ==="
           ls -la out/ || true
           exit 1
         fi
 
+        echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
