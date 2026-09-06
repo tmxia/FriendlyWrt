@@ -463,7 +463,12 @@ jobs:
           exit 1
         fi
         
-        # 查找并重命名生成的镜像文件
+        # 此时仍在 scripts/sd-fuse 目录
+        echo "=== Current directory: $(pwd) ==="
+        echo "=== Contents of out/ ==="
+        ls -la out/
+        
+        # 进入 out 目录
         cd out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
         if [ -z "$ORIG_IMG" ]; then
@@ -481,35 +486,39 @@ jobs:
           echo "Image already has correct name."
         fi
         
-        # 移动到 artifact
+        # 移动镜像到 artifact 目录（相对于项目根目录）
         mkdir -p ../../artifact
         mv "$TARGET_NAME" ../../artifact/
-        cd ../..
+        cd ../..  # 现在回到 project/scripts/sd-fuse
         
-        if [ ! -f "artifact/$TARGET_NAME" ]; then
+        # 确认移动成功
+        if [ ! -f "../../artifact/$TARGET_NAME" ]; then
           echo "ERROR: Failed to move image to artifact/"
-          ls -la artifact/
+          ls -la ../../artifact/
           exit 1
         fi
         
+        # 现在打包 tgz
         echo "=== Packaging tgz ==="
-        cd scripts/sd-fuse
-        if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
-          echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
+        # 当前目录：project/scripts/sd-fuse
+        if [ ! -d "$DIST_DIR" ]; then
+          echo "ERROR: image directory $DIST_DIR not found"
           ls -la
           exit 1
         fi
-        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
-        mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
+        archive_dir="${DIST_DIR}-rk3568"
+        mv "$DIST_DIR" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
         mv "${{ steps.config.outputs.archive_filename }}" ../../artifact/
-        cd ../..
+        cd ../..  # 回到 project 根目录
         
+        # 压缩镜像
         echo "=== Compressing image ==="
         cd artifact
         if [ -f "$TARGET_NAME" ]; then
           gzip "$TARGET_NAME"
           echo "Compressed image: $TARGET_NAME.gz"
+          ls -la "$TARGET_NAME.gz"
         else
           echo "ERROR: Image file not found in artifact/ for compression"
           ls -la
@@ -899,6 +908,11 @@ jobs:
           exit 1
         fi
         
+        # 此时仍在 scripts/sd-fuse 目录
+        echo "=== Current directory: $(pwd) ==="
+        echo "=== Contents of out/ ==="
+        ls -la out/
+        
         cd out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
         if [ -z "$ORIG_IMG" ]; then
@@ -918,32 +932,32 @@ jobs:
         
         mkdir -p ../../artifact
         mv "$TARGET_NAME" ../../artifact/
-        cd ../..
+        cd ../..  # 回到 scripts/sd-fuse
         
-        if [ ! -f "artifact/$TARGET_NAME" ]; then
+        if [ ! -f "../../artifact/$TARGET_NAME" ]; then
           echo "ERROR: Failed to move image to artifact/"
-          ls -la artifact/
+          ls -la ../../artifact/
           exit 1
         fi
         
         echo "=== Packaging tgz ==="
-        cd scripts/sd-fuse
-        if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
-          echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
+        if [ ! -d "$DIST_DIR" ]; then
+          echo "ERROR: image directory $DIST_DIR not found"
           ls -la
           exit 1
         fi
-        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
-        mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
+        archive_dir="${DIST_DIR}-rk3568"
+        mv "$DIST_DIR" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
         mv "${{ steps.config.outputs.archive_filename }}" ../../artifact/
-        cd ../..
+        cd ../..  # 回到 project 根目录
         
         echo "=== Compressing image ==="
         cd artifact
         if [ -f "$TARGET_NAME" ]; then
           gzip "$TARGET_NAME"
           echo "Compressed image: $TARGET_NAME.gz"
+          ls -la "$TARGET_NAME.gz"
         else
           echo "ERROR: Image file not found in artifact/ for compression"
           ls -la
