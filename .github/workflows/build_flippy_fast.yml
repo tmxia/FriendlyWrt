@@ -397,13 +397,13 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接 ----------
+    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接（修复复制路径） ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        # 确保根目录下 device/friendlyelec 存在
+        # 确保根目录有 device/friendlyelec
         if [ ! -d "device/friendlyelec" ]; then
             if [ -d "device/rk3568" ]; then
                 cp -r device/rk3568 device/friendlyelec
@@ -414,28 +414,30 @@ jobs:
             fi
         fi
         
-        # 进入 scripts/sd-fuse，准备文件链接
+        # 在根目录复制 .current_config.mk 到 scripts/sd-fuse（确保存在）
+        cp .current_config.mk scripts/sd-fuse/
+        
+        # 进入 scripts/sd-fuse 目录
         cd scripts/sd-fuse
         
-        # 删除可能存在的 device 目录（避免冲突）
+        # 删除可能存在的 device 目录，创建软链接指向根目录的 device
         rm -rf device
-        
-        # 创建软链接指向根目录的 device
         ln -sf ../device device
-        # 复制 .current_config.mk
-        cp ../.current_config.mk .
         
-        # 显示当前目录内容用于调试
+        # 检查文件是否就绪
         echo "=== Contents of scripts/sd-fuse ==="
         ls -la
         echo "=== Contents of scripts/sd-fuse/device ==="
         ls -la device/
         echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
         ls -la device/friendlyelec/ || echo "friendlyelec not found"
+        echo "=== .current_config.mk exists? ==="
+        ls -la .current_config.mk
         
         # 回到项目根目录
         cd ../..
         
+        # 导出变量
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -796,7 +798,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接 ----------
+    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接（修复复制路径） ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -808,16 +810,17 @@ jobs:
                 mkdir -p device/friendlyelec
             fi
         fi
+        cp .current_config.mk scripts/sd-fuse/
         cd scripts/sd-fuse
         rm -rf device
         ln -sf ../device device
-        cp ../.current_config.mk .
         echo "=== Contents of scripts/sd-fuse ==="
         ls -la
         echo "=== Contents of scripts/sd-fuse/device ==="
         ls -la device/
         echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
         ls -la device/friendlyelec/ || echo "friendlyelec not found"
+        ls -la .current_config.mk
         cd ../..
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -914,4 +917,4 @@ jobs:
           keep_minimum_runs: 0
           retain_days: 0
           delete_workflow_pattern: "Build FriendlyWrt With Flippy Kernel (Fast)"
-          repository: ${{ github.repository }}
+          repository: ${{ github.repository }}put
