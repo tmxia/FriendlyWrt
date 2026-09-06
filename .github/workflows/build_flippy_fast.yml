@@ -397,7 +397,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 关键修复：彻底移除交互式选择并强制变量 ----------
+    # ---------- 最终修复：保留 .current_config.mk 读取，仅移除交互式选择 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -410,29 +410,25 @@ jobs:
         # 1. 注释掉 device 检查
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
         
-        # 2. 删除所有包含 .current_config.mk 检查的 if 块
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
-        
-        # 3. 删除所有 select 相关代码（包括 case 和 esac）
+        # 2. 删除交互式选择代码块，但保留 .current_config.mk 的读取逻辑
         sed -i '/^# select board:/,/^esac/d' build.sh
         sed -i '/select/d' build.sh
         sed -i '/case \$/d' build.sh
         sed -i '/esac/d' build.sh
         
-        # 4. 强制在脚本开头设置 BOARD 和 CONFIG
+        # 3. 强制在脚本开头设置 BOARD 和 CONFIG（避免进入选择）
         sed -i '1a BOARD="rk3568"' build.sh
         sed -i '1a CONFIG="rockchip-docker"' build.sh
         sed -i '1a export BOARD CONFIG' build.sh
         
-        # 5. 关闭未定义变量检查
+        # 4. 关闭未定义变量检查
         sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
         sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
         sed -i '1a set +u' build.sh
         
-        echo "build.sh fully patched: interactive selections removed, variables forced."
+        echo "build.sh patched: interactive selections removed, BOARD/CONFIG forced, set -u disabled."
 
-    # ---------- 最终构建步骤（含调试输出） ----------
+    # ---------- 最终构建步骤 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -440,25 +436,21 @@ jobs:
         
         set +u
         
-        # 再次强制清理所有 .sh 文件中的 set -u
+        # 再次确保所有 .sh 文件中的 set -u 被替换
         find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
         find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
         
-        # 确保 build.sh 中的交互式代码被彻底删除
+        # 再次删除可能残留的选择代码
         sed -i '/^# select board:/,/^esac/d' build.sh
         sed -i '/select/d' build.sh
         sed -i '/case \$/d' build.sh
         sed -i '/esac/d' build.sh
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
         
-        # 强制设置变量
+        # 设置变量
         echo 'BOARD="rk3568"' >> build.sh
         echo 'CONFIG="rockchip-docker"' >> build.sh
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
-        
-        # 导出所有可能缺失的变量
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
         export ALL_MK_LINK=""
@@ -466,19 +458,8 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        # 调试模式运行 build.sh
-        echo "=== Starting build in debug mode ==="
-        set -x
-        ./build.sh sd-img 2>&1 | tee build.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        set +x
-        
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== Build failed with exit code $BUILD_EXIT ==="
-          echo "=== Last 100 lines of build.log ==="
-          tail -100 build.log
-          exit 1
-        fi
+        # 执行构建
+        ./build.sh sd-img
         
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -819,7 +800,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 关键修复：彻底移除交互式选择并强制变量 ----------
+    # ---------- 最终修复：保留 .current_config.mk 读取，仅移除交互式选择 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -829,8 +810,6 @@ jobs:
         echo "Checking .current_config.mk:"
         ls -la .current_config.mk || echo ".current_config.mk not found"
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
         sed -i '/^# select board:/,/^esac/d' build.sh
         sed -i '/select/d' build.sh
         sed -i '/case \$/d' build.sh
@@ -841,9 +820,9 @@ jobs:
         sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
         sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
         sed -i '1a set +u' build.sh
-        echo "build.sh fully patched: interactive selections removed, variables forced."
+        echo "build.sh patched: interactive selections removed, BOARD/CONFIG forced, set -u disabled."
 
-    # ---------- 最终构建步骤（含调试输出） ----------
+    # ---------- 最终构建步骤 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -855,8 +834,6 @@ jobs:
         sed -i '/select/d' build.sh
         sed -i '/case \$/d' build.sh
         sed -i '/esac/d' build.sh
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
         echo 'BOARD="rk3568"' >> build.sh
         echo 'CONFIG="rockchip-docker"' >> build.sh
         export BOARD="rk3568"
@@ -868,18 +845,7 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        echo "=== Starting build in debug mode ==="
-        set -x
-        ./build.sh sd-img 2>&1 | tee build.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        set +x
-        
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== Build failed with exit code $BUILD_EXIT ==="
-          echo "=== Last 100 lines of build.log ==="
-          tail -100 build.log
-          exit 1
-        fi
+        ./build.sh sd-img
         
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
