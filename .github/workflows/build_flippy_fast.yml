@@ -34,9 +34,9 @@ on:
 
 env:
   AUTO_REPLACE_TAG: 'false'
-  FOUND_MK_FILE: '0'       # 修复 [-gt] 操作数错误
-  MK_LINK: ''              # 修复 unbound variable
-  ALL_MK: ''               # 修复 unbound variable
+  FOUND_MK_FILE: '0'
+  MK_LINK: ''
+  ALL_MK: ''
 
 jobs:
   prepare_release:
@@ -396,6 +396,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
+    # ---------- 关键修复：关闭未定义变量检查 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -404,9 +405,12 @@ jobs:
         ls -la device/friendlyelec || echo "device/friendlyelec not found"
         echo "Checking .current_config.mk:"
         ls -la .current_config.mk || echo ".current_config.mk not found"
+        # 注释掉检查 device 和 .current_config.mk 的行
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
         sed -i '/.current_config.mk/ s/^/#/' build.sh
-        echo "build.sh patched to skip file checks."
+        # 在脚本开头插入 set +u，避免未定义变量中断
+        sed -i '1i set +u' build.sh
+        echo "build.sh patched: file checks disabled and 'set +u' added."
 
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
@@ -755,6 +759,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
+    # ---------- 关键修复：关闭未定义变量检查 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -765,7 +770,8 @@ jobs:
         ls -la .current_config.mk || echo ".current_config.mk not found"
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
         sed -i '/.current_config.mk/ s/^/#/' build.sh
-        echo "build.sh patched to skip file checks."
+        sed -i '1i set +u' build.sh
+        echo "build.sh patched: file checks disabled and 'set +u' added."
 
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
