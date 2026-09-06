@@ -398,14 +398,17 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：修补 build.sh + 确保文件到位 ----------
+    # ---------- 最终构建：彻底修补所有脚本，确保文件和变量 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        echo "=== Patching build.sh ==="
-        # 删除所有交互式选择和文件检查
+        echo "=== Patching all .sh scripts to disable 'set -u' ==="
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        
+        echo "=== Patching build.sh specifically ==="
         sed -i '/^# select board:/,/^esac/d' build.sh
         sed -i '/select/d' build.sh
         sed -i '/case \$/d' build.sh
@@ -413,31 +416,24 @@ jobs:
         sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
         sed -i '/no .current_config.mk/d' build.sh
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        # 在脚本开头强制设置 BOARD 和 CONFIG
         sed -i '1a BOARD="rk3568"' build.sh
         sed -i '1a CONFIG="rockchip-docker"' build.sh
         sed -i '1a export BOARD CONFIG' build.sh
-        # 关闭未定义变量检查
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
         sed -i '1a set +u' build.sh
-        echo "build.sh patched successfully."
+        echo "build.sh patched."
         
-        # 为了确保子脚本能找到文件，再次在 scripts/sd-fuse 中复制 device 和 .current_config.mk（已经复制过，但保险）
         echo "=== Re-ensuring files in scripts/sd-fuse ==="
         cp -r device scripts/sd-fuse/ 2>/dev/null || true
         cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
         cp configs scripts/sd-fuse/ -r 2>/dev/null || true
         
-        # 显示 scripts/sd-fuse 目录内容
         echo "=== Contents of scripts/sd-fuse ==="
         ls -la scripts/sd-fuse/
         echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found in scripts/sd-fuse"
+        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found"
         echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
         ls -la scripts/sd-fuse/device/friendlyelec/ 2>/dev/null || echo "friendlyelec not found"
         
-        # 导出变量
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -810,13 +806,17 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：修补 build.sh + 确保文件到位 ----------
+    # ---------- 最终构建：彻底修补所有脚本，确保文件和变量 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        echo "=== Patching build.sh ==="
+        echo "=== Patching all .sh scripts to disable 'set -u' ==="
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        
+        echo "=== Patching build.sh specifically ==="
         sed -i '/^# select board:/,/^esac/d' build.sh
         sed -i '/select/d' build.sh
         sed -i '/case \$/d' build.sh
@@ -827,10 +827,8 @@ jobs:
         sed -i '1a BOARD="rk3568"' build.sh
         sed -i '1a CONFIG="rockchip-docker"' build.sh
         sed -i '1a export BOARD CONFIG' build.sh
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
         sed -i '1a set +u' build.sh
-        echo "build.sh patched successfully."
+        echo "build.sh patched."
         
         echo "=== Re-ensuring files in scripts/sd-fuse ==="
         cp -r device scripts/sd-fuse/ 2>/dev/null || true
@@ -840,7 +838,7 @@ jobs:
         echo "=== Contents of scripts/sd-fuse ==="
         ls -la scripts/sd-fuse/
         echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found in scripts/sd-fuse"
+        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found"
         echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
         ls -la scripts/sd-fuse/device/friendlyelec/ 2>/dev/null || echo "friendlyelec not found"
         
