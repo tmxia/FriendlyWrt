@@ -34,7 +34,7 @@ on:
 
 env:
   AUTO_REPLACE_TAG: 'false'
-  FOUND_MK_FILE: ''
+  FOUND_MK_FILE: ''   # 修复 build.sh 中未定义变量错误
 
 jobs:
   prepare_release:
@@ -232,11 +232,11 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        DATES=(
-          $(date +%Y-%m-%d)
-          $(date -d "1 day ago" +%Y-%m-%d)
-          $(date -d "2 days ago" +%Y-%m-%d)
-        )
+        # 搜索最近 5 天（包含今天）
+        DATES=()
+        for i in {0..4}; do
+          DATES+=($(date -d "$i days ago" +%Y-%m-%d))
+        done
         FOUND=false
         for DATE in "${DATES[@]}"; do
           BASE_TAG="FriendlyWrt-flippy-${DATE}"
@@ -394,7 +394,6 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 关键修复：调试并补丁 build.sh 跳过文件检查 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -403,7 +402,6 @@ jobs:
         ls -la device/friendlyelec || echo "device/friendlyelec not found"
         echo "Checking .current_config.mk:"
         ls -la .current_config.mk || echo ".current_config.mk not found"
-        # 注释掉检查 device 和 .current_config.mk 的行
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
         sed -i '/.current_config.mk/ s/^/#/' build.sh
         echo "build.sh patched to skip file checks."
@@ -425,7 +423,6 @@ jobs:
           exit 1
         fi
 
-        # 打包 tgz
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
@@ -594,11 +591,11 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        DATES=(
-          $(date +%Y-%m-%d)
-          $(date -d "1 day ago" +%Y-%m-%d)
-          $(date -d "2 days ago" +%Y-%m-%d)
-        )
+        # 搜索最近 5 天（包含今天）
+        DATES=()
+        for i in {0..4}; do
+          DATES+=($(date -d "$i days ago" +%Y-%m-%d))
+        done
         FOUND=false
         for DATE in "${DATES[@]}"; do
           BASE_TAG="FriendlyWrt-flippy-${DATE}"
