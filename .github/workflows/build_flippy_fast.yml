@@ -450,7 +450,6 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # 跳过 build-rootfs-img.sh，直接运行 mk-sd-image.sh
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -465,8 +464,8 @@ jobs:
           exit 1
         fi
         
-        # 查找生成的镜像文件（mk-sd-image.sh 生成的文件名格式为 rk3568-sd-*.img）
-        echo "=== Checking for generated image ==="
+        # ---- 关键修复：重命名生成的镜像 ----
+        echo "=== Renaming generated image ==="
         GENERATED_IMG=$(ls scripts/sd-fuse/out/rk3568-sd-*.img 2>/dev/null | head -1)
         if [ -n "$GENERATED_IMG" ]; then
           TARGET_IMG="scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
@@ -474,22 +473,23 @@ jobs:
           mv "$GENERATED_IMG" "$TARGET_IMG"
           echo "Renamed successfully."
         else
-          echo "WARNING: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+          echo "ERROR: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+          ls -la scripts/sd-fuse/out/ || true
+          exit 1
         fi
         
-        # 再次检查目标文件是否存在
+        # ---- 检查目标文件 ----
+        echo "=== Checking for output image ==="
+        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
+        ls -la out/ || echo "project/out not found"
+        
         if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
           mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
-        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "ERROR: Image file not found in any location."
+          echo "ERROR: Image file not found after rename."
           echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
           exit 1
         fi
 
@@ -891,7 +891,7 @@ jobs:
           exit 1
         fi
         
-        # 查找生成的镜像文件并重命名为预期名称
+        # ---- 关键修复：重命名生成的镜像 ----
         echo "=== Renaming generated image ==="
         GENERATED_IMG=$(ls scripts/sd-fuse/out/rk3568-sd-*.img 2>/dev/null | head -1)
         if [ -n "$GENERATED_IMG" ]; then
@@ -900,9 +900,12 @@ jobs:
           mv "$GENERATED_IMG" "$TARGET_IMG"
           echo "Renamed successfully."
         else
-          echo "WARNING: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+          echo "ERROR: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+          ls -la scripts/sd-fuse/out/ || true
+          exit 1
         fi
         
+        # ---- 检查目标文件 ----
         echo "=== Checking for output image ==="
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
@@ -910,15 +913,10 @@ jobs:
         if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
           mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
-        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "ERROR: Image file not found in any location."
+          echo "ERROR: Image file not found after rename."
           echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
           exit 1
         fi
 
