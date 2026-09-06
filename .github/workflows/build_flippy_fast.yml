@@ -398,15 +398,21 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像 ----------
+    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像（非交互式） ----------
     - name: Build sd image
       id: build_sd_image
       run: |
         cd project
         
-        echo "=== Patching all .sh scripts to disable 'set -u' ==="
+        echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
         find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
         find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        # 修补 build-rootfs-img.sh 和 mk-sd-image.sh 跳过确认
+        sed -i 's/read -p/read -t 0.1 -p/g' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
+        sed -i 's/read -p/read -t 0.1 -p/g' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
+        # 如果上述不行，则直接删除交互式块
+        sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
+        sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
         
         echo "=== Patching build.sh specifically ==="
         sed -i '/^# select board:/,/^esac/d' build.sh
@@ -427,24 +433,14 @@ jobs:
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
         
-        # 清空并重建 rootfs 目录
         rm -rf "${TARGET_DIR}/rootfs"
         mkdir -p "${TARGET_DIR}/rootfs"
-        # 复制完整的 rootfs（直接复制内容）
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
-        # 显示内容以确认
+        
         echo "=== Contents of ${ROOTFS_SRC} ==="
         ls -la "${ROOTFS_SRC}" || echo "Source rootfs not found"
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
-        
-        # 确保 boot 和 dtb 目录存在（已在之前步骤部署）
-        if [ ! -d "${TARGET_DIR}/boot" ]; then
-          mkdir -p "${TARGET_DIR}/boot"
-        fi
-        if [ ! -d "${TARGET_DIR}/dtb/rockchip" ]; then
-          mkdir -p "${TARGET_DIR}/dtb/rockchip"
-        fi
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -460,8 +456,8 @@ jobs:
         
         cd scripts/sd-fuse
         
-        echo "=== Building rootfs.img ==="
-        ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
+        echo "=== Building rootfs.img (non-interactive) ==="
+        yes | ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
         BUILD_EXIT=${PIPESTATUS[0]}
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
@@ -470,8 +466,8 @@ jobs:
         fi
         echo "rootfs.img generated successfully."
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
+        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
@@ -484,7 +480,6 @@ jobs:
           exit 1
         fi
         
-        # 检查生成的镜像文件
         echo "=== Checking for output image ==="
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
@@ -836,15 +831,19 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像 ----------
+    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像（非交互式） ----------
     - name: Build sd image
       id: build_sd_image
       run: |
         cd project
         
-        echo "=== Patching all .sh scripts to disable 'set -u' ==="
+        echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
         find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
         find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        sed -i 's/read -p/read -t 0.1 -p/g' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
+        sed -i 's/read -p/read -t 0.1 -p/g' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
+        sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
+        sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
         
         echo "=== Patching build.sh specifically ==="
         sed -i '/^# select board:/,/^esac/d' build.sh
@@ -865,24 +864,14 @@ jobs:
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
         
-        # 清空并重建 rootfs 目录
         rm -rf "${TARGET_DIR}/rootfs"
         mkdir -p "${TARGET_DIR}/rootfs"
-        # 复制完整的 rootfs
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
-        # 显示内容以确认
+        
         echo "=== Contents of ${ROOTFS_SRC} ==="
         ls -la "${ROOTFS_SRC}" || echo "Source rootfs not found"
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
-        
-        # 确保 boot 和 dtb 目录存在
-        if [ ! -d "${TARGET_DIR}/boot" ]; then
-          mkdir -p "${TARGET_DIR}/boot"
-        fi
-        if [ ! -d "${TARGET_DIR}/dtb/rockchip" ]; then
-          mkdir -p "${TARGET_DIR}/dtb/rockchip"
-        fi
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -898,8 +887,8 @@ jobs:
         
         cd scripts/sd-fuse
         
-        echo "=== Building rootfs.img ==="
-        ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
+        echo "=== Building rootfs.img (non-interactive) ==="
+        yes | ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
         BUILD_EXIT=${PIPESTATUS[0]}
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
@@ -908,8 +897,8 @@ jobs:
         fi
         echo "rootfs.img generated successfully."
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
+        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
@@ -922,7 +911,6 @@ jobs:
           exit 1
         fi
         
-        # 检查生成的镜像文件
         echo "=== Checking for output image ==="
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
