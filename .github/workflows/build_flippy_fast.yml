@@ -385,6 +385,7 @@ jobs:
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled."
 
+    # ---------- 关键步骤：复制文件到 sd-fuse（确保子脚本可用） ----------
     - name: Copy necessary files to sd-fuse directories
       run: |
         cd project
@@ -397,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：修补 build.sh 并执行，带完整调试 ----------
+    # ---------- 最终构建：修补 build.sh + 确保文件到位 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -422,6 +423,20 @@ jobs:
         sed -i '1a set +u' build.sh
         echo "build.sh patched successfully."
         
+        # 为了确保子脚本能找到文件，再次在 scripts/sd-fuse 中复制 device 和 .current_config.mk（已经复制过，但保险）
+        echo "=== Re-ensuring files in scripts/sd-fuse ==="
+        cp -r device scripts/sd-fuse/ 2>/dev/null || true
+        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
+        cp configs scripts/sd-fuse/ -r 2>/dev/null || true
+        
+        # 显示 scripts/sd-fuse 目录内容
+        echo "=== Contents of scripts/sd-fuse ==="
+        ls -la scripts/sd-fuse/
+        echo "=== Contents of scripts/sd-fuse/device ==="
+        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found in scripts/sd-fuse"
+        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
+        ls -la scripts/sd-fuse/device/friendlyelec/ 2>/dev/null || echo "friendlyelec not found"
+        
         # 导出变量
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -432,11 +447,9 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        # 显示当前环境变量（用于调试）
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        # 运行构建，记录详细输出
         echo "=== Starting build.sh sd-img ==="
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
@@ -452,7 +465,6 @@ jobs:
           exit 1
         fi
         
-        # 检查生成的镜像文件
         echo "=== Checking for output image ==="
         ls -la out/ || echo "out/ directory not found"
         
@@ -466,7 +478,6 @@ jobs:
           exit 1
         fi
 
-        # 打包 tgz
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
@@ -786,6 +797,7 @@ jobs:
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled."
 
+    # ---------- 关键步骤：复制文件到 sd-fuse（确保子脚本可用） ----------
     - name: Copy necessary files to sd-fuse directories
       run: |
         cd project
@@ -798,7 +810,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：修补 build.sh 并执行，带完整调试 ----------
+    # ---------- 最终构建：修补 build.sh + 确保文件到位 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -819,6 +831,18 @@ jobs:
         sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
         sed -i '1a set +u' build.sh
         echo "build.sh patched successfully."
+        
+        echo "=== Re-ensuring files in scripts/sd-fuse ==="
+        cp -r device scripts/sd-fuse/ 2>/dev/null || true
+        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
+        cp configs scripts/sd-fuse/ -r 2>/dev/null || true
+        
+        echo "=== Contents of scripts/sd-fuse ==="
+        ls -la scripts/sd-fuse/
+        echo "=== Contents of scripts/sd-fuse/device ==="
+        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found in scripts/sd-fuse"
+        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
+        ls -la scripts/sd-fuse/device/friendlyelec/ 2>/dev/null || echo "friendlyelec not found"
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
