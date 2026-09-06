@@ -34,7 +34,8 @@ on:
 
 env:
   AUTO_REPLACE_TAG: 'false'
-  FOUND_MK_FILE: ''   # 修复 build.sh 中未定义变量错误
+  FOUND_MK_FILE: '0'       # 设为数值，避免 [-gt] 操作数错误
+  MK_LINK: ''              # 修复 unbound variable
 
 jobs:
   prepare_release:
