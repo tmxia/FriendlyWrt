@@ -465,6 +465,9 @@ jobs:
         fi
         
         # ---- 关键修复：重命名生成的镜像 ----
+        echo "=== Listing out directory contents before rename ==="
+        ls -la scripts/sd-fuse/out/ || echo "out directory not found"
+        
         echo "=== Renaming generated image ==="
         GENERATED_IMG=$(ls scripts/sd-fuse/out/rk3568-sd-*.img 2>/dev/null | head -1)
         if [ -n "$GENERATED_IMG" ]; then
@@ -474,14 +477,14 @@ jobs:
           echo "Renamed successfully."
         else
           echo "ERROR: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+          echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
           exit 1
         fi
         
         # ---- 检查目标文件 ----
-        echo "=== Checking for output image ==="
+        echo "=== Checking for output image after rename ==="
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
-        ls -la out/ || echo "project/out not found"
         
         if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
@@ -892,6 +895,9 @@ jobs:
         fi
         
         # ---- 关键修复：重命名生成的镜像 ----
+        echo "=== Listing out directory contents before rename ==="
+        ls -la scripts/sd-fuse/out/ || echo "out directory not found"
+        
         echo "=== Renaming generated image ==="
         GENERATED_IMG=$(ls scripts/sd-fuse/out/rk3568-sd-*.img 2>/dev/null | head -1)
         if [ -n "$GENERATED_IMG" ]; then
@@ -901,14 +907,14 @@ jobs:
           echo "Renamed successfully."
         else
           echo "ERROR: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+          echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
           exit 1
         fi
         
         # ---- 检查目标文件 ----
-        echo "=== Checking for output image ==="
+        echo "=== Checking for output image after rename ==="
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
-        ls -la out/ || echo "project/out not found"
         
         if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
