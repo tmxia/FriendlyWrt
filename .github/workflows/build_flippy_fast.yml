@@ -398,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：直接调用 mk-sd-image.sh ----------
+    # ---------- 最终构建：手动准备并调用 mk-sd-image.sh ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -422,17 +422,33 @@ jobs:
         sed -i '1a set +u' build.sh
         echo "build.sh patched."
         
-        echo "=== Re-ensuring files in scripts/sd-fuse ==="
-        cp -r device scripts/sd-fuse/ 2>/dev/null || true
-        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
-        cp configs scripts/sd-fuse/ -r 2>/dev/null || true
+        echo "=== Preparing rootfs in sd-fuse directory ==="
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
         
-        echo "=== Contents of scripts/sd-fuse ==="
-        ls -la scripts/sd-fuse/
-        echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found"
-        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
-        ls -la scripts/sd-fuse/device/friendlyelec/ 2>/dev/null || echo "friendlyelec not found"
+        # 确保目标目录存在
+        mkdir -p "${TARGET_DIR}/rootfs"
+        # 复制 rootfs（排除 .git 等）
+        cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
+        # 复制设备树和内核（已在 deploy 步骤中完成，但为保险再复制一次）
+        if [ -d "scripts/sd-fuse/${DIST_DIR}/boot" ]; then
+          echo "boot directory already exists."
+        else
+          mkdir -p "scripts/sd-fuse/${DIST_DIR}/boot"
+          echo "Warning: boot directory missing, creating empty."
+        fi
+        if [ -d "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" ]; then
+          echo "dtb directory already exists."
+        else
+          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
+          echo "Warning: dtb directory missing, creating empty."
+        fi
+        
+        echo "=== Contents of ${TARGET_DIR} ==="
+        ls -la "${TARGET_DIR}"
+        echo "=== Contents of ${TARGET_DIR}/rootfs ==="
+        ls -la "${TARGET_DIR}/rootfs/" || echo "rootfs not found"
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -446,10 +462,10 @@ jobs:
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        # 直接进入 scripts/sd-fuse 并调用 mk-sd-image.sh
+        # 进入 sd-fuse 目录并调用 mk-sd-image.sh
         cd scripts/sd-fuse
-        echo "=== Running mk-sd-image.sh directly ==="
-        ./mk-sd-image.sh 2>&1 | tee /tmp/build.log
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
+        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
@@ -462,7 +478,7 @@ jobs:
           exit 1
         fi
         
-        # 检查生成的镜像文件（可能在 scripts/sd-fuse/out 下）
+        # 检查生成的镜像文件
         echo "=== Checking for output image ==="
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
@@ -814,7 +830,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：直接调用 mk-sd-image.sh ----------
+    # ---------- 最终构建：手动准备并调用 mk-sd-image.sh ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -838,10 +854,29 @@ jobs:
         sed -i '1a set +u' build.sh
         echo "build.sh patched."
         
-        echo "=== Re-ensuring files in scripts/sd-fuse ==="
-        cp -r device scripts/sd-fuse/ 2>/dev/null || true
-        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
-        cp configs scripts/sd-fuse/ -r 2>/dev/null || true
+        echo "=== Preparing rootfs in sd-fuse directory ==="
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
+        
+        mkdir -p "${TARGET_DIR}/rootfs"
+        cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
+        
+        if [ -d "scripts/sd-fuse/${DIST_DIR}/boot" ]; then
+          echo "boot directory already exists."
+        else
+          mkdir -p "scripts/sd-fuse/${DIST_DIR}/boot"
+        fi
+        if [ -d "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" ]; then
+          echo "dtb directory already exists."
+        else
+          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
+        fi
+        
+        echo "=== Contents of ${TARGET_DIR} ==="
+        ls -la "${TARGET_DIR}"
+        echo "=== Contents of ${TARGET_DIR}/rootfs ==="
+        ls -la "${TARGET_DIR}/rootfs/" || echo "rootfs not found"
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -856,8 +891,8 @@ jobs:
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
         cd scripts/sd-fuse
-        echo "=== Running mk-sd-image.sh directly ==="
-        ./mk-sd-image.sh 2>&1 | tee /tmp/build.log
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
+        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
