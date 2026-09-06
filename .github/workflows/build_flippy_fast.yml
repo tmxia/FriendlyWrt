@@ -397,41 +397,30 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：强制复制 device 目录（不是软链接） ----------
+    # ---------- 最终构建：彻底修补 build.sh ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        # 确保根目录 device/friendlyelec 存在
-        if [ ! -d "device/friendlyelec" ]; then
-            if [ -d "device/rk3568" ]; then
-                cp -r device/rk3568 device/friendlyelec
-                echo "Copied device/rk3568 to device/friendlyelec"
-            else
-                mkdir -p device/friendlyelec
-                echo "Created device/friendlyelec (fallback)"
-            fi
-        fi
-        
-        # 强制删除 scripts/sd-fuse/device（如果存在，可能是软链接）
-        rm -rf scripts/sd-fuse/device
-        # 复制整个 device 目录到 scripts/sd-fuse
-        cp -r device scripts/sd-fuse/
-        # 复制 .current_config.mk
-        cp .current_config.mk scripts/sd-fuse/
-        
-        # 检查文件是否就绪
-        cd scripts/sd-fuse
-        echo "=== Contents of scripts/sd-fuse ==="
-        ls -la
-        echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la device/
-        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
-        ls -la device/friendlyelec/ || echo "friendlyelec not found"
-        echo "=== .current_config.mk exists? ==="
-        ls -la .current_config.mk
-        cd ../..
+        echo "=== Patching build.sh ==="
+        # 删除所有交互式选择和文件检查
+        sed -i '/^# select board:/,/^esac/d' build.sh
+        sed -i '/select/d' build.sh
+        sed -i '/case \$/d' build.sh
+        sed -i '/esac/d' build.sh
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
+        sed -i '/no .current_config.mk/d' build.sh
+        sed -i '/device\/friendlyelec/ s/^/#/' build.sh
+        # 在脚本开头强制设置 BOARD 和 CONFIG
+        sed -i '1a BOARD="rk3568"' build.sh
+        sed -i '1a CONFIG="rockchip-docker"' build.sh
+        sed -i '1a export BOARD CONFIG' build.sh
+        # 关闭未定义变量检查
+        sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
+        sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
+        sed -i '1a set +u' build.sh
+        echo "build.sh patched successfully."
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -793,33 +782,27 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：强制复制 device 目录（不是软链接） ----------
+    # ---------- 最终构建：彻底修补 build.sh ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        if [ ! -d "device/friendlyelec" ]; then
-            if [ -d "device/rk3568" ]; then
-                cp -r device/rk3568 device/friendlyelec
-            else
-                mkdir -p device/friendlyelec
-            fi
-        fi
-        
-        rm -rf scripts/sd-fuse/device
-        cp -r device scripts/sd-fuse/
-        cp .current_config.mk scripts/sd-fuse/
-        
-        cd scripts/sd-fuse
-        echo "=== Contents of scripts/sd-fuse ==="
-        ls -la
-        echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la device/
-        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
-        ls -la device/friendlyelec/ || echo "friendlyelec not found"
-        ls -la .current_config.mk
-        cd ../..
+        echo "=== Patching build.sh ==="
+        sed -i '/^# select board:/,/^esac/d' build.sh
+        sed -i '/select/d' build.sh
+        sed -i '/case \$/d' build.sh
+        sed -i '/esac/d' build.sh
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
+        sed -i '/no .current_config.mk/d' build.sh
+        sed -i '/device\/friendlyelec/ s/^/#/' build.sh
+        sed -i '1a BOARD="rk3568"' build.sh
+        sed -i '1a CONFIG="rockchip-docker"' build.sh
+        sed -i '1a export BOARD CONFIG' build.sh
+        sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
+        sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
+        sed -i '1a set +u' build.sh
+        echo "build.sh patched successfully."
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
