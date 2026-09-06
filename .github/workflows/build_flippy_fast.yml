@@ -385,7 +385,6 @@ jobs:
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled."
 
-    # ---------- 关键：将必要文件完整复制到 scripts/sd-fuse ----------
     - name: Copy necessary files to sd-fuse directories
       run: |
         cd project
@@ -398,7 +397,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：准备并运行 ----------
+    # ---------- 最终构建：在 project 根目录创建 device/friendlyelec 软链接 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -407,25 +406,34 @@ jobs:
         echo "=== Current directory: $(pwd) ==="
         ls -la
         
-        # 强制在 scripts/sd-fuse 下准备所有必需文件（确保 build.sh 进入后能找到）
-        mkdir -p scripts/sd-fuse/device
-        # 如果 device/rk3568 存在，则创建软链接到 scripts/sd-fuse/device/friendlyelec
-        if [ -d "device/rk3568" ]; then
-            ln -sf ../device/rk3568 scripts/sd-fuse/device/friendlyelec
-        else
-            mkdir -p scripts/sd-fuse/device/friendlyelec
+        # 关键：在 project 根目录创建 device/friendlyelec 软链接（指向 rk3568）
+        if [ ! -d "device/friendlyelec" ]; then
+            if [ -d "device/rk3568" ]; then
+                ln -sf rk3568 device/friendlyelec
+                echo "Created device/friendlyelec -> rk3568"
+            else
+                mkdir -p device/friendlyelec
+                echo "Created device/friendlyelec directory (fallback)"
+            fi
         fi
-        # 复制 .current_config.mk 和 configs 目录
-        cp .current_config.mk scripts/sd-fuse/
+        
+        # 同时在 scripts/sd-fuse 下也准备（双重保险）
+        mkdir -p scripts/sd-fuse/device
+        if [ ! -d "scripts/sd-fuse/device/friendlyelec" ]; then
+            if [ -d "device/rk3568" ]; then
+                ln -sf ../device/rk3568 scripts/sd-fuse/device/friendlyelec
+            else
+                mkdir -p scripts/sd-fuse/device/friendlyelec
+            fi
+        fi
+        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
         cp -r configs scripts/sd-fuse/ 2>/dev/null || true
-        # 同时复制 device 整个目录（以防软链接不起作用）
         cp -r device scripts/sd-fuse/ 2>/dev/null || true
         
-        # 显示准备结果
-        echo "=== Contents of scripts/sd-fuse ==="
-        ls -la scripts/sd-fuse/
-        echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la scripts/sd-fuse/device/ || echo "device not found"
+        echo "=== Contents of device/ ==="
+        ls -la device/
+        echo "=== Contents of scripts/sd-fuse/device/ ==="
+        ls -la scripts/sd-fuse/device/ || echo "not found"
         
         # 导出变量
         export BOARD="rk3568"
@@ -777,7 +785,6 @@ jobs:
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled."
 
-    # ---------- 关键：将必要文件完整复制到 scripts/sd-fuse ----------
     - name: Copy necessary files to sd-fuse directories
       run: |
         cd project
@@ -790,26 +797,37 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：准备并运行 ----------
+    # ---------- 最终构建：在 project 根目录创建 device/friendlyelec 软链接 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         echo "=== Current directory: $(pwd) ==="
         ls -la
-        mkdir -p scripts/sd-fuse/device
-        if [ -d "device/rk3568" ]; then
-            ln -sf ../device/rk3568 scripts/sd-fuse/device/friendlyelec
-        else
-            mkdir -p scripts/sd-fuse/device/friendlyelec
+        if [ ! -d "device/friendlyelec" ]; then
+            if [ -d "device/rk3568" ]; then
+                ln -sf rk3568 device/friendlyelec
+                echo "Created device/friendlyelec -> rk3568"
+            else
+                mkdir -p device/friendlyelec
+                echo "Created device/friendlyelec directory (fallback)"
+            fi
         fi
-        cp .current_config.mk scripts/sd-fuse/
+        mkdir -p scripts/sd-fuse/device
+        if [ ! -d "scripts/sd-fuse/device/friendlyelec" ]; then
+            if [ -d "device/rk3568" ]; then
+                ln -sf ../device/rk3568 scripts/sd-fuse/device/friendlyelec
+            else
+                mkdir -p scripts/sd-fuse/device/friendlyelec
+            fi
+        fi
+        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
         cp -r configs scripts/sd-fuse/ 2>/dev/null || true
         cp -r device scripts/sd-fuse/ 2>/dev/null || true
-        echo "=== Contents of scripts/sd-fuse ==="
-        ls -la scripts/sd-fuse/
-        echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la scripts/sd-fuse/device/ || echo "device not found"
+        echo "=== Contents of device/ ==="
+        ls -la device/
+        echo "=== Contents of scripts/sd-fuse/device/ ==="
+        ls -la scripts/sd-fuse/device/ || echo "not found"
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
