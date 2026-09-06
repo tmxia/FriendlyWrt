@@ -433,6 +433,13 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
+        # ===== 修复：创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错 =====
+        mkdir -p "${TARGET_DIR}/rootfs/dev" \
+                 "${TARGET_DIR}/rootfs/proc" \
+                 "${TARGET_DIR}/rootfs/sys" \
+                 "${TARGET_DIR}/rootfs/tmp"
+        # ===== 修复结束 =====
+        
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
         
@@ -889,6 +896,13 @@ jobs:
         rm -rf "${TARGET_DIR}/rootfs"
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
+        
+        # ===== 修复：创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错 =====
+        mkdir -p "${TARGET_DIR}/rootfs/dev" \
+                 "${TARGET_DIR}/rootfs/proc" \
+                 "${TARGET_DIR}/rootfs/sys" \
+                 "${TARGET_DIR}/rootfs/tmp"
+        # ===== 修复结束 =====
         
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
