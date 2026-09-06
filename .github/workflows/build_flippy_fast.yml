@@ -397,37 +397,35 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终修复：修补 build.sh 并运行 ----------
+    # ---------- 最终构建：创建 device/friendlyelec 并运行 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        # 打印当前目录
         echo "=== Current directory: $(pwd) ==="
         ls -la
         
-        # 修补 build.sh：移除所有交互式检查和选择代码
-        echo "Patching build.sh to skip board selection..."
-        # 注释掉 device/friendlyelec 检查
-        sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        # 删除 .current_config.mk 检查的 if 块
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
-        # 删除 select 相关代码
-        sed -i '/^# select board:/,/^esac/d' build.sh
-        sed -i '/select/d' build.sh
-        sed -i '/case \$/d' build.sh
-        sed -i '/esac/d' build.sh
-        # 强制在脚本开头设置 BOARD 和 CONFIG
-        sed -i '1a BOARD="rk3568"' build.sh
-        sed -i '1a CONFIG="rockchip-docker"' build.sh
-        sed -i '1a export BOARD CONFIG' build.sh
-        # 关闭未定义变量检查
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
-        sed -i '1a set +u' build.sh
-        echo "build.sh patched."
+        # 创建 device/friendlyelec 目录（复制 rk3568 内容）
+        if [ ! -d "device/friendlyelec" ]; then
+            if [ -d "device/rk3568" ]; then
+                cp -r device/rk3568 device/friendlyelec
+                echo "Copied device/rk3568 to device/friendlyelec"
+            else
+                mkdir -p device/friendlyelec
+                echo "Created device/friendlyelec directory (fallback)"
+            fi
+        fi
+        
+        # 确保 .current_config.mk 存在
+        if [ ! -f ".current_config.mk" ]; then
+            echo "ERROR: .current_config.mk not found in project root"
+            exit 1
+        fi
+        
+        # 显示 device 目录内容
+        echo "=== Contents of device/ ==="
+        ls -la device/
         
         # 导出变量
         export BOARD="rk3568"
@@ -439,7 +437,7 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        # 调试运行
+        # 调试运行（set -x 会显示每条命令，但不影响输出）
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -791,26 +789,18 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终修复：修补 build.sh 并运行 ----------
+    # ---------- 最终构建：创建 device/friendlyelec 并运行 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
-        echo "Patching build.sh..."
-        sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
-        sed -i '/^# select board:/,/^esac/d' build.sh
-        sed -i '/select/d' build.sh
-        sed -i '/case \$/d' build.sh
-        sed -i '/esac/d' build.sh
-        sed -i '1a BOARD="rk3568"' build.sh
-        sed -i '1a CONFIG="rockchip-docker"' build.sh
-        sed -i '1a export BOARD CONFIG' build.sh
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
-        sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
-        sed -i '1a set +u' build.sh
-        
+        if [ ! -d "device/friendlyelec" ]; then
+            if [ -d "device/rk3568" ]; then
+                cp -r device/rk3568 device/friendlyelec
+            else
+                mkdir -p device/friendlyelec
+            fi
+        fi
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -819,7 +809,6 @@ jobs:
         export ALL_MK=""
         export MK_LINK=""
         export FOUND_MK_FILE="0"
-        
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
