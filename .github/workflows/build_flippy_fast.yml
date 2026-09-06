@@ -398,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像、重命名、打包、压缩 ----------
+    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -450,9 +450,22 @@ jobs:
         
         cd scripts/sd-fuse
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        # 生成 rootfs.img（使用 sudo -E 保留环境变量）
+        echo "=== Building rootfs.img ==="
+        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
         BUILD_EXIT=${PIPESTATUS[0]}
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+          cat /tmp/build-rootfs.log
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        # 运行 mk-sd-image.sh（不再使用 yes，因为目录已完整）
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
+        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        cd ../..
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
         
@@ -463,12 +476,9 @@ jobs:
           exit 1
         fi
         
-        # 查找生成的镜像文件
+        # 重命名生成的镜像文件
         echo "=== Looking for generated image ==="
-        cd out
-        pwd
-        ls -la
-        
+        cd scripts/sd-fuse/out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
         if [ -z "$ORIG_IMG" ]; then
           echo "ERROR: No .img file found in out/"
@@ -487,10 +497,7 @@ jobs:
           echo "Image already has correct name."
         fi
         
-        # 确保 artifact 目录存在
         mkdir -p ../../artifact
-        
-        # 移动镜像
         mv "$TARGET_NAME" ../../artifact/
         cd ../..
         
@@ -848,7 +855,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像、重命名、打包、压缩 ----------
+    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -900,9 +907,20 @@ jobs:
         
         cd scripts/sd-fuse
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        echo "=== Building rootfs.img ==="
+        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
         BUILD_EXIT=${PIPESTATUS[0]}
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+          cat /tmp/build-rootfs.log
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
+        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        cd ../..
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
         
@@ -914,10 +932,7 @@ jobs:
         fi
         
         echo "=== Looking for generated image ==="
-        cd out
-        pwd
-        ls -la
-        
+        cd scripts/sd-fuse/out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
         if [ -z "$ORIG_IMG" ]; then
           echo "ERROR: No .img file found in out/"
