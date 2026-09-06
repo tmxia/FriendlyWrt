@@ -37,6 +37,7 @@ env:
   FOUND_MK_FILE: '0'
   MK_LINK: ''
   ALL_MK: ''
+  ALL_MK_LINK: ''   # 新增，修复 unbound variable
 
 jobs:
   prepare_release:
