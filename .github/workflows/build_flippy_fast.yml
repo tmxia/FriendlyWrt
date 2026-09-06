@@ -398,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像并重命名（无 yes，避免管道错误） ----------
+    # ---------- 最终构建：生成 rootfs.img 和 SD 镜像 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -450,8 +450,21 @@ jobs:
         
         cd scripts/sd-fuse
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        # 直接运行，无需 yes（因为交互提示已被删除）
+        # 修补 build-rootfs-img.sh，跳过 cd dev
+        sed -i 's/^[[:space:]]*cd dev/#cd dev/' build-rootfs-img.sh
+        
+        echo "=== Building rootfs.img ==="
+        sudo ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+          echo "=== Full log: ==="
+          cat /tmp/build-rootfs.log
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
@@ -465,7 +478,7 @@ jobs:
           exit 1
         fi
         
-        # ---- 关键修复：重命名生成的镜像 ----
+        # ---- 重命名生成的镜像 ----
         echo "=== Listing out directory contents before rename ==="
         ls -la scripts/sd-fuse/out/ || echo "out directory not found"
         
@@ -478,7 +491,6 @@ jobs:
           echo "Renamed successfully."
         else
           echo "ERROR: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
-          echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
           exit 1
         fi
@@ -492,7 +504,6 @@ jobs:
           mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
           echo "ERROR: Image file not found after rename."
-          echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
           exit 1
         fi
@@ -829,7 +840,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像并重命名（无 yes，避免管道错误） ----------
+    # ---------- 最终构建：生成 rootfs.img 和 SD 镜像 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -881,8 +892,21 @@ jobs:
         
         cd scripts/sd-fuse
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        # 直接运行，无需 yes（因为交互提示已被删除）
+        # 修补 build-rootfs-img.sh，跳过 cd dev
+        sed -i 's/^[[:space:]]*cd dev/#cd dev/' build-rootfs-img.sh
+        
+        echo "=== Building rootfs.img ==="
+        sudo ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+          echo "=== Full log: ==="
+          cat /tmp/build-rootfs.log
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
@@ -896,7 +920,7 @@ jobs:
           exit 1
         fi
         
-        # ---- 关键修复：重命名生成的镜像 ----
+        # ---- 重命名生成的镜像 ----
         echo "=== Listing out directory contents before rename ==="
         ls -la scripts/sd-fuse/out/ || echo "out directory not found"
         
@@ -909,7 +933,6 @@ jobs:
           echo "Renamed successfully."
         else
           echo "ERROR: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
-          echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
           exit 1
         fi
@@ -923,7 +946,6 @@ jobs:
           mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
           echo "ERROR: Image file not found after rename."
-          echo "=== Contents of scripts/sd-fuse/out ==="
           ls -la scripts/sd-fuse/out/ || true
           exit 1
         fi
