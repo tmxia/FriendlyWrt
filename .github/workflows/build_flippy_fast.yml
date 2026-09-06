@@ -397,13 +397,13 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接（修复复制路径） ----------
+    # ---------- 最终构建：强制复制 device 目录（不是软链接） ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        # 确保根目录有 device/friendlyelec
+        # 确保根目录 device/friendlyelec 存在
         if [ ! -d "device/friendlyelec" ]; then
             if [ -d "device/rk3568" ]; then
                 cp -r device/rk3568 device/friendlyelec
@@ -414,17 +414,15 @@ jobs:
             fi
         fi
         
-        # 在根目录复制 .current_config.mk 到 scripts/sd-fuse（确保存在）
+        # 强制删除 scripts/sd-fuse/device（如果存在，可能是软链接）
+        rm -rf scripts/sd-fuse/device
+        # 复制整个 device 目录到 scripts/sd-fuse
+        cp -r device scripts/sd-fuse/
+        # 复制 .current_config.mk
         cp .current_config.mk scripts/sd-fuse/
         
-        # 进入 scripts/sd-fuse 目录
-        cd scripts/sd-fuse
-        
-        # 删除可能存在的 device 目录，创建软链接指向根目录的 device
-        rm -rf device
-        ln -sf ../device device
-        
         # 检查文件是否就绪
+        cd scripts/sd-fuse
         echo "=== Contents of scripts/sd-fuse ==="
         ls -la
         echo "=== Contents of scripts/sd-fuse/device ==="
@@ -433,11 +431,8 @@ jobs:
         ls -la device/friendlyelec/ || echo "friendlyelec not found"
         echo "=== .current_config.mk exists? ==="
         ls -la .current_config.mk
-        
-        # 回到项目根目录
         cd ../..
         
-        # 导出变量
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -798,11 +793,12 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接（修复复制路径） ----------
+    # ---------- 最终构建：强制复制 device 目录（不是软链接） ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
+        
         if [ ! -d "device/friendlyelec" ]; then
             if [ -d "device/rk3568" ]; then
                 cp -r device/rk3568 device/friendlyelec
@@ -810,10 +806,12 @@ jobs:
                 mkdir -p device/friendlyelec
             fi
         fi
+        
+        rm -rf scripts/sd-fuse/device
+        cp -r device scripts/sd-fuse/
         cp .current_config.mk scripts/sd-fuse/
+        
         cd scripts/sd-fuse
-        rm -rf device
-        ln -sf ../device device
         echo "=== Contents of scripts/sd-fuse ==="
         ls -la
         echo "=== Contents of scripts/sd-fuse/device ==="
@@ -822,6 +820,7 @@ jobs:
         ls -la device/friendlyelec/ || echo "friendlyelec not found"
         ls -la .current_config.mk
         cd ../..
+        
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -830,16 +829,19 @@ jobs:
         export ALL_MK=""
         export MK_LINK=""
         export FOUND_MK_FILE="0"
+        
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
         set +x
+        
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== Build failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
           cat /tmp/build.log
           exit 1
         fi
+        
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -848,6 +850,7 @@ jobs:
           ls -la out/ || true
           exit 1
         fi
+
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
           echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found"
