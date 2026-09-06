@@ -398,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：直接使用已有的 rootfs 生成镜像 ----------
+    # ---------- 最终构建：生成镜像 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -429,10 +429,8 @@ jobs:
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
         
-        # 清空并重建 rootfs 目录
         rm -rf "${TARGET_DIR}/rootfs"
         mkdir -p "${TARGET_DIR}/rootfs"
-        # 复制完整的 rootfs 内容
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
@@ -446,15 +444,15 @@ jobs:
         export ALL_MK=""
         export MK_LINK=""
         export FOUND_MK_FILE="0"
+        # 强制指定输出文件名（mk-sd-image.sh 会读取此变量）
+        export RAW_IMAGE_NAME="${{ steps.config.outputs.img_filename }}"
         
         echo "=== Environment variables ==="
-        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
+        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK|RAW_IMAGE_NAME)=" || true
         
         cd scripts/sd-fuse
         
-        # 注意：我们跳过 build-rootfs-img.sh，因为 rootfs 已经准备完毕
-        # 直接运行 mk-sd-image.sh，它会使用 ${DIST_DIR}/rootfs 目录
-        
+        # 跳过 build-rootfs-img.sh，直接运行 mk-sd-image.sh
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -473,6 +471,7 @@ jobs:
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
         
+        # 尝试精确匹配，否则查找任何 .img 文件并重命名
         if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
           mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -480,12 +479,20 @@ jobs:
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "ERROR: Image file not found in any location."
-          echo "=== Contents of scripts/sd-fuse/out ==="
-          ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
-          exit 1
+          echo "Specified image file not found, searching for any .img file..."
+          FOUND_IMG=$(find scripts/sd-fuse/out -maxdepth 1 -name "*.img" | head -1)
+          if [ -n "$FOUND_IMG" ]; then
+            echo "Found: $FOUND_IMG, renaming to ${{ steps.config.outputs.img_filename }}"
+            mv "$FOUND_IMG" "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+            mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ../artifact/
+          else
+            echo "ERROR: No image file found in any location."
+            echo "=== Contents of scripts/sd-fuse/out ==="
+            ls -la scripts/sd-fuse/out/ || true
+            echo "=== Contents of out ==="
+            ls -la out/ || true
+            exit 1
+          fi
         fi
 
         echo "=== Packaging tgz ==="
@@ -820,7 +827,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：直接使用已有的 rootfs 生成镜像 ----------
+    # ---------- 最终构建：生成镜像 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -866,13 +873,13 @@ jobs:
         export ALL_MK=""
         export MK_LINK=""
         export FOUND_MK_FILE="0"
+        export RAW_IMAGE_NAME="${{ steps.config.outputs.img_filename }}"
         
         echo "=== Environment variables ==="
-        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
+        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK|RAW_IMAGE_NAME)=" || true
         
         cd scripts/sd-fuse
         
-        # 跳过 build-rootfs-img.sh，直接运行 mk-sd-image.sh
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -898,12 +905,20 @@ jobs:
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "ERROR: Image file not found in any location."
-          echo "=== Contents of scripts/sd-fuse/out ==="
-          ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
-          exit 1
+          echo "Specified image file not found, searching for any .img file..."
+          FOUND_IMG=$(find scripts/sd-fuse/out -maxdepth 1 -name "*.img" | head -1)
+          if [ -n "$FOUND_IMG" ]; then
+            echo "Found: $FOUND_IMG, renaming to ${{ steps.config.outputs.img_filename }}"
+            mv "$FOUND_IMG" "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+            mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ../artifact/
+          else
+            echo "ERROR: No image file found in any location."
+            echo "=== Contents of scripts/sd-fuse/out ==="
+            ls -la scripts/sd-fuse/out/ || true
+            echo "=== Contents of out ==="
+            ls -la out/ || true
+            exit 1
+          fi
         fi
 
         echo "=== Packaging tgz ==="
