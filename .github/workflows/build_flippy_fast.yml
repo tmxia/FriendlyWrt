@@ -397,37 +397,45 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：创建 device/friendlyelec 并运行 ----------
+    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
         
-        echo "=== Current directory: $(pwd) ==="
-        ls -la
-        
-        # 创建 device/friendlyelec 目录（复制 rk3568 内容）
+        # 确保根目录下 device/friendlyelec 存在
         if [ ! -d "device/friendlyelec" ]; then
             if [ -d "device/rk3568" ]; then
                 cp -r device/rk3568 device/friendlyelec
                 echo "Copied device/rk3568 to device/friendlyelec"
             else
                 mkdir -p device/friendlyelec
-                echo "Created device/friendlyelec directory (fallback)"
+                echo "Created device/friendlyelec (fallback)"
             fi
         fi
         
-        # 确保 .current_config.mk 存在
-        if [ ! -f ".current_config.mk" ]; then
-            echo "ERROR: .current_config.mk not found in project root"
-            exit 1
-        fi
+        # 进入 scripts/sd-fuse，准备文件链接
+        cd scripts/sd-fuse
         
-        # 显示 device 目录内容
-        echo "=== Contents of device/ ==="
+        # 删除可能存在的 device 目录（避免冲突）
+        rm -rf device
+        
+        # 创建软链接指向根目录的 device
+        ln -sf ../device device
+        # 复制 .current_config.mk
+        cp ../.current_config.mk .
+        
+        # 显示当前目录内容用于调试
+        echo "=== Contents of scripts/sd-fuse ==="
+        ls -la
+        echo "=== Contents of scripts/sd-fuse/device ==="
         ls -la device/
+        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
+        ls -la device/friendlyelec/ || echo "friendlyelec not found"
         
-        # 导出变量
+        # 回到项目根目录
+        cd ../..
+        
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -437,7 +445,6 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        # 调试运行（set -x 会显示每条命令，但不影响输出）
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -789,7 +796,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：创建 device/friendlyelec 并运行 ----------
+    # ---------- 最终构建：在 scripts/sd-fuse 中创建软链接 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -801,6 +808,17 @@ jobs:
                 mkdir -p device/friendlyelec
             fi
         fi
+        cd scripts/sd-fuse
+        rm -rf device
+        ln -sf ../device device
+        cp ../.current_config.mk .
+        echo "=== Contents of scripts/sd-fuse ==="
+        ls -la
+        echo "=== Contents of scripts/sd-fuse/device ==="
+        ls -la device/
+        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
+        ls -la device/friendlyelec/ || echo "friendlyelec not found"
+        cd ../..
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
