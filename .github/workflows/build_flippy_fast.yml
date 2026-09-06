@@ -396,7 +396,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 关键修复：关闭未定义变量检查 ----------
+    # ---------- 关键修复：彻底关闭未定义变量检查 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -408,9 +408,11 @@ jobs:
         # 注释掉检查 device 和 .current_config.mk 的行
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
         sed -i '/.current_config.mk/ s/^/#/' build.sh
-        # 在脚本开头插入 set +u，避免未定义变量中断
-        sed -i '1i set +u' build.sh
-        echo "build.sh patched: file checks disabled and 'set +u' added."
+        # 彻底替换所有 set -u 为 set +u（包括子 shell 中的）
+        sed -i 's/set -u/set +u/g' build.sh
+        # 确保脚本开头是 set +u（即使 shebang 在第一行，也在其后插入）
+        sed -i '1a set +u' build.sh
+        echo "build.sh patched: file checks disabled and all 'set -u' replaced with 'set +u'."
 
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
@@ -759,7 +761,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 关键修复：关闭未定义变量检查 ----------
+    # ---------- 关键修复：彻底关闭未定义变量检查 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -770,8 +772,9 @@ jobs:
         ls -la .current_config.mk || echo ".current_config.mk not found"
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
         sed -i '/.current_config.mk/ s/^/#/' build.sh
-        sed -i '1i set +u' build.sh
-        echo "build.sh patched: file checks disabled and 'set +u' added."
+        sed -i 's/set -u/set +u/g' build.sh
+        sed -i '1a set +u' build.sh
+        echo "build.sh patched: file checks disabled and all 'set -u' replaced with 'set +u'."
 
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
