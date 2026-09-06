@@ -402,26 +402,23 @@ jobs:
       id: build_sd_image
       run: |
         cd project
-        
-        # 显示当前目录内容用于调试
         echo "=== Current directory: $(pwd) ==="
         ls -la
         
-        # 确保 .current_config.mk 在可能需要的子目录中存在
-        mkdir -p scripts/sd-fuse friendlywrt
-        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
+        # 在项目根目录下准备文件（已有 .current_config.mk 和 device 链接）
+        # 但 build.sh 会在 scripts/sd-fuse 子目录中运行，需要在那里也准备
+        mkdir -p scripts/sd-fuse/device
+        if [ -d "device/rk3568" ]; then
+            ln -sf ../../device/rk3568 scripts/sd-fuse/device/friendlyelec
+        else
+            mkdir -p scripts/sd-fuse/device/friendlyelec
+        fi
+        # 复制 .current_config.mk 到 scripts/sd-fuse
+        cp .current_config.mk scripts/sd-fuse/
+        # 同时复制到 friendlywrt 目录
         cp .current_config.mk friendlywrt/ 2>/dev/null || true
         
-        # 如果 device/friendlyelec 不存在，创建一个（可能是软链接或空目录）
-        if [ ! -d "device/friendlyelec" ]; then
-            mkdir -p device/friendlyelec
-            # 如果 device 目录下有 rk3568，则创建链接或复制（根据实际结构）
-            if [ -d "device/rk3568" ]; then
-                ln -s rk3568 device/friendlyelec 2>/dev/null || cp -r device/rk3568 device/friendlyelec
-            fi
-        fi
-        
-        # 导出所有必需变量
+        # 导出变量
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -431,7 +428,7 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        # 调试模式运行
+        # 调试运行
         set -x
         ./build.sh sd-img 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -790,15 +787,14 @@ jobs:
         cd project
         echo "=== Current directory: $(pwd) ==="
         ls -la
-        mkdir -p scripts/sd-fuse friendlywrt
-        cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
-        cp .current_config.mk friendlywrt/ 2>/dev/null || true
-        if [ ! -d "device/friendlyelec" ]; then
-            mkdir -p device/friendlyelec
-            if [ -d "device/rk3568" ]; then
-                ln -s rk3568 device/friendlyelec 2>/dev/null || cp -r device/rk3568 device/friendlyelec
-            fi
+        mkdir -p scripts/sd-fuse/device
+        if [ -d "device/rk3568" ]; then
+            ln -sf ../../device/rk3568 scripts/sd-fuse/device/friendlyelec
+        else
+            mkdir -p scripts/sd-fuse/device/friendlyelec
         fi
+        cp .current_config.mk scripts/sd-fuse/
+        cp .current_config.mk friendlywrt/ 2>/dev/null || true
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
