@@ -432,7 +432,7 @@ jobs:
         
         echo "build.sh fully patched: interactive selections removed, variables forced."
 
-    # ---------- 最终构建步骤 ----------
+    # ---------- 最终构建步骤（含调试输出） ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -466,8 +466,19 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        # 执行构建
-        ./build.sh sd-img
+        # 调试模式运行 build.sh
+        echo "=== Starting build in debug mode ==="
+        set -x
+        ./build.sh sd-img 2>&1 | tee build.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        set +x
+        
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== Build failed with exit code $BUILD_EXIT ==="
+          echo "=== Last 100 lines of build.log ==="
+          tail -100 build.log
+          exit 1
+        fi
         
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
@@ -832,7 +843,7 @@ jobs:
         sed -i '1a set +u' build.sh
         echo "build.sh fully patched: interactive selections removed, variables forced."
 
-    # ---------- 最终构建步骤 ----------
+    # ---------- 最终构建步骤（含调试输出） ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -857,7 +868,18 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        ./build.sh sd-img
+        echo "=== Starting build in debug mode ==="
+        set -x
+        ./build.sh sd-img 2>&1 | tee build.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        set +x
+        
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== Build failed with exit code $BUILD_EXIT ==="
+          echo "=== Last 100 lines of build.log ==="
+          tail -100 build.log
+          exit 1
+        fi
         
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
