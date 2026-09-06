@@ -397,7 +397,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 关键修复：关闭未定义变量检查，但保留 .current_config.mk 检查 ----------
+    # ---------- 关键修复：关闭未定义变量检查，移除 .current_config.mk 检查 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -406,15 +406,17 @@ jobs:
         ls -la device/friendlyelec || echo "device/friendlyelec not found"
         echo "Checking .current_config.mk:"
         ls -la .current_config.mk || echo ".current_config.mk not found"
-        # 只注释 device/friendlyelec 检查，保留 .current_config.mk 检查（因为文件存在）
+        # 注释掉 device/friendlyelec 检查
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        # 不注释 .current_config.mk 检查
+        # 删除所有 .current_config.mk 检查的整个块
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
+        sed -i '/no .current_config.mk/d' build.sh
         # 注释掉所有 set -u 和 set -o nounset 行
         sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
         sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
         # 在脚本开头强制 set +u
         sed -i '1a set +u' build.sh
-        echo "build.sh patched: device check disabled, set -u/nounset commented, set +u added."
+        echo "build.sh patched: device check disabled, .current_config.mk check removed, set -u/nounset commented, set +u added."
 
     # ---------- 最终构建步骤 ----------
     - name: Build sd image with official build.sh sd-img
@@ -433,6 +435,13 @@ jobs:
         # 强制移除交互式选择板子的代码段，并预设 BOARD 变量
         sed -i '/^# select board:/,/^esac/d' build.sh
         echo 'BOARD="rk3568"' >> build.sh
+        
+        # 再次删除可能残留的 .current_config.mk 检查（双重保险）
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
+        sed -i '/no .current_config.mk/d' build.sh
+        
+        # 确保 .current_config.mk 存在
+        ls -la .current_config.mk || echo "WARNING: .current_config.mk not found, but we patched build.sh"
         
         # 导出所有可能缺失的变量
         export TOPDIR=$(pwd)
@@ -785,7 +794,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 关键修复：关闭未定义变量检查，但保留 .current_config.mk 检查 ----------
+    # ---------- 关键修复：关闭未定义变量检查，移除 .current_config.mk 检查 ----------
     - name: Debug and patch build.sh
       run: |
         cd project
@@ -795,11 +804,12 @@ jobs:
         echo "Checking .current_config.mk:"
         ls -la .current_config.mk || echo ".current_config.mk not found"
         sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        # 不注释 .current_config.mk 检查
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
+        sed -i '/no .current_config.mk/d' build.sh
         sed -i 's/^[[:space:]]*set[[:space:]]\+-u/#set -u/g' build.sh
         sed -i 's/^[[:space:]]*set[[:space:]]\+-o[[:space:]]\+nounset/#set -o nounset/g' build.sh
         sed -i '1a set +u' build.sh
-        echo "build.sh patched: device check disabled, set -u/nounset commented, set +u added."
+        echo "build.sh patched: device check disabled, .current_config.mk check removed, set -u/nounset commented, set +u added."
 
     # ---------- 最终构建步骤 ----------
     - name: Build sd image with official build.sh sd-img
@@ -810,10 +820,10 @@ jobs:
         find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
         find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
         sed -i '1a set +u' build.sh
-        
-        # 强制移除交互式选择板子的代码段，并预设 BOARD 变量
         sed -i '/^# select board:/,/^esac/d' build.sh
         echo 'BOARD="rk3568"' >> build.sh
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
+        sed -i '/no .current_config.mk/d' build.sh
         
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
