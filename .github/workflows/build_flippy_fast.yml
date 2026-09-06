@@ -398,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像 ----------
+    # ---------- 最终构建：生成镜像并重命名 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -444,11 +444,9 @@ jobs:
         export ALL_MK=""
         export MK_LINK=""
         export FOUND_MK_FILE="0"
-        # 强制指定输出文件名（mk-sd-image.sh 会读取此变量）
-        export RAW_IMAGE_NAME="${{ steps.config.outputs.img_filename }}"
         
         echo "=== Environment variables ==="
-        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK|RAW_IMAGE_NAME)=" || true
+        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
         cd scripts/sd-fuse
         
@@ -467,11 +465,19 @@ jobs:
           exit 1
         fi
         
-        echo "=== Checking for output image ==="
-        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
-        ls -la out/ || echo "project/out not found"
+        # 查找生成的镜像文件（mk-sd-image.sh 生成的文件名格式为 rk3568-sd-*.img）
+        echo "=== Checking for generated image ==="
+        GENERATED_IMG=$(ls scripts/sd-fuse/out/rk3568-sd-*.img 2>/dev/null | head -1)
+        if [ -n "$GENERATED_IMG" ]; then
+          TARGET_IMG="scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+          echo "Renaming $GENERATED_IMG to $TARGET_IMG"
+          mv "$GENERATED_IMG" "$TARGET_IMG"
+          echo "Renamed successfully."
+        else
+          echo "WARNING: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+        fi
         
-        # 尝试精确匹配，否则查找任何 .img 文件并重命名
+        # 再次检查目标文件是否存在
         if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
           mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
@@ -479,20 +485,12 @@ jobs:
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "Specified image file not found, searching for any .img file..."
-          FOUND_IMG=$(find scripts/sd-fuse/out -maxdepth 1 -name "*.img" | head -1)
-          if [ -n "$FOUND_IMG" ]; then
-            echo "Found: $FOUND_IMG, renaming to ${{ steps.config.outputs.img_filename }}"
-            mv "$FOUND_IMG" "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
-            mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ../artifact/
-          else
-            echo "ERROR: No image file found in any location."
-            echo "=== Contents of scripts/sd-fuse/out ==="
-            ls -la scripts/sd-fuse/out/ || true
-            echo "=== Contents of out ==="
-            ls -la out/ || true
-            exit 1
-          fi
+          echo "ERROR: Image file not found in any location."
+          echo "=== Contents of scripts/sd-fuse/out ==="
+          ls -la scripts/sd-fuse/out/ || true
+          echo "=== Contents of out ==="
+          ls -la out/ || true
+          exit 1
         fi
 
         echo "=== Packaging tgz ==="
@@ -827,7 +825,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像 ----------
+    # ---------- 最终构建：生成镜像并重命名 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -873,10 +871,9 @@ jobs:
         export ALL_MK=""
         export MK_LINK=""
         export FOUND_MK_FILE="0"
-        export RAW_IMAGE_NAME="${{ steps.config.outputs.img_filename }}"
         
         echo "=== Environment variables ==="
-        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK|RAW_IMAGE_NAME)=" || true
+        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
         cd scripts/sd-fuse
         
@@ -894,6 +891,18 @@ jobs:
           exit 1
         fi
         
+        # 查找生成的镜像文件并重命名为预期名称
+        echo "=== Renaming generated image ==="
+        GENERATED_IMG=$(ls scripts/sd-fuse/out/rk3568-sd-*.img 2>/dev/null | head -1)
+        if [ -n "$GENERATED_IMG" ]; then
+          TARGET_IMG="scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+          echo "Renaming $GENERATED_IMG to $TARGET_IMG"
+          mv "$GENERATED_IMG" "$TARGET_IMG"
+          echo "Renamed successfully."
+        else
+          echo "WARNING: No rk3568-sd-*.img file found in scripts/sd-fuse/out/"
+        fi
+        
         echo "=== Checking for output image ==="
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
@@ -905,20 +914,12 @@ jobs:
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "Specified image file not found, searching for any .img file..."
-          FOUND_IMG=$(find scripts/sd-fuse/out -maxdepth 1 -name "*.img" | head -1)
-          if [ -n "$FOUND_IMG" ]; then
-            echo "Found: $FOUND_IMG, renaming to ${{ steps.config.outputs.img_filename }}"
-            mv "$FOUND_IMG" "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
-            mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ../artifact/
-          else
-            echo "ERROR: No image file found in any location."
-            echo "=== Contents of scripts/sd-fuse/out ==="
-            ls -la scripts/sd-fuse/out/ || true
-            echo "=== Contents of out ==="
-            ls -la out/ || true
-            exit 1
-          fi
+          echo "ERROR: Image file not found in any location."
+          echo "=== Contents of scripts/sd-fuse/out ==="
+          ls -la scripts/sd-fuse/out/ || true
+          echo "=== Contents of out ==="
+          ls -la out/ || true
+          exit 1
         fi
 
         echo "=== Packaging tgz ==="
