@@ -450,7 +450,6 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # 直接运行 mk-sd-image.sh
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -464,40 +463,35 @@ jobs:
           exit 1
         fi
         
-        # 重命名生成的镜像文件
+        # 查找并重命名生成的镜像文件
         cd out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
-        if [ -n "$ORIG_IMG" ]; then
-          echo "Found original image: $ORIG_IMG"
-          mv "$ORIG_IMG" "${{ steps.config.outputs.img_filename }}"
-          echo "Renamed to: ${{ steps.config.outputs.img_filename }}"
-        else
+        if [ -z "$ORIG_IMG" ]; then
           echo "ERROR: No .img file found in out/"
           ls -la
           exit 1
         fi
+        echo "Found original image: $ORIG_IMG"
+        
+        TARGET_NAME="${{ steps.config.outputs.img_filename }}"
+        if [ "$ORIG_IMG" != "$TARGET_NAME" ]; then
+          mv "$ORIG_IMG" "$TARGET_NAME"
+          echo "Renamed to: $TARGET_NAME"
+        else
+          echo "Image already has correct name."
+        fi
+        
+        # 移动到 artifact
+        mkdir -p ../../artifact
+        mv "$TARGET_NAME" ../../artifact/
         cd ../..
         
-        echo "=== Checking for output image ==="
-        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
-        ls -la out/ || echo "project/out not found"
-        
-        # 移动镜像到 artifact 目录
-        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
-          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
-        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
-        else
-          echo "ERROR: Image file not found after renaming."
-          echo "=== Contents of scripts/sd-fuse/out ==="
-          ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
+        if [ ! -f "artifact/$TARGET_NAME" ]; then
+          echo "ERROR: Failed to move image to artifact/"
+          ls -la artifact/
           exit 1
         fi
-
+        
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
@@ -508,10 +502,20 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
+        mv "${{ steps.config.outputs.archive_filename }}" ../../artifact/
         cd ../..
-        cd ../artifact/
-        gzip *.img
+        
+        echo "=== Compressing image ==="
+        cd artifact
+        if [ -f "$TARGET_NAME" ]; then
+          gzip "$TARGET_NAME"
+          echo "Compressed image: $TARGET_NAME.gz"
+        else
+          echo "ERROR: Image file not found in artifact/ for compression"
+          ls -la
+          exit 1
+        fi
+        cd ..
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
@@ -895,39 +899,33 @@ jobs:
           exit 1
         fi
         
-        # 重命名生成的镜像文件
         cd out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
-        if [ -n "$ORIG_IMG" ]; then
-          echo "Found original image: $ORIG_IMG"
-          mv "$ORIG_IMG" "${{ steps.config.outputs.img_filename }}"
-          echo "Renamed to: ${{ steps.config.outputs.img_filename }}"
-        else
+        if [ -z "$ORIG_IMG" ]; then
           echo "ERROR: No .img file found in out/"
           ls -la
           exit 1
         fi
+        echo "Found original image: $ORIG_IMG"
+        
+        TARGET_NAME="${{ steps.config.outputs.img_filename }}"
+        if [ "$ORIG_IMG" != "$TARGET_NAME" ]; then
+          mv "$ORIG_IMG" "$TARGET_NAME"
+          echo "Renamed to: $TARGET_NAME"
+        else
+          echo "Image already has correct name."
+        fi
+        
+        mkdir -p ../../artifact
+        mv "$TARGET_NAME" ../../artifact/
         cd ../..
         
-        echo "=== Checking for output image ==="
-        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
-        ls -la out/ || echo "project/out not found"
-        
-        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
-          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
-        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
-        else
-          echo "ERROR: Image file not found after renaming."
-          echo "=== Contents of scripts/sd-fuse/out ==="
-          ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
+        if [ ! -f "artifact/$TARGET_NAME" ]; then
+          echo "ERROR: Failed to move image to artifact/"
+          ls -la artifact/
           exit 1
         fi
-
+        
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
@@ -938,10 +936,20 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
+        mv "${{ steps.config.outputs.archive_filename }}" ../../artifact/
         cd ../..
-        cd ../artifact/
-        gzip *.img
+        
+        echo "=== Compressing image ==="
+        cd artifact
+        if [ -f "$TARGET_NAME" ]; then
+          gzip "$TARGET_NAME"
+          echo "Compressed image: $TARGET_NAME.gz"
+        else
+          echo "ERROR: Image file not found in artifact/ for compression"
+          ls -la
+          exit 1
+        fi
+        cd ..
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
