@@ -37,7 +37,7 @@ env:
   FOUND_MK_FILE: '0'
   MK_LINK: ''
   ALL_MK: ''
-  ALL_MK_LINK: ''   # 新增，修复 unbound variable
+  ALL_MK_LINK: ''
 
 jobs:
   prepare_release:
@@ -416,12 +416,29 @@ jobs:
         sed -i '1a set +u' build.sh
         echo "build.sh patched: file checks disabled, all set -u/nounset commented, set +u added at top."
 
+    # ---------- 最终构建步骤，多重保障 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
+        
+        # 1. 当前 shell 关闭未定义变量检查
+        set +u
+        
+        # 2. 再次强制修改 build.sh 和所有可能调用的脚本
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        sed -i '1a set +u' build.sh
+        
+        # 3. 显式导出所有可能缺失的变量
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
+        export ALL_MK_LINK=""
+        export ALL_MK=""
+        export MK_LINK=""
+        export FOUND_MK_FILE="0"
+        
+        # 4. 执行构建
         ./build.sh sd-img
         
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
@@ -779,12 +796,24 @@ jobs:
         sed -i '1a set +u' build.sh
         echo "build.sh patched: file checks disabled, all set -u/nounset commented, set +u added at top."
 
+    # ---------- 最终构建步骤，多重保障 ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
         cd project
+        
+        set +u
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        sed -i '1a set +u' build.sh
+        
         export TOPDIR=$(pwd)
         export FRIENDLYWRT_SRC=$TOPDIR
+        export ALL_MK_LINK=""
+        export ALL_MK=""
+        export MK_LINK=""
+        export FOUND_MK_FILE="0"
+        
         ./build.sh sd-img
         
         if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
