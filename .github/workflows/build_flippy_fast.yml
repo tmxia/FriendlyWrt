@@ -385,7 +385,7 @@ jobs:
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled."
 
-    # ---------- 关键步骤：复制文件到 sd-fuse（确保子脚本可用） ----------
+    # ---------- 关键步骤：复制文件到 sd-fuse ----------
     - name: Copy necessary files to sd-fuse directories
       run: |
         cd project
@@ -398,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：彻底修补所有脚本，确保文件和变量 ----------
+    # ---------- 最终构建：直接调用 mk-sd-image.sh ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -446,30 +446,38 @@ jobs:
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        echo "=== Starting build.sh sd-img ==="
-        set -x
-        ./build.sh sd-img 2>&1 | tee /tmp/build.log
+        # 直接进入 scripts/sd-fuse 并调用 mk-sd-image.sh
+        cd scripts/sd-fuse
+        echo "=== Running mk-sd-image.sh directly ==="
+        ./mk-sd-image.sh 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
-        set +x
+        cd ../..
         
-        echo "=== Build finished with exit code: $BUILD_EXIT ==="
+        echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
         
         if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== Build failed with exit code $BUILD_EXIT ==="
+          echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
           cat /tmp/build.log
           exit 1
         fi
         
+        # 检查生成的镜像文件（可能在 scripts/sd-fuse/out 下）
         echo "=== Checking for output image ==="
-        ls -la out/ || echo "out/ directory not found"
+        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
+        ls -la out/ || echo "project/out not found"
         
-        if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
+        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
+        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
-          echo "=== Contents of out/ ==="
+          echo "ERROR: Image file not found in any location."
+          echo "=== Contents of scripts/sd-fuse/out ==="
+          ls -la scripts/sd-fuse/out/ || true
+          echo "=== Contents of out ==="
           ls -la out/ || true
           exit 1
         fi
@@ -793,7 +801,7 @@ jobs:
         sed -i '/please build kernel first/d' build.sh
         echo "Kernel check disabled."
 
-    # ---------- 关键步骤：复制文件到 sd-fuse（确保子脚本可用） ----------
+    # ---------- 关键步骤：复制文件到 sd-fuse ----------
     - name: Copy necessary files to sd-fuse directories
       run: |
         cd project
@@ -806,7 +814,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：彻底修补所有脚本，确保文件和变量 ----------
+    # ---------- 最终构建：直接调用 mk-sd-image.sh ----------
     - name: Build sd image with official build.sh sd-img
       id: build_sd_image
       run: |
@@ -835,13 +843,6 @@ jobs:
         cp .current_config.mk scripts/sd-fuse/ 2>/dev/null || true
         cp configs scripts/sd-fuse/ -r 2>/dev/null || true
         
-        echo "=== Contents of scripts/sd-fuse ==="
-        ls -la scripts/sd-fuse/
-        echo "=== Contents of scripts/sd-fuse/device ==="
-        ls -la scripts/sd-fuse/device/ 2>/dev/null || echo "device not found"
-        echo "=== Contents of scripts/sd-fuse/device/friendlyelec ==="
-        ls -la scripts/sd-fuse/device/friendlyelec/ 2>/dev/null || echo "friendlyelec not found"
-        
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
         export TOPDIR=$(pwd)
@@ -854,30 +855,36 @@ jobs:
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        echo "=== Starting build.sh sd-img ==="
-        set -x
-        ./build.sh sd-img 2>&1 | tee /tmp/build.log
+        cd scripts/sd-fuse
+        echo "=== Running mk-sd-image.sh directly ==="
+        ./mk-sd-image.sh 2>&1 | tee /tmp/build.log
         BUILD_EXIT=${PIPESTATUS[0]}
-        set +x
+        cd ../..
         
-        echo "=== Build finished with exit code: $BUILD_EXIT ==="
+        echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
         
         if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== Build failed with exit code $BUILD_EXIT ==="
+          echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
           cat /tmp/build.log
           exit 1
         fi
         
         echo "=== Checking for output image ==="
-        ls -la out/ || echo "out/ directory not found"
+        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
+        ls -la out/ || echo "project/out not found"
         
-        if [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
+        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
+        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
           echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
           mv out/${{ steps.config.outputs.img_filename }} ../artifact/
         else
-          echo "ERROR: Image file not found: out/${{ steps.config.outputs.img_filename }}"
-          echo "=== Contents of out/ ==="
+          echo "ERROR: Image file not found in any location."
+          echo "=== Contents of scripts/sd-fuse/out ==="
+          ls -la scripts/sd-fuse/out/ || true
+          echo "=== Contents of out ==="
           ls -la out/ || true
           exit 1
         fi
