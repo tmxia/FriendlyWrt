@@ -398,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像并重命名 ----------
+    # ---------- 最终构建：生成镜像并重命名（无 yes，避免管道错误） ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -451,7 +451,8 @@ jobs:
         cd scripts/sd-fuse
         
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        # 直接运行，无需 yes（因为交互提示已被删除）
+        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
@@ -828,7 +829,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像并重命名 ----------
+    # ---------- 最终构建：生成镜像并重命名（无 yes，避免管道错误） ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -881,7 +882,8 @@ jobs:
         cd scripts/sd-fuse
         
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        # 直接运行，无需 yes（因为交互提示已被删除）
+        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
