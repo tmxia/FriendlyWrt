@@ -455,7 +455,7 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ================== 正确调用 build-rootfs-img.sh：参数顺序为 目录 输出文件，使用绝对路径 ==================
+        # 生成 rootfs.img：参数顺序为 源目录 输出文件，使用绝对路径
         echo "=== Generating rootfs.img ==="
         sudo -E ./build-rootfs-img.sh "$(pwd)/${DIST_DIR}/rootfs" "$(pwd)/${DIST_DIR}/rootfs.img"
         if [ $? -ne 0 ]; then
@@ -464,7 +464,7 @@ jobs:
         fi
         echo "rootfs.img generated successfully."
         
-        # ================== 运行 mk-sd-image.sh，传入目录绝对路径 ==================
+        # 运行 mk-sd-image.sh，传入目录绝对路径
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
         BUILD_EXIT=$?
@@ -479,7 +479,6 @@ jobs:
           exit 1
         fi
         
-        # 重命名生成的镜像文件
         echo "=== Looking for generated image ==="
         cd scripts/sd-fuse/out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
@@ -511,7 +510,6 @@ jobs:
         fi
         echo "Image moved to artifact/$TARGET_NAME"
         
-        # 打包 tgz
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
@@ -526,7 +524,6 @@ jobs:
         cd ../..
         echo "tgz packaged: artifact/${{ steps.config.outputs.archive_filename }}"
         
-        # 压缩镜像
         echo "=== Compressing image ==="
         cd artifact
         if [ -f "$TARGET_NAME" ]; then
@@ -892,6 +889,7 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
+        # 创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错
         mkdir -p "${TARGET_DIR}/rootfs/dev" \
                  "${TARGET_DIR}/rootfs/proc" \
                  "${TARGET_DIR}/rootfs/sys" \
@@ -914,7 +912,7 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ================== 正确调用 build-rootfs-img.sh：参数顺序为 目录 输出文件，使用绝对路径 ==================
+        # 生成 rootfs.img：参数顺序为 源目录 输出文件，使用绝对路径
         echo "=== Generating rootfs.img ==="
         sudo -E ./build-rootfs-img.sh "$(pwd)/${DIST_DIR}/rootfs" "$(pwd)/${DIST_DIR}/rootfs.img"
         if [ $? -ne 0 ]; then
@@ -923,7 +921,7 @@ jobs:
         fi
         echo "rootfs.img generated successfully."
         
-        # ================== 运行 mk-sd-image.sh，传入目录绝对路径 ==================
+        # 运行 mk-sd-image.sh，传入目录绝对路径
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
         BUILD_EXIT=$?
