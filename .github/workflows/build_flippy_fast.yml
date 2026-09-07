@@ -450,7 +450,6 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # 直接运行 mk-sd-image.sh
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -482,21 +481,13 @@ jobs:
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
         
-        # 移动镜像到 artifact 目录
-        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
-          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
-        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
-        else
-          echo "ERROR: Image file not found after renaming."
-          echo "=== Contents of scripts/sd-fuse/out ==="
-          ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
-          exit 1
-        fi
+        # ========== 修复处：使用绝对路径移动镜像 ==========
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        echo "=== Moving image to $ARTIFACT_DIR ==="
+        mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
+          mv "out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
+          { echo "ERROR: Image file not found"; ls -la scripts/sd-fuse/out out; exit 1; }
+        ls -la "$ARTIFACT_DIR"
 
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
@@ -507,11 +498,13 @@ jobs:
         fi
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
-        tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
-        cd ../..
-        cd ../artifact/
-        gzip *.img
+        tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
+        echo "tgz created at $ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}"
+        
+        # ========== 在 artifact 目录中压缩 img ==========
+        cd "$ARTIFACT_DIR"
+        gzip "${{ steps.config.outputs.img_filename }}"
+        echo "Compressed image: ${{ steps.config.outputs.img_filename }}.gz"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
@@ -913,20 +906,13 @@ jobs:
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
         
-        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
-          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
-        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
-          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
-          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
-        else
-          echo "ERROR: Image file not found after renaming."
-          echo "=== Contents of scripts/sd-fuse/out ==="
-          ls -la scripts/sd-fuse/out/ || true
-          echo "=== Contents of out ==="
-          ls -la out/ || true
-          exit 1
-        fi
+        # ========== 修复处：使用绝对路径移动镜像 ==========
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        echo "=== Moving image to $ARTIFACT_DIR ==="
+        mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
+          mv "out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
+          { echo "ERROR: Image file not found"; ls -la scripts/sd-fuse/out out; exit 1; }
+        ls -la "$ARTIFACT_DIR"
 
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
@@ -937,11 +923,13 @@ jobs:
         fi
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
-        tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
-        cd ../..
-        cd ../artifact/
-        gzip *.img
+        tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
+        echo "tgz created at $ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}"
+        
+        # ========== 在 artifact 目录中压缩 img ==========
+        cd "$ARTIFACT_DIR"
+        gzip "${{ steps.config.outputs.img_filename }}"
+        echo "Compressed image: ${{ steps.config.outputs.img_filename }}.gz"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
