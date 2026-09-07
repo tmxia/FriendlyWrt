@@ -401,15 +401,17 @@ jobs:
     # ---------- 最终构建：生成镜像并打包所有产物 ----------
     - name: Build sd image and package artifacts
       id: build_sd_image_and_package
+      shell: bash
       run: |
         cd project
-        echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
+        
+        echo "=== Patching scripts ==="
         find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
         find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
         sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
         sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
         
-        echo "=== Patching build.sh specifically ==="
+        echo "=== Patching build.sh ==="
         sed -i '/^# select board:/,/^esac/d' build.sh || true
         sed -i '/select/d' build.sh || true
         sed -i '/case \$/d' build.sh || true
@@ -421,19 +423,14 @@ jobs:
         sed -i '1a CONFIG="rockchip-docker"' build.sh || true
         sed -i '1a export BOARD CONFIG' build.sh || true
         sed -i '1a set +u' build.sh || true
-        echo "build.sh patched."
         
-        echo "=== Preparing rootfs in sd-fuse directory ==="
+        echo "=== Preparing rootfs ==="
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
-        
         rm -rf "${TARGET_DIR}/rootfs"
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
-        
-        echo "=== Contents of ${TARGET_DIR}/rootfs ==="
-        ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -444,75 +441,48 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        echo "=== Environment variables ==="
-        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
-        
-        # ========== 打包 tgz（提前到 mk-sd-image.sh 之前） ==========
+        # 打包 tgz
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
         mkdir -p "$ARTIFACT_DIR"
-        echo "=== Packaging tgz BEFORE running mk-sd-image.sh ==="
+        echo "=== Packaging tgz ==="
         if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
           tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C scripts/sd-fuse "$DIST_DIR"
-          echo "tgz created at $ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}"
+          echo "tgz created"
         else
-          echo "ERROR: directory scripts/sd-fuse/${DIST_DIR} not found before mk-sd-image.sh"
-          ls -la scripts/sd-fuse
+          echo "ERROR: directory missing"
           exit 1
         fi
         
-        # 进入 sd-fuse 目录执行 mk-sd-image.sh
+        # 运行 mk-sd-image.sh，忽略退出码
         cd scripts/sd-fuse
+        set +e
+        yes | ./mk-sd-image.sh "${DIST_DIR}" > /tmp/mk-sd.log 2>&1
+        MK_EXIT=$?
+        set -e
+        echo "mk-sd-image.sh exit code: $MK_EXIT"
+        cat /tmp/mk-sd.log   # 打印日志以便调试
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        
-        echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
-        
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
-          echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log
-          exit 1
-        fi
-        
-        # 查找并重命名镜像文件（使用绝对路径）
+        # 查找并重命名镜像
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        OUT_DIR="$(pwd)/out"   # 此时 pwd 为 project/scripts/sd-fuse
-        if [ -d "$OUT_DIR" ]; then
-          ORIG_IMG=$(find "$OUT_DIR" -maxdepth 1 -name "*.img" -print -quit)
+        if [ -f "out/${IMG_FILE}" ]; then
+          echo "Image already named correctly"
+        else
+          ORIG_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           if [ -n "$ORIG_IMG" ]; then
-            echo "Found original image: $ORIG_IMG"
-            mv "$ORIG_IMG" "$OUT_DIR/$IMG_FILE"
-            echo "Renamed to: $OUT_DIR/$IMG_FILE"
+            echo "Renaming $ORIG_IMG to $IMG_FILE"
+            mv "$ORIG_IMG" "out/$IMG_FILE"
           else
-            echo "ERROR: No .img file found in $OUT_DIR"
-            ls -la "$OUT_DIR"
+            echo "ERROR: No .img found"
+            ls -la out || true
             exit 1
           fi
-        else
-          echo "ERROR: output directory $OUT_DIR not found"
-          exit 1
         fi
         
-        # 返回 project 目录（使用绝对路径）
-        cd "$GITHUB_WORKSPACE/project"
-        
-        # ========== 移动镜像到 artifact 目录 ==========
-        echo "=== Moving image to $ARTIFACT_DIR ==="
-        if [ -f "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
-          mv "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
-        else
-          echo "ERROR: Image file ${IMG_FILE} not found in scripts/sd-fuse/out!"
-          ls -la "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out" || true
-          exit 1
-        fi
-        ls -la "$ARTIFACT_DIR"
-        
-        # ========== 在 artifact 目录中压缩 img ==========
+        # 移动并压缩
+        mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
         cd "$ARTIFACT_DIR"
-        gzip -f "${IMG_FILE}"
-        echo "Compressed image: ${IMG_FILE}.gz"
+        gzip -f "$IMG_FILE"
+        echo "Compressed: $ARTIFACT_DIR/$IMG_FILE.gz"
         ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
@@ -835,15 +805,17 @@ jobs:
     # ---------- 最终构建：生成镜像并打包所有产物 ----------
     - name: Build sd image and package artifacts
       id: build_sd_image_and_package
+      shell: bash
       run: |
         cd project
-        echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
+        
+        echo "=== Patching scripts ==="
         find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
         find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
         sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
         sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
         
-        echo "=== Patching build.sh specifically ==="
+        echo "=== Patching build.sh ==="
         sed -i '/^# select board:/,/^esac/d' build.sh || true
         sed -i '/select/d' build.sh || true
         sed -i '/case \$/d' build.sh || true
@@ -855,19 +827,14 @@ jobs:
         sed -i '1a CONFIG="rockchip-docker"' build.sh || true
         sed -i '1a export BOARD CONFIG' build.sh || true
         sed -i '1a set +u' build.sh || true
-        echo "build.sh patched."
         
-        echo "=== Preparing rootfs in sd-fuse directory ==="
+        echo "=== Preparing rootfs ==="
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
         TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
-        
         rm -rf "${TARGET_DIR}/rootfs"
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
-        
-        echo "=== Contents of ${TARGET_DIR}/rootfs ==="
-        ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -878,75 +845,48 @@ jobs:
         export MK_LINK=""
         export FOUND_MK_FILE="0"
         
-        echo "=== Environment variables ==="
-        env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
-        
-        # ========== 打包 tgz（提前到 mk-sd-image.sh 之前） ==========
+        # 打包 tgz
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
         mkdir -p "$ARTIFACT_DIR"
-        echo "=== Packaging tgz BEFORE running mk-sd-image.sh ==="
+        echo "=== Packaging tgz ==="
         if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
           tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C scripts/sd-fuse "$DIST_DIR"
-          echo "tgz created at $ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}"
+          echo "tgz created"
         else
-          echo "ERROR: directory scripts/sd-fuse/${DIST_DIR} not found before mk-sd-image.sh"
-          ls -la scripts/sd-fuse
+          echo "ERROR: directory missing"
           exit 1
         fi
         
-        # 进入 sd-fuse 目录执行 mk-sd-image.sh
+        # 运行 mk-sd-image.sh，忽略退出码
         cd scripts/sd-fuse
+        set +e
+        yes | ./mk-sd-image.sh "${DIST_DIR}" > /tmp/mk-sd.log 2>&1
+        MK_EXIT=$?
+        set -e
+        echo "mk-sd-image.sh exit code: $MK_EXIT"
+        cat /tmp/mk-sd.log   # 打印日志以便调试
         
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        
-        echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
-        
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
-          echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log
-          exit 1
-        fi
-        
-        # 查找并重命名镜像文件（使用绝对路径）
+        # 查找并重命名镜像
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        OUT_DIR="$(pwd)/out"   # 此时 pwd 为 project/scripts/sd-fuse
-        if [ -d "$OUT_DIR" ]; then
-          ORIG_IMG=$(find "$OUT_DIR" -maxdepth 1 -name "*.img" -print -quit)
+        if [ -f "out/${IMG_FILE}" ]; then
+          echo "Image already named correctly"
+        else
+          ORIG_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           if [ -n "$ORIG_IMG" ]; then
-            echo "Found original image: $ORIG_IMG"
-            mv "$ORIG_IMG" "$OUT_DIR/$IMG_FILE"
-            echo "Renamed to: $OUT_DIR/$IMG_FILE"
+            echo "Renaming $ORIG_IMG to $IMG_FILE"
+            mv "$ORIG_IMG" "out/$IMG_FILE"
           else
-            echo "ERROR: No .img file found in $OUT_DIR"
-            ls -la "$OUT_DIR"
+            echo "ERROR: No .img found"
+            ls -la out || true
             exit 1
           fi
-        else
-          echo "ERROR: output directory $OUT_DIR not found"
-          exit 1
         fi
         
-        # 返回 project 目录（使用绝对路径）
-        cd "$GITHUB_WORKSPACE/project"
-        
-        # ========== 移动镜像到 artifact 目录 ==========
-        echo "=== Moving image to $ARTIFACT_DIR ==="
-        if [ -f "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
-          mv "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
-        else
-          echo "ERROR: Image file ${IMG_FILE} not found in scripts/sd-fuse/out!"
-          ls -la "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out" || true
-          exit 1
-        fi
-        ls -la "$ARTIFACT_DIR"
-        
-        # ========== 在 artifact 目录中压缩 img ==========
+        # 移动并压缩
+        mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
         cd "$ARTIFACT_DIR"
-        gzip -f "${IMG_FILE}"
-        echo "Compressed image: ${IMG_FILE}.gz"
+        gzip -f "$IMG_FILE"
+        echo "Compressed: $ARTIFACT_DIR/$IMG_FILE.gz"
         ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
