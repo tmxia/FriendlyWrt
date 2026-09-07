@@ -432,7 +432,7 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
-        # 创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错
+        # 创建必要的目录
         mkdir -p "${TARGET_DIR}/rootfs/dev" \
                  "${TARGET_DIR}/rootfs/proc" \
                  "${TARGET_DIR}/rootfs/sys" \
@@ -440,6 +440,25 @@ jobs:
         
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
+        
+        # ---------- 复制 u-boot 文件到 TARGET_DIR ----------
+        echo "=== Copying u-boot files to ${TARGET_DIR} ==="
+        # 查找编译生成的 uboot.img 和 idbloader.img
+        UBOOT_IMG=$(find . -name "uboot.img" -type f | head -1)
+        IDBLOADER_IMG=$(find . -name "idbloader.img" -type f | head -1)
+        SPL_LOADER=$(find . -name "rk356x_spl_loader_*.bin" -type f | head -1)
+        if [ -n "$UBOOT_IMG" ]; then
+          cp -f "$UBOOT_IMG" "${TARGET_DIR}/uboot.img"
+          echo "Copied uboot.img"
+        fi
+        if [ -n "$IDBLOADER_IMG" ]; then
+          cp -f "$IDBLOADER_IMG" "${TARGET_DIR}/idbloader.img"
+          echo "Copied idbloader.img"
+        fi
+        if [ -n "$SPL_LOADER" ]; then
+          cp -f "$SPL_LOADER" "${TARGET_DIR}/rk356x_spl_loader.bin"
+          echo "Copied rk356x_spl_loader.bin"
+        fi
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -455,18 +474,9 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # 生成 rootfs.img：参数顺序为 源目录 输出文件，使用绝对路径
-        echo "=== Generating rootfs.img ==="
-        sudo -E ./build-rootfs-img.sh "$(pwd)/${DIST_DIR}/rootfs" "$(pwd)/${DIST_DIR}/rootfs.img"
-        if [ $? -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed ==="
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
-        # 运行 mk-sd-image.sh，传入目录绝对路径
+        # 直接运行 mk-sd-image.sh，它会自动生成 rootfs.img 并打包
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
+        sudo -E ./mk-sd-image.sh "${DIST_DIR}"
         BUILD_EXIT=$?
         cd ../..
         
@@ -889,7 +899,6 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
-        # 创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错
         mkdir -p "${TARGET_DIR}/rootfs/dev" \
                  "${TARGET_DIR}/rootfs/proc" \
                  "${TARGET_DIR}/rootfs/sys" \
@@ -897,6 +906,24 @@ jobs:
         
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
+        
+        # ---------- 复制 u-boot 文件 ----------
+        echo "=== Copying u-boot files to ${TARGET_DIR} ==="
+        UBOOT_IMG=$(find . -name "uboot.img" -type f | head -1)
+        IDBLOADER_IMG=$(find . -name "idbloader.img" -type f | head -1)
+        SPL_LOADER=$(find . -name "rk356x_spl_loader_*.bin" -type f | head -1)
+        if [ -n "$UBOOT_IMG" ]; then
+          cp -f "$UBOOT_IMG" "${TARGET_DIR}/uboot.img"
+          echo "Copied uboot.img"
+        fi
+        if [ -n "$IDBLOADER_IMG" ]; then
+          cp -f "$IDBLOADER_IMG" "${TARGET_DIR}/idbloader.img"
+          echo "Copied idbloader.img"
+        fi
+        if [ -n "$SPL_LOADER" ]; then
+          cp -f "$SPL_LOADER" "${TARGET_DIR}/rk356x_spl_loader.bin"
+          echo "Copied rk356x_spl_loader.bin"
+        fi
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -912,18 +939,8 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # 生成 rootfs.img：参数顺序为 源目录 输出文件，使用绝对路径
-        echo "=== Generating rootfs.img ==="
-        sudo -E ./build-rootfs-img.sh "$(pwd)/${DIST_DIR}/rootfs" "$(pwd)/${DIST_DIR}/rootfs.img"
-        if [ $? -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed ==="
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
-        # 运行 mk-sd-image.sh，传入目录绝对路径
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
+        sudo -E ./mk-sd-image.sh "${DIST_DIR}"
         BUILD_EXIT=$?
         cd ../..
         
