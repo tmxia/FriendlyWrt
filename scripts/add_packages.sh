@@ -99,7 +99,7 @@ samba4-libs samba4-server luci-app-samba4
 minidlna luci-app-minidlna
 luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
 luci-app-diskman collectd luci-app-statistics
-luci-app-watchcat
+luci-app-watchcat luci-theme-openwrt-2020
 "
 
 for pkg in $DISABLE_PKGS; do
