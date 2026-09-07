@@ -444,16 +444,16 @@ jobs:
         # ---------- 复制 u-boot 文件（使用固定路径） ----------
         echo "=== Copying u-boot files to ${TARGET_DIR} ==="
         if [ -f "u-boot/uboot.img" ]; then
-          cp -f u-boot/uboot.img "${TARGET_DIR}/uboot.img"
+          cp -a u-boot/uboot.img "${TARGET_DIR}/uboot.img"
           echo "Copied uboot.img"
         fi
         if [ -f "u-boot/idbloader.img" ]; then
-          cp -f u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
+          cp -a u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
           echo "Copied idbloader.img"
         fi
         SPL_FILE=$(ls u-boot/rk356x_spl_loader_*.bin 2>/dev/null | head -1)
         if [ -n "$SPL_FILE" ]; then
-          cp -f "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
+          cp -a "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
           echo "Copied rk356x_spl_loader.bin"
         fi
         
@@ -471,9 +471,9 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ========== 关键修改：直接运行 mk-sd-image.sh，不再手动调用 build-rootfs-img.sh ==========
+        # ========== 关键：直接运行 mk-sd-image.sh，自动应答 N ==========
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (auto-answer N) ==="
-        yes N | sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        echo "N" | sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
@@ -907,16 +907,16 @@ jobs:
         # ---------- 复制 u-boot 文件（使用固定路径） ----------
         echo "=== Copying u-boot files to ${TARGET_DIR} ==="
         if [ -f "u-boot/uboot.img" ]; then
-          cp -f u-boot/uboot.img "${TARGET_DIR}/uboot.img"
+          cp -a u-boot/uboot.img "${TARGET_DIR}/uboot.img"
           echo "Copied uboot.img"
         fi
         if [ -f "u-boot/idbloader.img" ]; then
-          cp -f u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
+          cp -a u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
           echo "Copied idbloader.img"
         fi
         SPL_FILE=$(ls u-boot/rk356x_spl_loader_*.bin 2>/dev/null | head -1)
         if [ -n "$SPL_FILE" ]; then
-          cp -f "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
+          cp -a "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
           echo "Copied rk356x_spl_loader.bin"
         fi
         
@@ -934,9 +934,8 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ========== 关键修改：直接运行 mk-sd-image.sh，不再手动调用 build-rootfs-img.sh ==========
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (auto-answer N) ==="
-        yes N | sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        echo "N" | sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
