@@ -423,18 +423,26 @@ jobs:
         cd project
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
-    # 只编译 uboot，跳过 kernel 编译，并注入 flippy boot/dtb
+    # ---------- 编译 uboot 并注入 flippy boot/dtb ----------
     - name: Compile uboot and prepare flippy kernel
       run: |
         cd project
         ./build.sh uboot
 
-        # 创建 kernel 标记，欺骗构建系统
+        # 创建 kernel 标记（可能不需要，但保留以防某些脚本检查）
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-        # 注入 flippy boot 和 dtb 到 sd-fuse 目录
+        # 准备 rootfs 到 sd-fuse 目录，供 mk-sd-image.sh 使用
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_SRC="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
+        TARGET_ROOTFS="scripts/sd-fuse/${DIST_DIR}/rootfs"
+        rm -rf "$TARGET_ROOTFS"
+        mkdir -p "$TARGET_ROOTFS"
+        cp -a "$ROOTFS_SRC"/. "$TARGET_ROOTFS/"
+        echo "Rootfs copied to $TARGET_ROOTFS"
+
+        # 注入 flippy boot 和 dtb 到 sd-fuse 目录
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -448,27 +456,56 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-    - name: Build sd image
+    # ---------- 使用 mk-sd-image.sh 生成镜像（绕过 build.sh 内核检查） ----------
+    - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
       run: |
-        cd project
-        ./build.sh sd-img
-        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        cd project/scripts/sd-fuse
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
 
-        pushd scripts/sd-fuse/ > /dev/null
-        if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
-            echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found under scripts/sd-fuse/"
-            ls -la
-            exit 1
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
+        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "mk-sd-image.sh failed with exit code $BUILD_EXIT"
+          cat /tmp/mk-sd.log
+          exit 1
         fi
-        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
-        mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
-        tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../../artifact/
-        popd > /dev/null
 
-        cd ../artifact/
-        gzip *.img
+        # 重命名生成的镜像文件
+        cd out
+        ORIG_IMG=$(find . -maxdepth 1 -name "*.img" -print -quit)
+        if [ -z "$ORIG_IMG" ]; then
+          echo "ERROR: No .img file found in out/"
+          ls -la
+          exit 1
+        fi
+        mv "$ORIG_IMG" "$IMG_FILE"
+        echo "Renamed to $IMG_FILE"
+
+        # 移动镜像到 artifact 目录
+        cd ..
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
+        echo "Image moved to $ARTIFACT_DIR/$IMG_FILE"
+
+        # 打包 tgz（sd-fuse 下的目录）
+        if [ -d "$DIST_DIR" ]; then
+          archive_dir="${DIST_DIR}-rk3568"
+          mv "$DIST_DIR" "$archive_dir"
+          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
+          echo "tgz created"
+        else
+          echo "ERROR: directory $DIST_DIR not found"
+          exit 1
+        fi
+
+        # 压缩 img
+        cd "$ARTIFACT_DIR"
+        gzip -f "$IMG_FILE"
+        echo "Compressed image: $IMG_FILE.gz"
+        ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
@@ -488,6 +525,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
+  # ---------- 自动触发构建 ----------
   build_auto:
     needs: prepare_release
     runs-on: ubuntu-22.04
@@ -813,10 +851,20 @@ jobs:
         cd project
         ./build.sh uboot
 
+        # 创建 kernel 标记
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
+        # 准备 rootfs 到 sd-fuse 目录
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_SRC="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
+        TARGET_ROOTFS="scripts/sd-fuse/${DIST_DIR}/rootfs"
+        rm -rf "$TARGET_ROOTFS"
+        mkdir -p "$TARGET_ROOTFS"
+        cp -a "$ROOTFS_SRC"/. "$TARGET_ROOTFS/"
+        echo "Rootfs copied to $TARGET_ROOTFS"
+
+        # 注入 flippy boot 和 dtb
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -830,27 +878,51 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-    - name: Build sd image
+    - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
       run: |
-        cd project
-        ./build.sh sd-img
-        mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        cd project/scripts/sd-fuse
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
 
-        pushd scripts/sd-fuse/ > /dev/null
-        if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
-            echo "ERROR: image directory ${{ steps.config.outputs.dist_dir }} not found under scripts/sd-fuse/"
-            ls -la
-            exit 1
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
+        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "mk-sd-image.sh failed with exit code $BUILD_EXIT"
+          cat /tmp/mk-sd.log
+          exit 1
         fi
-        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
-        mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
-        tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv ${{ steps.config.outputs.archive_filename }} ../../../artifact/
-        popd > /dev/null
 
-        cd ../artifact/
-        gzip *.img
+        cd out
+        ORIG_IMG=$(find . -maxdepth 1 -name "*.img" -print -quit)
+        if [ -z "$ORIG_IMG" ]; then
+          echo "ERROR: No .img file found in out/"
+          ls -la
+          exit 1
+        fi
+        mv "$ORIG_IMG" "$IMG_FILE"
+        echo "Renamed to $IMG_FILE"
+
+        cd ..
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
+        echo "Image moved to $ARTIFACT_DIR/$IMG_FILE"
+
+        if [ -d "$DIST_DIR" ]; then
+          archive_dir="${DIST_DIR}-rk3568"
+          mv "$DIST_DIR" "$archive_dir"
+          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
+          echo "tgz created"
+        else
+          echo "ERROR: directory $DIST_DIR not found"
+          exit 1
+        fi
+
+        cd "$ARTIFACT_DIR"
+        gzip -f "$IMG_FILE"
+        echo "Compressed image: $IMG_FILE.gz"
+        ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
