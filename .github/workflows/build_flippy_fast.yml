@@ -441,9 +441,8 @@ jobs:
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
         
-        # ---------- 复制 u-boot 文件到 TARGET_DIR ----------
+        # ---------- 复制 u-boot 文件 ----------
         echo "=== Copying u-boot files to ${TARGET_DIR} ==="
-        # 查找编译生成的 uboot.img 和 idbloader.img
         UBOOT_IMG=$(find . -name "uboot.img" -type f | head -1)
         IDBLOADER_IMG=$(find . -name "idbloader.img" -type f | head -1)
         SPL_LOADER=$(find . -name "rk356x_spl_loader_*.bin" -type f | head -1)
@@ -474,7 +473,16 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # 直接运行 mk-sd-image.sh，它会自动生成 rootfs.img 并打包
+        # ---------- 手动生成 rootfs.img ----------
+        echo "=== Generating rootfs.img using build-rootfs-img.sh ==="
+        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
+        if [ $? -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed ==="
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        # ---------- 运行 mk-sd-image.sh ----------
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         sudo -E ./mk-sd-image.sh "${DIST_DIR}"
         BUILD_EXIT=$?
@@ -939,6 +947,16 @@ jobs:
         
         cd scripts/sd-fuse
         
+        # ---------- 手动生成 rootfs.img ----------
+        echo "=== Generating rootfs.img using build-rootfs-img.sh ==="
+        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
+        if [ $? -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed ==="
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        # ---------- 运行 mk-sd-image.sh ----------
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         sudo -E ./mk-sd-image.sh "${DIST_DIR}"
         BUILD_EXIT=$?
