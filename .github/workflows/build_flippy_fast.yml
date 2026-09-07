@@ -455,17 +455,16 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ================== 修正：生成 rootfs.img（参数顺序：输出文件 源目录） ==================
+        # ================== 正确调用 build-rootfs-img.sh：参数顺序为 目录 输出文件，使用绝对路径 ==================
         echo "=== Generating rootfs.img ==="
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
-        BUILD_EXIT=$?
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+        sudo -E ./build-rootfs-img.sh "$(pwd)/${DIST_DIR}/rootfs" "$(pwd)/${DIST_DIR}/rootfs.img"
+        if [ $? -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed ==="
           exit 1
         fi
         echo "rootfs.img generated successfully."
         
-        # ================== 运行 mk-sd-image.sh，使用绝对路径避免相对路径问题 ==================
+        # ================== 运行 mk-sd-image.sh，传入目录绝对路径 ==================
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
         BUILD_EXIT=$?
@@ -915,17 +914,16 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ================== 修正：生成 rootfs.img（参数顺序：输出文件 源目录） ==================
+        # ================== 正确调用 build-rootfs-img.sh：参数顺序为 目录 输出文件，使用绝对路径 ==================
         echo "=== Generating rootfs.img ==="
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
-        BUILD_EXIT=$?
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+        sudo -E ./build-rootfs-img.sh "$(pwd)/${DIST_DIR}/rootfs" "$(pwd)/${DIST_DIR}/rootfs.img"
+        if [ $? -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed ==="
           exit 1
         fi
         echo "rootfs.img generated successfully."
         
-        # ================== 运行 mk-sd-image.sh，使用绝对路径避免相对路径问题 ==================
+        # ================== 运行 mk-sd-image.sh，传入目录绝对路径 ==================
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
         BUILD_EXIT=$?
