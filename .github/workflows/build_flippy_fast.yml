@@ -455,10 +455,20 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ========== 修改：直接使用 mk-sd-image.sh，不再单独调用 build-rootfs-img.sh ==========
+        # ================== 修正：生成 rootfs.img（参数顺序：输出文件 源目录） ==================
+        echo "=== Generating rootfs.img ==="
+        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
+        BUILD_EXIT=$?
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        # ================== 运行 mk-sd-image.sh，使用绝对路径避免相对路径问题 ==================
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
-        BUILD_EXIT=${PIPESTATUS[0]}
+        sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
+        BUILD_EXIT=$?
         cd ../..
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
@@ -466,7 +476,7 @@ jobs:
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log
+          cat /tmp/mk-sd.log 2>/dev/null || echo "No log file"
           exit 1
         fi
         
@@ -905,10 +915,20 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ========== 修改：直接使用 mk-sd-image.sh，不再单独调用 build-rootfs-img.sh ==========
+        # ================== 修正：生成 rootfs.img（参数顺序：输出文件 源目录） ==================
+        echo "=== Generating rootfs.img ==="
+        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
+        BUILD_EXIT=$?
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
+          exit 1
+        fi
+        echo "rootfs.img generated successfully."
+        
+        # ================== 运行 mk-sd-image.sh，使用绝对路径避免相对路径问题 ==================
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
-        BUILD_EXIT=${PIPESTATUS[0]}
+        sudo -E ./mk-sd-image.sh "$(pwd)/${DIST_DIR}"
+        BUILD_EXIT=$?
         cd ../..
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
@@ -916,7 +936,7 @@ jobs:
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log
+          cat /tmp/mk-sd.log 2>/dev/null || echo "No log file"
           exit 1
         fi
         
