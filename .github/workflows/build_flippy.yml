@@ -433,7 +433,8 @@ jobs:
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-        # 准备 rootfs 到 sd-fuse 目录，供 mk-sd-image.sh 使用
+        # 获取变量
+        source .current_config.mk
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
         TARGET_ROOTFS="scripts/sd-fuse/${DIST_DIR}/rootfs"
@@ -442,7 +443,7 @@ jobs:
         cp -a "$ROOTFS_SRC"/. "$TARGET_ROOTFS/"
         echo "Rootfs copied to $TARGET_ROOTFS"
 
-        # 注入 flippy boot 和 dtb 到 sd-fuse 目录
+        # 注入 flippy boot 和 dtb
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -456,14 +457,30 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-    # ---------- 使用 mk-sd-image.sh 生成镜像（绕过 build.sh 内核检查） ----------
+    # ---------- 使用 mk-sd-image.sh 生成镜像（提前打包 tgz） ----------
     - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
       run: |
         cd project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
 
+        # 1. 在运行 mk-sd-image.sh 之前打包 tgz
+        if [ -d "$DIST_DIR" ]; then
+          archive_dir="${DIST_DIR}-rk3568"
+          mv "$DIST_DIR" "$archive_dir"
+          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
+          echo "tgz created"
+          # 打包后将目录名恢复，供 mk-sd-image.sh 使用
+          mv "$archive_dir" "$DIST_DIR"
+        else
+          echo "ERROR: directory $DIST_DIR not found before mk-sd-image.sh"
+          ls -la
+          exit 1
+        fi
+
+        # 2. 运行 mk-sd-image.sh 生成 RAW 镜像
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -473,7 +490,7 @@ jobs:
           exit 1
         fi
 
-        # 重命名生成的镜像文件
+        # 3. 重命名并移动镜像
         cd out
         ORIG_IMG=$(find . -maxdepth 1 -name "*.img" -print -quit)
         if [ -z "$ORIG_IMG" ]; then
@@ -483,25 +500,12 @@ jobs:
         fi
         mv "$ORIG_IMG" "$IMG_FILE"
         echo "Renamed to $IMG_FILE"
-
-        # 移动镜像到 artifact 目录
         cd ..
-        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
         echo "Image moved to $ARTIFACT_DIR/$IMG_FILE"
 
-        # 打包 tgz（sd-fuse 下的目录）
-        if [ -d "$DIST_DIR" ]; then
-          archive_dir="${DIST_DIR}-rk3568"
-          mv "$DIST_DIR" "$archive_dir"
-          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
-          echo "tgz created"
-        else
-          echo "ERROR: directory $DIST_DIR not found"
-          exit 1
-        fi
-
-        # 压缩 img
+        # 4. 压缩 img
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
         echo "Compressed image: $IMG_FILE.gz"
@@ -855,7 +859,8 @@ jobs:
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-        # 准备 rootfs 到 sd-fuse 目录
+        # 获取变量
+        source .current_config.mk
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
         TARGET_ROOTFS="scripts/sd-fuse/${DIST_DIR}/rootfs"
@@ -884,7 +889,22 @@ jobs:
         cd project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
 
+        # 1. 提前打包 tgz
+        if [ -d "$DIST_DIR" ]; then
+          archive_dir="${DIST_DIR}-rk3568"
+          mv "$DIST_DIR" "$archive_dir"
+          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
+          echo "tgz created"
+          mv "$archive_dir" "$DIST_DIR"
+        else
+          echo "ERROR: directory $DIST_DIR not found before mk-sd-image.sh"
+          ls -la
+          exit 1
+        fi
+
+        # 2. 运行 mk-sd-image.sh
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -894,6 +914,7 @@ jobs:
           exit 1
         fi
 
+        # 3. 重命名并移动镜像
         cd out
         ORIG_IMG=$(find . -maxdepth 1 -name "*.img" -print -quit)
         if [ -z "$ORIG_IMG" ]; then
@@ -903,22 +924,12 @@ jobs:
         fi
         mv "$ORIG_IMG" "$IMG_FILE"
         echo "Renamed to $IMG_FILE"
-
         cd ..
-        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
         echo "Image moved to $ARTIFACT_DIR/$IMG_FILE"
 
-        if [ -d "$DIST_DIR" ]; then
-          archive_dir="${DIST_DIR}-rk3568"
-          mv "$DIST_DIR" "$archive_dir"
-          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
-          echo "tgz created"
-        else
-          echo "ERROR: directory $DIST_DIR not found"
-          exit 1
-        fi
-
+        # 4. 压缩 img
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
         echo "Compressed image: $IMG_FILE.gz"
