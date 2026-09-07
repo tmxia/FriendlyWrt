@@ -235,6 +235,7 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        # 搜索最近 5 天（包含今天）
         DATES=()
         for i in {0..4}; do
           DATES+=($(date -d "$i days ago" +%Y-%m-%d))
@@ -397,7 +398,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像 ----------
+    # ---------- 最终构建：生成镜像并重命名 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -432,30 +433,8 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
-        # 创建必要的目录
-        mkdir -p "${TARGET_DIR}/rootfs/dev" \
-                 "${TARGET_DIR}/rootfs/proc" \
-                 "${TARGET_DIR}/rootfs/sys" \
-                 "${TARGET_DIR}/rootfs/tmp"
-        
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
-        
-        # ---------- 复制 u-boot 文件 ----------
-        echo "=== Copying u-boot files to ${TARGET_DIR} ==="
-        if [ -f "u-boot/uboot.img" ]; then
-          cp -a u-boot/uboot.img "${TARGET_DIR}/uboot.img"
-          echo "Copied uboot.img"
-        fi
-        if [ -f "u-boot/idbloader.img" ]; then
-          cp -a u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
-          echo "Copied idbloader.img"
-        fi
-        SPL_FILE=$(ls u-boot/rk356x_spl_loader_*.bin 2>/dev/null | head -1)
-        if [ -n "$SPL_FILE" ]; then
-          cp -a "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
-          echo "Copied rk356x_spl_loader.bin"
-        fi
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -471,62 +450,54 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ---------- 手动生成 rootfs.img ----------
-        echo "=== Generating rootfs.img using build-rootfs-img.sh ==="
-        # 正确顺序：源目录在前，输出文件在后
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img"
-        if [ $? -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed ==="
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
-        # ---------- 运行 mk-sd-image.sh ----------
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "${DIST_DIR}"
-        BUILD_EXIT=$?
-        cd ../..
+        # 直接运行 mk-sd-image.sh
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
+        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
         
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log 2>/dev/null || echo "No log file"
+          cat /tmp/mk-sd.log
           exit 1
         fi
         
-        echo "=== Looking for generated image ==="
-        cd scripts/sd-fuse/out
+        # 重命名生成的镜像文件
+        cd out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
-        if [ -z "$ORIG_IMG" ]; then
+        if [ -n "$ORIG_IMG" ]; then
+          echo "Found original image: $ORIG_IMG"
+          mv "$ORIG_IMG" "${{ steps.config.outputs.img_filename }}"
+          echo "Renamed to: ${{ steps.config.outputs.img_filename }}"
+        else
           echo "ERROR: No .img file found in out/"
           ls -la
           exit 1
         fi
-        echo "Found original image: $ORIG_IMG"
-        
-        TARGET_NAME="${{ steps.config.outputs.img_filename }}"
-        echo "Target name: $TARGET_NAME"
-        
-        if [ "$ORIG_IMG" != "$TARGET_NAME" ]; then
-          mv "$ORIG_IMG" "$TARGET_NAME"
-          echo "Renamed to: $TARGET_NAME"
-        else
-          echo "Image already has correct name."
-        fi
-        
-        mkdir -p ../../artifact
-        mv "$TARGET_NAME" ../../artifact/
         cd ../..
         
-        if [ ! -f "artifact/$TARGET_NAME" ]; then
-          echo "ERROR: Failed to move image to artifact/"
-          ls -la artifact/
+        echo "=== Checking for output image ==="
+        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
+        ls -la out/ || echo "project/out not found"
+        
+        # 移动镜像到 artifact 目录
+        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
+        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
+          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        else
+          echo "ERROR: Image file not found after renaming."
+          echo "=== Contents of scripts/sd-fuse/out ==="
+          ls -la scripts/sd-fuse/out/ || true
+          echo "=== Contents of out ==="
+          ls -la out/ || true
           exit 1
         fi
-        echo "Image moved to artifact/$TARGET_NAME"
-        
+
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
@@ -537,27 +508,10 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv "${{ steps.config.outputs.archive_filename }}" ../../artifact/
+        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
         cd ../..
-        echo "tgz packaged: artifact/${{ steps.config.outputs.archive_filename }}"
-        
-        echo "=== Compressing image ==="
-        cd artifact
-        if [ -f "$TARGET_NAME" ]; then
-          gzip "$TARGET_NAME"
-          echo "Compressed image: $TARGET_NAME.gz"
-        else
-          echo "ERROR: Image file not found in artifact/ for compression"
-          ls -la
-          exit 1
-        fi
-        cd ..
-        
-        echo "=== Artifact directory contents ==="
-        ls -la artifact/
-        echo "====================================="
-        
-        echo "=== Build completed successfully ==="
+        cd ../artifact/
+        gzip *.img
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
@@ -713,6 +667,7 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        # 搜索最近 5 天（包含今天）
         DATES=()
         for i in {0..4}; do
           DATES+=($(date -d "$i days ago" +%Y-%m-%d))
@@ -875,7 +830,7 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成 rootfs.img 并制作 SD 镜像 ----------
+    # ---------- 最终构建：生成镜像并重命名 ----------
     - name: Build sd image
       id: build_sd_image
       run: |
@@ -910,29 +865,8 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
-        mkdir -p "${TARGET_DIR}/rootfs/dev" \
-                 "${TARGET_DIR}/rootfs/proc" \
-                 "${TARGET_DIR}/rootfs/sys" \
-                 "${TARGET_DIR}/rootfs/tmp"
-        
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
-        
-        # ---------- 复制 u-boot 文件 ----------
-        echo "=== Copying u-boot files to ${TARGET_DIR} ==="
-        if [ -f "u-boot/uboot.img" ]; then
-          cp -a u-boot/uboot.img "${TARGET_DIR}/uboot.img"
-          echo "Copied uboot.img"
-        fi
-        if [ -f "u-boot/idbloader.img" ]; then
-          cp -a u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
-          echo "Copied idbloader.img"
-        fi
-        SPL_FILE=$(ls u-boot/rk356x_spl_loader_*.bin 2>/dev/null | head -1)
-        if [ -n "$SPL_FILE" ]; then
-          cp -a "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
-          echo "Copied rk356x_spl_loader.bin"
-        fi
         
         export BOARD="rk3568"
         export CONFIG="rockchip-docker"
@@ -948,62 +882,52 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ---------- 手动生成 rootfs.img ----------
-        echo "=== Generating rootfs.img using build-rootfs-img.sh ==="
-        # 正确顺序：源目录在前，输出文件在后
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img"
-        if [ $? -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed ==="
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
-        # ---------- 运行 mk-sd-image.sh ----------
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "${DIST_DIR}"
-        BUILD_EXIT=$?
-        cd ../..
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
+        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
         
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log 2>/dev/null || echo "No log file"
+          cat /tmp/mk-sd.log
           exit 1
         fi
         
-        echo "=== Looking for generated image ==="
-        cd scripts/sd-fuse/out
+        # 重命名生成的镜像文件
+        cd out
         ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
-        if [ -z "$ORIG_IMG" ]; then
+        if [ -n "$ORIG_IMG" ]; then
+          echo "Found original image: $ORIG_IMG"
+          mv "$ORIG_IMG" "${{ steps.config.outputs.img_filename }}"
+          echo "Renamed to: ${{ steps.config.outputs.img_filename }}"
+        else
           echo "ERROR: No .img file found in out/"
           ls -la
           exit 1
         fi
-        echo "Found original image: $ORIG_IMG"
-        
-        TARGET_NAME="${{ steps.config.outputs.img_filename }}"
-        echo "Target name: $TARGET_NAME"
-        
-        if [ "$ORIG_IMG" != "$TARGET_NAME" ]; then
-          mv "$ORIG_IMG" "$TARGET_NAME"
-          echo "Renamed to: $TARGET_NAME"
-        else
-          echo "Image already has correct name."
-        fi
-        
-        mkdir -p ../../artifact
-        mv "$TARGET_NAME" ../../artifact/
         cd ../..
         
-        if [ ! -f "artifact/$TARGET_NAME" ]; then
-          echo "ERROR: Failed to move image to artifact/"
-          ls -la artifact/
+        echo "=== Checking for output image ==="
+        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
+        ls -la out/ || echo "project/out not found"
+        
+        if [ -f "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}"
+          mv scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }} ../artifact/
+        elif [ -f "out/${{ steps.config.outputs.img_filename }}" ]; then
+          echo "Image generated successfully: out/${{ steps.config.outputs.img_filename }}"
+          mv out/${{ steps.config.outputs.img_filename }} ../artifact/
+        else
+          echo "ERROR: Image file not found after renaming."
+          echo "=== Contents of scripts/sd-fuse/out ==="
+          ls -la scripts/sd-fuse/out/ || true
+          echo "=== Contents of out ==="
+          ls -la out/ || true
           exit 1
         fi
-        echo "Image moved to artifact/$TARGET_NAME"
-        
+
         echo "=== Packaging tgz ==="
         cd scripts/sd-fuse
         if [ ! -d "${{ steps.config.outputs.dist_dir }}" ]; then
@@ -1014,27 +938,10 @@ jobs:
         archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
-        mv "${{ steps.config.outputs.archive_filename }}" ../../artifact/
+        mv ${{ steps.config.outputs.archive_filename }} ../../artifact/
         cd ../..
-        echo "tgz packaged: artifact/${{ steps.config.outputs.archive_filename }}"
-        
-        echo "=== Compressing image ==="
-        cd artifact
-        if [ -f "$TARGET_NAME" ]; then
-          gzip "$TARGET_NAME"
-          echo "Compressed image: $TARGET_NAME.gz"
-        else
-          echo "ERROR: Image file not found in artifact/ for compression"
-          ls -la
-          exit 1
-        fi
-        cd ..
-        
-        echo "=== Artifact directory contents ==="
-        ls -la artifact/
-        echo "====================================="
-        
-        echo "=== Build completed successfully ==="
+        cd ../artifact/
+        gzip *.img
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
