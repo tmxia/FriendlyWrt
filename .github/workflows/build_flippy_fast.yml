@@ -471,7 +471,7 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ========== 关键：直接运行 mk-sd-image.sh，自动应答 N ==========
+        # 直接运行 mk-sd-image.sh，自动应答 N
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (auto-answer N) ==="
         echo "N" | sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -542,6 +542,11 @@ jobs:
           exit 1
         fi
         cd ..
+        
+        # ====== 新增：列出 artifact 目录内容，便于调试 ======
+        echo "=== Artifact directory contents ==="
+        ls -la artifact/
+        echo "====================================="
         
         echo "=== Build completed successfully ==="
 
@@ -1004,6 +1009,10 @@ jobs:
           exit 1
         fi
         cd ..
+        
+        echo "=== Artifact directory contents ==="
+        ls -la artifact/
+        echo "====================================="
         
         echo "=== Build completed successfully ==="
 
