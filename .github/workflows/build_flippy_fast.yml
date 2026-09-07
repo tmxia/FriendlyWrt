@@ -399,8 +399,8 @@ jobs:
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
     # ---------- 最终构建：生成镜像并重命名 ----------
-    - name: Build sd image
-      id: build_sd_image
+    - name: Build sd image (generate raw image)
+      id: build_sd_image_raw
       run: |
         cd project
         
@@ -448,7 +448,7 @@ jobs:
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        # ========== 修改：打包 tgz 提前到 mk-sd-image.sh 之前 ==========
+        # ========== 打包 tgz 提前到 mk-sd-image.sh 之前 ==========
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
         echo "=== Packaging tgz BEFORE running mk-sd-image.sh ==="
         if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
@@ -493,17 +493,35 @@ jobs:
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
         
-        # ========== 使用绝对路径移动镜像 ==========
-        echo "=== Moving image to $ARTIFACT_DIR ==="
-        mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
-          mv "out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
-          { echo "ERROR: Image file not found"; ls -la scripts/sd-fuse/out out; exit 1; }
-        ls -la "$ARTIFACT_DIR"
+        # 记录镜像路径供后续步骤使用
+        echo "IMAGE_PATH=scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" >> $GITHUB_ENV
+        echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> $GITHUB_ENV
+
+    - name: Move and compress image
+      run: |
+        set -e
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
         
-        # ========== 在 artifact 目录中压缩 img ==========
-        cd "$ARTIFACT_DIR"
-        gzip -f "${{ steps.config.outputs.img_filename }}"
-        echo "Compressed image: ${{ steps.config.outputs.img_filename }}.gz"
+        # 重新确定镜像实际位置
+        if [ -f "project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
+          IMG_SRC="project/scripts/sd-fuse/out/${IMG_FILE}"
+        elif [ -f "project/out/${IMG_FILE}" ]; then
+          IMG_SRC="project/out/${IMG_FILE}"
+        else
+          echo "ERROR: Image file ${IMG_FILE} not found!"
+          ls -la project/scripts/sd-fuse/out project/out || true
+          exit 1
+        fi
+        
+        echo "Moving image from ${IMG_SRC} to ${ARTIFACT_DIR}/"
+        mv "${IMG_SRC}" "${ARTIFACT_DIR}/"
+        
+        cd "${ARTIFACT_DIR}"
+        echo "Compressing image..."
+        gzip -f "${IMG_FILE}"
+        echo "Compressed image: ${IMG_FILE}.gz"
+        ls -la "${ARTIFACT_DIR}"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
@@ -823,8 +841,8 @@ jobs:
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
     # ---------- 最终构建：生成镜像并重命名 ----------
-    - name: Build sd image
-      id: build_sd_image
+    - name: Build sd image (generate raw image)
+      id: build_sd_image_raw
       run: |
         cd project
         
@@ -872,7 +890,7 @@ jobs:
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        # ========== 修改：打包 tgz 提前到 mk-sd-image.sh 之前 ==========
+        # ========== 打包 tgz 提前到 mk-sd-image.sh 之前 ==========
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
         echo "=== Packaging tgz BEFORE running mk-sd-image.sh ==="
         if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
@@ -917,17 +935,35 @@ jobs:
         ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
         ls -la out/ || echo "project/out not found"
         
-        # ========== 使用绝对路径移动镜像 ==========
-        echo "=== Moving image to $ARTIFACT_DIR ==="
-        mv "scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
-          mv "out/${{ steps.config.outputs.img_filename }}" "$ARTIFACT_DIR/" || \
-          { echo "ERROR: Image file not found"; ls -la scripts/sd-fuse/out out; exit 1; }
-        ls -la "$ARTIFACT_DIR"
+        # 记录镜像路径供后续步骤使用
+        echo "IMAGE_PATH=scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" >> $GITHUB_ENV
+        echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> $GITHUB_ENV
+
+    - name: Move and compress image
+      run: |
+        set -e
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
         
-        # ========== 在 artifact 目录中压缩 img ==========
-        cd "$ARTIFACT_DIR"
-        gzip -f "${{ steps.config.outputs.img_filename }}"
-        echo "Compressed image: ${{ steps.config.outputs.img_filename }}.gz"
+        # 重新确定镜像实际位置
+        if [ -f "project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
+          IMG_SRC="project/scripts/sd-fuse/out/${IMG_FILE}"
+        elif [ -f "project/out/${IMG_FILE}" ]; then
+          IMG_SRC="project/out/${IMG_FILE}"
+        else
+          echo "ERROR: Image file ${IMG_FILE} not found!"
+          ls -la project/scripts/sd-fuse/out project/out || true
+          exit 1
+        fi
+        
+        echo "Moving image from ${IMG_SRC} to ${ARTIFACT_DIR}/"
+        mv "${IMG_SRC}" "${ARTIFACT_DIR}/"
+        
+        cd "${ARTIFACT_DIR}"
+        echo "Compressing image..."
+        gzip -f "${IMG_FILE}"
+        echo "Compressed image: ${IMG_FILE}.gz"
+        ls -la "${ARTIFACT_DIR}"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
