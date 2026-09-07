@@ -402,27 +402,25 @@ jobs:
     - name: Build sd image and package artifacts
       id: build_sd_image_and_package
       run: |
-        set -e  # 任何命令失败立即退出
         cd project
-        
         echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
-        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
-        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
         sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
         sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
         
         echo "=== Patching build.sh specifically ==="
-        sed -i '/^# select board:/,/^esac/d' build.sh
-        sed -i '/select/d' build.sh
-        sed -i '/case \$/d' build.sh
-        sed -i '/esac/d' build.sh
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
-        sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        sed -i '1a BOARD="rk3568"' build.sh
-        sed -i '1a CONFIG="rockchip-docker"' build.sh
-        sed -i '1a export BOARD CONFIG' build.sh
-        sed -i '1a set +u' build.sh
+        sed -i '/^# select board:/,/^esac/d' build.sh || true
+        sed -i '/select/d' build.sh || true
+        sed -i '/case \$/d' build.sh || true
+        sed -i '/esac/d' build.sh || true
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh || true
+        sed -i '/no .current_config.mk/d' build.sh || true
+        sed -i '/device\/friendlyelec/ s/^/#/' build.sh || true
+        sed -i '1a BOARD="rk3568"' build.sh || true
+        sed -i '1a CONFIG="rockchip-docker"' build.sh || true
+        sed -i '1a export BOARD CONFIG' build.sh || true
+        sed -i '1a set +u' build.sh || true
         echo "build.sh patched."
         
         echo "=== Preparing rootfs in sd-fuse directory ==="
@@ -462,6 +460,7 @@ jobs:
           exit 1
         fi
         
+        # 进入 sd-fuse 目录执行 mk-sd-image.sh
         cd scripts/sd-fuse
         
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
@@ -477,30 +476,35 @@ jobs:
           exit 1
         fi
         
-        # 重命名生成的镜像文件
-        cd out
-        ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
-        if [ -n "$ORIG_IMG" ]; then
-          echo "Found original image: $ORIG_IMG"
-          mv "$ORIG_IMG" "${{ steps.config.outputs.img_filename }}"
-          echo "Renamed to: ${{ steps.config.outputs.img_filename }}"
+        # 查找并重命名镜像文件（使用绝对路径）
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        OUT_DIR="$(pwd)/out"   # 此时 pwd 为 project/scripts/sd-fuse
+        if [ -d "$OUT_DIR" ]; then
+          ORIG_IMG=$(find "$OUT_DIR" -maxdepth 1 -name "*.img" -print -quit)
+          if [ -n "$ORIG_IMG" ]; then
+            echo "Found original image: $ORIG_IMG"
+            mv "$ORIG_IMG" "$OUT_DIR/$IMG_FILE"
+            echo "Renamed to: $OUT_DIR/$IMG_FILE"
+          else
+            echo "ERROR: No .img file found in $OUT_DIR"
+            ls -la "$OUT_DIR"
+            exit 1
+          fi
         else
-          echo "ERROR: No .img file found in out/"
-          ls -la
+          echo "ERROR: output directory $OUT_DIR not found"
           exit 1
         fi
-        cd ../..
+        
+        # 返回 project 目录（使用绝对路径）
+        cd "$GITHUB_WORKSPACE/project"
         
         # ========== 移动镜像到 artifact 目录 ==========
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
         echo "=== Moving image to $ARTIFACT_DIR ==="
-        if [ -f "scripts/sd-fuse/out/${IMG_FILE}" ]; then
-          mv "scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
-        elif [ -f "out/${IMG_FILE}" ]; then
-          mv "out/${IMG_FILE}" "$ARTIFACT_DIR/"
+        if [ -f "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
+          mv "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
         else
-          echo "ERROR: Image file ${IMG_FILE} not found!"
-          ls -la scripts/sd-fuse/out out || true
+          echo "ERROR: Image file ${IMG_FILE} not found in scripts/sd-fuse/out!"
+          ls -la "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out" || true
           exit 1
         fi
         ls -la "$ARTIFACT_DIR"
@@ -832,27 +836,25 @@ jobs:
     - name: Build sd image and package artifacts
       id: build_sd_image_and_package
       run: |
-        set -e  # 任何命令失败立即退出
         cd project
-        
         echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
-        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \;
-        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \;
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
         sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
         sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
         
         echo "=== Patching build.sh specifically ==="
-        sed -i '/^# select board:/,/^esac/d' build.sh
-        sed -i '/select/d' build.sh
-        sed -i '/case \$/d' build.sh
-        sed -i '/esac/d' build.sh
-        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh
-        sed -i '/no .current_config.mk/d' build.sh
-        sed -i '/device\/friendlyelec/ s/^/#/' build.sh
-        sed -i '1a BOARD="rk3568"' build.sh
-        sed -i '1a CONFIG="rockchip-docker"' build.sh
-        sed -i '1a export BOARD CONFIG' build.sh
-        sed -i '1a set +u' build.sh
+        sed -i '/^# select board:/,/^esac/d' build.sh || true
+        sed -i '/select/d' build.sh || true
+        sed -i '/case \$/d' build.sh || true
+        sed -i '/esac/d' build.sh || true
+        sed -i '/if \[ ! -f .current_config.mk \]/,/fi/d' build.sh || true
+        sed -i '/no .current_config.mk/d' build.sh || true
+        sed -i '/device\/friendlyelec/ s/^/#/' build.sh || true
+        sed -i '1a BOARD="rk3568"' build.sh || true
+        sed -i '1a CONFIG="rockchip-docker"' build.sh || true
+        sed -i '1a export BOARD CONFIG' build.sh || true
+        sed -i '1a set +u' build.sh || true
         echo "build.sh patched."
         
         echo "=== Preparing rootfs in sd-fuse directory ==="
@@ -892,6 +894,7 @@ jobs:
           exit 1
         fi
         
+        # 进入 sd-fuse 目录执行 mk-sd-image.sh
         cd scripts/sd-fuse
         
         echo "=== Running mk-sd-image.sh ${DIST_DIR} (non-interactive) ==="
@@ -907,30 +910,35 @@ jobs:
           exit 1
         fi
         
-        # 重命名生成的镜像文件
-        cd out
-        ORIG_IMG=$(ls *.img 2>/dev/null | head -1)
-        if [ -n "$ORIG_IMG" ]; then
-          echo "Found original image: $ORIG_IMG"
-          mv "$ORIG_IMG" "${{ steps.config.outputs.img_filename }}"
-          echo "Renamed to: ${{ steps.config.outputs.img_filename }}"
+        # 查找并重命名镜像文件（使用绝对路径）
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        OUT_DIR="$(pwd)/out"   # 此时 pwd 为 project/scripts/sd-fuse
+        if [ -d "$OUT_DIR" ]; then
+          ORIG_IMG=$(find "$OUT_DIR" -maxdepth 1 -name "*.img" -print -quit)
+          if [ -n "$ORIG_IMG" ]; then
+            echo "Found original image: $ORIG_IMG"
+            mv "$ORIG_IMG" "$OUT_DIR/$IMG_FILE"
+            echo "Renamed to: $OUT_DIR/$IMG_FILE"
+          else
+            echo "ERROR: No .img file found in $OUT_DIR"
+            ls -la "$OUT_DIR"
+            exit 1
+          fi
         else
-          echo "ERROR: No .img file found in out/"
-          ls -la
+          echo "ERROR: output directory $OUT_DIR not found"
           exit 1
         fi
-        cd ../..
+        
+        # 返回 project 目录（使用绝对路径）
+        cd "$GITHUB_WORKSPACE/project"
         
         # ========== 移动镜像到 artifact 目录 ==========
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
         echo "=== Moving image to $ARTIFACT_DIR ==="
-        if [ -f "scripts/sd-fuse/out/${IMG_FILE}" ]; then
-          mv "scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
-        elif [ -f "out/${IMG_FILE}" ]; then
-          mv "out/${IMG_FILE}" "$ARTIFACT_DIR/"
+        if [ -f "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
+          mv "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
         else
-          echo "ERROR: Image file ${IMG_FILE} not found!"
-          ls -la scripts/sd-fuse/out out || true
+          echo "ERROR: Image file ${IMG_FILE} not found in scripts/sd-fuse/out!"
+          ls -la "$GITHUB_WORKSPACE/project/scripts/sd-fuse/out" || true
           exit 1
         fi
         ls -la "$ARTIFACT_DIR"
