@@ -398,10 +398,11 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像并重命名 ----------
-    - name: Build sd image (generate raw image)
-      id: build_sd_image_raw
+    # ---------- 最终构建：生成镜像并打包所有产物 ----------
+    - name: Build sd image and package artifacts
+      id: build_sd_image_and_package
       run: |
+        set -e  # 任何命令失败立即退出
         cd project
         
         echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
@@ -448,8 +449,9 @@ jobs:
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        # ========== 打包 tgz 提前到 mk-sd-image.sh 之前 ==========
+        # ========== 打包 tgz（提前到 mk-sd-image.sh 之前） ==========
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        mkdir -p "$ARTIFACT_DIR"
         echo "=== Packaging tgz BEFORE running mk-sd-image.sh ==="
         if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
           tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C scripts/sd-fuse "$DIST_DIR"
@@ -489,39 +491,25 @@ jobs:
         fi
         cd ../..
         
-        echo "=== Checking for output image ==="
-        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
-        ls -la out/ || echo "project/out not found"
-        
-        # 记录镜像路径供后续步骤使用
-        echo "IMAGE_PATH=scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" >> $GITHUB_ENV
-        echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> $GITHUB_ENV
-
-    - name: Move and compress image
-      run: |
-        set -e
-        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        # ========== 移动镜像到 artifact 目录 ==========
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        
-        # 重新确定镜像实际位置
-        if [ -f "project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
-          IMG_SRC="project/scripts/sd-fuse/out/${IMG_FILE}"
-        elif [ -f "project/out/${IMG_FILE}" ]; then
-          IMG_SRC="project/out/${IMG_FILE}"
+        echo "=== Moving image to $ARTIFACT_DIR ==="
+        if [ -f "scripts/sd-fuse/out/${IMG_FILE}" ]; then
+          mv "scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
+        elif [ -f "out/${IMG_FILE}" ]; then
+          mv "out/${IMG_FILE}" "$ARTIFACT_DIR/"
         else
           echo "ERROR: Image file ${IMG_FILE} not found!"
-          ls -la project/scripts/sd-fuse/out project/out || true
+          ls -la scripts/sd-fuse/out out || true
           exit 1
         fi
+        ls -la "$ARTIFACT_DIR"
         
-        echo "Moving image from ${IMG_SRC} to ${ARTIFACT_DIR}/"
-        mv "${IMG_SRC}" "${ARTIFACT_DIR}/"
-        
-        cd "${ARTIFACT_DIR}"
-        echo "Compressing image..."
+        # ========== 在 artifact 目录中压缩 img ==========
+        cd "$ARTIFACT_DIR"
         gzip -f "${IMG_FILE}"
         echo "Compressed image: ${IMG_FILE}.gz"
-        ls -la "${ARTIFACT_DIR}"
+        ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
@@ -840,10 +828,11 @@ jobs:
         done < /tmp/sd_fuse_dirs.txt
         echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-    # ---------- 最终构建：生成镜像并重命名 ----------
-    - name: Build sd image (generate raw image)
-      id: build_sd_image_raw
+    # ---------- 最终构建：生成镜像并打包所有产物 ----------
+    - name: Build sd image and package artifacts
+      id: build_sd_image_and_package
       run: |
+        set -e  # 任何命令失败立即退出
         cd project
         
         echo "=== Patching all .sh scripts to disable 'set -u' and interactive prompts ==="
@@ -890,8 +879,9 @@ jobs:
         echo "=== Environment variables ==="
         env | grep -E "^(BOARD|CONFIG|TOPDIR|FOUND_MK_FILE|ALL_MK|MK_LINK|ALL_MK_LINK)=" || true
         
-        # ========== 打包 tgz 提前到 mk-sd-image.sh 之前 ==========
+        # ========== 打包 tgz（提前到 mk-sd-image.sh 之前） ==========
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        mkdir -p "$ARTIFACT_DIR"
         echo "=== Packaging tgz BEFORE running mk-sd-image.sh ==="
         if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
           tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C scripts/sd-fuse "$DIST_DIR"
@@ -931,39 +921,25 @@ jobs:
         fi
         cd ../..
         
-        echo "=== Checking for output image ==="
-        ls -la scripts/sd-fuse/out/ || echo "scripts/sd-fuse/out not found"
-        ls -la out/ || echo "project/out not found"
-        
-        # 记录镜像路径供后续步骤使用
-        echo "IMAGE_PATH=scripts/sd-fuse/out/${{ steps.config.outputs.img_filename }}" >> $GITHUB_ENV
-        echo "ARTIFACT_DIR=$ARTIFACT_DIR" >> $GITHUB_ENV
-
-    - name: Move and compress image
-      run: |
-        set -e
-        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        # ========== 移动镜像到 artifact 目录 ==========
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        
-        # 重新确定镜像实际位置
-        if [ -f "project/scripts/sd-fuse/out/${IMG_FILE}" ]; then
-          IMG_SRC="project/scripts/sd-fuse/out/${IMG_FILE}"
-        elif [ -f "project/out/${IMG_FILE}" ]; then
-          IMG_SRC="project/out/${IMG_FILE}"
+        echo "=== Moving image to $ARTIFACT_DIR ==="
+        if [ -f "scripts/sd-fuse/out/${IMG_FILE}" ]; then
+          mv "scripts/sd-fuse/out/${IMG_FILE}" "$ARTIFACT_DIR/"
+        elif [ -f "out/${IMG_FILE}" ]; then
+          mv "out/${IMG_FILE}" "$ARTIFACT_DIR/"
         else
           echo "ERROR: Image file ${IMG_FILE} not found!"
-          ls -la project/scripts/sd-fuse/out project/out || true
+          ls -la scripts/sd-fuse/out out || true
           exit 1
         fi
+        ls -la "$ARTIFACT_DIR"
         
-        echo "Moving image from ${IMG_SRC} to ${ARTIFACT_DIR}/"
-        mv "${IMG_SRC}" "${ARTIFACT_DIR}/"
-        
-        cd "${ARTIFACT_DIR}"
-        echo "Compressing image..."
+        # ========== 在 artifact 目录中压缩 img ==========
+        cd "$ARTIFACT_DIR"
         gzip -f "${IMG_FILE}"
         echo "Compressed image: ${IMG_FILE}.gz"
-        ls -la "${ARTIFACT_DIR}"
+        ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
       uses: svenstaro/upload-release-action@v2
