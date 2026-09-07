@@ -235,7 +235,6 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        # 搜索最近 5 天（包含今天）
         DATES=()
         for i in {0..4}; do
           DATES+=($(date -d "$i days ago" +%Y-%m-%d))
@@ -433,12 +432,11 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
-        # ===== 修复：创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错 =====
+        # 创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错
         mkdir -p "${TARGET_DIR}/rootfs/dev" \
                  "${TARGET_DIR}/rootfs/proc" \
                  "${TARGET_DIR}/rootfs/sys" \
                  "${TARGET_DIR}/rootfs/tmp"
-        # ===== 修复结束 =====
         
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
@@ -457,20 +455,9 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # 生成 rootfs.img（使用 sudo -E 保留环境变量）
-        echo "=== Building rootfs.img ==="
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
-          cat /tmp/build-rootfs.log
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
-        # 运行 mk-sd-image.sh（不再使用 yes，因为目录已完整）
+        # ========== 修改：直接使用 mk-sd-image.sh，不再单独调用 build-rootfs-img.sh ==========
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
@@ -699,7 +686,6 @@ jobs:
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
         ROOTFS_FILE="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        # 搜索最近 5 天（包含今天）
         DATES=()
         for i in {0..4}; do
           DATES+=($(date -d "$i days ago" +%Y-%m-%d))
@@ -897,12 +883,10 @@ jobs:
         mkdir -p "${TARGET_DIR}/rootfs"
         cp -r "${ROOTFS_SRC}"/* "${TARGET_DIR}/rootfs/" 2>/dev/null || true
         
-        # ===== 修复：创建必要的目录，避免 build-rootfs-img.sh 因缺少 dev 而报错 =====
         mkdir -p "${TARGET_DIR}/rootfs/dev" \
                  "${TARGET_DIR}/rootfs/proc" \
                  "${TARGET_DIR}/rootfs/sys" \
                  "${TARGET_DIR}/rootfs/tmp"
-        # ===== 修复结束 =====
         
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
@@ -921,18 +905,9 @@ jobs:
         
         cd scripts/sd-fuse
         
-        echo "=== Building rootfs.img ==="
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs" "${DIST_DIR}/rootfs.img" 2>&1 | tee /tmp/build-rootfs.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed with exit code $BUILD_EXIT ==="
-          cat /tmp/build-rootfs.log
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
+        # ========== 修改：直接使用 mk-sd-image.sh，不再单独调用 build-rootfs-img.sh ==========
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
