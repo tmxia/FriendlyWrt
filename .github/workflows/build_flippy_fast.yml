@@ -441,21 +441,19 @@ jobs:
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
         
-        # ---------- 复制 u-boot 文件 ----------
+        # ---------- 复制 u-boot 文件（使用固定路径） ----------
         echo "=== Copying u-boot files to ${TARGET_DIR} ==="
-        UBOOT_IMG=$(find . -name "uboot.img" -type f | head -1)
-        IDBLOADER_IMG=$(find . -name "idbloader.img" -type f | head -1)
-        SPL_LOADER=$(find . -name "rk356x_spl_loader_*.bin" -type f | head -1)
-        if [ -n "$UBOOT_IMG" ]; then
-          cp -f "$UBOOT_IMG" "${TARGET_DIR}/uboot.img"
+        if [ -f "u-boot/uboot.img" ]; then
+          cp -f u-boot/uboot.img "${TARGET_DIR}/uboot.img"
           echo "Copied uboot.img"
         fi
-        if [ -n "$IDBLOADER_IMG" ]; then
-          cp -f "$IDBLOADER_IMG" "${TARGET_DIR}/idbloader.img"
+        if [ -f "u-boot/idbloader.img" ]; then
+          cp -f u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
           echo "Copied idbloader.img"
         fi
-        if [ -n "$SPL_LOADER" ]; then
-          cp -f "$SPL_LOADER" "${TARGET_DIR}/rk356x_spl_loader.bin"
+        SPL_FILE=$(ls u-boot/rk356x_spl_loader_*.bin 2>/dev/null | head -1)
+        if [ -n "$SPL_FILE" ]; then
+          cp -f "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
           echo "Copied rk356x_spl_loader.bin"
         fi
         
@@ -473,19 +471,10 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ---------- 手动生成 rootfs.img ----------
-        echo "=== Generating rootfs.img using build-rootfs-img.sh ==="
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
-        if [ $? -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed ==="
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
-        # ---------- 运行 mk-sd-image.sh ----------
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "${DIST_DIR}"
-        BUILD_EXIT=$?
+        # ========== 关键修改：直接运行 mk-sd-image.sh，不再手动调用 build-rootfs-img.sh ==========
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} (auto-answer N) ==="
+        yes N | sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
@@ -493,7 +482,7 @@ jobs:
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log 2>/dev/null || echo "No log file"
+          cat /tmp/mk-sd.log
           exit 1
         fi
         
@@ -915,21 +904,19 @@ jobs:
         echo "=== Contents of ${TARGET_DIR}/rootfs ==="
         ls -la "${TARGET_DIR}/rootfs/" || echo "Target rootfs not found"
         
-        # ---------- 复制 u-boot 文件 ----------
+        # ---------- 复制 u-boot 文件（使用固定路径） ----------
         echo "=== Copying u-boot files to ${TARGET_DIR} ==="
-        UBOOT_IMG=$(find . -name "uboot.img" -type f | head -1)
-        IDBLOADER_IMG=$(find . -name "idbloader.img" -type f | head -1)
-        SPL_LOADER=$(find . -name "rk356x_spl_loader_*.bin" -type f | head -1)
-        if [ -n "$UBOOT_IMG" ]; then
-          cp -f "$UBOOT_IMG" "${TARGET_DIR}/uboot.img"
+        if [ -f "u-boot/uboot.img" ]; then
+          cp -f u-boot/uboot.img "${TARGET_DIR}/uboot.img"
           echo "Copied uboot.img"
         fi
-        if [ -n "$IDBLOADER_IMG" ]; then
-          cp -f "$IDBLOADER_IMG" "${TARGET_DIR}/idbloader.img"
+        if [ -f "u-boot/idbloader.img" ]; then
+          cp -f u-boot/idbloader.img "${TARGET_DIR}/idbloader.img"
           echo "Copied idbloader.img"
         fi
-        if [ -n "$SPL_LOADER" ]; then
-          cp -f "$SPL_LOADER" "${TARGET_DIR}/rk356x_spl_loader.bin"
+        SPL_FILE=$(ls u-boot/rk356x_spl_loader_*.bin 2>/dev/null | head -1)
+        if [ -n "$SPL_FILE" ]; then
+          cp -f "$SPL_FILE" "${TARGET_DIR}/rk356x_spl_loader.bin"
           echo "Copied rk356x_spl_loader.bin"
         fi
         
@@ -947,19 +934,10 @@ jobs:
         
         cd scripts/sd-fuse
         
-        # ---------- 手动生成 rootfs.img ----------
-        echo "=== Generating rootfs.img using build-rootfs-img.sh ==="
-        sudo -E ./build-rootfs-img.sh "${DIST_DIR}/rootfs.img" "${DIST_DIR}/rootfs"
-        if [ $? -ne 0 ]; then
-          echo "=== build-rootfs-img.sh failed ==="
-          exit 1
-        fi
-        echo "rootfs.img generated successfully."
-        
-        # ---------- 运行 mk-sd-image.sh ----------
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        sudo -E ./mk-sd-image.sh "${DIST_DIR}"
-        BUILD_EXIT=$?
+        # ========== 关键修改：直接运行 mk-sd-image.sh，不再手动调用 build-rootfs-img.sh ==========
+        echo "=== Running mk-sd-image.sh ${DIST_DIR} (auto-answer N) ==="
+        yes N | sudo -E ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
+        BUILD_EXIT=${PIPESTATUS[0]}
         cd ../..
         
         echo "=== mk-sd-image.sh finished with exit code: $BUILD_EXIT ==="
@@ -967,7 +945,7 @@ jobs:
         if [ $BUILD_EXIT -ne 0 ]; then
           echo "=== mk-sd-image.sh failed with exit code $BUILD_EXIT ==="
           echo "=== Full build log: ==="
-          cat /tmp/mk-sd.log 2>/dev/null || echo "No log file"
+          cat /tmp/mk-sd.log
           exit 1
         fi
         
