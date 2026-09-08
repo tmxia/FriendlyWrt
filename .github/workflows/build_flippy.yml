@@ -429,35 +429,42 @@ jobs:
         cd project
         ./build.sh uboot
 
-        # 创建 kernel 标记（可能不需要，但保留以防某些脚本检查）
+        # Patch build.sh 移除内核检查，允许 sd-img 运行
+        sed -i '/please build kernel first/d' build.sh || true
+        sed -i '/if \[ ! -f friendlywrt\/kernel\/\.built \]/,/fi/d' build.sh || true
+
+        # 创建 kernel 标记（以防其他检查）
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-        # 获取变量
-        source .current_config.mk
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_SRC="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
-        TARGET_ROOTFS="scripts/sd-fuse/${DIST_DIR}/rootfs"
-        rm -rf "$TARGET_ROOTFS"
-        mkdir -p "$TARGET_ROOTFS"
-        cp -a "$ROOTFS_SRC"/. "$TARGET_ROOTFS/"
-        echo "Rootfs copied to $TARGET_ROOTFS"
+        # 运行 sd-img，自动创建 scripts/sd-fuse/${DIST_DIR} 并生成初始镜像
+        ./build.sh sd-img
 
-        # 注入 flippy boot 和 dtb
+        # 获取 flippy 文件并覆盖默认内核
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
-        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
-          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
-          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
-          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
-          echo "Flippy boot/dtb deployed."
-        else
-          echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+
+        if [ -n "$BOOT_TAR" ]; then
+          echo "Extracting flippy boot to temporary dir..."
+          mkdir -p /tmp/flippy_boot
+          tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
+          # 查找 boot.img 和 kernel.img 并覆盖到 sd-fuse 目录
+          find /tmp/flippy_boot -name "boot.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
+          find /tmp/flippy_boot -name "kernel.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
+          # 如果 boot 包中有其他需要覆盖的文件（如 resource.img），也可以处理，这里只覆盖两个主要文件
         fi
 
-    # ---------- 使用 mk-sd-image.sh 生成镜像（提前打包 tgz，不移动目录） ----------
+        if [ -n "$DTB_TAR" ]; then
+          echo "Extracting flippy dtb..."
+          rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
+          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
+          tar xzf "$DTB_TAR" -C "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" --strip-components=1
+        fi
+
+        echo "Flippy boot/dtb deployed."
+
+    # ---------- 使用 mk-sd-image.sh 重新生成最终镜像 ----------
     - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
       run: |
@@ -477,7 +484,7 @@ jobs:
           exit 1
         fi
 
-        # 2. 运行 mk-sd-image.sh 生成 RAW 镜像
+        # 2. 运行 mk-sd-image.sh 生成最终 RAW 镜像（目录已存在，不会尝试下载）
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
@@ -852,30 +859,39 @@ jobs:
         cd project
         ./build.sh uboot
 
+        # Patch build.sh 移除内核检查，允许 sd-img 运行
+        sed -i '/please build kernel first/d' build.sh || true
+        sed -i '/if \[ ! -f friendlywrt\/kernel\/\.built \]/,/fi/d' build.sh || true
+
+        # 创建 kernel 标记（以防其他检查）
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-        source .current_config.mk
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        ROOTFS_SRC="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
-        TARGET_ROOTFS="scripts/sd-fuse/${DIST_DIR}/rootfs"
-        rm -rf "$TARGET_ROOTFS"
-        mkdir -p "$TARGET_ROOTFS"
-        cp -a "$ROOTFS_SRC"/. "$TARGET_ROOTFS/"
-        echo "Rootfs copied to $TARGET_ROOTFS"
+        # 运行 sd-img，自动创建 scripts/sd-fuse/${DIST_DIR} 并生成初始镜像
+        ./build.sh sd-img
 
+        # 获取 flippy 文件并覆盖默认内核
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
-        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
-          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
-          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
-          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
-          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
-          echo "Flippy boot/dtb deployed."
-        else
-          echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+
+        if [ -n "$BOOT_TAR" ]; then
+          echo "Extracting flippy boot to temporary dir..."
+          mkdir -p /tmp/flippy_boot
+          tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
+          # 查找 boot.img 和 kernel.img 并覆盖到 sd-fuse 目录
+          find /tmp/flippy_boot -name "boot.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
+          find /tmp/flippy_boot -name "kernel.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
         fi
+
+        if [ -n "$DTB_TAR" ]; then
+          echo "Extracting flippy dtb..."
+          rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
+          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
+          tar xzf "$DTB_TAR" -C "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" --strip-components=1
+        fi
+
+        echo "Flippy boot/dtb deployed."
 
     - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
@@ -896,7 +912,7 @@ jobs:
           exit 1
         fi
 
-        # 2. 运行 mk-sd-image.sh
+        # 2. 运行 mk-sd-image.sh 生成最终 RAW 镜像
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
         yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
         BUILD_EXIT=${PIPESTATUS[0]}
