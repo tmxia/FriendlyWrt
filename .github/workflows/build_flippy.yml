@@ -457,7 +457,7 @@ jobs:
           echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-    # ---------- 使用 mk-sd-image.sh 生成镜像（提前打包 tgz） ----------
+    # ---------- 使用 mk-sd-image.sh 生成镜像（提前打包 tgz，不移动目录） ----------
     - name: Build sd image with mk-sd-image.sh
       id: build_sd_image
       run: |
@@ -466,14 +466,11 @@ jobs:
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
 
-        # 1. 在运行 mk-sd-image.sh 之前打包 tgz
+        # 1. 提前打包 tgz（不移动原目录，使用 --transform 重命名顶层目录）
         if [ -d "$DIST_DIR" ]; then
-          archive_dir="${DIST_DIR}-rk3568"
-          mv "$DIST_DIR" "$archive_dir"
-          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
+          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
+              --transform "s/^${DIST_DIR}/${DIST_DIR}-rk3568/" "$DIST_DIR"
           echo "tgz created"
-          # 打包后将目录名恢复，供 mk-sd-image.sh 使用
-          mv "$archive_dir" "$DIST_DIR"
         else
           echo "ERROR: directory $DIST_DIR not found before mk-sd-image.sh"
           ls -la
@@ -855,11 +852,9 @@ jobs:
         cd project
         ./build.sh uboot
 
-        # 创建 kernel 标记
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
 
-        # 获取变量
         source .current_config.mk
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         ROOTFS_SRC="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
@@ -869,7 +864,6 @@ jobs:
         cp -a "$ROOTFS_SRC"/. "$TARGET_ROOTFS/"
         echo "Rootfs copied to $TARGET_ROOTFS"
 
-        # 注入 flippy boot 和 dtb
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
         if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
@@ -891,13 +885,11 @@ jobs:
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
 
-        # 1. 提前打包 tgz
+        # 1. 提前打包 tgz（不移动原目录，使用 --transform 重命名顶层目录）
         if [ -d "$DIST_DIR" ]; then
-          archive_dir="${DIST_DIR}-rk3568"
-          mv "$DIST_DIR" "$archive_dir"
-          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" "$archive_dir"
+          tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
+              --transform "s/^${DIST_DIR}/${DIST_DIR}-rk3568/" "$DIST_DIR"
           echo "tgz created"
-          mv "$archive_dir" "$DIST_DIR"
         else
           echo "ERROR: directory $DIST_DIR not found before mk-sd-image.sh"
           ls -la
