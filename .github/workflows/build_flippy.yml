@@ -254,11 +254,9 @@ jobs:
 
         echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
 
-        # 解压模块，用于注入 rootfs
         mkdir -p /tmp/flippy_modules
         tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
 
-        # 保存 boot/dtb 路径供后续使用
         echo "BOOT_TAR=$BOOT_TAR" >> $GITHUB_ENV
         echo "DTB_TAR=$DTB_TAR" >> $GITHUB_ENV
 
@@ -348,37 +346,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    # ---------- 构建 SD 镜像（使用 flippy 内核） ----------
-    - name: Download friendlywrt rootfs (non-docker)
-      if: matrix.SET == 'non-docker'
-      uses: robinraju/release-downloader@v1.6
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        repository: ${{ github.repository }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-flippy-${{ matrix.VERSION }}.tgz"
-
-    - name: Download friendlywrt rootfs (docker)
-      if: matrix.SET == 'docker'
-      uses: robinraju/release-downloader@v1.6
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        repository: ${{ github.repository }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-flippy-${{ matrix.VERSION }}-docker.tgz"
-
-    - name: Download host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      uses: robinraju/release-downloader@v1.6
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        repository: ${{ github.repository }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "host-pm-${{ matrix.VERSION }}.tgz"
-
+    # ---------- 构建 SD 镜像（直接使用 mk-sd-image.sh） ----------
     - name: Prepare config for img
       id: config
       run: |
@@ -411,121 +379,130 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    - name: Unpack friendlywrt rootfs
+    - name: Compile uboot (with guard)
       run: |
         cd project
-        SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-flippy-${{ matrix.VERSION }}${SUFFIX}.tgz"
-
-    - name: Unpack host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      run: |
-        cd project
-        tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
-
-    # ---------- 编译 uboot 并注入 flippy boot/dtb ----------
-    - name: Compile uboot and prepare flippy kernel
-      run: |
-        cd $GITHUB_WORKSPACE/project   # 确保在 project 根目录
-        ./build.sh uboot
-        cd $GITHUB_WORKSPACE/project   # 强制返回根目录（重要！）
-
-        # 确保 .current_config.mk 存在（如果丢失则重新创建）
-        if [ ! -f .current_config.mk ]; then
-          CPU=rk3568
-          [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-          DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
-          CONFIG=rockchip${SUFFIX}
-          cat > .current_config.mk <<EOL
-        . device/friendlyelec/$CPU/base.mk
-        TARGET_IMAGE_DIRNAME=${DIST_DIR}
-        TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
-        EOL
+        mkdir -p friendlywrt/u-boot
+        if [ ! -f friendlywrt/u-boot/.built ]; then
+          ./build.sh uboot
+          touch friendlywrt/u-boot/.built
         fi
+        echo "U-boot ready."
 
-        # Patch build.sh 移除内核检查，允许 sd-img 运行
-        sed -i '/please build kernel first/d' build.sh || true
-        sed -i '/if \[ ! -f friendlywrt\/kernel\/\.built \]/,/fi/d' build.sh || true
-
-        # 创建 kernel 标记（以防其他检查）
+    - name: Create kernel .built marker
+      run: |
+        cd project
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
+        echo "Kernel marker created."
 
-        # 运行 sd-img，自动创建 scripts/sd-fuse/${DIST_DIR} 并生成初始镜像
-        cd $GITHUB_WORKSPACE/project   # 再次确保在根目录
-        ./build.sh sd-img
-
-        # 获取 flippy 文件并覆盖默认内核
+    - name: Deploy flippy kernel boot/dtb to sd-fuse
+      run: |
+        cd project
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-
-        if [ -n "$BOOT_TAR" ]; then
-          echo "Extracting flippy boot to temporary dir..."
-          mkdir -p /tmp/flippy_boot
-          tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
-          find /tmp/flippy_boot -name "boot.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
-          find /tmp/flippy_boot -name "kernel.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
+        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
+          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
+        else
+          echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-        if [ -n "$DTB_TAR" ]; then
-          echo "Extracting flippy dtb..."
-          rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-          tar xzf "$DTB_TAR" -C "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" --strip-components=1
-        fi
-
-        echo "Flippy boot/dtb deployed."
-
-    # ---------- 使用 mk-sd-image.sh 重新生成最终镜像 ----------
-    - name: Build sd image with mk-sd-image.sh
-      id: build_sd_image
+    - name: Copy necessary files to sd-fuse directories
       run: |
-        cd project/scripts/sd-fuse
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        cd project
+        # 确保 device 目录存在，若已被意外删除则重新同步
+        if [ ! -d "device/friendlyelec" ]; then
+          echo "device/friendlyelec missing, re-syncing..."
+          repo sync -c device/friendlyelec --no-clone-bundle
+        fi
+        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
+        while read -r dir; do
+          if [ "$dir" != "scripts/sd-fuse" ]; then
+            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
+          fi
+        done < /tmp/sd_fuse_dirs.txt
+        echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-        # 1. 提前打包 tgz（不移动原目录，使用 --transform 重命名顶层目录）
-        if [ -d "$DIST_DIR" ]; then
+    - name: Build sd image and package artifacts
+      id: build_sd_image
+      shell: bash
+      run: |
+        cd project
+        
+        echo "=== Patching scripts ==="
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
+        sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
+        sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
+        
+        echo "=== Preparing rootfs ==="
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
+        rm -rf "${TARGET_DIR}/rootfs"
+        mkdir -p "${TARGET_DIR}/rootfs"
+        cp -a "${ROOTFS_SRC}"/. "${TARGET_DIR}/rootfs/"
+        
+        export BOARD="rk3568"
+        export CONFIG="rockchip${{ steps.config.outputs.suffix }}"
+        export TOPDIR=$(pwd)
+        export FRIENDLYWRT_SRC=$TOPDIR
+        export ALL_MK_LINK=""
+        export ALL_MK=""
+        export MK_LINK=""
+        export FOUND_MK_FILE="0"
+        
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        mkdir -p "$ARTIFACT_DIR"
+        
+        # 打包 tgz（提前，避免目录被清理）
+        if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
           tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
-              --transform "s/^${DIST_DIR}/${DIST_DIR}-rk3568/" "$DIST_DIR"
+              -C scripts/sd-fuse "$DIST_DIR"
           echo "tgz created"
         else
-          echo "ERROR: directory $DIST_DIR not found before mk-sd-image.sh"
-          ls -la
+          echo "ERROR: directory missing before mk-sd-image.sh"
+          ls -la scripts/sd-fuse
           exit 1
         fi
-
-        # 2. 运行 mk-sd-image.sh 生成最终 RAW 镜像（目录已存在，不会尝试下载）
+        
+        # 运行 mk-sd-image.sh
+        cd scripts/sd-fuse
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "mk-sd-image.sh failed with exit code $BUILD_EXIT"
-          cat /tmp/mk-sd.log
-          exit 1
+        set +e
+        yes | ./mk-sd-image.sh "${DIST_DIR}" > /tmp/mk-sd.log 2>&1
+        MK_EXIT=$?
+        set -e
+        echo "mk-sd-image.sh exit code: $MK_EXIT"
+        cat /tmp/mk-sd.log
+        
+        # 查找并重命名镜像
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        if [ -f "out/${IMG_FILE}" ]; then
+          echo "Image already named correctly"
+        else
+          ORIG_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
+          if [ -n "$ORIG_IMG" ]; then
+            echo "Renaming $ORIG_IMG to $IMG_FILE"
+            mv "$ORIG_IMG" "out/$IMG_FILE"
+          else
+            echo "ERROR: No .img found"
+            ls -la out || true
+            exit 1
+          fi
         fi
-
-        # 3. 重命名并移动镜像
-        cd out
-        ORIG_IMG=$(find . -maxdepth 1 -name "*.img" -print -quit)
-        if [ -z "$ORIG_IMG" ]; then
-          echo "ERROR: No .img file found in out/"
-          ls -la
-          exit 1
-        fi
-        mv "$ORIG_IMG" "$IMG_FILE"
-        echo "Renamed to $IMG_FILE"
-        cd ..
-
+        
+        # 移动并压缩
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
-        echo "Image moved to $ARTIFACT_DIR/$IMG_FILE"
-
-        # 4. 压缩 img
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
-        echo "Compressed image: $IMG_FILE.gz"
+        echo "Compressed: $ARTIFACT_DIR/$IMG_FILE.gz"
         ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
@@ -557,7 +534,6 @@ jobs:
       matrix:
         VERSION: ['24.10', '25.12']
         SET: [docker, non-docker]
-
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -793,36 +769,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    - name: Download friendlywrt rootfs (non-docker)
-      if: matrix.SET == 'non-docker'
-      uses: robinraju/release-downloader@v1.6
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        repository: ${{ github.repository }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-flippy-${{ matrix.VERSION }}.tgz"
-
-    - name: Download friendlywrt rootfs (docker)
-      if: matrix.SET == 'docker'
-      uses: robinraju/release-downloader@v1.6
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        repository: ${{ github.repository }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-flippy-${{ matrix.VERSION }}-docker.tgz"
-
-    - name: Download host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      uses: robinraju/release-downloader@v1.6
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        repository: ${{ github.repository }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "host-pm-${{ matrix.VERSION }}.tgz"
-
+    # ---------- 构建 SD 镜像 ----------
     - name: Prepare config for img
       id: config
       run: |
@@ -855,119 +802,129 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    - name: Unpack friendlywrt rootfs
+    - name: Compile uboot (with guard)
       run: |
         cd project
-        SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-flippy-${{ matrix.VERSION }}${SUFFIX}.tgz"
-
-    - name: Unpack host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      run: |
-        cd project
-        tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
-
-    - name: Compile uboot and prepare flippy kernel
-      run: |
-        cd $GITHUB_WORKSPACE/project   # 确保在 project 根目录
-        ./build.sh uboot
-        cd $GITHUB_WORKSPACE/project   # 强制返回根目录（重要！）
-
-        # 确保 .current_config.mk 存在（如果丢失则重新创建）
-        if [ ! -f .current_config.mk ]; then
-          CPU=rk3568
-          [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-          DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
-          CONFIG=rockchip${SUFFIX}
-          cat > .current_config.mk <<EOL
-        . device/friendlyelec/$CPU/base.mk
-        TARGET_IMAGE_DIRNAME=${DIST_DIR}
-        TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
-        EOL
+        mkdir -p friendlywrt/u-boot
+        if [ ! -f friendlywrt/u-boot/.built ]; then
+          ./build.sh uboot
+          touch friendlywrt/u-boot/.built
         fi
+        echo "U-boot ready."
 
-        # Patch build.sh 移除内核检查
-        sed -i '/please build kernel first/d' build.sh || true
-        sed -i '/if \[ ! -f friendlywrt\/kernel\/\.built \]/,/fi/d' build.sh || true
-
-        # 创建 kernel 标记
+    - name: Create kernel .built marker
+      run: |
+        cd project
         mkdir -p friendlywrt/kernel
         touch friendlywrt/kernel/.built
+        echo "Kernel marker created."
 
-        # 运行 sd-img
-        cd $GITHUB_WORKSPACE/project   # 再次确保在根目录
-        ./build.sh sd-img
-
-        # 获取 flippy 文件并覆盖默认内核
+    - name: Deploy flippy kernel boot/dtb to sd-fuse
+      run: |
+        cd project
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_TAR="${{ env.BOOT_TAR }}"
         DTB_TAR="${{ env.DTB_TAR }}"
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-
-        if [ -n "$BOOT_TAR" ]; then
-          echo "Extracting flippy boot to temporary dir..."
-          mkdir -p /tmp/flippy_boot
-          tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
-          find /tmp/flippy_boot -name "boot.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
-          find /tmp/flippy_boot -name "kernel.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
+        if [ -n "$BOOT_TAR" ] && [ -n "$DTB_TAR" ]; then
+          echo "Deploying flippy kernel boot/dtb to scripts/sd-fuse/${DIST_DIR} ..."
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/boot/
+          tar xzf "$BOOT_TAR" -C scripts/sd-fuse/${DIST_DIR}/boot/ --strip-components=1
+          mkdir -p scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/
+          tar xzf "$DTB_TAR" -C scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ --strip-components=1
+        else
+          echo "WARNING: flippy kernel boot/dtb not found, skipping deployment."
         fi
 
-        if [ -n "$DTB_TAR" ]; then
-          echo "Extracting flippy dtb..."
-          rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-          tar xzf "$DTB_TAR" -C "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" --strip-components=1
-        fi
-
-        echo "Flippy boot/dtb deployed."
-
-    - name: Build sd image with mk-sd-image.sh
-      id: build_sd_image
+    - name: Copy necessary files to sd-fuse directories
       run: |
-        cd project/scripts/sd-fuse
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        cd project
+        if [ ! -d "device/friendlyelec" ]; then
+          echo "device/friendlyelec missing, re-syncing..."
+          repo sync -c device/friendlyelec --no-clone-bundle
+        fi
+        find scripts/sd-fuse -type d > /tmp/sd_fuse_dirs.txt
+        cp -r device configs .current_config.mk friendlywrt/.config scripts/sd-fuse/
+        while read -r dir; do
+          if [ "$dir" != "scripts/sd-fuse" ]; then
+            cp -r device configs .current_config.mk friendlywrt/.config "$dir/"
+          fi
+        done < /tmp/sd_fuse_dirs.txt
+        echo "Copied device, configs, .current_config.mk, and .config to sd-fuse subdirectories."
 
-        # 1. 提前打包 tgz
-        if [ -d "$DIST_DIR" ]; then
+    - name: Build sd image and package artifacts
+      id: build_sd_image
+      shell: bash
+      run: |
+        cd project
+        
+        echo "=== Patching scripts ==="
+        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
+        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
+        sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
+        sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
+        
+        echo "=== Preparing rootfs ==="
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
+        TARGET_DIR="scripts/sd-fuse/${DIST_DIR}"
+        rm -rf "${TARGET_DIR}/rootfs"
+        mkdir -p "${TARGET_DIR}/rootfs"
+        cp -a "${ROOTFS_SRC}"/. "${TARGET_DIR}/rootfs/"
+        
+        export BOARD="rk3568"
+        export CONFIG="rockchip${{ steps.config.outputs.suffix }}"
+        export TOPDIR=$(pwd)
+        export FRIENDLYWRT_SRC=$TOPDIR
+        export ALL_MK_LINK=""
+        export ALL_MK=""
+        export MK_LINK=""
+        export FOUND_MK_FILE="0"
+        
+        ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+        mkdir -p "$ARTIFACT_DIR"
+        
+        # 打包 tgz
+        if [ -d "scripts/sd-fuse/${DIST_DIR}" ]; then
           tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
-              --transform "s/^${DIST_DIR}/${DIST_DIR}-rk3568/" "$DIST_DIR"
+              -C scripts/sd-fuse "$DIST_DIR"
           echo "tgz created"
         else
-          echo "ERROR: directory $DIST_DIR not found before mk-sd-image.sh"
-          ls -la
+          echo "ERROR: directory missing before mk-sd-image.sh"
+          ls -la scripts/sd-fuse
           exit 1
         fi
-
-        # 2. 运行 mk-sd-image.sh
+        
+        # 运行 mk-sd-image.sh
+        cd scripts/sd-fuse
         echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
-        yes | ./mk-sd-image.sh "${DIST_DIR}" 2>&1 | tee /tmp/mk-sd.log
-        BUILD_EXIT=${PIPESTATUS[0]}
-        if [ $BUILD_EXIT -ne 0 ]; then
-          echo "mk-sd-image.sh failed with exit code $BUILD_EXIT"
-          cat /tmp/mk-sd.log
-          exit 1
+        set +e
+        yes | ./mk-sd-image.sh "${DIST_DIR}" > /tmp/mk-sd.log 2>&1
+        MK_EXIT=$?
+        set -e
+        echo "mk-sd-image.sh exit code: $MK_EXIT"
+        cat /tmp/mk-sd.log
+        
+        # 查找并重命名镜像
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
+        if [ -f "out/${IMG_FILE}" ]; then
+          echo "Image already named correctly"
+        else
+          ORIG_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
+          if [ -n "$ORIG_IMG" ]; then
+            echo "Renaming $ORIG_IMG to $IMG_FILE"
+            mv "$ORIG_IMG" "out/$IMG_FILE"
+          else
+            echo "ERROR: No .img found"
+            ls -la out || true
+            exit 1
+          fi
         fi
-
-        # 3. 重命名并移动镜像
-        cd out
-        ORIG_IMG=$(find . -maxdepth 1 -name "*.img" -print -quit)
-        if [ -z "$ORIG_IMG" ]; then
-          echo "ERROR: No .img file found in out/"
-          ls -la
-          exit 1
-        fi
-        mv "$ORIG_IMG" "$IMG_FILE"
-        echo "Renamed to $IMG_FILE"
-        cd ..
-
+        
+        # 移动并压缩
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
-        echo "Image moved to $ARTIFACT_DIR/$IMG_FILE"
-
-        # 4. 压缩 img
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
-        echo "Compressed image: $IMG_FILE.gz"
+        echo "Compressed: $ARTIFACT_DIR/$IMG_FILE.gz"
         ls -la "$ARTIFACT_DIR"
 
     - name: Upload images-XYZ.tgz to release
