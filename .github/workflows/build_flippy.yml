@@ -294,23 +294,56 @@ jobs:
         echo "BOOT_DIR=/tmp/flippy_boot" >> $GITHUB_ENV
         echo "DTB_DIR=/tmp/flippy_dtb" >> $GITHUB_ENV
 
-    - name: Replace kernel files
+    - name: Replace kernel inside boot.img
       run: |
         cd $GITHUB_WORKSPACE/project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_DIR="/tmp/flippy_boot"
         DTB_DIR="/tmp/flippy_dtb"
+        BOOT_IMG="scripts/sd-fuse/${DIST_DIR}/boot.img"
 
-        echo "=== Replacing boot.img and kernel.img ==="
-        cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
-        cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
+        # 挂载 boot.img
+        mkdir -p /tmp/boot_mnt
+        sudo mount -o loop "$BOOT_IMG" /tmp/boot_mnt
 
-        echo "=== Replacing dtb directory ==="
-        rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-        mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-        cp -f "$DTB_DIR"/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
+        # 查找并复制内核文件
+        VMLINUZ=$(find "$BOOT_DIR" -name "vmlinuz-*" | head -1)
+        UINITRD=$(find "$BOOT_DIR" -name "uInitrd-*" | head -1)
+        if [ -n "$VMLINUZ" ]; then
+          # 备份并删除旧内核
+          sudo rm -f /tmp/boot_mnt/kernel.img /tmp/boot_mnt/Image /tmp/boot_mnt/zImage
+          sudo cp "$VMLINUZ" /tmp/boot_mnt/kernel.img
+          sudo cp "$VMLINUZ" /tmp/boot_mnt/Image   # 以防配置引用 Image
+          echo "Copied vmlinuz as kernel.img"
+        else
+          echo "ERROR: vmlinuz not found in flippy boot"
+          exit 1
+        fi
+        if [ -n "$UINITRD" ]; then
+          sudo rm -f /tmp/boot_mnt/uInitrd /tmp/boot_mnt/initrd.img
+          sudo cp "$UINITRD" /tmp/boot_mnt/uInitrd
+          echo "Copied uInitrd"
+        fi
 
-        echo "Kernel files replaced."
+        # 替换 dtb 文件
+        if [ -d "$DTB_DIR" ]; then
+          sudo rm -rf /tmp/boot_mnt/dtb/rockchip
+          sudo mkdir -p /tmp/boot_mnt/dtb/rockchip
+          sudo cp -f "$DTB_DIR"/*.dtb /tmp/boot_mnt/dtb/rockchip/ 2>/dev/null || true
+          echo "Copied dtb files"
+        fi
+
+        # 修改启动配置（如果存在 extlinux/extlinux.conf）
+        if [ -f /tmp/boot_mnt/extlinux/extlinux.conf ]; then
+          sudo sed -i 's/^\(\s*LINUX\s*\).*/\1\/kernel.img/' /tmp/boot_mnt/extlinux/extlinux.conf
+          sudo sed -i 's/^\(\s*INITRD\s*\).*/\1\/uInitrd/' /tmp/boot_mnt/extlinux/extlinux.conf
+          sudo sed -i 's/^\(\s*FDT\s*\).*/\1\/dtb\/rockchip\/rk3568-nanopi-r5s.dtb/' /tmp/boot_mnt/extlinux/extlinux.conf
+          echo "Updated extlinux.conf"
+        fi
+
+        # 卸载
+        sudo umount /tmp/boot_mnt
+        echo "boot.img updated with flippy kernel"
 
     - name: Build final image and package
       id: build_sd_image
@@ -569,23 +602,56 @@ jobs:
         echo "BOOT_DIR=/tmp/flippy_boot" >> $GITHUB_ENV
         echo "DTB_DIR=/tmp/flippy_dtb" >> $GITHUB_ENV
 
-    - name: Replace kernel files
+    - name: Replace kernel inside boot.img
       run: |
         cd $GITHUB_WORKSPACE/project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_DIR="/tmp/flippy_boot"
         DTB_DIR="/tmp/flippy_dtb"
+        BOOT_IMG="scripts/sd-fuse/${DIST_DIR}/boot.img"
 
-        echo "=== Replacing boot.img and kernel.img ==="
-        cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
-        cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
+        # 挂载 boot.img
+        mkdir -p /tmp/boot_mnt
+        sudo mount -o loop "$BOOT_IMG" /tmp/boot_mnt
 
-        echo "=== Replacing dtb directory ==="
-        rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-        mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-        cp -f "$DTB_DIR"/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
+        # 查找并复制内核文件
+        VMLINUZ=$(find "$BOOT_DIR" -name "vmlinuz-*" | head -1)
+        UINITRD=$(find "$BOOT_DIR" -name "uInitrd-*" | head -1)
+        if [ -n "$VMLINUZ" ]; then
+          # 备份并删除旧内核
+          sudo rm -f /tmp/boot_mnt/kernel.img /tmp/boot_mnt/Image /tmp/boot_mnt/zImage
+          sudo cp "$VMLINUZ" /tmp/boot_mnt/kernel.img
+          sudo cp "$VMLINUZ" /tmp/boot_mnt/Image   # 以防配置引用 Image
+          echo "Copied vmlinuz as kernel.img"
+        else
+          echo "ERROR: vmlinuz not found in flippy boot"
+          exit 1
+        fi
+        if [ -n "$UINITRD" ]; then
+          sudo rm -f /tmp/boot_mnt/uInitrd /tmp/boot_mnt/initrd.img
+          sudo cp "$UINITRD" /tmp/boot_mnt/uInitrd
+          echo "Copied uInitrd"
+        fi
 
-        echo "Kernel files replaced."
+        # 替换 dtb 文件
+        if [ -d "$DTB_DIR" ]; then
+          sudo rm -rf /tmp/boot_mnt/dtb/rockchip
+          sudo mkdir -p /tmp/boot_mnt/dtb/rockchip
+          sudo cp -f "$DTB_DIR"/*.dtb /tmp/boot_mnt/dtb/rockchip/ 2>/dev/null || true
+          echo "Copied dtb files"
+        fi
+
+        # 修改启动配置（如果存在 extlinux/extlinux.conf）
+        if [ -f /tmp/boot_mnt/extlinux/extlinux.conf ]; then
+          sudo sed -i 's/^\(\s*LINUX\s*\).*/\1\/kernel.img/' /tmp/boot_mnt/extlinux/extlinux.conf
+          sudo sed -i 's/^\(\s*INITRD\s*\).*/\1\/uInitrd/' /tmp/boot_mnt/extlinux/extlinux.conf
+          sudo sed -i 's/^\(\s*FDT\s*\).*/\1\/dtb\/rockchip\/rk3568-nanopi-r5s.dtb/' /tmp/boot_mnt/extlinux/extlinux.conf
+          echo "Updated extlinux.conf"
+        fi
+
+        # 卸载
+        sudo umount /tmp/boot_mnt
+        echo "boot.img updated with flippy kernel"
 
     - name: Build final image and package
       id: build_sd_image
