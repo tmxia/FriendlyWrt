@@ -204,148 +204,6 @@ jobs:
         cd project/friendlywrt
         make -j$(nproc)
 
-    # ---------- 获取 flippy 内核 ----------
-    - name: Get latest flippy kernel version
-      id: flippy_version
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
-        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
-        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
-        if [ -z "$VERSIONS" ]; then
-          echo "ERROR: No kernel tarballs found in kernel_flippy release"
-          exit 1
-        fi
-        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
-        echo "version=$LATEST" >> $GITHUB_OUTPUT
-        echo "Latest flippy kernel version: $LATEST"
-
-    - name: Download and extract flippy kernel
-      run: |
-        cd project
-        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
-
-        mkdir -p /tmp/flippy_extract
-        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
-
-        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
-        if [ ! -d "$KERNEL_DIR" ]; then
-          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
-        fi
-        if [ -z "$KERNEL_DIR" ] || [ ! -d "$KERNEL_DIR" ]; then
-          echo "ERROR: Kernel directory not found"
-          ls -la /tmp/flippy_extract
-          exit 1
-        fi
-        echo "Kernel directory: $KERNEL_DIR"
-
-        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-        MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
-
-        if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MODULES_TAR" ]; then
-          echo "ERROR: Could not find boot, dtb, or modules archives. Listing contents:"
-          ls -laR "$KERNEL_DIR"
-          exit 1
-        fi
-
-        echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
-
-        mkdir -p /tmp/flippy_modules
-        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
-
-        echo "BOOT_TAR=$BOOT_TAR" >> $GITHUB_ENV
-        echo "DTB_TAR=$DTB_TAR" >> $GITHUB_ENV
-
-    # ---------- 替换 rootfs 中的内核模块 ----------
-    - name: Inject flippy modules into rootfs before packaging
-      run: |
-        cd project
-        source .current_config.mk
-        ROOTFS_DIR="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
-
-        if [ -d /tmp/flippy_modules ]; then
-          MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
-          if [ -n "$MODULES_DIR_NAME" ]; then
-            echo "Injecting flippy modules to $ROOTFS_DIR/lib/modules ..."
-            rm -rf "$ROOTFS_DIR/lib/modules"
-            mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
-            cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
-            find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
-            echo "Flippy modules injected."
-          else
-            echo "WARNING: Could not determine modules directory name, skipping injection."
-          fi
-        else
-          echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
-        fi
-
-    - name: Create rootfs package
-      id: create_rootfs_package
-      run: |
-        cd project
-        source .current_config.mk
-        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-flippy-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
-              ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
-        echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
-
-    - name: Create host package-manager bundle
-      id: create_host_pm_package
-      if: matrix.SET == 'non-docker'
-      run: |
-        cd project
-        source .current_config.mk
-        PM_BIN=
-        [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk ]  && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk
-        [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg ] && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg
-        if [ -z "$PM_BIN" ]; then
-          echo "ERROR: neither apk nor opkg found under ${FRIENDLYWRT_SRC}/staging_dir/host/bin/"
-          exit 1
-        fi
-        echo "Detected host package manager: $PM_BIN"
-
-        ldd_out=$(ldd "$PM_BIN" 2>&1 || true)
-        echo "$ldd_out"
-        if ! echo "$ldd_out" | grep -q "not a dynamic executable"; then
-          bad_paths=$(echo "$ldd_out" | grep -oE '=> /[^ ]+' | sed 's|=> ||' \
-                       | grep -vE '^/(lib|lib64|usr/lib)/' || true)
-          not_found=$(echo "$ldd_out" | grep -F "not found" || true)
-          if [ -n "$bad_paths" ] || [ -n "$not_found" ]; then
-            echo "ERROR: $PM_BIN has non-portable dynamic dependencies:"
-            [ -n "$bad_paths" ] && { echo "non-system paths:"; echo "$bad_paths"; }
-            [ -n "$not_found" ] && { echo "unresolved:"; echo "$not_found"; }
-            exit 1
-          fi
-        fi
-
-        host_pm_filename="host-pm-${{ matrix.VERSION }}.tgz"
-        tar czf ../artifact/${host_pm_filename} "$PM_BIN"
-        echo "host_pm_filename=$host_pm_filename" >> $GITHUB_OUTPUT
-
-    - name: Upload rootfs package
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        asset_name: ${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
-
-    - name: Upload host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ steps.create_host_pm_package.outputs.host_pm_filename }}
-        asset_name: ${{ steps.create_host_pm_package.outputs.host_pm_filename }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
-
     # ---------- 构建 SD 镜像（使用 flippy 内核） ----------
     - name: Prepare config for img
       id: config
@@ -379,19 +237,14 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    - name: Compile uboot and prepare flippy kernel
+    - name: Compile uboot and kernel (FriendlyWrt default)
       run: |
         cd $GITHUB_WORKSPACE/project
-
-        # 编译 uboot
         ./build.sh uboot
-
-        # 强制返回根目录并重新同步 device/friendlyelec（修复 uboot 可能删除目录的问题）
-        cd $GITHUB_WORKSPACE/project
+        # 重新同步 device/friendlyelec，防止 uboot 编译删除
         repo sync -c device/friendlyelec --no-clone-bundle
-
-        # 确保 .current_config.mk 存在
-        if [ ! -f .current_config.mk ]; then
+        # 重新生成 .current_config.mk
+        source .current_config.mk 2>/dev/null || {
           CPU=rk3568
           [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
           DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
@@ -401,85 +254,99 @@ jobs:
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         EOL
+        }
+        # 编译内核，生成必要的辅助文件（resource.img, boot.img 等）
+        ./build.sh kernel
+
+    - name: Get latest flippy kernel version
+      id: flippy_version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
+        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
+        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
+        if [ -z "$VERSIONS" ]; then
+          echo "ERROR: No kernel tarballs found in kernel_flippy release"
+          exit 1
         fi
+        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
+        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        echo "Latest flippy kernel version: $LATEST"
 
-        # Patch build.sh 移除内核检查
-        sed -i '/please build kernel first/d' build.sh || true
+    - name: Download and extract flippy kernel
+      run: |
+        cd $GITHUB_WORKSPACE/project
+        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
+        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
 
-        # 创建 kernel 标记
-        mkdir -p friendlywrt/kernel
-        touch friendlywrt/kernel/.built
+        mkdir -p /tmp/flippy_extract
+        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
 
-        # 运行 sd-img，自动创建完整的 scripts/sd-fuse/${DIST_DIR} 并生成初始镜像
-        ./build.sh sd-img
+        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
+        if [ ! -d "$KERNEL_DIR" ]; then
+          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
+        fi
+        echo "Kernel directory: $KERNEL_DIR"
 
-        # 覆盖 flippy 内核文件
-        BOOT_TAR="${{ env.BOOT_TAR }}"
-        DTB_TAR="${{ env.DTB_TAR }}"
+        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
+
+        mkdir -p /tmp/flippy_boot /tmp/flippy_dtb
+        tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
+        tar xzf "$DTB_TAR" -C /tmp/flippy_dtb
+
+        echo "BOOT_DIR=/tmp/flippy_boot" >> $GITHUB_ENV
+        echo "DTB_DIR=/tmp/flippy_dtb" >> $GITHUB_ENV
+
+    - name: Replace default kernel with flippy
+      run: |
+        cd $GITHUB_WORKSPACE/project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        BOOT_DIR="/tmp/flippy_boot"
+        DTB_DIR="/tmp/flippy_dtb"
 
-        if [ -n "$BOOT_TAR" ]; then
-          echo "Extracting flippy boot to temporary dir..."
-          mkdir -p /tmp/flippy_boot
-          tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
-          find /tmp/flippy_boot -name "boot.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
-          find /tmp/flippy_boot -name "kernel.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
+        # 复制 flippy 的 boot.img 和 kernel.img 到 sd-fuse 目录
+        if [ -f "$BOOT_DIR/boot.img" ]; then
+          cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/"
+          echo "boot.img replaced"
+        fi
+        if [ -f "$BOOT_DIR/kernel.img" ]; then
+          cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/"
+          echo "kernel.img replaced"
         fi
 
-        if [ -n "$DTB_TAR" ]; then
-          echo "Extracting flippy dtb..."
-          rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-          tar xzf "$DTB_TAR" -C "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" --strip-components=1
-        fi
-
-        echo "Flippy boot/dtb deployed."
+        # 替换 dtb 目录
+        rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
+        mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
+        cp -f "$DTB_DIR"/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
+        echo "dtb replaced"
 
     - name: Build sd image and package artifacts
       id: build_sd_image
-      shell: bash
       run: |
-        cd project
-        
-        echo "=== Patching scripts ==="
-        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
-        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
-        sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
-        sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
-        
+        cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
-        
-        # 确保 sd-fuse 目录存在且完整（由上一步 sd-img 生成）
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}" ]; then
-          echo "ERROR: scripts/sd-fuse/${DIST_DIR} does not exist"
-          ls -la scripts/sd-fuse
-          exit 1
-        fi
-        
-        # 打包 tgz（提前，避免目录被后续操作影响）
+
+        # 打包 tgz（提前）
         tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
-            -C scripts/sd-fuse "$DIST_DIR"
+            -C . "$DIST_DIR"
         echo "tgz created"
-        
-        # 运行 mk-sd-image.sh 重新生成镜像（此时目录完整，不会触发下载）
-        cd scripts/sd-fuse
-        echo "=== Running mk-sd-image.sh ${DIST_DIR} ==="
+
+        # 运行 mk-sd-image.sh 重新生成镜像（目录已完整，不会下载）
         set +e
-        yes | ./mk-sd-image.sh "${DIST_DIR}" > /tmp/mk-sd.log 2>&1
+        yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
-        
+
         # 查找并重命名镜像
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
-        if [ -f "out/${IMG_FILE}" ]; then
-          echo "Image already named correctly"
-        else
+        if [ ! -f "out/${IMG_FILE}" ]; then
           ORIG_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           if [ -n "$ORIG_IMG" ]; then
-            echo "Renaming $ORIG_IMG to $IMG_FILE"
             mv "$ORIG_IMG" "out/$IMG_FILE"
           else
             echo "ERROR: No .img found"
@@ -487,7 +354,7 @@ jobs:
             exit 1
           fi
         fi
-        
+
         # 移动并压缩
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
         cd "$ARTIFACT_DIR"
@@ -619,146 +486,6 @@ jobs:
         cd project/friendlywrt
         make -j$(nproc)
 
-    - name: Get latest flippy kernel version
-      id: flippy_version
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
-        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
-        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
-        if [ -z "$VERSIONS" ]; then
-          echo "ERROR: No kernel tarballs found in kernel_flippy release"
-          exit 1
-        fi
-        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
-        echo "version=$LATEST" >> $GITHUB_OUTPUT
-        echo "Latest flippy kernel version: $LATEST"
-
-    - name: Download and extract flippy kernel
-      run: |
-        cd project
-        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        echo "Downloading flippy kernel $KERNEL_VER from ophub/kernel (kernel_flippy release)"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
-
-        mkdir -p /tmp/flippy_extract
-        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
-
-        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
-        if [ ! -d "$KERNEL_DIR" ]; then
-          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
-        fi
-        if [ -z "$KERNEL_DIR" ] || [ ! -d "$KERNEL_DIR" ]; then
-          echo "ERROR: Kernel directory not found"
-          ls -la /tmp/flippy_extract
-          exit 1
-        fi
-        echo "Kernel directory: $KERNEL_DIR"
-
-        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-        MODULES_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
-
-        if [ -z "$BOOT_TAR" ] || [ -z "$DTB_TAR" ] || [ -z "$MODULES_TAR" ]; then
-          echo "ERROR: Could not find boot, dtb, or modules archives. Listing contents:"
-          ls -laR "$KERNEL_DIR"
-          exit 1
-        fi
-
-        echo "Found boot: $BOOT_TAR, dtb: $DTB_TAR, modules: $MODULES_TAR"
-
-        mkdir -p /tmp/flippy_modules
-        tar xzf "$MODULES_TAR" -C /tmp/flippy_modules
-
-        echo "BOOT_TAR=$BOOT_TAR" >> $GITHUB_ENV
-        echo "DTB_TAR=$DTB_TAR" >> $GITHUB_ENV
-
-    - name: Inject flippy modules into rootfs before packaging
-      run: |
-        cd project
-        source .current_config.mk
-        ROOTFS_DIR="${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS}"
-
-        if [ -d /tmp/flippy_modules ]; then
-          MODULES_DIR_NAME=$(ls /tmp/flippy_modules | grep -E '^[0-9]+\.[0-9]+\.[0-9]+-flippy-[0-9]+\+?$' | head -1)
-          if [ -n "$MODULES_DIR_NAME" ]; then
-            echo "Injecting flippy modules to $ROOTFS_DIR/lib/modules ..."
-            rm -rf "$ROOTFS_DIR/lib/modules"
-            mkdir -p "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME"
-            cp -r /tmp/flippy_modules/$MODULES_DIR_NAME/* "$ROOTFS_DIR/lib/modules/$MODULES_DIR_NAME/"
-            find "$ROOTFS_DIR/lib/modules" -type f -exec chmod 644 {} \;
-            echo "Flippy modules injected."
-          else
-            echo "WARNING: Could not determine modules directory name, skipping injection."
-          fi
-        else
-          echo "WARNING: /tmp/flippy_modules not found, skipping module injection."
-        fi
-
-    - name: Create rootfs package
-      id: create_rootfs_package
-      run: |
-        cd project
-        source .current_config.mk
-        [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-flippy-${{ matrix.VERSION }}${SUFFIX}.tgz"
-        tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
-              ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
-        echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
-
-    - name: Create host package-manager bundle
-      id: create_host_pm_package
-      if: matrix.SET == 'non-docker'
-      run: |
-        cd project
-        source .current_config.mk
-        PM_BIN=
-        [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk ]  && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk
-        [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg ] && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg
-        if [ -z "$PM_BIN" ]; then
-          echo "ERROR: neither apk nor opkg found under ${FRIENDLYWRT_SRC}/staging_dir/host/bin/"
-          exit 1
-        fi
-        echo "Detected host package manager: $PM_BIN"
-
-        ldd_out=$(ldd "$PM_BIN" 2>&1 || true)
-        echo "$ldd_out"
-        if ! echo "$ldd_out" | grep -q "not a dynamic executable"; then
-          bad_paths=$(echo "$ldd_out" | grep -oE '=> /[^ ]+' | sed 's|=> ||' \
-                       | grep -vE '^/(lib|lib64|usr/lib)/' || true)
-          not_found=$(echo "$ldd_out" | grep -F "not found" || true)
-          if [ -n "$bad_paths" ] || [ -n "$not_found" ]; then
-            echo "ERROR: $PM_BIN has non-portable dynamic dependencies:"
-            [ -n "$bad_paths" ] && { echo "non-system paths:"; echo "$bad_paths"; }
-            [ -n "$not_found" ] && { echo "unresolved:"; echo "$not_found"; }
-            exit 1
-          fi
-        fi
-
-        host_pm_filename="host-pm-${{ matrix.VERSION }}.tgz"
-        tar czf ../artifact/${host_pm_filename} "$PM_BIN"
-        echo "host_pm_filename=$host_pm_filename" >> $GITHUB_OUTPUT
-
-    - name: Upload rootfs package
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        asset_name: ${{ steps.create_rootfs_package.outputs.rootfs_filename }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
-
-    - name: Upload host package-manager bundle
-      if: matrix.SET == 'non-docker'
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ steps.create_host_pm_package.outputs.host_pm_filename }}
-        asset_name: ${{ steps.create_host_pm_package.outputs.host_pm_filename }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
-
     # ---------- 构建 SD 镜像 ----------
     - name: Prepare config for img
       id: config
@@ -792,16 +519,12 @@ jobs:
         echo "dist_dir=$DIST_DIR" >> $GITHUB_OUTPUT
         echo "suffix=$SUFFIX" >> $GITHUB_OUTPUT
 
-    - name: Compile uboot and prepare flippy kernel
+    - name: Compile uboot and kernel (FriendlyWrt default)
       run: |
         cd $GITHUB_WORKSPACE/project
-
         ./build.sh uboot
-
-        cd $GITHUB_WORKSPACE/project
         repo sync -c device/friendlyelec --no-clone-bundle
-
-        if [ ! -f .current_config.mk ]; then
+        source .current_config.mk 2>/dev/null || {
           CPU=rk3568
           [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
           DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
@@ -811,67 +534,90 @@ jobs:
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         EOL
+        }
+        ./build.sh kernel
+
+    - name: Get latest flippy kernel version
+      id: flippy_version
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
+        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
+        VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
+        if [ -z "$VERSIONS" ]; then
+          echo "ERROR: No kernel tarballs found in kernel_flippy release"
+          exit 1
         fi
+        LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
+        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        echo "Latest flippy kernel version: $LATEST"
 
-        sed -i '/please build kernel first/d' build.sh || true
+    - name: Download and extract flippy kernel
+      run: |
+        cd $GITHUB_WORKSPACE/project
+        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
+        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
 
-        mkdir -p friendlywrt/kernel
-        touch friendlywrt/kernel/.built
+        mkdir -p /tmp/flippy_extract
+        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
 
-        ./build.sh sd-img
+        KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
+        if [ ! -d "$KERNEL_DIR" ]; then
+          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
+        fi
+        echo "Kernel directory: $KERNEL_DIR"
 
-        BOOT_TAR="${{ env.BOOT_TAR }}"
-        DTB_TAR="${{ env.DTB_TAR }}"
+        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
+
+        mkdir -p /tmp/flippy_boot /tmp/flippy_dtb
+        tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
+        tar xzf "$DTB_TAR" -C /tmp/flippy_dtb
+
+        echo "BOOT_DIR=/tmp/flippy_boot" >> $GITHUB_ENV
+        echo "DTB_DIR=/tmp/flippy_dtb" >> $GITHUB_ENV
+
+    - name: Replace default kernel with flippy
+      run: |
+        cd $GITHUB_WORKSPACE/project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        BOOT_DIR="/tmp/flippy_boot"
+        DTB_DIR="/tmp/flippy_dtb"
 
-        if [ -n "$BOOT_TAR" ]; then
-          mkdir -p /tmp/flippy_boot
-          tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
-          find /tmp/flippy_boot -name "boot.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
-          find /tmp/flippy_boot -name "kernel.img" -exec cp -f {} "scripts/sd-fuse/${DIST_DIR}/" \;
+        if [ -f "$BOOT_DIR/boot.img" ]; then
+          cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/"
+          echo "boot.img replaced"
+        fi
+        if [ -f "$BOOT_DIR/kernel.img" ]; then
+          cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/"
+          echo "kernel.img replaced"
         fi
 
-        if [ -n "$DTB_TAR" ]; then
-          rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-          mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-          tar xzf "$DTB_TAR" -C "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip" --strip-components=1
-        fi
-
-        echo "Flippy boot/dtb deployed."
+        rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
+        mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
+        cp -f "$DTB_DIR"/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
+        echo "dtb replaced"
 
     - name: Build sd image and package artifacts
       id: build_sd_image
-      shell: bash
       run: |
-        cd project
-        
-        find . -name "*.sh" -exec sed -i 's/set -u/set +u/g' {} \; || true
-        find . -name "*.sh" -exec sed -i 's/set -o nounset/set +o nounset/g' {} \; || true
-        sed -i '/read -p/d' scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || true
-        sed -i '/read -p/d' scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || true
-        
+        cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
-        
-        if [ ! -d "scripts/sd-fuse/${DIST_DIR}" ]; then
-          echo "ERROR: scripts/sd-fuse/${DIST_DIR} does not exist"
-          ls -la scripts/sd-fuse
-          exit 1
-        fi
-        
+
         tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
-            -C scripts/sd-fuse "$DIST_DIR"
+            -C . "$DIST_DIR"
         echo "tgz created"
-        
-        cd scripts/sd-fuse
+
         set +e
-        yes | ./mk-sd-image.sh "${DIST_DIR}" > /tmp/mk-sd.log 2>&1
+        yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
-        
-        IMG_FILE="${{ steps.config.outputs.img_filename }}"
+
         if [ ! -f "out/${IMG_FILE}" ]; then
           ORIG_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           if [ -n "$ORIG_IMG" ]; then
@@ -882,7 +628,7 @@ jobs:
             exit 1
           fi
         fi
-        
+
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
