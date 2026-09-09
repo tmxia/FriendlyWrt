@@ -204,7 +204,6 @@ jobs:
         cd project/friendlywrt
         make -j$(nproc)
 
-    # ---------- 构建 SD 镜像（使用 flippy 内核） ----------
     - name: Prepare config for img
       id: config
       run: |
@@ -240,11 +239,16 @@ jobs:
     - name: Compile uboot and kernel (FriendlyWrt default)
       run: |
         cd $GITHUB_WORKSPACE/project
+
+        echo "=== Compiling uboot ==="
         ./build.sh uboot
-        # 重新同步 device/friendlyelec，防止 uboot 编译删除
+
+        echo "=== Re-syncing device/friendlyelec ==="
+        cd $GITHUB_WORKSPACE/project
         repo sync -c device/friendlyelec --no-clone-bundle
-        # 重新生成 .current_config.mk
-        source .current_config.mk 2>/dev/null || {
+
+        echo "=== Ensuring .current_config.mk exists ==="
+        if [ ! -f .current_config.mk ]; then
           CPU=rk3568
           [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
           DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
@@ -254,75 +258,61 @@ jobs:
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         EOL
-        }
-        # 编译内核，生成必要的辅助文件（resource.img, boot.img 等）
+        fi
+
+        echo "=== Compiling kernel (for auxiliary files) ==="
         ./build.sh kernel
+
+        echo "=== Running sd-img to generate full directory ==="
+        ./build.sh sd-img
 
     - name: Get latest flippy kernel version
       id: flippy_version
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
+        echo "Fetching latest flippy kernel version..."
         ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
         VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
-        if [ -z "$VERSIONS" ]; then
-          echo "ERROR: No kernel tarballs found in kernel_flippy release"
-          exit 1
-        fi
         LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
         echo "version=$LATEST" >> $GITHUB_OUTPUT
-        echo "Latest flippy kernel version: $LATEST"
+        echo "Latest flippy kernel: $LATEST"
 
     - name: Download and extract flippy kernel
       run: |
         cd $GITHUB_WORKSPACE/project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
-
+        wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz" -O /tmp/flippy_all.tar.gz
         mkdir -p /tmp/flippy_extract
-        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
-
+        tar xzf /tmp/flippy_all.tar.gz -C /tmp/flippy_extract
         KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
-        if [ ! -d "$KERNEL_DIR" ]; then
-          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
-        fi
-        echo "Kernel directory: $KERNEL_DIR"
-
-        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-
+        BOOT_TAR=$(find "$KERNEL_DIR" -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$KERNEL_DIR" -name "dtb-rockchip-*.tar.gz" | head -1)
         mkdir -p /tmp/flippy_boot /tmp/flippy_dtb
         tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
         tar xzf "$DTB_TAR" -C /tmp/flippy_dtb
-
         echo "BOOT_DIR=/tmp/flippy_boot" >> $GITHUB_ENV
         echo "DTB_DIR=/tmp/flippy_dtb" >> $GITHUB_ENV
 
-    - name: Replace default kernel with flippy
+    - name: Replace kernel files
       run: |
         cd $GITHUB_WORKSPACE/project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_DIR="/tmp/flippy_boot"
         DTB_DIR="/tmp/flippy_dtb"
 
-        # 复制 flippy 的 boot.img 和 kernel.img 到 sd-fuse 目录
-        if [ -f "$BOOT_DIR/boot.img" ]; then
-          cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/"
-          echo "boot.img replaced"
-        fi
-        if [ -f "$BOOT_DIR/kernel.img" ]; then
-          cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/"
-          echo "kernel.img replaced"
-        fi
+        echo "=== Replacing boot.img and kernel.img ==="
+        cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
+        cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
 
-        # 替换 dtb 目录
+        echo "=== Replacing dtb directory ==="
         rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
         mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
         cp -f "$DTB_DIR"/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
-        echo "dtb replaced"
 
-    - name: Build sd image and package artifacts
+        echo "Kernel files replaced."
+
+    - name: Build final image and package
       id: build_sd_image
       run: |
         cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
@@ -330,18 +320,21 @@ jobs:
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
 
-        # 打包 tgz（提前）
-        tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
-            -C . "$DIST_DIR"
+        # 打包 tgz（此时目录完整）
+        tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C . "$DIST_DIR"
         echo "tgz created"
 
-        # 运行 mk-sd-image.sh 重新生成镜像（目录已完整，不会下载）
+        # 运行 mk-sd-image.sh 重新生成最终镜像
         set +e
         yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
+        if [ $MK_EXIT -ne 0 ]; then
+          echo "mk-sd-image.sh failed"
+          exit 1
+        fi
 
         # 查找并重命名镜像
         if [ ! -f "out/${IMG_FILE}" ]; then
@@ -486,7 +479,6 @@ jobs:
         cd project/friendlywrt
         make -j$(nproc)
 
-    # ---------- 构建 SD 镜像 ----------
     - name: Prepare config for img
       id: config
       run: |
@@ -522,9 +514,16 @@ jobs:
     - name: Compile uboot and kernel (FriendlyWrt default)
       run: |
         cd $GITHUB_WORKSPACE/project
+
+        echo "=== Compiling uboot ==="
         ./build.sh uboot
+
+        echo "=== Re-syncing device/friendlyelec ==="
+        cd $GITHUB_WORKSPACE/project
         repo sync -c device/friendlyelec --no-clone-bundle
-        source .current_config.mk 2>/dev/null || {
+
+        echo "=== Ensuring .current_config.mk exists ==="
+        if [ ! -f .current_config.mk ]; then
           CPU=rk3568
           [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
           DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
@@ -534,72 +533,61 @@ jobs:
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         EOL
-        }
+        fi
+
+        echo "=== Compiling kernel (for auxiliary files) ==="
         ./build.sh kernel
+
+        echo "=== Running sd-img to generate full directory ==="
+        ./build.sh sd-img
 
     - name: Get latest flippy kernel version
       id: flippy_version
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        echo "Fetching latest flippy kernel version from ophub/kernel release kernel_flippy..."
+        echo "Fetching latest flippy kernel version..."
         ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
         VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//')
-        if [ -z "$VERSIONS" ]; then
-          echo "ERROR: No kernel tarballs found in kernel_flippy release"
-          exit 1
-        fi
         LATEST=$(echo "$VERSIONS" | sort -V | tail -1)
         echo "version=$LATEST" >> $GITHUB_OUTPUT
-        echo "Latest flippy kernel version: $LATEST"
+        echo "Latest flippy kernel: $LATEST"
 
     - name: Download and extract flippy kernel
       run: |
         cd $GITHUB_WORKSPACE/project
         KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        wget -q https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz -O /tmp/kernel_all.tar.gz
-
+        wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz" -O /tmp/flippy_all.tar.gz
         mkdir -p /tmp/flippy_extract
-        tar xzf /tmp/kernel_all.tar.gz -C /tmp/flippy_extract
-
+        tar xzf /tmp/flippy_all.tar.gz -C /tmp/flippy_extract
         KERNEL_DIR="/tmp/flippy_extract/$KERNEL_VER"
-        if [ ! -d "$KERNEL_DIR" ]; then
-          KERNEL_DIR=$(find /tmp/flippy_extract -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
-        fi
-        echo "Kernel directory: $KERNEL_DIR"
-
-        BOOT_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find "$KERNEL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-
+        BOOT_TAR=$(find "$KERNEL_DIR" -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$KERNEL_DIR" -name "dtb-rockchip-*.tar.gz" | head -1)
         mkdir -p /tmp/flippy_boot /tmp/flippy_dtb
         tar xzf "$BOOT_TAR" -C /tmp/flippy_boot
         tar xzf "$DTB_TAR" -C /tmp/flippy_dtb
-
         echo "BOOT_DIR=/tmp/flippy_boot" >> $GITHUB_ENV
         echo "DTB_DIR=/tmp/flippy_dtb" >> $GITHUB_ENV
 
-    - name: Replace default kernel with flippy
+    - name: Replace kernel files
       run: |
         cd $GITHUB_WORKSPACE/project
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         BOOT_DIR="/tmp/flippy_boot"
         DTB_DIR="/tmp/flippy_dtb"
 
-        if [ -f "$BOOT_DIR/boot.img" ]; then
-          cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/"
-          echo "boot.img replaced"
-        fi
-        if [ -f "$BOOT_DIR/kernel.img" ]; then
-          cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/"
-          echo "kernel.img replaced"
-        fi
+        echo "=== Replacing boot.img and kernel.img ==="
+        cp -f "$BOOT_DIR/boot.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
+        cp -f "$BOOT_DIR/kernel.img" "scripts/sd-fuse/${DIST_DIR}/" 2>/dev/null || true
 
+        echo "=== Replacing dtb directory ==="
         rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
         mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
         cp -f "$DTB_DIR"/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
-        echo "dtb replaced"
 
-    - name: Build sd image and package artifacts
+        echo "Kernel files replaced."
+
+    - name: Build final image and package
       id: build_sd_image
       run: |
         cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
@@ -607,17 +595,23 @@ jobs:
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
 
-        tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" \
-            -C . "$DIST_DIR"
+        # 打包 tgz（此时目录完整）
+        tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C . "$DIST_DIR"
         echo "tgz created"
 
+        # 运行 mk-sd-image.sh 重新生成最终镜像
         set +e
         yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
+        if [ $MK_EXIT -ne 0 ]; then
+          echo "mk-sd-image.sh failed"
+          exit 1
+        fi
 
+        # 查找并重命名镜像
         if [ ! -f "out/${IMG_FILE}" ]; then
           ORIG_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           if [ -n "$ORIG_IMG" ]; then
@@ -629,6 +623,7 @@ jobs:
           fi
         fi
 
+        # 移动并压缩
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
