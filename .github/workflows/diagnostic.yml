@@ -31,9 +31,14 @@ jobs:
           sudo apt-get install -qq --no-install-recommends \
             file xxd binwalk p7zip-full u-boot-tools \
             device-tree-compiler cpio gzip xz-utils lz4 zstd \
-            python3 python3-pyelftools binutils-aarch64-linux-gnu
+            python3 python3-pyelftools binutils-aarch64-linux-gnu \
+            e2fsprogs util-linux kmod
 
-      - name: Find and download existing images tgz
+      # ============================================================
+      # ==============  A: FriendlyWrt 产物分析  ===================
+      # ============================================================
+
+      - name: A0 - Download existing images tgz
         id: find_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,84 +60,80 @@ jobs:
           tar xzf "$PATTERN"
           echo "release_tag=$FOUND" >> $GITHUB_OUTPUT
 
-      - name: Step 1 - KRNL header analysis
+      - name: A1 - FriendlyWrt file inventory
+        run: |
+          echo "########## A1: File inventory ##########"
+          SDDIR=$(dirname "$(find /tmp/existing -name parameter.txt | head -1)")
+          echo "SD-fuse dir: $SDDIR"
+          ls -la "$SDDIR/"
+          echo ""
+          for f in "$SDDIR"/*; do
+            [ -f "$f" ] && printf "%-30s %10s  %s\n" "$(basename "$f")" "$(stat -c%s "$f")" "$(file -b "$f")"
+          done
+
+      - name: A2 - FriendlyWrt kernel.img header
         run: |
           set -e
           KIMG=$(find /tmp/existing -name "kernel.img" | head -1)
-          echo "########## STEP 1: KRNL header ##########"
+          echo "########## A2: FriendlyWrt kernel.img ##########"
           echo "File: $KIMG"
           SIZE=$(stat -c%s "$KIMG")
           echo "Size: $SIZE bytes"
-          echo ""
           echo "--- First 128 bytes ---"
           xxd -l 128 "$KIMG"
           echo ""
           python3 << PYEOF
           with open("$KIMG", 'rb') as f:
-              data = f.read(128)
+              data = f.read(256)
           magic = data[0:4]
-          print(f"Magic: {magic} ({magic.hex()})")
+          print(f"Magic: {magic}")
           size_field_le = int.from_bytes(data[4:8], 'little')
           print(f"Size field (LE u32 @ 0x04): {size_field_le}")
           print(f"File size: $SIZE")
           print(f"File size - 8: {$SIZE - 8}")
-          print(f"Match file-8: {size_field_le == $SIZE - 8}")
-          arm64_magic_off = data.find(b'ARM\x64')
-          print(f"ARM64 magic at file offset: 0x{arm64_magic_off:x}")
+          print(f"Match: {size_field_le == $SIZE - 8}")
+          arm64_off = data.find(b'ARM\x64')
+          print(f"ARM64 magic at: 0x{arm64_off:x}")
+          if arm64_off >= 0:
+              base = 8 + arm64_off
+              print("\nARM64 Image header:")
+              for name, off, w in [("code0",0,4),("code1",4,4),("text_offset",8,8),
+                                   ("image_size",16,8),("flags",24,8),("magic",56,8)]:
+                  pos = base + off
+                  val = int.from_bytes(data[pos:pos+w], 'little')
+                  print(f"  {name:<12} @ +0x{off:02x}: 0x{val:0{w*2}x} ({val})")
           PYEOF
+          echo ""
+          echo "--- 内核版本字符串 ---"
+          dd if="$KIMG" bs=1 skip=8 count=$((4*1024*1024)) 2>/dev/null | strings -n 8 | grep -iE "Linux version|flippy" | head -10
 
-      - name: Step 2 - boot.img structure
+      - name: A3 - FriendlyWrt boot.img
         run: |
           set -e
           BIMG=$(find /tmp/existing -name "boot.img" | head -1)
-          echo "########## STEP 2: boot.img ##########"
+          echo "########## A3: FriendlyWrt boot.img ##########"
           echo "Size: $(stat -c%s "$BIMG")"
-          echo "--- First 32 bytes ---"
-          xxd -l 32 "$BIMG"
-          echo ""
-          # 提取 payload 并解压
+          xxd -l 64 "$BIMG"
           dd if="$BIMG" of=/tmp/boot_payload.gz bs=1 skip=8 status=none
-          echo "Payload (after 8-byte header) size: $(stat -c%s /tmp/boot_payload.gz)"
-          file /tmp/boot_payload.gz
-          echo ""
           if zcat /tmp/boot_payload.gz > /tmp/boot_extracted 2>/dev/null; then
             echo "Decompressed size: $(stat -c%s /tmp/boot_extracted)"
-            echo "--- First 64 bytes ---"
-            xxd -l 64 /tmp/boot_extracted
-            echo ""
             file /tmp/boot_extracted
-            echo ""
             EXT4_MAGIC=$(xxd -s 0x438 -l 2 -p /tmp/boot_extracted)
-            echo "Magic at offset 0x438 (ext4 check): $EXT4_MAGIC"
+            echo "Magic @ 0x438: $EXT4_MAGIC"
             if [ "$EXT4_MAGIC" = "53ef" ]; then
-              echo ">>> ext4 filesystem"
+              echo ">>> ext4"
               cp /tmp/boot_extracted /tmp/boot_fs.img
               sudo mkdir -p /tmp/boot_mnt
-              if sudo mount -o loop,ro /tmp/boot_fs.img /tmp/boot_mnt 2>/dev/null; then
-                echo "--- boot.img contents ---"
-                sudo ls -la /tmp/boot_mnt/
-                echo ""
-                echo "--- File types inside boot ---"
-                for f in /tmp/boot_mnt/*; do
-                  [ -e "$f" ] && echo "$(sudo file "$f" 2>/dev/null | sed 's|/tmp/boot_mnt/||')"
-                done
-                sudo umount /tmp/boot_mnt
-              fi
-            else
-              echo ">>> Not ext4, first bytes: $(xxd -l 4 -p /tmp/boot_extracted)"
-              if [ "$(xxd -l 4 -p /tmp/boot_extracted)" = "d00dfeed" ]; then
-                echo ">>> FIT image detected"
-                fdtdump /tmp/boot_extracted 2>/dev/null | head -80 || true
-                dumpimage -l /tmp/boot_extracted 2>&1 | head -40 || true
-              fi
+              sudo mount -o loop,ro /tmp/boot_fs.img /tmp/boot_mnt 2>/dev/null || true
+              sudo find /tmp/boot_mnt -maxdepth 2 -type f -exec ls -la {} \; 2>/dev/null
+              sudo umount /tmp/boot_mnt 2>/dev/null || true
             fi
           fi
 
-      - name: Step 3 - parameter.txt partition table
+      - name: A4 - FriendlyWrt parameter.txt
         run: |
-          set -e
           PARAM=$(find /tmp/existing -name "parameter.txt" | head -1)
-          echo "########## STEP 3: parameter.txt ##########"
+          echo "########## A4: parameter.txt ##########"
           cat "$PARAM"
           echo ""
           python3 << 'PYEOF'
@@ -143,154 +144,417 @@ jobs:
                   content = f.read()
               m = re.search(r'CMDLINE:\s*mtdparts=([^:]+):(.+)$', content, re.M)
               if m:
-                  print(f"{'Partition':<15} {'Offset':>12} {'Size':>14} {'Size(MB)':>10}")
-                  print("-" * 60)
+                  print(f"{'Partition':<15} {'Offset':>12} {'Size':>14} {'MB':>8} {'End':>14}")
+                  print("-" * 70)
                   for p in m.group(2).split(','):
                       pm = re.match(r'(-|0x[0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(([^)]+)\)', p)
                       if pm:
                           size, offset, name = pm.group(1), pm.group(2), pm.group(3)
+                          off_int = int(offset, 16)
                           if size == '-':
-                              print(f"{name:<15} {offset:>12} {'rest':>14} {'-':>10}")
+                              print(f"{name:<15} {offset:>12} {'rest':>14} {'-':>8} {'-':>14}")
                           else:
-                              mb = int(size, 16) * 512 / 1024 / 1024
-                              print(f"{name:<15} {offset:>12} {size:>14} {mb:>10.2f}")
+                              size_int = int(size, 16)
+                              print(f"{name:<15} {offset:>12} {size:>14} {size_int*512/1024/1024:>8.2f} 0x{off_int+size_int:08x}")
           PYEOF
 
-      - name: Step 4 - flippy vmlinuz structure
+      - name: A5 - FriendlyWrt rootfs.img modules
+        run: |
+          set -e
+          RIMG=$(find /tmp/existing -name "rootfs.img" | head -1)
+          echo "########## A5: FriendlyWrt rootfs.img ##########"
+          echo "File: $RIMG"
+          echo "Size: $(stat -c%s "$RIMG")"
+          xxd -l 16 "$RIMG"
+          sudo mkdir -p /tmp/rootfs_mnt
+          if sudo mount -o loop,ro "$RIMG" /tmp/rootfs_mnt; then
+            echo ""
+            echo "=== /lib/modules/ ==="
+            sudo ls -la /tmp/rootfs_mnt/lib/modules/ || echo "  (不存在)"
+            for d in /tmp/rootfs_mnt/lib/modules/*/; do
+              [ -d "$d" ] && echo ">>> $d 共 $(sudo find "$d" -name '*.ko*' | wc -l) 个 .ko"
+            done
+            echo ""
+            echo "=== modules.dep 版本字符串 ==="
+            sudo find /tmp/rootfs_mnt/lib/modules -name "modules.dep" -exec strings -n 6 {} \; 2>/dev/null | grep -oE "6\.[0-9]+\.[0-9]+[a-z0-9.+-]*" | sort -u | head
+            echo ""
+            echo "=== /etc/openwrt_release ==="
+            sudo cat /tmp/rootfs_mnt/etc/openwrt_release 2>/dev/null || true
+            echo ""
+            echo "=== 关键模块存在性 ==="
+            for mod in ext4 overlay squashfs nls_cp437 usb-storage mmc_block dw_mmc_rockchip phy_rockchip_inno_usb2 rockchip_saradc; do
+              R=$(sudo find /tmp/rootfs_mnt/lib/modules -name "${mod}.ko*" 2>/dev/null | head -1)
+              [ -n "$R" ] && echo "  ✓ $mod" || echo "  ✗ $mod"
+            done
+            sudo umount /tmp/rootfs_mnt
+          fi
+
+      - name: A6 - FriendlyWrt uboot / dtb
+        run: |
+          SDDIR=$(dirname "$(find /tmp/existing -name parameter.txt | head -1)")
+          echo "########## A6: FriendlyWrt dtb ##########"
+          ls "$SDDIR/dtb/" 2>/dev/null || echo "(无 dtb 目录)"
+          find "$SDDIR" -name "*.dtb" 2>/dev/null | head -20
+          echo ""
+          echo "########## A6b: uboot / idbloader ##########"
+          for f in "$SDDIR/uboot.img" "$SDDIR/idbloader.img" "$SDDIR/trust.img"; do
+            [ -f "$f" ] && echo "$f: $(stat -c%s "$f") bytes"
+          done
+          echo ""
+          echo "--- uboot.img 里的 kernel/boot 相关字符串 ---"
+          [ -f "$SDDIR/uboot.img" ] && strings -n 6 "$SDDIR/uboot.img" | grep -iE "kernel|boot.img|resource.img|mmcblk|bootargs" | head -30
+          echo ""
+          echo "--- idbloader.img 里的相关字符串 ---"
+          [ -f "$SDDIR/idbloader.img" ] && strings -n 6 "$SDDIR/idbloader.img" | grep -iE "kernel|bootargs|mmc" | head -20
+
+      # ============================================================
+      # ==============  B: flippy 内核包完整分析  ==================
+      # ============================================================
+
+      - name: B0 - Download flippy kernel package
+        id: flippy_ver
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          mkdir -p /tmp/flippy && cd /tmp/flippy
+          mkdir -p /tmp/flippy_pkg
+          cd /tmp/flippy_pkg
           ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
           LATEST=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1)
-          echo "Latest flippy: $LATEST"
-          wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${LATEST}.tar.gz" -O /tmp/flippy/flippy.tar.gz
-          cd /tmp/flippy
-          tar xzf flippy.tar.gz
-          mkdir -p boot dtb
-          tar xzf "$(find /tmp/flippy/$LATEST -name 'boot-*.tar.gz' | head -1)" -C boot
-          tar xzf "$(find /tmp/flippy/$LATEST -name 'dtb-rockchip-*.tar.gz' | head -1)" -C dtb
-          
-          echo "########## STEP 4: flippy vmlinuz ##########"
-          ls -la /tmp/flippy/boot/
+          echo "Latest flippy version: $LATEST"
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+          wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${LATEST}.tar.gz" -O flippy.tar.gz
+          ls -la flippy.tar.gz
+          file flippy.tar.gz
+
+      - name: B1 - flippy package top-level structure
+        run: |
+          set -e
+          cd /tmp/flippy_pkg
+          echo "########## B1: flippy tar.gz 内部结构 ##########"
+          tar tzvf flippy.tar.gz | head -60
           echo ""
-          VMLINUZ=$(find /tmp/flippy/boot -name "vmlinuz-*" | head -1)
+          echo "--- 完整文件列表 ---"
+          tar tzf flippy.tar.gz
+
+      - name: B2 - Extract flippy package
+        run: |
+          set -e
+          cd /tmp/flippy_pkg
+          LATEST="${{ steps.flippy_ver.outputs.version }}"
+          tar xzf flippy.tar.gz
+          echo "########## B2: 解压后目录 ##########"
+          ls -la /tmp/flippy_pkg/
+          echo ""
+          echo "=== $LATEST 目录内容 ==="
+          ls -la "/tmp/flippy_pkg/$LATEST/"
+          echo ""
+          echo "=== 各个子压缩包大小和类型 ==="
+          for f in "/tmp/flippy_pkg/$LATEST"/*; do
+            [ -f "$f" ] && printf "%-50s %10s  %s\n" "$(basename "$f")" "$(stat -c%s "$f")" "$(file -b "$f")"
+          done
+          echo ""
+          echo "=== 各子压缩包内部文件列表 ==="
+          for f in "/tmp/flippy_pkg/$LATEST"/*.tar.gz; do
+            echo "--- $(basename "$f") ---"
+            tar tzf "$f" | head -20
+            echo "  (共 $(tar tzf "$f" | wc -l) 个条目)"
+          done
+
+      - name: B3 - flippy boot files detail
+        run: |
+          set -e
+          LATEST="${{ steps.flippy_ver.outputs.version }}"
+          mkdir -p /tmp/flippy_pkg/boot
+          tar xzf "$(find /tmp/flippy_pkg/$LATEST -name 'boot-*.tar.gz' | head -1)" -C /tmp/flippy_pkg/boot
+          echo "########## B3: flippy boot 目录 ##########"
+          ls -la /tmp/flippy_pkg/boot/
+          echo ""
+          echo "=== 各文件类型 ==="
+          for f in /tmp/flippy_pkg/boot/*; do
+            [ -f "$f" ] && printf "%-45s %10s  %s\n" "$(basename "$f")" "$(stat -c%s "$f")" "$(file -b "$f")"
+          done
+          echo ""
+          VMLINUZ=$(find /tmp/flippy_pkg/boot -name "vmlinuz-*" | head -1)
+          echo "=== vmlinuz 完整 ARM64 header ==="
           echo "Path: $VMLINUZ"
           echo "Size: $(stat -c%s "$VMLINUZ")"
-          echo ""
           echo "--- First 128 bytes ---"
           xxd -l 128 "$VMLINUZ"
           echo ""
-          echo "--- R5S/R5C dtb files ---"
-          ls /tmp/flippy/dtb/ | grep -iE "r5s|r5c" | head -20
-
-      - name: Step 5 - Compare and construct kernel.img preview
-        run: |
-          set -e
-          echo "########## STEP 5: COMPARISON ##########"
-          KIMG=$(find /tmp/existing -name "kernel.img" | head -1)
-          VMLINUZ=$(find /tmp/flippy/boot -name "vmlinuz-*" | head -1)
-          
-          KIMG_SIZE=$(stat -c%s "$KIMG")
-          VMLINUZ_SIZE=$(stat -c%s "$VMLINUZ")
-          
-          echo "=========== FriendlyWrt ==========="
-          echo "kernel.img path:        $KIMG"
-          echo "kernel.img size:        $KIMG_SIZE bytes"
-          echo "kernel.img header:      $(xxd -l 8 -p "$KIMG")"
-          echo ""
-          echo "=========== flippy ==========="
-          echo "vmlinuz path:           $VMLINUZ"
-          echo "vmlinuz size:           $VMLINUZ_SIZE bytes"
-          echo "vmlinuz header:         $(xxd -l 8 -p "$VMLINUZ")"
-          echo ""
-          echo "=========== Kernel partition capacity ==========="
-          PARAM=$(find /tmp/existing -name "parameter.txt" | head -1)
-          KERNEL_SIZE_HEX=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM" | head -1 | cut -d@ -f1)
-          if [ -n "$KERNEL_SIZE_HEX" ]; then
-            KERNEL_SIZE_BYTES=$((KERNEL_SIZE_HEX * 512))
-            echo "kernel partition:       $KERNEL_SIZE_BYTES bytes ($((KERNEL_SIZE_BYTES / 1024 / 1024)) MiB)"
-            echo "vmlinuz + 8 bytes:      $((VMLINUZ_SIZE + 8)) bytes"
-            if [ $((VMLINUZ_SIZE + 8)) -le $KERNEL_SIZE_BYTES ]; then
-              echo ">>> ✓ FITS in kernel partition"
-            else
-              echo ">>> ✗ TOO BIG for kernel partition"
-            fi
-          fi
-          echo ""
-          echo "=========== Constructed kernel.img preview ==========="
-          SIZE_HEX=$(printf '%08x' $VMLINUZ_SIZE)
-          SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-          printf 'KRNL' > /tmp/preview_kernel.img
-          printf "$SIZE_LE" | xxd -r -p >> /tmp/preview_kernel.img
-          cat "$VMLINUZ" >> /tmp/preview_kernel.img
-          echo "Constructed size: $(stat -c%s /tmp/preview_kernel.img) bytes"
-          echo "First 16 bytes:   $(xxd -l 16 -p /tmp/preview_kernel.img)"
-          python3 << 'PYEOF'
-          data = open('/tmp/preview_kernel.img','rb').read(2048)
-          idx = data.find(b'ARM\x64')
-          print(f"ARM64 magic at:   0x{idx:x}")
-          print(f"Expected:         0x40")
-          print('✓ MATCH' if idx == 0x40 else f'✗ MISMATCH')
-          PYEOF
-
-      - name: Step 6 - vmlinuz ARM64 header fields
-        run: |
-          set -e
-          VMLINUZ=$(find /tmp/flippy/boot -name "vmlinuz-*" | head -1)
-          echo "########## STEP 6: vmlinuz ARM64 header ##########"
           python3 << PYEOF
           with open("$VMLINUZ", 'rb') as f:
               data = f.read(512)
           arm64_off = data.find(b'ARM\x64')
           print(f"ARM64 magic at: 0x{arm64_off:x}")
-          base = arm64_off
-          print(f"\nARM64 Image header starts at 0x{base:x}:")
-          for name, off in [("code0", 0), ("code1", 4), ("text_offset", 8), ("image_size", 16), ("flags", 24), ("res2", 32), ("res3", 40), ("res4", 48), ("magic", 56)]:
-              pos = base + off
-              if pos + 8 <= len(data):
-                  if off in (0, 4):
-                      val = int.from_bytes(data[pos:pos+4], 'little')
-                      print(f"  {name:<12} @ +0x{off:02x}: 0x{val:08x}")
-                  else:
-                      val = int.from_bytes(data[pos:pos+8], 'little')
-                      print(f"  {name:<12} @ +0x{off:02x}: 0x{val:016x} ({val})")
+          if arm64_off >= 0:
+              base = arm64_off
+              print(f"\nARM64 Image header (base=0x{base:x}):")
+              for name, off, w in [("code0",0,4),("code1",4,4),("text_offset",8,8),
+                                   ("image_size",16,8),("flags",24,8),("res2",32,8),
+                                   ("res3",40,8),("res4",48,8),("magic",56,8)]:
+                  pos = base + off
+                  if pos + w <= len(data):
+                      val = int.from_bytes(data[pos:pos+w], 'little')
+                      print(f"  {name:<12} @ +0x{off:02x}: 0x{val:0{w*2}x} ({val})")
           PYEOF
+          echo ""
+          echo "=== vmlinuz 版本字符串 ==="
+          strings -n 8 "$VMLINUZ" | grep -iE "Linux version|flippy" | head -5
 
-      - name: Step 7 - Constructed kernel.img ARM64 header
+      - name: B4 - flippy boot config (内核配置)
         run: |
           set -e
-          echo "########## STEP 7: preview kernel.img ARM64 header ##########"
+          LATEST="${{ steps.flippy_ver.outputs.version }}"
+          echo "########## B4: flippy 内核 config ##########"
+          CONFIG=$(find /tmp/flippy_pkg/boot -name "config-*" | head -1)
+          if [ -n "$CONFIG" ]; then
+            echo "Config file: $CONFIG"
+            echo "Size: $(stat -c%s "$CONFIG")"
+            echo ""
+            echo "=== 关键配置项 ==="
+            grep -E "CONFIG_LOCALVERSION|CONFIG_LOCALVERSION_AUTO|CONFIG_DEFAULT_HOSTNAME|CONFIG_ARM64_|CONFIG_ARCH_ROCKCHIP|CONFIG_OVERLAY_FS|CONFIG_EXT4_FS|CONFIG_SQUASHFS|CONFIG_BLK_DEV_INITRD|CONFIG_MODULES=" "$CONFIG" | head -40
+            echo ""
+            echo "=== 文件系统相关 ==="
+            grep -E "CONFIG_(EXT4|SQUASHFS|F2FS|VFAT|NTFS|OVERLAY_FS|NLS)" "$CONFIG" | head -30
+            echo ""
+            echo "=== 存储/USB 相关 ==="
+            grep -E "CONFIG_(MMC_|USB_|SCSI_|SATA_|NVME_)" "$CONFIG" | head -30
+            echo ""
+            echo "=== CONFIG_MODULE_SIG ==="
+            grep -E "CONFIG_MODULE_SIG" "$CONFIG"
+            echo ""
+            echo "=== 总开关数 ==="
+            echo "总 config 项: $(wc -l < "$CONFIG")"
+            echo "=y 的: $(grep -c '=y$' "$CONFIG")"
+            echo "=m 的: $(grep -c '=m$' "$CONFIG")"
+          fi
+
+      - name: B5 - flippy modules detail
+        run: |
+          set -e
+          LATEST="${{ steps.flippy_ver.outputs.version }}"
+          mkdir -p /tmp/flippy_pkg/modules
+          tar xzf "$(find /tmp/flippy_pkg/$LATEST -name 'modules-*.tar.gz' | head -1)" -C /tmp/flippy_pkg/modules
+          echo "########## B5: flippy modules ##########"
+          ls -la /tmp/flippy_pkg/modules/
+          MODNAME=$(ls /tmp/flippy_pkg/modules/ | head -1)
+          echo "模块目录名: $MODNAME"
+          echo "目录大小: $(du -sh /tmp/flippy_pkg/modules/$MODNAME | cut -f1)"
+          echo ""
+          echo "=== 顶层文件 ==="
+          ls -la "/tmp/flippy_pkg/modules/$MODNAME/" | head -30
+          echo ""
+          echo "=== .ko 总数 ==="
+          find "/tmp/flippy_pkg/modules/$MODNAME" -name "*.ko" | wc -l
+          echo ""
+          echo "=== .ko.gz / .ko.xz / .ko.zst 数量 ==="
+          find "/tmp/flippy_pkg/modules/$MODNAME" -name "*.ko.gz" | wc -l
+          find "/tmp/flippy_pkg/modules/$MODNAME" -name "*.ko.xz" | wc -l
+          find "/tmp/flippy_pkg/modules/$MODNAME" -name "*.ko.zst" | wc -l
+          echo ""
+          echo "=== modules.dep 里的版本字符串 ==="
+          strings -n 6 "/tmp/flippy_pkg/modules/$MODNAME/modules.dep" 2>/dev/null | head -3
+          grep -oE "6\.[0-9]+\.[0-9]+[a-z0-9.+-]*" "/tmp/flippy_pkg/modules/$MODNAME/modules.dep" 2>/dev/null | sort -u | head
+          echo ""
+          echo "=== 关键模块存在性（这些如果缺会导致启动问题） ==="
+          for mod in ext4 overlay squashfs nls_cp437 nls_iso8859-1 usb-storage mmc_block dw_mmc_rockchip phy_rockchip_inno_usb2 rockchip_saradc; do
+            FOUND=$(find "/tmp/flippy_pkg/modules/$MODNAME" -name "${mod}.ko*" 2>/dev/null | head -1)
+            [ -n "$FOUND" ] && echo "  ✓ $mod" || echo "  ✗ $mod"
+          done
+          echo ""
+          echo "=== 模块目录结构（前3层） ==="
+          find "/tmp/flippy_pkg/modules/$MODNAME" -maxdepth 3 -type d | head -30
+          echo ""
+          echo "=== modules.dep 大小 ==="
+          ls -la "/tmp/flippy_pkg/modules/$MODNAME/modules.dep"* 2>/dev/null
+
+      - name: B6 - flippy dtb detail
+        run: |
+          set -e
+          LATEST="${{ steps.flippy_ver.outputs.version }}"
+          mkdir -p /tmp/flippy_pkg/dtb
+          tar xzf "$(find /tmp/flippy_pkg/$LATEST -name 'dtb-rockchip-*.tar.gz' | head -1)" -C /tmp/flippy_pkg/dtb
+          echo "########## B6: flippy dtb ##########"
+          echo "=== dtb 目录结构 ==="
+          find /tmp/flippy_pkg/dtb -maxdepth 2 -type d
+          echo ""
+          echo "=== dtb 总数 ==="
+          find /tmp/flippy_pkg/dtb -name "*.dtb" | wc -l
+          echo ""
+          echo "=== R5S/R5C/rk3568 相关 dtb ==="
+          find /tmp/flippy_pkg/dtb -name "*r5s*" -o -name "*r5c*" -o -name "*rk3568*" | head -30
+          echo ""
+          echo "=== 完整 dtb 列表（前 50） ==="
+          find /tmp/flippy_pkg/dtb -name "*.dtb" | head -50
+          echo ""
+          echo "=== R5S dtb compatible 信息 ==="
+          for f in $(find /tmp/flippy_pkg/dtb -name "*r5s*.dtb" | head -3); do
+            echo "--- $f ---"
+            fdtdump "$f" 2>/dev/null | grep -E "compatible|model" | head -5 || true
+          done
+
+      - name: B7 - flippy uInitrd and System.map
+        run: |
+          set -e
+          echo "########## B7: flippy uInitrd / System.map ##########"
+          UINITRD=$(find /tmp/flippy_pkg/boot -name "uInitrd-*" | head -1)
+          if [ -n "$UINITRD" ]; then
+            echo "uInitrd: $UINITRD"
+            echo "Size: $(stat -c%s "$UINITRD")"
+            xxd -l 32 "$UINITRD"
+            file "$UINITRD"
+          fi
+          echo ""
+          SYSMAP=$(find /tmp/flippy_pkg/boot -name "System.map-*" | head -1)
+          if [ -n "$SYSMAP" ]; then
+            echo "System.map: $SYSMAP"
+            echo "Size: $(stat -c%s "$SYSMAP")"
+            echo "--- 前 5 行 ---"
+            head -5 "$SYSMAP"
+          fi
+          echo ""
+          INITRD=$(find /tmp/flippy_pkg/boot -name "initrd.img-*" | head -1)
+          if [ -n "$INITRD" ]; then
+            echo "initrd.img: $INITRD"
+            echo "Size: $(stat -c%s "$INITRD")"
+          fi
+
+      # ============================================================
+      # ==============  C: 对比和可行性分析  ======================
+      # ============================================================
+
+      - name: C1 - FriendlyWrt vs flippy kernel 对比
+        run: |
+          set -e
+          echo "########## C1: Kernel 对比 ##########"
+          KIMG=$(find /tmp/existing -name "kernel.img" | head -1)
+          VMLINUZ=$(find /tmp/flippy_pkg/boot -name "vmlinuz-*" | head -1)
+          PARAM=$(find /tmp/existing -name "parameter.txt" | head -1)
+
+          KIMG_SIZE=$(stat -c%s "$KIMG")
+          VMLINUZ_SIZE=$(stat -c%s "$VMLINUZ")
+
+          echo "=========== FriendlyWrt ==========="
+          echo "kernel.img size:      $KIMG_SIZE bytes"
+          echo "kernel.img header:    $(xxd -l 8 -p "$KIMG")"
+          echo ""
+          echo "=========== flippy ==========="
+          echo "vmlinuz size:         $VMLINUZ_SIZE bytes"
+          echo "vmlinuz header:       $(xxd -l 8 -p "$VMLINUZ")"
+          echo "构造后 kernel.img:    $((VMLINUZ_SIZE + 8)) bytes"
+          echo ""
+          echo "=========== 分区容量 ==========="
+          KERNEL_SIZE_HEX=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM" | head -1 | cut -d@ -f1)
+          if [ -n "$KERNEL_SIZE_HEX" ]; then
+            KERNEL_SIZE_BYTES=$((KERNEL_SIZE_HEX * 512))
+            echo "kernel 分区:          $KERNEL_SIZE_BYTES bytes ($((KERNEL_SIZE_BYTES / 1024 / 1024)) MiB)"
+            echo "当前 kernel.img:      $KIMG_SIZE bytes"
+            echo "flippy vmlinuz + 8:   $((VMLINUZ_SIZE + 8)) bytes"
+            echo ""
+            if [ $((VMLINUZ_SIZE + 8)) -le $KERNEL_SIZE_BYTES ]; then
+              echo ">>> ✓ flippy 装得下当前分区"
+            else
+              NEED=$(echo "scale=2; ($VMLINUZ_SIZE + 8) / 1024 / 1024" | bc)
+              echo ">>> ✗ flippy 太大，需要 ≥ ${NEED} MiB"
+              echo "    当前 0x$KERNEL_SIZE_HEX = $((KERNEL_SIZE_BYTES / 1024 / 1024)) MiB"
+              echo "    建议改为 0x18000 = 48 MiB 或更大"
+            fi
+          fi
+
+      - name: C2 - KRNL 一致性检查
+        run: |
           python3 << 'PYEOF'
-          data = open('/tmp/preview_kernel.img','rb').read(512)
-          arm64_off = data.find(b'ARM\x64')
-          print(f"ARM64 magic at: 0x{arm64_off:x}")
-          base = arm64_off
-          print(f"\nARM64 Image header:")
-          for name, off in [("code0", 0), ("code1", 4), ("text_offset", 8), ("image_size", 16), ("flags", 24), ("magic", 56)]:
-              pos = base + off
-              if pos + 8 <= len(data):
-                  if off in (0, 4):
-                      val = int.from_bytes(data[pos:pos+4], 'little')
-                      print(f"  {name:<12} @ +0x{off:02x}: 0x{val:08x}")
-                  else:
-                      val = int.from_bytes(data[pos:pos+8], 'little')
-                      print(f"  {name:<12} @ +0x{off:02x}: 0x{val:016x} ({val})")
+          import glob, os
+          k = glob.glob("/tmp/existing/**/kernel.img", recursive=True)
+          if k:
+              with open(k[0], 'rb') as f:
+                  data = f.read(32)
+              sz = int.from_bytes(data[4:8], 'little')
+              actual = os.path.getsize(k[0])
+              print(f"kernel.img KRNL 声明 payload: {sz}")
+              print(f"kernel.img 实际大小:          {actual}")
+              print(f"实际 - 8:                     {actual - 8}")
+              if sz == actual - 8:
+                  print("✓ 声明和实际一致")
+              else:
+                  print(f"✗ 不一致！差 {actual - 8 - sz} 字节（可能是截断或填充）")
           PYEOF
 
-      - name: Step 8 - Summary
+      - name: C3 - 构造预览 kernel.img
+        run: |
+          set -e
+          VMLINUZ=$(find /tmp/flippy_pkg/boot -name "vmlinuz-*" | head -1)
+          VMLINUZ_SIZE=$(stat -c%s "$VMLINUZ")
+          echo "########## C3: 预览构造 kernel.img ##########"
+          SIZE_HEX=$(printf '%08x' $VMLINUZ_SIZE)
+          SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
+          printf 'KRNL' > /tmp/preview_kernel.img
+          printf "$SIZE_LE" | xxd -r -p >> /tmp/preview_kernel.img
+          cat "$VMLINUZ" >> /tmp/preview_kernel.img
+          echo "构造后大小: $(stat -c%s /tmp/preview_kernel.img) bytes"
+          echo "前 16 字节: $(xxd -l 16 -p /tmp/preview_kernel.img)"
+          echo ""
+          python3 << 'PYEOF'
+          data = open('/tmp/preview_kernel.img','rb').read(2048)
+          idx = data.find(b'ARM\x64')
+          print(f"ARM64 magic at: 0x{idx:x} (期望 0x40)")
+          print('✓ MATCH' if idx == 0x40 else '✗ MISMATCH')
+          if idx == 0x40:
+              base = idx
+              print("\nARM64 Image header:")
+              for name, off, w in [("code0",0,4),("code1",4,4),("text_offset",8,8),
+                                   ("image_size",16,8),("flags",24,8),("magic",56,8)]:
+                  pos = base + off
+                  val = int.from_bytes(data[pos:pos+w], 'little')
+                  print(f"  {name:<12} @ +0x{off:02x}: 0x{val:0{w*2}x} ({val})")
+          PYEOF
+          echo ""
+          echo "--- 确认 flippy 字符串在里面 ---"
+          strings -n 8 /tmp/preview_kernel.img | grep -iE "flippy|Linux version" | head -5
+
+      - name: C4 - 模块版本对比
+        run: |
+          echo "########## C4: 模块版本对比 ##########"
+          echo "=========== FriendlyWrt rootfs ==========="
+          RIMG=$(find /tmp/existing -name "rootfs.img" | head -1)
+          sudo mkdir -p /tmp/rfs
+          if sudo mount -o loop,ro "$RIMG" /tmp/rfs; then
+            sudo ls /tmp/rfs/lib/modules/ 2>/dev/null || echo "  (空)"
+            sudo umount /tmp/rfs
+          fi
+          echo ""
+          echo "=========== flippy modules ==========="
+          ls /tmp/flippy_pkg/modules/
+          echo ""
+          echo "=========== 对比关键模块 ==========="
+          FL_MOD=$(ls /tmp/flippy_pkg/modules/ | head -1)
+          echo "flippy 模块数: $(find /tmp/flippy_pkg/modules/$FL_MOD -name '*.ko*' | wc -l)"
+
+      - name: C5 - Summary
         run: |
           echo ""
           echo "==================================================================="
           echo "                       DIAGNOSTIC COMPLETE"
           echo "==================================================================="
           echo ""
-          KIMG=$(find /tmp/existing -name "kernel.img" | head -1)
-          VMLINUZ=$(find /tmp/flippy/boot -name "vmlinuz-*" | head -1)
-          echo "FriendlyWrt kernel.img: $(stat -c%s "$KIMG") bytes"
-          echo "flippy vmlinuz:         $(stat -c%s "$VMLINUZ") bytes"
+          echo "=== flippy 包信息 ==="
+          echo "版本:           ${{ steps.flippy_ver.outputs.version }}"
+          echo "boot 目录大小:  $(du -sh /tmp/flippy_pkg/boot 2>/dev/null | cut -f1)"
+          echo "modules 大小:   $(du -sh /tmp/flippy_pkg/modules 2>/dev/null | cut -f1)"
+          echo "dtb 大小:       $(du -sh /tmp/flippy_pkg/dtb 2>/dev/null | cut -f1)"
           echo ""
-          echo "Constructed kernel.img preview: $(stat -c%s /tmp/preview_kernel.img) bytes"
+          echo "=== FriendlyWrt 信息 ==="
+          SDDIR=$(dirname "$(find /tmp/existing -name parameter.txt | head -1)")
+          echo "kernel.img:     $(stat -c%s "$SDDIR/kernel.img" 2>/dev/null) bytes"
+          echo "rootfs.img:     $(stat -c%s "$SDDIR/rootfs.img" 2>/dev/null) bytes"
           echo ""
-          echo "Please provide the full log output to determine the exact strategy."
+          echo "请把每个 STEP 的完整输出发回。重点看："
+          echo "  A2  kernel.img KRNL 声明 vs 实际"
+          echo "  A5  FriendlyWrt rootfs 里的模块版本"
+          echo "  A6  uboot 里的 kernel/boot 加载线索"
+          echo "  B3  flippy vmlinuz 的 ARM64 header"
+          echo "  B4  flippy 内核 config 关键项"
+          echo "  B5  flippy modules 里有哪些关键模块"
+          echo "  B6  flippy dtb 里有没有 R5S/R5C"
+          echo "  C1  flippy 能不能装进分区"
+          echo "  C3  构造出来的 kernel.img 里有没有 flippy 字符串"
