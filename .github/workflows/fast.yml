@@ -1,4 +1,4 @@
-name: Quick Verify Flippy Kernel
+name: Quick Verify Kernel Replacement
 
 on:
   workflow_dispatch:
@@ -35,6 +35,14 @@ on:
         options:
           - 'true'
           - 'false'
+      kernel_release:
+        description: 'Kernel source'
+        required: true
+        default: 'kernel_rk35xx'
+        type: choice
+        options:
+          - kernel_rk35xx
+          - kernel_flippy
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
@@ -59,14 +67,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
+          BASE_TAG="FriendlyWrt-${KERNEL_RELEASE_SHORT:-rk35xx}-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
           fi
 
           if [ "$FORCE_BASE" = "true" ]; then
-            # 只删本次触发相关的前缀（避免误删同日期的正式构建）
             EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
               | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
             for tag in $EXISTING_TAGS; do
@@ -88,12 +95,14 @@ jobs:
                   [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
                 fi
               done
-              NEXT=$((MAX_NUM + 1))
-              TAG="${BASE_TAG}-${NEXT}"
+              TAG="${BASE_TAG}-$((MAX_NUM+1))"
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Generated release tag: $TAG"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KERNEL_RELEASE_SHORT: ${{ inputs.kernel_release == 'kernel_rk35xx' && 'rk35xx' || 'flippy' }}
 
       - name: Create or update release
         uses: softprops/action-gh-release@v1
@@ -123,7 +132,7 @@ jobs:
         sudo apt-get install -qq --no-install-recommends \
           wget git rsync time file unzip bc bzip2 xxd \
           python3 dosfstools e2fsprogs parted \
-          android-sdk-libsparse-utils
+          android-sdk-libsparse-utils u-boot-tools
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git clone https://github.com/friendlyarm/repo /tmp/repo
@@ -131,7 +140,7 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/artifact
         chmod +x scripts/*.sh
         echo "=== 工具检查 ==="
-        which xxd simg2img img2simg mkfs.ext4
+        which xxd simg2img img2simg mkfs.ext4 mkimage
         echo "cores: $(nproc)"
 
     - name: Fetch sd-fuse scripts
@@ -141,7 +150,6 @@ jobs:
           -b master-v${{ inputs.version }} -m rk3568.xml \
           --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
         repo sync -c scripts/sd-fuse --no-clone-bundle
-        echo "=== sd-fuse 目录 ==="
         ls -la /tmp/scripts/sd-fuse/
 
     - name: Find and download images tgz
@@ -152,7 +160,6 @@ jobs:
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
-        echo "查找: $PATTERN"
 
         TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
         FOUND=""
@@ -175,11 +182,17 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         TARGET_MODEL: ${{ inputs.model }}
         SLIM_MODE: ${{ inputs.slim }}
+        KERNEL_RELEASE: ${{ inputs.kernel_release }}
       run: |
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
-        IMG_NAME="R5S-R5C-Series-FriendlyWrt-flippy-${{ inputs.version }}${SUFFIX}.img"
+        if [ "${{ inputs.kernel_release }}" == "kernel_rk35xx" ]; then
+          KERNEL_SHORT="rk35xx"
+        else
+          KERNEL_SHORT="flippy"
+        fi
+        IMG_NAME="R5S-R5C-Series-FriendlyWrt-${KERNEL_SHORT}-${{ inputs.version }}${SUFFIX}.img"
 
         bash $GITHUB_WORKSPACE/scripts/replace-kernel.sh \
           "${{ steps.images.outputs.images_tgz }}" \
@@ -192,10 +205,8 @@ jobs:
     - name: Compress image
       run: |
         cd $GITHUB_WORKSPACE/artifact
-        echo "=== 压缩前 ==="
         ls -la
         gzip -f *.img
-        echo "=== 压缩后 ==="
         ls -la
 
     - name: Upload img.gz to release
@@ -210,6 +221,6 @@ jobs:
     - name: Upload img.gz as workflow artifact (backup)
       uses: actions/upload-artifact@v4
       with:
-        name: flippy-img-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
+        name: img-${{ inputs.kernel_release }}-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
         path: ${{ github.workspace }}/artifact/*.img.gz
         retention-days: 7
