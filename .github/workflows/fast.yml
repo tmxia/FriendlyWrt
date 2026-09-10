@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Rootfs version'
+        description: 'Version'
         required: true
         default: '24.10'
         type: choice
@@ -19,6 +19,22 @@ on:
         options:
           - docker
           - non-docker
+      model:
+        description: 'Target model'
+        required: true
+        default: 'r5s'
+        type: choice
+        options:
+          - r5s
+          - r5c
+      slim:
+        description: 'Slim mode (精简 dtb/modules)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   quick_verify:
@@ -28,7 +44,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Initialization
+    - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
@@ -43,7 +59,10 @@ jobs:
         git clone https://github.com/friendlyarm/repo /tmp/repo
         sudo -E cp /tmp/repo/repo /usr/bin/
         mkdir -p $GITHUB_WORKSPACE/artifact
-        chmod +x scripts/flippy-kernel.sh scripts/quick-build.sh
+        chmod +x scripts/*.sh
+        echo "=== 工具检查 ==="
+        which xxd simg2img img2simg mkfs.ext4
+        echo "cores: $(nproc)"
 
     - name: Fetch sd-fuse scripts
       run: |
@@ -54,18 +73,20 @@ jobs:
         repo sync -c scripts/sd-fuse --no-clone-bundle
         echo "=== sd-fuse 目录 ==="
         ls -la /tmp/scripts/sd-fuse/
+        echo "=== mk-sd-image.sh 检查 ==="
+        head -5 /tmp/scripts/sd-fuse/mk-sd-image.sh
 
-    - name: Find and download rootfs tgz
-      id: rootfs
+    - name: Find and download images tgz
+      id: images
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-        PATTERN="rootfs-friendlywrt-${{ inputs.version }}${SUFFIX}.tgz"
+        PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
         echo "查找: $PATTERN"
 
-        TAGS=$(gh release list --limit 30 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
+        TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
         FOUND=""
         for TAG in $TAGS; do
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qF "$PATTERN"; then
@@ -79,35 +100,39 @@ jobs:
         cd /tmp/inputs
         gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
         ls -la
+        echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
-        echo "rootfs_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
-
-    - name: Run quick-build
+    - name: Replace kernel and build image
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TARGET_MODEL: ${{ inputs.model }}
+        SLIM_MODE: ${{ inputs.slim }}
       run: |
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
         IMG_NAME="R5S-R5C-Series-FriendlyWrt-flippy-${{ inputs.version }}${SUFFIX}.img"
 
-        bash $GITHUB_WORKSPACE/scripts/quick-build.sh \
-          "${{ steps.rootfs.outputs.rootfs_tgz }}" \
+        bash $GITHUB_WORKSPACE/scripts/replace-kernel.sh \
+          "${{ steps.images.outputs.images_tgz }}" \
           "/tmp/scripts/sd-fuse" \
           "$DIST_NAME" \
           "$GITHUB_WORKSPACE/artifact/$IMG_NAME"
 
         echo "img_name=$IMG_NAME" >> $GITHUB_ENV
 
-    - name: Compress and list
+    - name: Compress image
       run: |
         cd $GITHUB_WORKSPACE/artifact
+        echo "=== 压缩前 ==="
+        ls -la
         gzip -f *.img
+        echo "=== 压缩后 ==="
         ls -la
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: flippy-img-${{ inputs.version }}-${{ inputs.set }}
-        path: |
-          ${{ github.workspace }}/artifact/*.img.gz
+        name: flippy-img-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
+        path: ${{ github.workspace }}/artifact/*.img.gz
+        retention-days: 7
