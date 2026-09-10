@@ -15,8 +15,13 @@
 #   FLIPPY_TAG         release tag (默认 kernel_flippy)
 #   FLIPPY_FORCE=1     强制重新应用
 #   ROOTFS_TARGET_MB   rootfs 目标大小 MB (默认 2048)
+#   FLIPPY_DEBUG=1     打开 set -x 调试
 
 set -euo pipefail
+
+if [ "${FLIPPY_DEBUG:-0}" = "1" ]; then
+    set -x
+fi
 
 FLIPPY_REPO="${FLIPPY_REPO:-ophub/kernel}"
 FLIPPY_TAG="${FLIPPY_TAG:-kernel_flippy}"
@@ -24,8 +29,7 @@ FLIPPY_CACHE_DIR="${FLIPPY_CACHE_DIR:-/tmp/flippy-cache}"
 FLIPPY_FORCE="${FLIPPY_FORCE:-0}"
 ROOTFS_TARGET_MB="${ROOTFS_TARGET_MB:-2048}"
 
-# parameter.txt 分区布局常量
-# 原始: kernel 40 MiB + rootfs 1 GiB
+# 原始布局: kernel 40 MiB + rootfs 1 GiB
 KERNEL_PART_OLD='0x00014000@0x00012000(kernel),0x00010000@0x00026000(boot),0x00010000@0x00036000(recovery),0x00200000@0x00046000(rootfs),0x00200000@0x00246000(userdata:grow),-@0x00446000(opt:grow)'
 # 中间态: kernel 48 MiB + rootfs 1 GiB
 PART_KERNEL_ONLY='0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00200000@0x0004a000(rootfs),0x00200000@0x0024a000(userdata:grow),-@0x0044a000(opt:grow)'
@@ -51,12 +55,14 @@ Env:
   FLIPPY_TAG         release tag (默认 kernel_flippy)
   FLIPPY_FORCE=1     强制重新应用
   ROOTFS_TARGET_MB   rootfs 目标大小 MB (默认 2048)
+  FLIPPY_DEBUG=1     打开 set -x 调试
 EOF
     exit 0
 }
 
 check_tools() {
     local missing=()
+    local t
     for t in wget tar xxd python3 simg2img img2simg file e2fsck resize2fs; do
         if ! command -v "$t" >/dev/null 2>&1; then
             missing+=("$t")
@@ -66,6 +72,7 @@ check_tools() {
         err "缺少工具: ${missing[*]}
   安装: sudo apt-get install -y wget tar xxd python3 file android-sdk-libsparse-utils e2fsprogs"
     fi
+    return 0
 }
 
 get_latest_version() {
@@ -81,6 +88,7 @@ for a in d.get('assets',[]):
     print(a['name'])" 2>/dev/null || true)
     fi
     echo "$assets" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1
+    return 0
 }
 
 # fetch [version] -> 打印解压后的缓存目录路径
@@ -106,8 +114,9 @@ fetch_flippy() {
     log "下载 flippy $version ..." >&2
     local tarball="$FLIPPY_CACHE_DIR/$version.tar.gz"
     if [ ! -f "$tarball" ]; then
-        wget -q "https://github.com/$FLIPPY_REPO/releases/download/$FLIPPY_TAG/${version}.tar.gz" -O "$tarball" \
-            || err "下载 flippy 失败: $version"
+        if ! wget -q "https://github.com/$FLIPPY_REPO/releases/download/$FLIPPY_TAG/${version}.tar.gz" -O "$tarball"; then
+            err "下载 flippy 失败: $version"
+        fi
     fi
 
     log "解压 flippy 包 ..." >&2
@@ -128,9 +137,9 @@ fetch_flippy() {
 
     touch "$ver_dir/.ready"
     echo "$ver_dir"
+    return 0
 }
 
-# 用 grep -a 搜全文件，避免 dd bs=1 慢且漏
 kernel_already_flippy() {
     local kimg="$1"
     if [ ! -f "$kimg" ]; then
@@ -152,8 +161,12 @@ m = re.search(r'(0x[0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(rootfs\)', content)
 if m:
     print(int(m.group(1), 16) * 512 // (1024 * 1024))
 PYEOF
+    return 0
 }
 
+# ============================================================
+# verify_sd_fuse: 验证 sd-fuse 目录
+# ============================================================
 verify_sd_fuse() {
     local sd_fuse_dir="$1"
     local kimg="$sd_fuse_dir/kernel.img"
@@ -170,6 +183,7 @@ verify_sd_fuse() {
     if ! kernel_already_flippy "$kimg"; then
         err "kernel.img 里没有 flippy 字符串"
     fi
+
     local magic_off
     magic_off=$(python3 -c "
 data = open('$kimg','rb').read(256)
@@ -180,15 +194,19 @@ print(data.find(b'ARM\x64'))
     fi
     log "  ✓ kernel.img 含 flippy + ARM64 magic at 0x40"
 
-    # rootfs.img 里的模块
     local raw="/tmp/verify_sd.$$.raw.img"
     local mnt="/tmp/verify_sd_mnt.$$"
-    simg2img "$rimg" "$raw" || err "rootfs.img simg2img 失败"
+    if ! simg2img "$rimg" "$raw"; then
+        err "rootfs.img simg2img 失败"
+    fi
     sudo mkdir -p "$mnt"
-    sudo mount -o loop,ro "$raw" "$mnt"
+    if ! sudo mount -o loop,ro "$raw" "$mnt"; then
+        rm -f "$raw"
+        err "挂载 rootfs.img 失败"
+    fi
     local mods
     mods=$(sudo ls "$mnt/lib/modules/" 2>/dev/null || true)
-    sudo umount "$mnt"
+    sudo umount "$mnt" 2>/dev/null || true
     sudo rmdir "$mnt" 2>/dev/null || true
     rm -f "$raw"
 
@@ -197,15 +215,19 @@ print(data.find(b'ARM\x64'))
     fi
     log "  ✓ rootfs.img 含 flippy modules: $mods"
 
-    # rootfs 分区大小（改成 if，避免函数返回非零）
     local part_mb
     part_mb=$(rootfs_partition_size_mb "$param")
     log "  rootfs 分区大小: ${part_mb} MB"
     if [ "$part_mb" -lt 2048 ]; then
         warn "  rootfs 分区 < 2048 MB"
     fi
+
+    return 0
 }
 
+# ============================================================
+# apply_flippy: 主流程
+# ============================================================
 apply_flippy() {
     local sd_fuse_dir="${1:-}"
     local version="${2:-}"
@@ -286,7 +308,6 @@ assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
         rm -f "$new_kernel"
         log "kernel.img -> $(stat -c%s "$kimg") bytes"
 
-        # 立即验证
         if ! kernel_already_flippy "$kimg"; then
             err "kernel.img 替换后立即验证失败：找不到 flippy 字符串"
         fi
@@ -301,7 +322,9 @@ assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
     local target_bytes=$((ROOTFS_TARGET_MB * 1024 * 1024))
 
     rm -f "$raw"
-    simg2img "$rimg" "$raw" || err "simg2img 失败"
+    if ! simg2img "$rimg" "$raw"; then
+        err "simg2img 失败"
+    fi
     local raw_size
     raw_size=$(stat -c%s "$raw")
     log "  raw ext4 原始大小: $raw_size bytes"
@@ -316,18 +339,18 @@ assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
         log "  rootfs 已是 flippy 模块 ($existing) 且容量已扩，跳过"
         rm -f "$raw"
     else
-        # 3a. 扩容 raw ext4
         if [ "$raw_size" -lt "$target_bytes" ]; then
             log "  扩容 raw ext4: $raw_size -> $target_bytes bytes"
             truncate -s "$target_bytes" "$raw"
             log "  e2fsck 检查 ..."
             sudo e2fsck -f -y "$raw" >/dev/null 2>&1 || warn "  e2fsck 有警告（正常）"
             log "  resize2fs ..."
-            sudo resize2fs "$raw" >/dev/null 2>&1 || err "resize2fs 失败"
+            if ! sudo resize2fs "$raw" >/dev/null 2>&1; then
+                err "resize2fs 失败"
+            fi
             log "  扩容后: $(stat -c%s "$raw") bytes"
         fi
 
-        # 3b. 挂载替换
         log "  rootfs 当前模块: ${existing:-<empty>}，替换中..."
         sudo mount -o loop "$raw" "$mnt"
         sudo rm -rf "$mnt/lib/modules/"*
@@ -342,7 +365,6 @@ assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
         fi
         log "  新模块: $newmods"
 
-        # 清理缓存腾空间
         sudo rm -rf "$mnt/var/cache/opkg/"* 2>/dev/null || true
         sudo rm -rf "$mnt/tmp/"* 2>/dev/null || true
 
@@ -352,8 +374,10 @@ assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
 
         sudo umount "$mnt"
 
-        # 3c. raw -> sparse
-        img2simg "$raw" "$rimg" || err "img2simg 失败"
+        if ! img2simg "$raw" "$rimg"; then
+            rm -f "$raw"
+            err "img2simg 失败"
+        fi
         log "  rootfs.img -> $(stat -c%s "$rimg") bytes (sparse)"
         rm -f "$raw"
     fi
@@ -361,8 +385,12 @@ assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
 
     verify_sd_fuse "$sd_fuse_dir"
     log "✓ apply 完成"
+    return 0
 }
 
+# ============================================================
+# verify_raw: 验证 raw 镜像
+# ============================================================
 verify_raw() {
     local raw="${1:-}"
     if [ -z "$raw" ]; then
@@ -373,7 +401,6 @@ verify_raw() {
     fi
     log "验证 raw 镜像: $raw ($(stat -c%s "$raw") bytes)"
 
-    # kernel 分区
     local kernel_offset=$((0x12000 * 512))
     local magic_pos
     magic_pos=$(python3 -c "
@@ -387,13 +414,11 @@ print(data.find(b'ARM\x64'))
     fi
     log "  ✓ kernel 分区 ARM64 magic at 0x40"
 
-    # 提取 kernel 分区（跳过 8 字节 KRNL 头，读 48 MiB）
     if ! tail -c +$((kernel_offset + 9)) "$raw" | head -c $((48*1024*1024)) | grep -a -q "flippy"; then
         err "kernel 分区里没有 flippy 字符串"
     fi
     log "  ✓ kernel 分区含 flippy"
 
-    # rootfs 分区（新布局：offset 0x4a000, size 0x400000 = 2 GiB）
     local rootfs_offset_sh=$((0x4a000))
     local rootfs_size_sh=$((0x400000))
     local sparse="/tmp/verify_sparse.$$"
@@ -404,7 +429,10 @@ print(data.find(b'ARM\x64'))
     local magic
     magic=$(xxd -l 4 -p "$sparse")
     if [ "$magic" = "3aff26ed" ]; then
-        simg2img "$sparse" "$vraw" || { rm -f "$sparse"; err "rootfs 分区 simg2img 失败"; }
+        if ! simg2img "$sparse" "$vraw"; then
+            rm -f "$sparse"
+            err "rootfs 分区 simg2img 失败"
+        fi
     else
         mv "$sparse" "$vraw"
     fi
@@ -418,7 +446,10 @@ print(data.find(b'ARM\x64'))
     fi
 
     sudo mkdir -p "$mnt"
-    sudo mount -o loop,ro "$vraw" "$mnt" || { rm -f "$vraw"; err "挂载 rootfs 失败"; }
+    if ! sudo mount -o loop,ro "$vraw" "$mnt"; then
+        rm -f "$vraw"
+        err "挂载 rootfs 失败"
+    fi
     local mods
     mods=$(sudo ls "$mnt/lib/modules/" 2>/dev/null || true)
     local df_out
@@ -434,8 +465,12 @@ print(data.find(b'ARM\x64'))
     log "  rootfs 使用: $df_out"
 
     log "✓ 验证通过"
+    return 0
 }
 
+# ============================================================
+# 主入口
+# ============================================================
 cmd="${1:-}"
 case "$cmd" in
     apply)   shift; apply_flippy "$@" ;;
