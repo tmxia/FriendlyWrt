@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version'
+        description: 'OpenWrt version'
         required: true
         default: '24.10'
         type: choice
@@ -35,14 +35,14 @@ on:
         options:
           - 'true'
           - 'false'
-      kernel_release:
-        description: 'Kernel source'
+      kernel_version:
+        description: 'Kernel version'
         required: true
-        default: 'kernel_rk35xx'
+        default: '6.18.y'
         type: choice
         options:
-          - kernel_rk35xx
-          - kernel_flippy
+          - '6.18.y'
+          - '6.12.y'
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
@@ -54,6 +54,8 @@ on:
 
 env:
   AUTO_REPLACE_TAG: 'false'
+  KERNEL_REPO: 'breakingbadboy/OpenWrt'
+  KERNEL_RELEASE: 'kernel_stable'
 
 jobs:
   prepare_release:
@@ -62,22 +64,13 @@ jobs:
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
     steps:
-      - name: Compute kernel short name
-        id: kernel_short
-        run: |
-          if [ "${{ inputs.kernel_release }}" == "kernel_rk35xx" ]; then
-            echo "short=rk35xx" >> $GITHUB_OUTPUT
-          else
-            echo "short=flippy" >> $GITHUB_OUTPUT
-          fi
-
       - name: Generate unique release tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KERNEL_SHORT: ${{ steps.kernel_short.outputs.short }}
         run: |
-          BASE_TAG="FriendlyWrt-${KERNEL_SHORT}-$(date +%Y-%m-%d)"
+          KERNEL_SHORT="${{ inputs.kernel_version }}"
+          BASE_TAG="FriendlyWrt-bbb-${KERNEL_SHORT}-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -190,18 +183,16 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         TARGET_MODEL: ${{ inputs.model }}
         SLIM_MODE: ${{ inputs.slim }}
-        KERNEL_RELEASE: ${{ inputs.kernel_release }}
+        KERNEL_REPO: ${{ env.KERNEL_REPO }}
+        KERNEL_RELEASE: ${{ env.KERNEL_RELEASE }}
+        KERNEL_VERSION: ${{ inputs.kernel_version }}
       run: |
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
 
-        if [ "${{ inputs.kernel_release }}" == "kernel_rk35xx" ]; then
-          KERNEL_SHORT="rk35xx"
-        else
-          KERNEL_SHORT="flippy"
-        fi
-        IMG_NAME="R5S-R5C-Series-FriendlyWrt-${KERNEL_SHORT}-${{ inputs.version }}${SUFFIX}.img"
+        KERNEL_SHORT="${{ inputs.kernel_version }}"
+        IMG_NAME="R5S-R5C-Series-FriendlyWrt-bbb-${KERNEL_SHORT}-${{ inputs.version }}${SUFFIX}.img"
 
         bash $GITHUB_WORKSPACE/scripts/replace-kernel.sh \
           "${{ steps.images.outputs.images_tgz }}" \
@@ -232,6 +223,6 @@ jobs:
     - name: Upload img.gz as workflow artifact (backup)
       uses: actions/upload-artifact@v4
       with:
-        name: img-${{ inputs.kernel_release }}-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
+        name: img-bbb-${{ inputs.kernel_version }}-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
         path: ${{ github.workspace }}/artifact/*.img.gz
         retention-days: 7
