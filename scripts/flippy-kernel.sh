@@ -87,11 +87,13 @@ d=json.load(sys.stdin)
 for a in d.get('assets',[]):
     print(a['name'])" 2>/dev/null || true)
     fi
-    echo "$assets" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1
+    # 避免 pipefail 因为 grep 无匹配返回 1 而中断
+    local version
+    version=$(echo "$assets" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1 || true)
+    echo "$version"
     return 0
 }
 
-# fetch [version] -> 打印解压后的缓存目录路径
 fetch_flippy() {
     local version="${1:-}"
     check_tools
@@ -165,7 +167,42 @@ PYEOF
 }
 
 # ============================================================
-# verify_sd_fuse: 验证 sd-fuse 目录
+# 通用：从文件里 grep 一个字符串，不用管道
+# 返回 0 = 找到，1 = 没找到
+# ============================================================
+file_contains() {
+    local file="$1"
+    local pattern="$2"
+    if [ ! -f "$file" ]; then
+        return 1
+    fi
+    if grep -a -q "$pattern" "$file" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# ============================================================
+# 通用：从 raw 镜像的某个偏移抽一段出来到临时文件
+# raw_extract <raw> <offset_sectors> <size_sectors> <out_file>
+# ============================================================
+raw_extract() {
+    local raw="$1"
+    local offset_sh="$2"
+    local size_sh="$3"
+    local out="$4"
+
+    # 用 bs=1M 分块，避免大 offset 时的字节级 I/O 慢
+    # 注意：offset_sh 是 512 字节扇区数，转换为 1M 需要精确处理
+    # 用 dd bs=512 兼容所有情况
+    if ! dd if="$raw" of="$out" bs=512 skip="$offset_sh" count="$size_sh" status=none; then
+        return 1
+    fi
+    return 0
+}
+
+# ============================================================
+# verify_sd_fuse
 # ============================================================
 verify_sd_fuse() {
     local sd_fuse_dir="$1"
@@ -226,7 +263,7 @@ print(data.find(b'ARM\x64'))
 }
 
 # ============================================================
-# apply_flippy: 主流程
+# apply_flippy
 # ============================================================
 apply_flippy() {
     local sd_fuse_dir="${1:-}"
@@ -389,7 +426,7 @@ assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
 }
 
 # ============================================================
-# verify_raw: 验证 raw 镜像
+# verify_raw
 # ============================================================
 verify_raw() {
     local raw="${1:-}"
@@ -401,31 +438,52 @@ verify_raw() {
     fi
     log "验证 raw 镜像: $raw ($(stat -c%s "$raw") bytes)"
 
-    local kernel_offset=$((0x12000 * 512))
+    # ---------- kernel 分区 ----------
+    local kernel_offset_sh=$((0x12000))
+    local kernel_size_sh=$((0x18000))   # 48 MiB
+    local kernel_part="/tmp/verify_kernel_part.$$.bin"
+
+    # 只读前 8 字节检查 KRNL 头，然后从头读整个 kernel 分区到临时文件
+    raw_extract "$raw" "$kernel_offset_sh" "$kernel_size_sh" "$kernel_part"
+    if [ ! -s "$kernel_part" ]; then
+        rm -f "$kernel_part"
+        err "提取 kernel 分区失败"
+    fi
+    log "  kernel 分区提取: $(stat -c%s "$kernel_part") bytes"
+
+    # ARM64 magic 检查（KRNL 8 字节头之后 0x38 位置 = 分区里 0x40）
     local magic_pos
     magic_pos=$(python3 -c "
-with open('$raw','rb') as f:
-    f.seek($kernel_offset)
-    data = f.read(256)
+data = open('$kernel_part','rb').read(256)
 print(data.find(b'ARM\x64'))
 ")
     if [ "$magic_pos" != "64" ]; then
+        rm -f "$kernel_part"
         err "kernel 分区 ARM64 magic at 0x$(printf %x "$magic_pos")，期望 0x40"
     fi
     log "  ✓ kernel 分区 ARM64 magic at 0x40"
 
-    if ! tail -c +$((kernel_offset + 9)) "$raw" | head -c $((48*1024*1024)) | grep -a -q "flippy"; then
+    # flippy 字符串检查（在文件里 grep，不用管道）
+    if ! file_contains "$kernel_part" "flippy"; then
+        rm -f "$kernel_part"
         err "kernel 分区里没有 flippy 字符串"
     fi
+    rm -f "$kernel_part"
     log "  ✓ kernel 分区含 flippy"
 
+    # ---------- rootfs 分区 ----------
     local rootfs_offset_sh=$((0x4a000))
-    local rootfs_size_sh=$((0x400000))
+    local rootfs_size_sh=$((0x400000))  # 2 GiB
     local sparse="/tmp/verify_sparse.$$"
     local vraw="/tmp/verify_raw.$$"
     local mnt="/tmp/verify_rootfs_mnt.$$"
 
-    dd if="$raw" of="$sparse" bs=1M skip=$((rootfs_offset_sh / 2048)) count=$((rootfs_size_sh / 2048)) 2>/dev/null
+    raw_extract "$raw" "$rootfs_offset_sh" "$rootfs_size_sh" "$sparse"
+    if [ ! -s "$sparse" ]; then
+        err "提取 rootfs 分区失败"
+    fi
+    log "  rootfs 分区提取: $(stat -c%s "$sparse") bytes"
+
     local magic
     magic=$(xxd -l 4 -p "$sparse")
     if [ "$magic" = "3aff26ed" ]; then
