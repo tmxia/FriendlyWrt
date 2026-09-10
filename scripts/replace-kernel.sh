@@ -1,19 +1,19 @@
 #!/bin/bash
-# replace-kernel.sh - 使用 breakingbadboy/OpenWrt 仓库的 kernel_stable 内核替换 FriendlyWrt kernel.img
+# replace-kernel.sh - 从 breakingbadboy/OpenWrt 下载内核替换 FriendlyWrt kernel.img
 #
 # 用法:
 #   replace-kernel.sh <images.tgz> <sdfuse-dir> <dist-name> <output-img>
 #
 # 环境变量:
 #   TARGET_MODEL     - r5s (默认) / r5c
-#   SLIM_MODE        - true (默认) 精简 dtb / false 保留全部
+#   SLIM_MODE        - true (默认) / false
 #   KERNEL_REPO      - breakingbadboy/OpenWrt (默认)
-#   KERNEL_RELEASE   - kernel_stable (默认) / kernel_rk35xx / kernel_flippy
-#   KERNEL_VERSION   - 6.18.y (默认) 或 6.12.y
+#   KERNEL_VERSION   - 6.18.y (默认) / 6.12.y
 set -euo pipefail
 
-VERSION="2026-09-10-v5-bbb"
+VERSION="2026-09-10-v6-bbb"
 log() { echo -e "\033[0;32m[replace]\033[0m $*"; }
+warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err() { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
 log "replace-kernel.sh version: $VERSION"
 
@@ -24,7 +24,6 @@ OUTPUT_IMG="$4"
 TARGET_MODEL="${TARGET_MODEL:-r5s}"
 SLIM_MODE="${SLIM_MODE:-true}"
 KERNEL_REPO="${KERNEL_REPO:-breakingbadboy/OpenWrt}"
-KERNEL_RELEASE="${KERNEL_RELEASE:-kernel_stable}"
 KERNEL_VERSION="${KERNEL_VERSION:-6.18.y}"
 
 log "参数:"
@@ -35,7 +34,6 @@ log "  output img:      $OUTPUT_IMG"
 log "  target model:    $TARGET_MODEL"
 log "  slim mode:       $SLIM_MODE"
 log "  kernel repo:     $KERNEL_REPO"
-log "  kernel release:  $KERNEL_RELEASE"
 log "  kernel version:  $KERNEL_VERSION"
 
 WORK_DIR=$(mktemp -d /tmp/replace-kernel.XXXXXX)
@@ -52,67 +50,233 @@ tar xzf "$IMAGES_TGZ" -C "$WORK_DIR/base"
 BASE_DIR=$(find "$WORK_DIR/base" -maxdepth 2 -type d -name "friendlywrt*" | head -1)
 [ -z "$BASE_DIR" ] && { err "找不到顶层目录"; ls -la "$WORK_DIR/base"; exit 1; }
 log "官方 images 顶层: $BASE_DIR"
-ls -la "$BASE_DIR/"
 
 # ============================================================
-# 2. 从 breakingbadboy/OpenWrt 下载内核
+# 2. 从 breakingbadboy/OpenWrt 下载内核（多级回退）
 # ============================================================
-log "========== [2/6] 从 $KERNEL_REPO 下载内核 =========="
+log "========== [2/6] 从 $KERNEL_REPO 下载 $KERNEL_VERSION 内核 =========="
 
-# 查找匹配的内核版本
-KERNEL_ASSETS=$(gh release view "$KERNEL_RELEASE" --repo "$KERNEL_REPO" --json assets --jq '.assets[].name')
+# ---------- 2.1 获取可用的 tag 列表 ----------
+log "  步骤 1: 列出 $KERNEL_REPO 的所有 release tag"
+TAG_LIST=""
 
-# 根据 KERNEL_VERSION 过滤（如 6.18.y -> 6.18.x）
+# 尝试方式 A: gh release list
+if TAG_LIST=$(gh release list --limit 100 --repo "$KERNEL_REPO" --json tagName --jq '.[].tagName' 2>/tmp/gh_list_err); then
+  log "  ✓ gh release list 成功，找到 $(echo "$TAG_LIST" | wc -l) 个 tag"
+else
+  warn "  gh release list 失败:"
+  cat /tmp/gh_list_err 2>/dev/null | head -5 || true
+fi
+
+# 尝试方式 B: GitHub API
+if [ -z "$TAG_LIST" ]; then
+  log "  步骤 1b: 尝试 GitHub API"
+  API_URL="https://api.github.com/repos/${KERNEL_REPO}/releases?per_page=100"
+  AUTH_HEADER=""
+  [ -n "${GH_TOKEN:-}" ] && AUTH_HEADER="-H \"Authorization: Bearer $GH_TOKEN\""
+  TAG_LIST=$(curl -sL -H "Accept: application/vnd.github+json" \
+    ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
+    "$API_URL" 2>/dev/null \
+    | grep -oE '"tag_name":\s*"[^"]+"' \
+    | sed 's/.*: *"//;s/"$//' || echo "")
+  [ -n "$TAG_LIST" ] && log "  ✓ API 成功，找到 $(echo "$TAG_LIST" | wc -l) 个 tag"
+fi
+
+if [ -z "$TAG_LIST" ]; then
+  err "  无法列出 $KERNEL_REPO 的 release"
+  err "  请检查: https://github.com/$KERNEL_REPO/releases"
+  err "  或 GH_TOKEN 是否有 repo 权限"
+  exit 1
+fi
+
+log "  可用 tag (前 20):"
+echo "$TAG_LIST" | head -20 | sed 's/^/    /'
+
+# ---------- 2.2 选择内核 tag ----------
+# 优先选择: kernel_stable > kernel_rk35xx > 任何 kernel_* > 6.*
+SELECTED_TAG=""
+for candidate in "kernel_stable" "kernel_rk35xx" "kernel_flippy"; do
+  if echo "$TAG_LIST" | grep -qx "$candidate"; then
+    SELECTED_TAG="$candidate"
+    log "  ✓ 优先选择 tag: $SELECTED_TAG"
+    break
+  fi
+done
+
+# 如果没有 kernel_* tag，尝试直接用 KERNEL_VERSION 匹配
+if [ -z "$SELECTED_TAG" ]; then
+  log "  步骤 2: 没有 kernel_* tag，尝试匹配 $KERNEL_VERSION"
+  for t in $TAG_LIST; do
+    if echo "$t" | grep -qE "^kernel.*"; then
+      SELECTED_TAG="$t"
+      break
+    fi
+  done
+fi
+
+if [ -z "$SELECTED_TAG" ]; then
+  err "  无法从 tag 列表中选出内核 tag"
+  err "  tag 列表: $TAG_LIST"
+  exit 1
+fi
+log "  选中内核 tag: $SELECTED_TAG"
+
+# ---------- 2.3 获取该 tag 下的 assets ----------
+log "  步骤 3: 获取 $SELECTED_TAG 的 assets"
+KERNEL_ASSETS=""
+
+# 方式 A: gh release view
+if KERNEL_ASSETS=$(gh release view "$SELECTED_TAG" --repo "$KERNEL_REPO" --json assets --jq '.assets[].name' 2>/tmp/gh_view_err); then
+  log "  ✓ gh release view 成功"
+else
+  warn "  gh release view 失败:"
+  cat /tmp/gh_view_err 2>/dev/null | head -5 || true
+fi
+
+# 方式 B: GitHub API
+if [ -z "$KERNEL_ASSETS" ]; then
+  log "  步骤 3b: 通过 GitHub API 查询 assets"
+  API_URL="https://api.github.com/repos/${KERNEL_REPO}/releases/tags/${SELECTED_TAG}"
+  KERNEL_ASSETS=$(curl -sL -H "Accept: application/vnd.github+json" \
+    ${GH_TOKEN:+-H "Authorization: Bearer $GH_TOKEN"} \
+    "$API_URL" 2>/dev/null \
+    | grep -oE '"name":\s*"[^"]+\.tar\.gz"' \
+    | sed 's/.*: *"//;s/"$//' || echo "")
+  [ -n "$KERNEL_ASSETS" ] && log "  ✓ API 成功"
+fi
+
+if [ -z "$KERNEL_ASSETS" ]; then
+  err "  无法获取 $SELECTED_TAG 的 assets 列表"
+  exit 1
+fi
+
+log "  可用内核包 (前 20):"
+echo "$KERNEL_ASSETS" | head -20 | sed 's/^/    /'
+
+# ---------- 2.4 按 KERNEL_VERSION 匹配版本 ----------
 VERSION_PREFIX="${KERNEL_VERSION%.y}"
+log "  步骤 4: 匹配前缀 '$VERSION_PREFIX.*.tar.gz'"
+
 MATCHED_VER=$(echo "$KERNEL_ASSETS" | grep -E "^${VERSION_PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V | tail -1)
 
 if [ -z "$MATCHED_VER" ]; then
-  err "在 $KERNEL_REPO/$KERNEL_RELEASE 中找不到 $KERNEL_VERSION 版本的内核"
-  log "可用内核包:"
-  echo "$KERNEL_ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | head -20
+  # 尝试更宽松的匹配
+  warn "  严格匹配失败，尝试宽松匹配（包含 ${VERSION_PREFIX} 的任意 tar.gz）"
+  MATCHED_FILE=$(echo "$KERNEL_ASSETS" | grep -E "${VERSION_PREFIX}" | grep '\.tar\.gz$' | head -1)
+  if [ -n "$MATCHED_FILE" ]; then
+    MATCHED_VER="${MATCHED_FILE%.tar\.gz}"
+    log "  宽松匹配到: $MATCHED_FILE"
+  fi
+fi
+
+if [ -z "$MATCHED_VER" ]; then
+  err "  无法匹配 $KERNEL_VERSION 版本"
+  err "  可用包:"
+  echo "$KERNEL_ASSETS" | grep '\.tar\.gz$' | head -20 | sed 's/^/    /'
   exit 1
 fi
-log "  匹配到内核版本: $MATCHED_VER"
 
-KERNEL_CACHE="/tmp/${KERNEL_RELEASE}-cache/$MATCHED_VER"
-if [ ! -f "$KERNEL_CACHE/.ready" ]; then
-  log "  下载 $KERNEL_RELEASE $MATCHED_VER ..."
+# 如果 MATCHED_VER 包含 .tar.gz 后缀，去掉
+MATCHED_VER="${MATCHED_VER%.tar.gz}"
+log "  ✓ 匹配版本: $MATCHED_VER"
+
+# ---------- 2.5 下载并解压 ----------
+KERNEL_CACHE="/tmp/kernel-cache-$SELECTED_TAG/$MATCHED_VER"
+if [ -f "$KERNEL_CACHE/.ready" ]; then
+  log "  ✓ 缓存命中: $KERNEL_CACHE"
+else
+  log "  步骤 5: 下载内核 $MATCHED_VER"
   rm -rf "$KERNEL_CACHE"
   mkdir -p "$KERNEL_CACHE"
   cd "$KERNEL_CACHE"
-  wget -q "https://github.com/${KERNEL_REPO}/releases/download/${KERNEL_RELEASE}/${MATCHED_VER}.tar.gz" -O kernel.tar.gz
-  tar xzf kernel.tar.gz
 
+  DOWNLOAD_URL="https://github.com/${KERNEL_REPO}/releases/download/${SELECTED_TAG}/${MATCHED_VER}.tar.gz"
+  log "  URL: $DOWNLOAD_URL"
+
+  # 下载（多次尝试）
+  DOWNLOAD_OK=false
+  if wget -q --timeout=120 --tries=2 "$DOWNLOAD_URL" -O kernel.tar.gz 2>/dev/null; then
+    DOWNLOAD_OK=true
+    log "  ✓ wget 下载成功"
+  fi
+  if [ "$DOWNLOAD_OK" != "true" ]; then
+    log "  wget 失败，尝试 curl..."
+    if curl -L -f --connect-timeout 60 --max-time 300 "$DOWNLOAD_URL" -o kernel.tar.gz 2>/dev/null; then
+      DOWNLOAD_OK=true
+      log "  ✓ curl 下载成功"
+    fi
+  fi
+  if [ "$DOWNLOAD_OK" != "true" ]; then
+    err "  下载失败: $DOWNLOAD_URL"
+    err "  请检查文件是否存在于:"
+    err "    https://github.com/$KERNEL_REPO/releases/tag/$SELECTED_TAG"
+    exit 1
+  fi
+
+  log "  文件大小: $(stat -c%s kernel.tar.gz) bytes"
+
+  # 解压
+  if ! tar xzf kernel.tar.gz 2>/dev/null; then
+    err "  tar 解压失败"
+    file kernel.tar.gz
+    head -c 200 kernel.tar.gz | xxd | head -5
+    exit 1
+  fi
+
+  # 定位内核目录
   LOCAL_KDIR="$MATCHED_VER"
-  [ ! -d "$LOCAL_KDIR" ] && LOCAL_KDIR=$(find . -maxdepth 1 -type d -name "*$MATCHED_VER*" | head -1)
-  [ -z "$LOCAL_KDIR" ] && { err "解压后找不到内核目录"; ls -la; exit 1; }
+  if [ ! -d "$LOCAL_KDIR" ]; then
+    LOCAL_KDIR=$(find . -maxdepth 2 -type d -name "*${MATCHED_VER}*" ! -path "./boot*" ! -path "./dtb*" ! -path "./modules*" | head -1)
+  fi
 
-  log "  内核目录内容:"
-  ls -la "$LOCAL_KDIR/"
+  if [ -z "$LOCAL_KDIR" ] || [ ! -d "$LOCAL_KDIR" ]; then
+    err "  解压后找不到内核目录"
+    log "  当前目录内容:"
+    ls -la
+    exit 1
+  fi
+
+  log "  内核目录: $LOCAL_KDIR"
+  ls -la "$LOCAL_KDIR/" | head -20
 
   mkdir -p boot dtb modules
 
   # 查找 boot 子包
   BOOT_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-  [ -n "$BOOT_TAR" ] && tar xzf "$BOOT_TAR" -C boot
+  if [ -n "$BOOT_TAR" ]; then
+    tar xzf "$BOOT_TAR" -C boot
+    log "  ✓ 解压 boot: $(basename "$BOOT_TAR")"
+  else
+    warn "  找不到 boot-*.tar.gz"
+  fi
 
   # 查找 dtb 子包
   DTB_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
   [ -z "$DTB_TAR" ] && DTB_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-*.tar.gz" | head -1)
-  [ -n "$DTB_TAR" ] && tar xzf "$DTB_TAR" -C dtb
+  if [ -n "$DTB_TAR" ]; then
+    tar xzf "$DTB_TAR" -C dtb
+    log "  ✓ 解压 dtb: $(basename "$DTB_TAR")"
+  else
+    warn "  找不到 dtb-*.tar.gz"
+  fi
 
   # 查找 modules 子包
   MODULES_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
-  [ -n "$MODULES_TAR" ] && tar xzf "$MODULES_TAR" -C modules
+  if [ -n "$MODULES_TAR" ]; then
+    tar xzf "$MODULES_TAR" -C modules
+    log "  ✓ 解压 modules: $(basename "$MODULES_TAR")"
+  else
+    warn "  找不到 modules-*.tar.gz"
+  fi
 
   log "  boot 目录内容:"
-  ls -la "$KERNEL_CACHE/boot/" 2>/dev/null || log "    (空)"
+  ls -la "$KERNEL_CACHE/boot/" 2>/dev/null | head -10 || log "    (空)"
   log "  dtb 目录内容 (前 5):"
   ls "$KERNEL_CACHE/dtb/" 2>/dev/null | head -5 || log "    (空)"
 
   touch .ready
 fi
-log "  内核缓存: $KERNEL_CACHE"
+log "  ✓ 内核缓存: $KERNEL_CACHE"
 
 # ============================================================
 # 3. 复制官方骨架到目标
@@ -124,37 +288,35 @@ cp -a "$BASE_DIR" "$TARGET_DIR"
 log "  已复制: $TARGET_DIR"
 
 # ============================================================
-# 4. 构造 kernel.img（使用 breakingbadboy 内核）
+# 4. 构造 kernel.img
 # ============================================================
 log "========== [4/6] 构造 kernel.img =========="
 
-# 在 boot 目录查找内核文件
 IMAGE_FILE=""
-for pattern in "Image" "vmlinuz-*" "kernel*.img" "*.bin" "Image-*"; do
-  IMAGE_FILE=$(find "$KERNEL_CACHE/boot" -maxdepth 2 -name "$pattern" -type f 2>/dev/null | head -1)
+for pattern in "Image" "vmlinuz-*" "kernel*.img" "*.bin" "Image-*" "uImage*"; do
+  IMAGE_FILE=$(find "$KERNEL_CACHE/boot" -maxdepth 3 -name "$pattern" -type f 2>/dev/null | head -1)
   [ -n "$IMAGE_FILE" ] && break
 done
 
 if [ -z "$IMAGE_FILE" ]; then
   err "找不到内核 Image 文件"
   log "boot 目录完整列表:"
-  ls -laR "$KERNEL_CACHE/boot/"
+  find "$KERNEL_CACHE/boot" -type f 2>/dev/null | head -30
   exit 1
 fi
 
 IMAGE_SIZE=$(stat -c%s "$IMAGE_FILE")
 log "  内核文件: $(basename "$IMAGE_FILE") ($IMAGE_SIZE bytes)"
-log "  文件类型:"
-file "$IMAGE_FILE" || true
+log "  文件类型: $(file -b "$IMAGE_FILE" || echo unknown)"
 log "  前 64 字节:"
-xxd -l 64 "$IMAGE_FILE"
+xxd -l 64 "$IMAGE_FILE" | sed 's/^/    /'
 
 MAGIC=$(xxd -l 4 -p "$IMAGE_FILE")
 log "  前 4 字节 magic: $MAGIC"
 
-# 根据 magic 判断格式
+# 构造 kernel.img
 if [ "$MAGIC" = "4b524e4c" ]; then
-  log "  >>> 文件已是 KRNL 格式，直接使用"
+  log "  >>> 已是 KRNL 格式，直接使用"
   cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
 
 elif [ "$MAGIC" = "d00dfeed" ]; then
@@ -162,7 +324,7 @@ elif [ "$MAGIC" = "d00dfeed" ]; then
   cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
 
 elif [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "4d5a" ]; then
-  log "  >>> PE 格式，尝试提取纯 ARM64 Image..."
+  log "  >>> PE/EFI 格式，提取纯 ARM64 Image"
   python3 - "$IMAGE_FILE" "$WORK_DIR/extracted.img" <<'PYEOF'
 import sys
 data = open(sys.argv[1], 'rb').read()
@@ -174,7 +336,7 @@ if idx >= 0x38:
         open(sys.argv[2], 'wb').write(image_data)
         print(f"  ✓ 从 PE 提取 ARM64 Image: 起始 0x{start:x}, 大小 {len(image_data)}")
         sys.exit(0)
-print("  ✗ 无法提取")
+print("  ✗ PE 提取失败")
 sys.exit(1)
 PYEOF
   if [ -f "$WORK_DIR/extracted.img" ]; then
@@ -186,7 +348,7 @@ PYEOF
     cat "$WORK_DIR/extracted.img" >> "$TARGET_DIR/kernel.img"
     log "  已构造 KRNL + Image"
   else
-    err "PE 提取失败"
+    err "  PE 提取失败"
     exit 1
   fi
 
@@ -211,7 +373,6 @@ else
 fi
 
 # 验证 kernel.img
-log "  验证 kernel.img..."
 python3 - "$TARGET_DIR/kernel.img" <<'PYEOF'
 import sys
 data = open(sys.argv[1], 'rb').read(256)
@@ -251,7 +412,7 @@ if [ "$SLIM_MODE" = "true" ]; then
       log "    dtb: $BEFORE -> $AFTER 个"
     fi
   else
-    log "    WARNING: 内核包中找不到 r5s/r5c dtb，保留骨架 dtb"
+    warn "    找不到 r5s/r5c dtb，保留骨架 dtb"
   fi
 else
   log "    完整模式：保留骨架 dtb"
@@ -271,7 +432,7 @@ else
       cp "$INITRD" "$TARGET_DIR/uInitrd"
     log "    uInitrd: $(stat -c%s "$TARGET_DIR/uInitrd") bytes"
   else
-    log "    WARNING: 找不到 uInitrd"
+    warn "    找不到 uInitrd，保留骨架"
   fi
 fi
 
@@ -294,7 +455,7 @@ else
 fi
 
 log "  最终目录内容:"
-ls -la "$TARGET_DIR/"
+ls -la "$TARGET_DIR/" | head -20
 
 # ============================================================
 # 6. 生成镜像 + 验证
@@ -338,6 +499,8 @@ PYEOF
 
 log "=========================================="
 log "✓ 完成 (version $VERSION)"
+log "  内核 tag: $SELECTED_TAG"
+log "  内核版本: $MATCHED_VER"
 log "  输出: $OUTPUT_IMG"
 log "  大小: $(stat -c%s "$OUTPUT_IMG") bytes ($(($(stat -c%s "$OUTPUT_IMG")/1024/1024)) MiB)"
 log "=========================================="
