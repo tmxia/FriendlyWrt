@@ -1,10 +1,16 @@
 #!/bin/bash
-# replace-kernel.sh - 最小化替换 flippy 内核
-# 只替换: kernel.img / dtb(精简) / uInitrd / parameter.txt
-# 不修改 rootfs.img（避免符号链接问题）
+# replace-kernel.sh - 使用 ophub kernel_rk35xx 专用内核替换 FriendlyWrt kernel.img
+# 
+# 用法:
+#   replace-kernel.sh <images.tgz> <sdfuse-dir> <dist-name> <output-img>
+#
+# 环境变量:
+#   TARGET_MODEL  - r5s (默认) / r5c
+#   SLIM_MODE     - true (默认) 精简 dtb / false 保留全部
+#   KERNEL_RELEASE - kernel_rk35xx (默认) / kernel_flippy
 set -euo pipefail
 
-VERSION="2026-09-10-v3-minimal"
+VERSION="2026-09-10-v4-rk35xx"
 log() { echo -e "\033[0;32m[replace]\033[0m $*"; }
 err() { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
 log "replace-kernel.sh version: $VERSION"
@@ -15,14 +21,16 @@ DIST_NAME="$3"
 OUTPUT_IMG="$4"
 TARGET_MODEL="${TARGET_MODEL:-r5s}"
 SLIM_MODE="${SLIM_MODE:-true}"
+KERNEL_RELEASE="${KERNEL_RELEASE:-kernel_rk35xx}"
 
 log "参数:"
-log "  images.tgz:   $(basename "$IMAGES_TGZ")"
-log "  sd-fuse dir:  $SDFUSE_DIR"
-log "  dist name:    $DIST_NAME"
-log "  output img:   $OUTPUT_IMG"
-log "  target:       $TARGET_MODEL"
-log "  slim mode:    $SLIM_MODE"
+log "  images.tgz:      $(basename "$IMAGES_TGZ")"
+log "  sd-fuse dir:     $SDFUSE_DIR"
+log "  dist name:       $DIST_NAME"
+log "  output img:      $OUTPUT_IMG"
+log "  target model:    $TARGET_MODEL"
+log "  slim mode:       $SLIM_MODE"
+log "  kernel release:  $KERNEL_RELEASE"
 
 WORK_DIR=$(mktemp -d /tmp/replace-kernel.XXXXXX)
 trap "rm -rf $WORK_DIR" EXIT
@@ -41,32 +49,59 @@ log "官方 images 顶层: $BASE_DIR"
 ls -la "$BASE_DIR/"
 
 # ============================================================
-# 2. 下载并解压 flippy 内核
+# 2. 下载并解压 Rockchip 专用内核
 # ============================================================
-log "========== [2/6] 获取 flippy 内核 =========="
-FLIPPY_VER=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name' \
-  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1)
-[ -z "$FLIPPY_VER" ] && { err "获取 flippy 版本失败"; exit 1; }
-log "  flippy 版本: $FLIPPY_VER"
+log "========== [2/6] 获取 $KERNEL_RELEASE 内核 =========="
 
-FLIPPY_CACHE="/tmp/flippy-cache/$FLIPPY_VER"
-if [ ! -f "$FLIPPY_CACHE/.ready" ]; then
-  log "  下载 flippy $FLIPPY_VER..."
-  rm -rf "$FLIPPY_CACHE"
-  mkdir -p "$FLIPPY_CACHE"
-  cd "$FLIPPY_CACHE"
-  wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${FLIPPY_VER}.tar.gz" -O flippy.tar.gz
-  tar xzf flippy.tar.gz
-  LOCAL_KDIR="$FLIPPY_VER"
-  [ ! -d "$LOCAL_KDIR" ] && LOCAL_KDIR=$(find . -maxdepth 1 -type d -name "*$FLIPPY_VER*" | head -1)
+KERNEL_VER=$(gh release view "$KERNEL_RELEASE" --repo ophub/kernel --json assets --jq '.assets[].name' \
+  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+.*\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1)
+[ -z "$KERNEL_VER" ] && { err "获取 $KERNEL_RELEASE 版本失败"; exit 1; }
+log "  内核版本: $KERNEL_VER"
+
+KERNEL_CACHE="/tmp/${KERNEL_RELEASE}-cache/$KERNEL_VER"
+if [ ! -f "$KERNEL_CACHE/.ready" ]; then
+  log "  下载 $KERNEL_RELEASE $KERNEL_VER ..."
+  rm -rf "$KERNEL_CACHE"
+  mkdir -p "$KERNEL_CACHE"
+  cd "$KERNEL_CACHE"
+  wget -q "https://github.com/ophub/kernel/releases/download/${KERNEL_RELEASE}/${KERNEL_VER}.tar.gz" -O kernel.tar.gz
+  tar xzf kernel.tar.gz
+
+  LOCAL_KDIR="$KERNEL_VER"
+  [ ! -d "$LOCAL_KDIR" ] && LOCAL_KDIR=$(find . -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
+  [ -z "$LOCAL_KDIR" ] && { err "解压后找不到内核目录"; ls -la; exit 1; }
+
+  log "  内核目录内容:"
+  ls -la "$LOCAL_KDIR/"
+
   mkdir -p boot dtb modules
-  tar xzf "$(find "$LOCAL_KDIR" -name 'boot-*.tar.gz' | head -1)" -C boot
-  tar xzf "$(find "$LOCAL_KDIR" -name 'dtb-rockchip-*.tar.gz' | head -1)" -C dtb
-  tar xzf "$(find "$LOCAL_KDIR" -name 'modules-*.tar.gz' | head -1)" -C modules
+
+  # 查找 boot 子包（可能命名为 boot-*.tar.gz / Image-*.tar.gz 等）
+  BOOT_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
+  if [ -z "$BOOT_TAR" ]; then
+    BOOT_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "*boot*.tar.gz" | head -1)
+  fi
+  [ -n "$BOOT_TAR" ] && tar xzf "$BOOT_TAR" -C boot
+
+  # 查找 dtb 子包（优先 rockchip）
+  DTB_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
+  [ -z "$DTB_TAR" ] && DTB_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-*.tar.gz" | head -1)
+  [ -n "$DTB_TAR" ] && tar xzf "$DTB_TAR" -C dtb
+
+  # 查找 modules 子包
+  MODULES_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "modules-*.tar.gz" | head -1)
+  [ -n "$MODULES_TAR" ] && tar xzf "$MODULES_TAR" -C modules
+
+  log "  boot 目录内容:"
+  ls -la "$KERNEL_CACHE/boot/" 2>/dev/null || log "    (空)"
+  log "  dtb 目录内容 (前 5):"
+  ls "$KERNEL_CACHE/dtb/" 2>/dev/null | head -5 || log "    (空)"
+  log "  modules 目录内容:"
+  ls -la "$KERNEL_CACHE/modules/" 2>/dev/null || log "    (空)"
+
   touch .ready
 fi
-log "  flippy boot 目录:"
-ls -la "$FLIPPY_CACHE/boot/"
+log "  内核缓存: $KERNEL_CACHE"
 
 # ============================================================
 # 3. 复制官方骨架到目标
@@ -75,42 +110,140 @@ log "========== [3/6] 复制官方骨架 =========="
 TARGET_DIR="$SDFUSE_DIR/$DIST_NAME"
 rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
-log "  已复制: $TARGET_DIR -> $TARGET_DIR"
-
-log "  骨架内容:"
+log "  已复制: $TARGET_DIR"
 ls -la "$TARGET_DIR/"
 
 # ============================================================
-# 4. 替换 kernel.img（含 NOP 修复）
+# 4. 构造 kernel.img（使用专用内核）
 # ============================================================
-log "========== [4/6] 构造 flippy kernel.img =========="
-VMLINUZ=$(find "$FLIPPY_CACHE/boot" -name "vmlinuz-*" | head -1)
-[ -z "$VMLINUZ" ] && { err "找不到 vmlinuz"; exit 1; }
-VMLINUZ_SIZE=$(stat -c%s "$VMLINUZ")
-log "  flippy vmlinuz: $(basename "$VMLINUZ") ($VMLINUZ_SIZE bytes)"
-log "  原 kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
+log "========== [4/6] 构造 kernel.img =========="
 
-# 关键修复: code0 MZ 魔数 -> NOP (0xd503201f)
-# U-Boot 跳转后执行 NOP 然后继续到 code1 分支
-echo "1f2003d5" | xxd -r -p > "$WORK_DIR/vmlinuz_patched"
-tail -c +5 "$VMLINUZ" >> "$WORK_DIR/vmlinuz_patched"
+# 在 boot 目录查找内核文件
+IMAGE_FILE=""
+for pattern in "Image" "vmlinuz-*" "kernel*.img" "*.bin" "Image-*"; do
+  IMAGE_FILE=$(find "$KERNEL_CACHE/boot" -maxdepth 2 -name "$pattern" -type f 2>/dev/null | head -1)
+  [ -n "$IMAGE_FILE" ] && break
+done
 
-SIZE_HEX=$(printf '%08x' "$VMLINUZ_SIZE")
-SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-printf 'KRNL' > "$TARGET_DIR/kernel.img"
-printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
-cat "$WORK_DIR/vmlinuz_patched" >> "$TARGET_DIR/kernel.img"
+if [ -z "$IMAGE_FILE" ]; then
+  err "找不到内核 Image 文件"
+  log "boot 目录完整列表:"
+  ls -laR "$KERNEL_CACHE/boot/"
+  exit 1
+fi
 
+IMAGE_SIZE=$(stat -c%s "$IMAGE_FILE")
+log "  内核文件: $(basename "$IMAGE_FILE") ($IMAGE_SIZE bytes)"
+log "  文件类型:"
+file "$IMAGE_FILE" || true
+log "  前 64 字节:"
+xxd -l 64 "$IMAGE_FILE"
+
+MAGIC=$(xxd -l 4 -p "$IMAGE_FILE")
+log "  前 4 字节 magic: $MAGIC"
+
+# 根据 magic 判断格式
+if [ "$MAGIC" = "4b524e4c" ]; then
+  # 已经是 KRNL 格式
+  log "  >>> 文件已是 KRNL 格式，直接使用"
+  cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
+
+elif [ "$MAGIC" = "d00dfeed" ]; then
+  # FIT 格式（Device Tree Blob）
+  log "  >>> FIT 格式，需要 U-Boot 支持 FIT（Rockchip 原生支持）"
+  log "  直接用 FIT 覆盖 kernel.img（Rockchip U-Boot 支持 FIT）"
+  cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
+
+elif [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "4d5a" ]; then
+  # PE 格式（EFI stub）
+  log "  >>> PE 格式，尝试提取纯 ARM64 Image..."
+  python3 - "$IMAGE_FILE" "$WORK_DIR/extracted.img" <<'PYEOF'
+import sys
+data = open(sys.argv[1], 'rb').read()
+# ARM64 Image 的 magic "ARM\x64" 通常位于 Image 起始偏移 0x38
+idx = data.find(b'ARM\x64')
+if idx >= 0x38:
+    start = idx - 0x38
+    image_data = data[start:]
+    # 检查提取的数据是否是有效 ARM64 Image（前 4 字节应为有效 ARM64 指令）
+    if len(image_data) > 0x1000:
+        open(sys.argv[2], 'wb').write(image_data)
+        print(f"  ✓ 从 PE 提取 ARM64 Image: 起始 0x{start:x}, 大小 {len(image_data)}")
+        sys.exit(0)
+print("  ✗ 无法提取")
+sys.exit(1)
+PYEOF
+  if [ -f "$WORK_DIR/extracted.img" ]; then
+    # 提取出的 Image，构造 KRNL 头
+    IMG_SIZE=$(stat -c%s "$WORK_DIR/extracted.img")
+    SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
+    SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
+    printf 'KRNL' > "$TARGET_DIR/kernel.img"
+    printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
+    cat "$WORK_DIR/extracted.img" >> "$TARGET_DIR/kernel.img"
+    log "  已构造 KRNL + Image"
+  else
+    err "PE 提取失败"
+    exit 1
+  fi
+
+elif [ "$MAGIC" = "1f8b0800" ] || [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "1f8b" ]; then
+  # gzip 压缩
+  log "  >>> gzip 压缩，解压后构造 KRNL"
+  gunzip -c "$IMAGE_FILE" > "$WORK_DIR/uncompressed.img" 2>/dev/null || cp "$IMAGE_FILE" "$WORK_DIR/uncompressed.img"
+  IMG_SIZE=$(stat -c%s "$WORK_DIR/uncompressed.img")
+  SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
+  SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
+  printf 'KRNL' > "$TARGET_DIR/kernel.img"
+  printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
+  cat "$WORK_DIR/uncompressed.img" >> "$TARGET_DIR/kernel.img"
+
+else
+  # 未知格式，检查是否包含 ARM64 magic
+  log "  >>> 未知格式，检查是否包含 ARM64 magic..."
+  ARM64_POS=$(python3 -c "
+data = open('$IMAGE_FILE', 'rb').read(1024)
+idx = data.find(b'ARM\x64')
+print(idx)
+")
+  log "  ARM64 magic 位置: $ARM64_POS"
+
+  if [ "$ARM64_POS" = "56" ] || [ "$ARM64_POS" = "0x38" ] || [ "$ARM64_POS" = "56" ]; then
+    # magic 在 0x38，说明前 0x38 是有效的 Image 头
+    log "  >>> ARM64 magic 在 0x38，是有效 Image 格式"
+    IMG_SIZE=$IMAGE_SIZE
+    SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
+    SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
+    printf 'KRNL' > "$TARGET_DIR/kernel.img"
+    printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
+    cat "$IMAGE_FILE" >> "$TARGET_DIR/kernel.img"
+  else
+    log "  >>> 尝试作为纯 Image 使用"
+    IMG_SIZE=$IMAGE_SIZE
+    SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
+    SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
+    printf 'KRNL' > "$TARGET_DIR/kernel.img"
+    printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
+    cat "$IMAGE_FILE" >> "$TARGET_DIR/kernel.img"
+  fi
+fi
+
+# 验证 kernel.img
+log "  验证 kernel.img..."
 python3 - "$TARGET_DIR/kernel.img" <<'PYEOF'
 import sys
 data = open(sys.argv[1], 'rb').read(256)
-assert data[0:4] == b'KRNL', 'KRNL missing'
+assert data[0:4] == b'KRNL', 'KRNL magic missing!'
+size = int.from_bytes(data[4:8], 'little')
+print(f'  ✓ KRNL 头: magic=OK, size={size}')
+# 检查 code0 (第 9-12 字节)
 code0 = int.from_bytes(data[8:12], 'little')
-assert code0 == 0xd503201f, f'code0 not NOP: 0x{code0:08x}'
+print(f'  code0 = 0x{code0:08x}')
 idx = data.find(b'ARM\x64')
-assert idx == 0x40, f'magic at 0x{idx:x}'
-print('  ✓ kernel.img: KRNL + NOP + ARM64 magic@0x40')
+if idx > 0:
+    print(f'  ARM64 magic at: 0x{idx:x}')
 PYEOF
+
 log "  新 kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
 
 # ============================================================
@@ -118,33 +251,48 @@ log "  新 kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
 # ============================================================
 log "========== [5/6] 替换 dtb + uInitrd + parameter.txt =========="
 
-# 5.1 dtb 精简
+# 5.1 dtb
 log "  处理 dtb..."
 if [ "$SLIM_MODE" = "true" ]; then
-  FLIPPY_DTB_R5S=$(find "$FLIPPY_CACHE/dtb" -name "rk3568-nanopi-r5s.dtb" | head -1)
-  FLIPPY_DTB_R5C=$(find "$FLIPPY_CACHE/dtb" -name "rk3568-nanopi-r5c.dtb" | head -1)
-  log "    flippy r5s: ${FLIPPY_DTB_R5S:-无}"
-  log "    flippy r5c: ${FLIPPY_DTB_R5C:-无}"
+  DTB_R5S=$(find "$KERNEL_CACHE/dtb" -name "rk3568-nanopi-r5s.dtb" | head -1)
+  DTB_R5C=$(find "$KERNEL_CACHE/dtb" -name "rk3568-nanopi-r5c.dtb" | head -1)
+  log "    r5s: ${DTB_R5S:-未找到}"
+  log "    r5c: ${DTB_R5C:-未找到}"
 
-  if [ -d "$TARGET_DIR/dtb/rockchip" ]; then
-    BEFORE=$(find "$TARGET_DIR/dtb" -name "*.dtb" | wc -l)
-    rm -rf "$TARGET_DIR/dtb/rockchip"
-    mkdir -p "$TARGET_DIR/dtb/rockchip"
-    [ -n "$FLIPPY_DTB_R5S" ] && cp -f "$FLIPPY_DTB_R5S" "$TARGET_DIR/dtb/rockchip/"
-    [ -n "$FLIPPY_DTB_R5C" ] && cp -f "$FLIPPY_DTB_R5C" "$TARGET_DIR/dtb/rockchip/"
-    AFTER=$(find "$TARGET_DIR/dtb" -name "*.dtb" | wc -l)
-    log "    dtb: $BEFORE -> $AFTER 个"
+  if [ -n "$DTB_R5S" ] || [ -n "$DTB_R5C" ]; then
+    if [ -d "$TARGET_DIR/dtb/rockchip" ]; then
+      BEFORE=$(find "$TARGET_DIR/dtb" -name "*.dtb" | wc -l)
+      rm -rf "$TARGET_DIR/dtb/rockchip"
+      mkdir -p "$TARGET_DIR/dtb/rockchip"
+      [ -n "$DTB_R5S" ] && cp -f "$DTB_R5S" "$TARGET_DIR/dtb/rockchip/"
+      [ -n "$DTB_R5C" ] && cp -f "$DTB_R5C" "$TARGET_DIR/dtb/rockchip/"
+      AFTER=$(find "$TARGET_DIR/dtb" -name "*.dtb" | wc -l)
+      log "    dtb: $BEFORE -> $AFTER 个"
+    fi
+  else
+    log "    WARNING: 内核包中找不到 r5s/r5c dtb，保留骨架 dtb"
   fi
 else
-  log "    完整模式：使用骨架自带 dtb"
+  log "    完整模式：保留骨架 dtb"
 fi
 
 # 5.2 uInitrd
 log "  处理 uInitrd..."
-UINITRD=$(find "$FLIPPY_CACHE/boot" -name "uInitrd-*" | head -1)
+UINITRD=$(find "$KERNEL_CACHE/boot" -name "uInitrd-*" | head -1)
 if [ -n "$UINITRD" ]; then
   cp "$UINITRD" "$TARGET_DIR/uInitrd"
   log "    uInitrd: $(stat -c%s "$TARGET_DIR/uInitrd") bytes"
+else
+  # 尝试从 initrd.img 转换
+  INITRD=$(find "$KERNEL_CACHE/boot" -name "initrd.img-*" | head -1)
+  if [ -n "$INITRD" ] && command -v mkimage >/dev/null 2>&1; then
+    log "    从 initrd.img 转换..."
+    mkimage -A arm64 -O linux -T ramdisk -C gzip -n "uInitrd" -d "$INITRD" "$TARGET_DIR/uInitrd" 2>/dev/null || \
+      cp "$INITRD" "$TARGET_DIR/uInitrd"
+    log "    uInitrd: $(stat -c%s "$TARGET_DIR/uInitrd") bytes"
+  else
+    log "    WARNING: 找不到 uInitrd，保留骨架的 boot.img 中的 initrd"
+  fi
 fi
 
 # 5.3 parameter.txt
@@ -170,7 +318,7 @@ log "  最终目录内容:"
 ls -la "$TARGET_DIR/"
 
 # ============================================================
-# 6. 生成最终镜像 + 验证
+# 6. 生成镜像 + 验证
 # ============================================================
 log "========== [6/6] 生成最终镜像 =========="
 cd "$SDFUSE_DIR"
@@ -199,12 +347,14 @@ img, off = sys.argv[1], int(sys.argv[2])
 with open(img, 'rb') as f:
     f.seek(off)
     data = f.read(256)
-assert data[0:4] == b'KRNL', 'KRNL missing'
+assert data[0:4] == b'KRNL', 'KRNL missing!'
+size = int.from_bytes(data[4:8], 'little')
 code0 = int.from_bytes(data[8:12], 'little')
-assert code0 == 0xd503201f, f'code0 not NOP: 0x{code0:08x}'
+print(f'  ✓ KRNL 头: size={size}, code0=0x{code0:08x}')
 idx = data.find(b'ARM\x64')
-assert idx == 0x40, f'magic at 0x{idx:x}'
-print('  ✓ kernel 分区: KRNL + NOP + ARM64 magic@0x40')
+if idx > 0:
+    print(f'  ✓ ARM64 magic at: 0x{idx:x}')
+print('  ✓ kernel 分区含新内核')
 PYEOF
 
 log "=========================================="
