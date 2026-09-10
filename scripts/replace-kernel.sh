@@ -1,16 +1,18 @@
 #!/bin/bash
-# replace-kernel.sh - 使用 ophub kernel_rk35xx 专用内核替换 FriendlyWrt kernel.img
-# 
+# replace-kernel.sh - 使用 breakingbadboy/OpenWrt 仓库的 kernel_stable 内核替换 FriendlyWrt kernel.img
+#
 # 用法:
 #   replace-kernel.sh <images.tgz> <sdfuse-dir> <dist-name> <output-img>
 #
 # 环境变量:
-#   TARGET_MODEL  - r5s (默认) / r5c
-#   SLIM_MODE     - true (默认) 精简 dtb / false 保留全部
-#   KERNEL_RELEASE - kernel_rk35xx (默认) / kernel_flippy
+#   TARGET_MODEL     - r5s (默认) / r5c
+#   SLIM_MODE        - true (默认) 精简 dtb / false 保留全部
+#   KERNEL_REPO      - breakingbadboy/OpenWrt (默认)
+#   KERNEL_RELEASE   - kernel_stable (默认) / kernel_rk35xx / kernel_flippy
+#   KERNEL_VERSION   - 6.18.y (默认) 或 6.12.y
 set -euo pipefail
 
-VERSION="2026-09-10-v4-rk35xx"
+VERSION="2026-09-10-v5-bbb"
 log() { echo -e "\033[0;32m[replace]\033[0m $*"; }
 err() { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
 log "replace-kernel.sh version: $VERSION"
@@ -21,7 +23,9 @@ DIST_NAME="$3"
 OUTPUT_IMG="$4"
 TARGET_MODEL="${TARGET_MODEL:-r5s}"
 SLIM_MODE="${SLIM_MODE:-true}"
-KERNEL_RELEASE="${KERNEL_RELEASE:-kernel_rk35xx}"
+KERNEL_REPO="${KERNEL_REPO:-breakingbadboy/OpenWrt}"
+KERNEL_RELEASE="${KERNEL_RELEASE:-kernel_stable}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.18.y}"
 
 log "参数:"
 log "  images.tgz:      $(basename "$IMAGES_TGZ")"
@@ -30,7 +34,9 @@ log "  dist name:       $DIST_NAME"
 log "  output img:      $OUTPUT_IMG"
 log "  target model:    $TARGET_MODEL"
 log "  slim mode:       $SLIM_MODE"
+log "  kernel repo:     $KERNEL_REPO"
 log "  kernel release:  $KERNEL_RELEASE"
+log "  kernel version:  $KERNEL_VERSION"
 
 WORK_DIR=$(mktemp -d /tmp/replace-kernel.XXXXXX)
 trap "rm -rf $WORK_DIR" EXIT
@@ -49,26 +55,36 @@ log "官方 images 顶层: $BASE_DIR"
 ls -la "$BASE_DIR/"
 
 # ============================================================
-# 2. 下载并解压 Rockchip 专用内核
+# 2. 从 breakingbadboy/OpenWrt 下载内核
 # ============================================================
-log "========== [2/6] 获取 $KERNEL_RELEASE 内核 =========="
+log "========== [2/6] 从 $KERNEL_REPO 下载内核 =========="
 
-KERNEL_VER=$(gh release view "$KERNEL_RELEASE" --repo ophub/kernel --json assets --jq '.assets[].name' \
-  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+.*\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1)
-[ -z "$KERNEL_VER" ] && { err "获取 $KERNEL_RELEASE 版本失败"; exit 1; }
-log "  内核版本: $KERNEL_VER"
+# 查找匹配的内核版本
+KERNEL_ASSETS=$(gh release view "$KERNEL_RELEASE" --repo "$KERNEL_REPO" --json assets --jq '.assets[].name')
 
-KERNEL_CACHE="/tmp/${KERNEL_RELEASE}-cache/$KERNEL_VER"
+# 根据 KERNEL_VERSION 过滤（如 6.18.y -> 6.18.x）
+VERSION_PREFIX="${KERNEL_VERSION%.y}"
+MATCHED_VER=$(echo "$KERNEL_ASSETS" | grep -E "^${VERSION_PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V | tail -1)
+
+if [ -z "$MATCHED_VER" ]; then
+  err "在 $KERNEL_REPO/$KERNEL_RELEASE 中找不到 $KERNEL_VERSION 版本的内核"
+  log "可用内核包:"
+  echo "$KERNEL_ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | head -20
+  exit 1
+fi
+log "  匹配到内核版本: $MATCHED_VER"
+
+KERNEL_CACHE="/tmp/${KERNEL_RELEASE}-cache/$MATCHED_VER"
 if [ ! -f "$KERNEL_CACHE/.ready" ]; then
-  log "  下载 $KERNEL_RELEASE $KERNEL_VER ..."
+  log "  下载 $KERNEL_RELEASE $MATCHED_VER ..."
   rm -rf "$KERNEL_CACHE"
   mkdir -p "$KERNEL_CACHE"
   cd "$KERNEL_CACHE"
-  wget -q "https://github.com/ophub/kernel/releases/download/${KERNEL_RELEASE}/${KERNEL_VER}.tar.gz" -O kernel.tar.gz
+  wget -q "https://github.com/${KERNEL_REPO}/releases/download/${KERNEL_RELEASE}/${MATCHED_VER}.tar.gz" -O kernel.tar.gz
   tar xzf kernel.tar.gz
 
-  LOCAL_KDIR="$KERNEL_VER"
-  [ ! -d "$LOCAL_KDIR" ] && LOCAL_KDIR=$(find . -maxdepth 1 -type d -name "*$KERNEL_VER*" | head -1)
+  LOCAL_KDIR="$MATCHED_VER"
+  [ ! -d "$LOCAL_KDIR" ] && LOCAL_KDIR=$(find . -maxdepth 1 -type d -name "*$MATCHED_VER*" | head -1)
   [ -z "$LOCAL_KDIR" ] && { err "解压后找不到内核目录"; ls -la; exit 1; }
 
   log "  内核目录内容:"
@@ -76,14 +92,11 @@ if [ ! -f "$KERNEL_CACHE/.ready" ]; then
 
   mkdir -p boot dtb modules
 
-  # 查找 boot 子包（可能命名为 boot-*.tar.gz / Image-*.tar.gz 等）
+  # 查找 boot 子包
   BOOT_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-  if [ -z "$BOOT_TAR" ]; then
-    BOOT_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "*boot*.tar.gz" | head -1)
-  fi
   [ -n "$BOOT_TAR" ] && tar xzf "$BOOT_TAR" -C boot
 
-  # 查找 dtb 子包（优先 rockchip）
+  # 查找 dtb 子包
   DTB_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
   [ -z "$DTB_TAR" ] && DTB_TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-*.tar.gz" | head -1)
   [ -n "$DTB_TAR" ] && tar xzf "$DTB_TAR" -C dtb
@@ -96,8 +109,6 @@ if [ ! -f "$KERNEL_CACHE/.ready" ]; then
   ls -la "$KERNEL_CACHE/boot/" 2>/dev/null || log "    (空)"
   log "  dtb 目录内容 (前 5):"
   ls "$KERNEL_CACHE/dtb/" 2>/dev/null | head -5 || log "    (空)"
-  log "  modules 目录内容:"
-  ls -la "$KERNEL_CACHE/modules/" 2>/dev/null || log "    (空)"
 
   touch .ready
 fi
@@ -111,10 +122,9 @@ TARGET_DIR="$SDFUSE_DIR/$DIST_NAME"
 rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
 log "  已复制: $TARGET_DIR"
-ls -la "$TARGET_DIR/"
 
 # ============================================================
-# 4. 构造 kernel.img（使用专用内核）
+# 4. 构造 kernel.img（使用 breakingbadboy 内核）
 # ============================================================
 log "========== [4/6] 构造 kernel.img =========="
 
@@ -144,28 +154,22 @@ log "  前 4 字节 magic: $MAGIC"
 
 # 根据 magic 判断格式
 if [ "$MAGIC" = "4b524e4c" ]; then
-  # 已经是 KRNL 格式
   log "  >>> 文件已是 KRNL 格式，直接使用"
   cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
 
 elif [ "$MAGIC" = "d00dfeed" ]; then
-  # FIT 格式（Device Tree Blob）
-  log "  >>> FIT 格式，需要 U-Boot 支持 FIT（Rockchip 原生支持）"
-  log "  直接用 FIT 覆盖 kernel.img（Rockchip U-Boot 支持 FIT）"
+  log "  >>> FIT 格式，直接使用"
   cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
 
 elif [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "4d5a" ]; then
-  # PE 格式（EFI stub）
   log "  >>> PE 格式，尝试提取纯 ARM64 Image..."
   python3 - "$IMAGE_FILE" "$WORK_DIR/extracted.img" <<'PYEOF'
 import sys
 data = open(sys.argv[1], 'rb').read()
-# ARM64 Image 的 magic "ARM\x64" 通常位于 Image 起始偏移 0x38
 idx = data.find(b'ARM\x64')
 if idx >= 0x38:
     start = idx - 0x38
     image_data = data[start:]
-    # 检查提取的数据是否是有效 ARM64 Image（前 4 字节应为有效 ARM64 指令）
     if len(image_data) > 0x1000:
         open(sys.argv[2], 'wb').write(image_data)
         print(f"  ✓ 从 PE 提取 ARM64 Image: 起始 0x{start:x}, 大小 {len(image_data)}")
@@ -174,7 +178,6 @@ print("  ✗ 无法提取")
 sys.exit(1)
 PYEOF
   if [ -f "$WORK_DIR/extracted.img" ]; then
-    # 提取出的 Image，构造 KRNL 头
     IMG_SIZE=$(stat -c%s "$WORK_DIR/extracted.img")
     SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
     SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
@@ -187,8 +190,7 @@ PYEOF
     exit 1
   fi
 
-elif [ "$MAGIC" = "1f8b0800" ] || [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "1f8b" ]; then
-  # gzip 压缩
+elif [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "1f8b" ]; then
   log "  >>> gzip 压缩，解压后构造 KRNL"
   gunzip -c "$IMAGE_FILE" > "$WORK_DIR/uncompressed.img" 2>/dev/null || cp "$IMAGE_FILE" "$WORK_DIR/uncompressed.img"
   IMG_SIZE=$(stat -c%s "$WORK_DIR/uncompressed.img")
@@ -199,33 +201,13 @@ elif [ "$MAGIC" = "1f8b0800" ] || [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "1f8b" ]; t
   cat "$WORK_DIR/uncompressed.img" >> "$TARGET_DIR/kernel.img"
 
 else
-  # 未知格式，检查是否包含 ARM64 magic
-  log "  >>> 未知格式，检查是否包含 ARM64 magic..."
-  ARM64_POS=$(python3 -c "
-data = open('$IMAGE_FILE', 'rb').read(1024)
-idx = data.find(b'ARM\x64')
-print(idx)
-")
-  log "  ARM64 magic 位置: $ARM64_POS"
-
-  if [ "$ARM64_POS" = "56" ] || [ "$ARM64_POS" = "0x38" ] || [ "$ARM64_POS" = "56" ]; then
-    # magic 在 0x38，说明前 0x38 是有效的 Image 头
-    log "  >>> ARM64 magic 在 0x38，是有效 Image 格式"
-    IMG_SIZE=$IMAGE_SIZE
-    SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
-    SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-    printf 'KRNL' > "$TARGET_DIR/kernel.img"
-    printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
-    cat "$IMAGE_FILE" >> "$TARGET_DIR/kernel.img"
-  else
-    log "  >>> 尝试作为纯 Image 使用"
-    IMG_SIZE=$IMAGE_SIZE
-    SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
-    SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-    printf 'KRNL' > "$TARGET_DIR/kernel.img"
-    printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
-    cat "$IMAGE_FILE" >> "$TARGET_DIR/kernel.img"
-  fi
+  log "  >>> 未知格式，作为纯 Image 使用"
+  IMG_SIZE=$IMAGE_SIZE
+  SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
+  SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
+  printf 'KRNL' > "$TARGET_DIR/kernel.img"
+  printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
+  cat "$IMAGE_FILE" >> "$TARGET_DIR/kernel.img"
 fi
 
 # 验证 kernel.img
@@ -236,7 +218,6 @@ data = open(sys.argv[1], 'rb').read(256)
 assert data[0:4] == b'KRNL', 'KRNL magic missing!'
 size = int.from_bytes(data[4:8], 'little')
 print(f'  ✓ KRNL 头: magic=OK, size={size}')
-# 检查 code0 (第 9-12 字节)
 code0 = int.from_bytes(data[8:12], 'little')
 print(f'  code0 = 0x{code0:08x}')
 idx = data.find(b'ARM\x64')
@@ -283,7 +264,6 @@ if [ -n "$UINITRD" ]; then
   cp "$UINITRD" "$TARGET_DIR/uInitrd"
   log "    uInitrd: $(stat -c%s "$TARGET_DIR/uInitrd") bytes"
 else
-  # 尝试从 initrd.img 转换
   INITRD=$(find "$KERNEL_CACHE/boot" -name "initrd.img-*" | head -1)
   if [ -n "$INITRD" ] && command -v mkimage >/dev/null 2>&1; then
     log "    从 initrd.img 转换..."
@@ -291,7 +271,7 @@ else
       cp "$INITRD" "$TARGET_DIR/uInitrd"
     log "    uInitrd: $(stat -c%s "$TARGET_DIR/uInitrd") bytes"
   else
-    log "    WARNING: 找不到 uInitrd，保留骨架的 boot.img 中的 initrd"
+    log "    WARNING: 找不到 uInitrd"
   fi
 fi
 
@@ -309,7 +289,6 @@ else
     log "    kernel 分区: 40 MiB -> 48 MiB"
   else
     err "    parameter.txt 修改失败"
-    grep CMDLINE "$PARAM"
     exit 1
   fi
 fi
