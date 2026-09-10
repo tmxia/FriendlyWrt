@@ -57,7 +57,7 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/artifact
         which simg2img img2simg || { echo "ERROR: missing sparse tools"; exit 1; }
 
-    - name: Find base release
+    - name: Find and download base release
       id: base
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,24 +88,63 @@ jobs:
       run: |
         cd /tmp/base
         tar xzf images-*.tgz
-        SDDIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
-        [ -z "$SDDIR" ] && { echo "找不到解压目录"; ls -la; exit 1; }
+        echo "=== 解压后 /tmp/base ==="
+        ls -la /tmp/base
+
+        # 关键：用绝对路径查找，避免相对路径 bug
+        SDDIR=$(find /tmp/base -maxdepth 1 -mindepth 1 -type d -name "friendlywrt*" | head -1)
+        if [ -z "$SDDIR" ]; then
+          echo "ERROR: 找不到解压目录"
+          find /tmp/base -maxdepth 2 -type d
+          exit 1
+        fi
         echo "解压目录: $SDDIR"
+        echo "=== $SDDIR 内容 ==="
+        ls -la "$SDDIR"
         echo "SDDIR=$SDDIR" >> $GITHUB_ENV
 
-    - name: Sync scripts/sd-fuse (only, fast)
+    - name: Sync sd-fuse tools
       run: |
         mkdir -p /tmp/work
         cd /tmp/work
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests \
           -b master-v${{ inputs.version }} -m rk3568.xml \
           --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
-        repo sync -c scripts --no-clone-bundle
-        repo sync -c scripts/sd-fuse --no-clone-bundle
-        echo "=== scripts/sd-fuse ==="
-        ls -la scripts/sd-fuse/
-        echo "=== tools ==="
-        ls -la scripts/sd-fuse/tools/ 2>/dev/null || true
+        # 只 sync sd-fuse，不 sync friendlywrt
+        repo sync -c scripts/sd-fuse --no-clone-bundle || true
+
+        echo "=== scripts/sd-fuse 顶层 ==="
+        ls -la scripts/sd-fuse/ 2>/dev/null || echo "(空)"
+        echo "=== scripts/sd-fuse/tools ==="
+        ls -la scripts/sd-fuse/tools/ 2>/dev/null || echo "(空)"
+
+    - name: Ensure mk-sd-image.sh available
+      run: |
+        cd /tmp/work/scripts/sd-fuse
+
+        if [ ! -f "mk-sd-image.sh" ]; then
+          echo "本地无 mk-sd-image.sh，从 GitHub 下载"
+          wget -q "https://raw.githubusercontent.com/friendlyarm/sd-fuse_rk3568/master/mk-sd-image.sh" \
+            -O mk-sd-image.sh || { echo "ERROR: 下载 mk-sd-image.sh 失败"; exit 1; }
+          chmod +x mk-sd-image.sh
+        fi
+
+        if [ ! -f "tools/util.sh" ]; then
+          echo "本地无 tools/util.sh，从 GitHub 下载"
+          mkdir -p tools
+          wget -q "https://raw.githubusercontent.com/friendlyarm/sd-fuse_rk3568/master/tools/util.sh" \
+            -O tools/util.sh || true
+          chmod +x tools/util.sh
+        fi
+
+        echo "=== 最终 sd-fuse 顶层 ==="
+        ls -la
+        echo ""
+        echo "=== mk-sd-image.sh 头部 ==="
+        head -30 mk-sd-image.sh
+        echo ""
+        echo "=== tools/ ==="
+        ls -la tools/
 
     - name: Setup workspace
       run: |
@@ -114,10 +153,16 @@ jobs:
         DIST_DIR=friendlywrt$(echo ${{ inputs.version }}|awk -F . '{print $1}')${SUFFIX}
         echo "DIST_DIR=$DIST_DIR" >> $GITHUB_ENV
 
-        # 把 base images 目录重命名为 DIST_DIR，放到 scripts/sd-fuse/ 下
+        echo "SDDIR=$SDDIR"
+        echo "DIST_DIR=$DIST_DIR"
+        echo "目标路径: /tmp/work/scripts/sd-fuse/${DIST_DIR}"
+
         rm -rf "/tmp/work/scripts/sd-fuse/${DIST_DIR}"
         mv "$SDDIR" "/tmp/work/scripts/sd-fuse/${DIST_DIR}"
-        echo "=== sd-fuse workspace ==="
+
+        echo "=== workspace sd-fuse ==="
+        ls -la "/tmp/work/scripts/sd-fuse/"
+        echo "=== ${DIST_DIR}/ ==="
         ls -la "/tmp/work/scripts/sd-fuse/${DIST_DIR}/"
 
     - name: Apply flippy kernel and modules
@@ -131,6 +176,17 @@ jobs:
       id: build
       run: |
         cd /tmp/work/scripts/sd-fuse
+        DIST_DIR="${{ env.DIST_DIR }}"
+
+        echo "=== 当前目录 ==="
+        pwd
+        ls -la
+        echo ""
+        echo "=== 目标 dist dir ==="
+        ls -la "$DIST_DIR/"
+
+        # 确保 mk-sd-image.sh 有执行权限
+        chmod +x mk-sd-image.sh
 
         set +e
         yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
@@ -138,10 +194,15 @@ jobs:
         set -e
         echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
-        [ $MK_EXIT -eq 0 ] || { echo "FAILED"; exit 1; }
+
+        if [ $MK_EXIT -ne 0 ]; then
+          echo "=== 失败，检查 out 目录 ==="
+          ls -la out/ 2>/dev/null || true
+          exit 1
+        fi
 
         IMG=$(ls out/*.img 2>/dev/null | head -1)
-        [ -z "$IMG" ] && { echo "no image found"; ls -la out/; exit 1; }
+        [ -z "$IMG" ] && { echo "没有生成 .img"; ls -la out/ 2>/dev/null; exit 1; }
         echo "Generated: $IMG ($(stat -c%s "$IMG") bytes)"
 
         SUFFIX=""
@@ -164,7 +225,7 @@ jobs:
 
         # tgz（含修改后的 sd-fuse 目录）
         tar czf "$GITHUB_WORKSPACE/artifact/$TGZ_FILE" \
-          -C /tmp/work/scripts/sd-fuse "$DIST_DIR"
+          -C /tmp/work/scripts/sd-fuse "${{ env.DIST_DIR }}"
 
         # gz
         cd $GITHUB_WORKSPACE/artifact
