@@ -28,7 +28,7 @@ on:
           - r5s
           - r5c
       slim:
-        description: 'Slim mode (精简 dtb/modules)'
+        description: 'Slim mode (精简 dtb)'
         required: true
         default: 'true'
         type: choice
@@ -73,8 +73,6 @@ jobs:
         repo sync -c scripts/sd-fuse --no-clone-bundle
         echo "=== sd-fuse 目录 ==="
         ls -la /tmp/scripts/sd-fuse/
-        echo "=== mk-sd-image.sh 检查 ==="
-        head -5 /tmp/scripts/sd-fuse/mk-sd-image.sh
 
     - name: Find and download images tgz
       id: images
