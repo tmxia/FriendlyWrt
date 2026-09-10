@@ -73,7 +73,7 @@ jobs:
                   [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
                 fi
               done
-              TAG="${BASE_TAG}-$((MAX_NUM + 1))"
+              TAG="${BASE_TAG}-$((MAX_NUM+1))"
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -92,9 +92,7 @@ jobs:
   build_manual:
     needs: prepare_release
     runs-on: ubuntu-22.04
-    if: |
-      github.event.repository.owner.id == github.event.sender.id &&
-      github.event_name == 'workflow_dispatch'
+    if: github.event.repository.owner.id == github.event.sender.id && github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
         VERSION: ${{ fromJSON(github.event.inputs.version == 'both' && '["24.10","25.12"]' || format('["{0}"]', github.event.inputs.version)) }}
@@ -110,7 +108,7 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -qq --no-install-recommends \
           build-essential libncurses5-dev libncursesw5-dev \
-          gawk git rsync wget curl time file unzip bc bzip2 \
+          gawk git rsync wget time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
           flex bison qemu-user-static debootstrap \
           dosfstools e2fsprogs parted xxd \
@@ -123,8 +121,8 @@ jobs:
         mkdir -p ./artifact
         sudo swapoff -a || true
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
-        which simg2img img2simg || { echo "ERROR: simg2img/img2simg not found"; exit 1; }
-        bash $GITHUB_WORKSPACE/scripts/flippy-kernel.sh show
+        which simg2img img2simg
+        chmod +x scripts/flippy-kernel.sh
         echo "cores: $(nproc)"
 
     - name: Download source
@@ -132,14 +130,14 @@ jobs:
         mkdir project
         cd project
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests -b master-v${{ matrix.VERSION }} \
-                -m rk3568.xml --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
+                -m rk3568.xml --repo-url=https://github.com/friendlyarm/repo  --no-clone-bundle
         repo sync -c friendlywrt --no-clone-bundle
         repo sync -c configs --no-clone-bundle
         repo sync -c device/common --no-clone-bundle
         repo sync -c device/friendlyelec --no-clone-bundle
         repo sync -c scripts --no-clone-bundle
-        repo sync -c scripts/sd-fuse --no-clone-bundle
-        repo sync -c toolchain --no-clone-bundle
+        repo sync -c scripts/sd-fuse  --no-clone-bundle
+        repo sync -c toolchain  --no-clone-bundle
 
     - name: Apply customizations
       run: |
@@ -229,55 +227,52 @@ jobs:
         fi
         ./build.sh kernel
         ./build.sh sd-img
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "=== sd-fuse/${DIST_DIR} contents ==="
-        ls -la "scripts/sd-fuse/${DIST_DIR}/"
 
-    - name: Apply flippy kernel and modules
+    - name: Apply flippy kernel (via script)
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" apply \
-          "$GITHUB_WORKSPACE/project/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}"
+          "$GITHUB_WORKSPACE/project/scripts/sd-fuse/${DIST_DIR}"
 
-    - name: Build final image and verify
+    - name: Build final image
       id: build_sd_image
       run: |
         cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
-
-        # 打包 tgz（内含修改后的 kernel.img / rootfs.img / parameter.txt）
         tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C . "$DIST_DIR"
         echo "tgz created"
-
-        # 重新生成 raw 镜像
+        chmod +x mk-sd-image.sh
         set +e
         yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
-        [ $MK_EXIT -eq 0 ] || { echo "FAILED"; exit 1; }
-
-        # 重命名
+        [ $MK_EXIT -eq 0 ] || { echo "mk-sd-image.sh failed"; exit 1; }
         if [ ! -f "out/${IMG_FILE}" ]; then
           ORIG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           [ -n "$ORIG" ] && mv "$ORIG" "out/$IMG_FILE"
         fi
-        [ -f "out/$IMG_FILE" ] || { echo "No .img"; ls -la out; exit 1; }
+        [ -f "out/$IMG_FILE" ] || { echo "No .img found"; ls -la out; exit 1; }
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
+        echo "Raw image: $ARTIFACT_DIR/$IMG_FILE"
 
-        # 验证 raw 镜像
-        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" verify "$ARTIFACT_DIR/$IMG_FILE"
+    - name: Verify final image (via script)
+      run: |
+        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" verify \
+          "$GITHUB_WORKSPACE/artifact/${{ steps.config.outputs.img_filename }}"
 
-        # 压缩
-        cd "$ARTIFACT_DIR"
-        gzip -f "$IMG_FILE"
-        echo "Compressed: $IMG_FILE.gz"
+    - name: Compress final image
+      run: |
+        cd $GITHUB_WORKSPACE/artifact
+        gzip -f "${{ steps.config.outputs.img_filename }}"
+        ls -la
 
-    - name: Upload images-XYZ.tgz to release
+    - name: Upload images-XYZ.tgz
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -286,7 +281,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    - name: Upload XYZ.img.gz to release
+    - name: Upload XYZ.img.gz
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -316,7 +311,7 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -qq --no-install-recommends \
           build-essential libncurses5-dev libncursesw5-dev \
-          gawk git rsync wget curl time file unzip bc bzip2 \
+          gawk git rsync wget time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
           flex bison qemu-user-static debootstrap \
           dosfstools e2fsprogs parted xxd \
@@ -328,8 +323,8 @@ jobs:
         sudo -E cp repo/repo /usr/bin/
         mkdir -p ./artifact
         sudo swapoff -a || true
-        which simg2img img2simg || { echo "ERROR: simg2img/img2simg not found"; exit 1; }
-        bash $GITHUB_WORKSPACE/scripts/flippy-kernel.sh show
+        which simg2img img2simg
+        chmod +x scripts/flippy-kernel.sh
 
     - name: Download source
       run: |
@@ -424,50 +419,47 @@ jobs:
         }
         ./build.sh kernel
         ./build.sh sd-img
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        echo "=== sd-fuse/${DIST_DIR} ==="
-        ls -la "scripts/sd-fuse/${DIST_DIR}/"
 
-    - name: Apply flippy kernel and modules
+    - name: Apply flippy kernel (via script)
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" apply \
-          "$GITHUB_WORKSPACE/project/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}"
+          "$GITHUB_WORKSPACE/project/scripts/sd-fuse/${DIST_DIR}"
 
-    - name: Build final image and verify
+    - name: Build final image
       id: build_sd_image
       run: |
         cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
-
         tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C . "$DIST_DIR"
-        echo "tgz created"
-
+        chmod +x mk-sd-image.sh
         set +e
         yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
-        echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
-        [ $MK_EXIT -eq 0 ] || { echo "FAILED"; exit 1; }
-
+        [ $MK_EXIT -eq 0 ] || exit 1
         if [ ! -f "out/${IMG_FILE}" ]; then
           ORIG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           [ -n "$ORIG" ] && mv "$ORIG" "out/$IMG_FILE"
         fi
-        [ -f "out/$IMG_FILE" ] || { echo "No .img"; ls -la out; exit 1; }
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
 
-        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" verify "$ARTIFACT_DIR/$IMG_FILE"
+    - name: Verify final image (via script)
+      run: |
+        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" verify \
+          "$GITHUB_WORKSPACE/artifact/${{ steps.config.outputs.img_filename }}"
 
-        cd "$ARTIFACT_DIR"
-        gzip -f "$IMG_FILE"
-        echo "Compressed: $IMG_FILE.gz"
+    - name: Compress and upload
+      run: |
+        cd $GITHUB_WORKSPACE/artifact
+        gzip -f "${{ steps.config.outputs.img_filename }}"
 
-    - name: Upload images-XYZ.tgz
+    - name: Upload tgz
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -476,7 +468,7 @@ jobs:
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
 
-    - name: Upload XYZ.img.gz
+    - name: Upload img.gz
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
