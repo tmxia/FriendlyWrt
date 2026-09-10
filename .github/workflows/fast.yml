@@ -1,10 +1,10 @@
-name: Fast Build - Flippy from Existing Release
+name: Quick Verify Flippy Kernel
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'OpenWrt version'
+        description: 'Rootfs version'
         required: true
         default: '24.10'
         type: choice
@@ -19,272 +19,95 @@ on:
         options:
           - docker
           - non-docker
-      base_release:
-        description: 'Base release tag (empty = auto find latest)'
-        required: false
-        default: ''
-      replace_existing:
-        description: 'Replace existing fast release tag'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
 
 jobs:
-  fast_build:
+  quick_verify:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
-    - name: Init environment
+    - name: Initialization
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo rm -rf /etc/apt/sources.list.d
         sudo apt-get update -qq
         sudo apt-get install -qq --no-install-recommends \
-          wget curl git rsync time file unzip bc bzip2 \
-          python3 python3-pyelftools device-tree-compiler \
-          dosfstools e2fsprogs parted xxd \
+          wget git rsync time file unzip bc bzip2 xxd \
+          python3 dosfstools e2fsprogs parted \
           android-sdk-libsparse-utils
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
-        git clone --depth=1 https://github.com/friendlyarm/repo
-        sudo cp repo/repo /usr/bin/
+        git clone https://github.com/friendlyarm/repo /tmp/repo
+        sudo -E cp /tmp/repo/repo /usr/bin/
         mkdir -p $GITHUB_WORKSPACE/artifact
-        which simg2img img2simg || { echo "ERROR: missing sparse tools"; exit 1; }
+        chmod +x scripts/flippy-kernel.sh scripts/quick-build.sh
 
-    - name: Find and download base release
-      id: base
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Fetch sd-fuse scripts
       run: |
-        SUFFIX=""
-        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-        PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
-
-        BASE_TAG="${{ inputs.base_release }}"
-        if [ -z "$BASE_TAG" ]; then
-          TAGS=$(gh release list --limit 30 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
-          for TAG in $TAGS; do
-            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qF "$PATTERN"; then
-              BASE_TAG="$TAG"; break
-            fi
-          done
-        fi
-        [ -z "$BASE_TAG" ] && { echo "找不到含 $PATTERN 的 release"; exit 1; }
-        echo "base_release=$BASE_TAG" >> $GITHUB_OUTPUT
-        echo "使用 base release: $BASE_TAG"
-
-        mkdir -p /tmp/base
-        cd /tmp/base
-        gh release download "$BASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
-        ls -la
-
-    - name: Extract base images
-      run: |
-        cd /tmp/base
-        tar xzf images-*.tgz
-        echo "=== 解压后 /tmp/base ==="
-        ls -la /tmp/base
-
-        # 关键：用绝对路径查找，避免相对路径 bug
-        SDDIR=$(find /tmp/base -maxdepth 1 -mindepth 1 -type d -name "friendlywrt*" | head -1)
-        if [ -z "$SDDIR" ]; then
-          echo "ERROR: 找不到解压目录"
-          find /tmp/base -maxdepth 2 -type d
-          exit 1
-        fi
-        echo "解压目录: $SDDIR"
-        echo "=== $SDDIR 内容 ==="
-        ls -la "$SDDIR"
-        echo "SDDIR=$SDDIR" >> $GITHUB_ENV
-
-    - name: Sync sd-fuse tools
-      run: |
-        mkdir -p /tmp/work
-        cd /tmp/work
+        cd /tmp
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests \
           -b master-v${{ inputs.version }} -m rk3568.xml \
           --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
-        # 只 sync sd-fuse，不 sync friendlywrt
-        repo sync -c scripts/sd-fuse --no-clone-bundle || true
+        repo sync -c scripts/sd-fuse --no-clone-bundle
+        echo "=== sd-fuse 目录 ==="
+        ls -la /tmp/scripts/sd-fuse/
 
-        echo "=== scripts/sd-fuse 顶层 ==="
-        ls -la scripts/sd-fuse/ 2>/dev/null || echo "(空)"
-        echo "=== scripts/sd-fuse/tools ==="
-        ls -la scripts/sd-fuse/tools/ 2>/dev/null || echo "(空)"
-
-    - name: Ensure mk-sd-image.sh available
-      run: |
-        cd /tmp/work/scripts/sd-fuse
-
-        if [ ! -f "mk-sd-image.sh" ]; then
-          echo "本地无 mk-sd-image.sh，从 GitHub 下载"
-          wget -q "https://raw.githubusercontent.com/friendlyarm/sd-fuse_rk3568/master/mk-sd-image.sh" \
-            -O mk-sd-image.sh || { echo "ERROR: 下载 mk-sd-image.sh 失败"; exit 1; }
-          chmod +x mk-sd-image.sh
-        fi
-
-        if [ ! -f "tools/util.sh" ]; then
-          echo "本地无 tools/util.sh，从 GitHub 下载"
-          mkdir -p tools
-          wget -q "https://raw.githubusercontent.com/friendlyarm/sd-fuse_rk3568/master/tools/util.sh" \
-            -O tools/util.sh || true
-          chmod +x tools/util.sh
-        fi
-
-        echo "=== 最终 sd-fuse 顶层 ==="
-        ls -la
-        echo ""
-        echo "=== mk-sd-image.sh 头部 ==="
-        head -30 mk-sd-image.sh
-        echo ""
-        echo "=== tools/ ==="
-        ls -la tools/
-
-    - name: Setup workspace
-      run: |
-        SUFFIX=""
-        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-        DIST_DIR=friendlywrt$(echo ${{ inputs.version }}|awk -F . '{print $1}')${SUFFIX}
-        echo "DIST_DIR=$DIST_DIR" >> $GITHUB_ENV
-
-        echo "SDDIR=$SDDIR"
-        echo "DIST_DIR=$DIST_DIR"
-        echo "目标路径: /tmp/work/scripts/sd-fuse/${DIST_DIR}"
-
-        rm -rf "/tmp/work/scripts/sd-fuse/${DIST_DIR}"
-        mv "$SDDIR" "/tmp/work/scripts/sd-fuse/${DIST_DIR}"
-
-        echo "=== workspace sd-fuse ==="
-        ls -la "/tmp/work/scripts/sd-fuse/"
-        echo "=== ${DIST_DIR}/ ==="
-        ls -la "/tmp/work/scripts/sd-fuse/${DIST_DIR}/"
-
-    - name: Apply flippy kernel and modules
+    - name: Find and download rootfs tgz
+      id: rootfs
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" apply \
-          "/tmp/work/scripts/sd-fuse/${DIST_DIR}"
-
-    - name: Build raw image
-      id: build
-      run: |
-        cd /tmp/work/scripts/sd-fuse
-        DIST_DIR="${{ env.DIST_DIR }}"
-
-        echo "=== 当前目录 ==="
-        pwd
-        ls -la
-        echo ""
-        echo "=== 目标 dist dir ==="
-        ls -la "$DIST_DIR/"
-
-        # 确保 mk-sd-image.sh 有执行权限
-        chmod +x mk-sd-image.sh
-
-        set +e
-        yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
-        MK_EXIT=$?
-        set -e
-        echo "mk-sd-image.sh exit code: $MK_EXIT"
-        cat /tmp/mk-sd.log
-
-        if [ $MK_EXIT -ne 0 ]; then
-          echo "=== 失败，检查 out 目录 ==="
-          ls -la out/ 2>/dev/null || true
-          exit 1
-        fi
-
-        IMG=$(ls out/*.img 2>/dev/null | head -1)
-        [ -z "$IMG" ] && { echo "没有生成 .img"; ls -la out/ 2>/dev/null; exit 1; }
-        echo "Generated: $IMG ($(stat -c%s "$IMG") bytes)"
-
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-        IMG_FILE="R5S-R5C-Series-FriendlyWrt-flippy-${{ inputs.version }}${SUFFIX}.img"
+        PATTERN="rootfs-friendlywrt-${{ inputs.version }}${SUFFIX}.tgz"
+        echo "查找: $PATTERN"
 
-        mv "$IMG" "$GITHUB_WORKSPACE/artifact/$IMG_FILE"
-        echo "img_file=$IMG_FILE" >> $GITHUB_OUTPUT
-
-    - name: Verify image
-      run: |
-        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" verify \
-          "$GITHUB_WORKSPACE/artifact/${{ steps.build.outputs.img_file }}"
-
-    - name: Package artifacts
-      run: |
-        SUFFIX=""
-        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-        TGZ_FILE="images-R5S-R5C-Series-FriendlyWrt-flippy-${{ inputs.version }}${SUFFIX}.tgz"
-
-        # tgz（含修改后的 sd-fuse 目录）
-        tar czf "$GITHUB_WORKSPACE/artifact/$TGZ_FILE" \
-          -C /tmp/work/scripts/sd-fuse "${{ env.DIST_DIR }}"
-
-        # gz
-        cd $GITHUB_WORKSPACE/artifact
-        gzip -f "${{ steps.build.outputs.img_file }}"
-
-        echo "TGZ_FILE=$TGZ_FILE" >> $GITHUB_ENV
-        echo "IMG_FILE=${{ steps.build.outputs.img_file }}" >> $GITHUB_ENV
-        ls -la
-
-    - name: Generate release tag
-      id: release_tag
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        BASE_TAG="FriendlyWrt-flippy-fast-$(date +%Y-%m-%d)"
-        FORCE="${{ inputs.replace_existing }}"
-        if [ "$FORCE" = "true" ]; then
-          gh release delete "$BASE_TAG" --yes --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
-          git push origin --delete "refs/tags/$BASE_TAG" 2>/dev/null || true
-          TAG="$BASE_TAG"
-        else
-          if gh release view "$BASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            MAX_NUM=0
-            for t in $(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$"); do
-              if [[ $t =~ -([0-9]+)$ ]]; then
-                NUM=${BASH_REMATCH[1]}
-                [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
-              fi
-            done
-            TAG="${BASE_TAG}-$((MAX_NUM + 1))"
-          else
-            TAG="$BASE_TAG"
+        TAGS=$(gh release list --limit 30 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
+        FOUND=""
+        for TAG in $TAGS; do
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qF "$PATTERN"; then
+            FOUND="$TAG"; break
           fi
-        fi
-        echo "tag=$TAG" >> $GITHUB_OUTPUT
+        done
+        [ -z "$FOUND" ] && { echo "ERROR: 找不到 $PATTERN"; exit 1; }
+        echo "使用 release: $FOUND"
 
-    - name: Create release
-      uses: softprops/action-gh-release@v1
+        mkdir -p /tmp/inputs
+        cd /tmp/inputs
+        gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
+        ls -la
+
+        echo "rootfs_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
+
+    - name: Run quick-build
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.release_tag.outputs.tag }}
-        draft: false
-        prerelease: false
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        SUFFIX=""
+        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
+        DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
+        IMG_NAME="R5S-R5C-Series-FriendlyWrt-flippy-${{ inputs.version }}${SUFFIX}.img"
 
-    - name: Upload img.gz
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ env.IMG_FILE }}.gz
-        asset_name: ${{ env.IMG_FILE }}.gz
-        tag: ${{ steps.release_tag.outputs.tag }}
-        overwrite: true
+        bash $GITHUB_WORKSPACE/scripts/quick-build.sh \
+          "${{ steps.rootfs.outputs.rootfs_tgz }}" \
+          "/tmp/scripts/sd-fuse" \
+          "$DIST_NAME" \
+          "$GITHUB_WORKSPACE/artifact/$IMG_NAME"
 
-    - name: Upload images tgz
-      uses: svenstaro/upload-release-action@v2
+        echo "img_name=$IMG_NAME" >> $GITHUB_ENV
+
+    - name: Compress and list
+      run: |
+        cd $GITHUB_WORKSPACE/artifact
+        gzip -f *.img
+        ls -la
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
       with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ env.TGZ_FILE }}
-        asset_name: ${{ env.TGZ_FILE }}
-        tag: ${{ steps.release_tag.outputs.tag }}
-        overwrite: true
+        name: flippy-img-${{ inputs.version }}-${{ inputs.set }}
+        path: |
+          ${{ github.workspace }}/artifact/*.img.gz
