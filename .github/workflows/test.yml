@@ -1,10 +1,10 @@
-name: Diagnostic - Inspect Kernel Image Structure
+name: Diagnostic - Full Kernel Structure Extraction
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to diagnose'
+        description: 'Version'
         required: true
         default: '24.10'
         type: choice
@@ -25,227 +25,306 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     steps:
-      - name: Install diagnostic tools
+      - name: Install tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -qq --no-install-recommends \
             file xxd binwalk p7zip-full u-boot-tools \
-            device-tree-compiler cpio gzip xz-utils lz4 zstd
+            device-tree-compiler cpio gzip xz-utils lz4 zstd \
+            python3 python3-pyelftools binutils-aarch64-linux-gnu
 
-      - name: Find latest release with any images tgz
+      - name: Find and download existing images tgz
         id: find_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SUFFIX=""
           [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-          # 只匹配 images- 开头、包含版本、包含类型后缀
           PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
-          echo "Looking for: $PATTERN"
-
           TAGS=$(gh release list --limit 30 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
           FOUND=""
           for TAG in $TAGS; do
             if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qF "$PATTERN"; then
-              FOUND="$TAG"
-              break
+              FOUND="$TAG"; break
             fi
           done
-          if [ -z "$FOUND" ]; then
-            echo "ERROR: No release found containing $PATTERN"
-            echo "List of recent assets:"
-            for TAG in $TAGS; do
-              echo "=== $TAG ==="
-              gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' || true
-            done
-            exit 1
-          fi
-          echo "release_tag=$FOUND" >> $GITHUB_OUTPUT
-          echo "pattern=$PATTERN" >> $GITHUB_OUTPUT
-
-      - name: Download existing images tgz
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
+          [ -z "$FOUND" ] && { echo "Not found"; exit 1; }
           mkdir -p /tmp/existing
           cd /tmp/existing
-          gh release download "${{ steps.find_release.outputs.release_tag }}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --pattern "${{ steps.find_release.outputs.pattern }}" \
-            --dir .
-          ls -la
+          gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
+          tar xzf "$PATTERN"
+          echo "release_tag=$FOUND" >> $GITHUB_OUTPUT
 
-      - name: Extract and inspect images tgz
-        run: |
-          cd /tmp/existing
-          TGZ="${{ steps.find_release.outputs.pattern }}"
-          tar xzf "$TGZ"
-          echo "########## Top-level contents ##########"
-          ls -la
-
-          IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
-          echo "IMG_DIR=$IMG_DIR"
-          echo "########## Contents of $IMG_DIR ##########"
-          ls -la "$IMG_DIR/"
-
-          echo ""
-          echo "########## File types of every file ##########"
-          for f in "$IMG_DIR"/*; do
-            echo "--- $(basename $f)"
-            file "$f"
-          done
-
-      - name: Deep inspect kernel.img
+      - name: Step 1 - Parse KRNL header 12 bytes precisely
         run: |
           cd /tmp/existing
           IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
           KIMG="$IMG_DIR/kernel.img"
-          echo "########## kernel.img size ##########"
-          ls -la "$KIMG"
-          echo "########## kernel.img first 512 bytes (hex) ##########"
-          xxd "$KIMG" | head -32
-          echo "########## kernel.img strings (first 40 lines) ##########"
-          strings "$KIMG" | head -40
-          echo "########## kernel.img magic check ##########"
-          MAGIC=$(xxd -l 4 -p "$KIMG")
-          echo "Magic: $MAGIC"
-          if [ "$MAGIC" = "d00dfeed" ]; then
-            echo ">>> FIT image (Device Tree format)"
-            echo "########## FIT structure via fdtdump ##########"
-            fdtdump "$KIMG" 2>/dev/null | head -150 || true
-            echo "########## FIT content via dumpimage -l ##########"
-            dumpimage -l "$KIMG" 2>&1 | head -80 || true
-          elif [[ "$MAGIC" == 1f8b* ]]; then
-            echo ">>> gzip compressed"
-            echo "Try decompress and inspect:"
-            zcat "$KIMG" 2>/dev/null | head -c 128 | xxd | head -8
-          elif [[ "$MAGIC" == fd377a58* ]]; then
-            echo ">>> xz compressed"
-          else
-            echo ">>> Unknown, running binwalk"
-            binwalk "$KIMG" | head -40 || true
-          fi
+          echo "########## STEP 1: KRNL header analysis ##########"
+          echo "File: $KIMG"
+          echo "Size: $(stat -c%s "$KIMG") bytes"
+          echo ""
+          echo "--- First 64 bytes (hex) ---"
+          xxd -l 64 "$KIMG"
+          echo ""
+          echo "--- Header breakdown ---"
+          echo "Bytes 0-3 (magic):   $(xxd -l 4 -p "$KIMG")"
+          echo "Bytes 4-7 (size?):   $(xxd -s 4 -l 4 -p "$KIMG")"
+          echo "Bytes 8-11 (resv?):  $(xxd -s 8 -l 4 -p "$KIMG")"
+          echo "Bytes 12-15:         $(xxd -s 12 -l 4 -p "$KIMG")"
+          echo ""
+          echo "--- Little-endian interpretation of bytes 4-7 ---"
+          hexval=$(xxd -s 4 -l 4 -p "$KIMG")
+          val_le=$((16#${hexval:6:2}${hexval:4:2}${hexval:2:2}${hexval:0:2}))
+          echo "0x$hexval -> $val_le (as LE integer)"
+          echo "File size minus header: $(($(stat -c%s "$KIMG") - 12))"
+          echo "File size minus 8: $(($(stat -c%s "$KIMG") - 8))"
+          echo ""
+          echo "--- Search for ARM64 magic 'ARMd' (41524d64) in first 1KB ---"
+          xxd -l 1024 "$KIMG" | grep -i "4152 4d64" || echo "not found in first 1KB"
+          echo ""
+          echo "--- Offset of ARM64 magic ---"
+          python3 -c "
+          import sys
+          with open('$KIMG','rb') as f:
+            data = f.read(2048)
+          idx = data.find(b'ARM\x64')
+          print(f'ARM64 magic found at offset: {idx} (0x{idx:x})')
+          idx2 = data.find(b'ARM\x64', idx+1)
+          print(f'Second occurrence at: {idx2}')
+          "
 
-      - name: Deep inspect boot.img
+      - name: Step 2 - Analyze KRNL payload structure
+        run: |
+          cd /tmp/existing
+          IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+          KIMG="$IMG_DIR/kernel.img"
+          echo "########## STEP 2: KRNL payload analysis ##########"
+          # 检查偏移 0x40 处的载荷
+          echo "--- At offset 0x40 (after 8-byte KRNL + 0x38?) ---"
+          xxd -s 0x40 -l 32 "$KIMG"
+          echo ""
+          echo "--- At offset 0x0C (after 12-byte KRNL) ---"
+          xxd -s 0x0C -l 32 "$KIMG"
+          echo ""
+          echo "--- Looking for ARM64 Image magic pattern ---"
+          # ARM64 Image 有 text_offset, image_size 等字段
+          python3 << 'PYEOF'
+          with open("/tmp/existing") as _: pass
+          import glob
+          kimgs = glob.glob("/tmp/existing/friendlywrt*/kernel.img")
+          if not kimgs:
+            print("kernel.img not found")
+          else:
+            with open(kimgs[0],'rb') as f:
+              data = f.read(256)
+            print("Offset | Hex")
+            for i in range(0, 256, 16):
+              print(f"0x{i:04x} | {data[i:i+16].hex()}")
+            # ARM64 头结构：在 image_offset+0x08 处有 text_offset
+            # 在 offset+0x10 处有 image_size
+            print("\nPossible ARM64 header fields at offset 0x08 onwards:")
+            for off in [0x08, 0x10, 0x18, 0x20, 0x38]:
+              if off + 8 <= len(data):
+                val = int.from_bytes(data[off:off+8], 'little')
+                print(f"  offset 0x{off:02x}: {val} (0x{val:x})")
+          PYEOF
+
+      - name: Step 3 - Extract and inspect boot.img content
         run: |
           cd /tmp/existing
           IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
           BIMG="$IMG_DIR/boot.img"
-          echo "########## boot.img size ##########"
-          ls -la "$BIMG"
-          echo "########## boot.img first 256 bytes ##########"
-          xxd "$BIMG" | head -16
-          echo "########## boot.img strings (first 20) ##########"
-          strings "$BIMG" | head -20
-          echo "########## 7z list ##########"
-          7z l "$BIMG" 2>&1 | head -40 || true
-          echo "########## binwalk ##########"
-          binwalk "$BIMG" | head -30 || true
+          echo "########## STEP 3: boot.img detailed analysis ##########"
+          echo "Size: $(stat -c%s "$BIMG")"
+          echo ""
+          echo "--- First 32 bytes ---"
+          xxd -l 32 "$BIMG"
+          echo ""
+          echo "--- Magic check ---"
+          MAGIC=$(xxd -l 4 -p "$BIMG")
+          echo "Magic: $MAGIC"
+          echo ""
+          # 跳过前 8 字节 KRNL 头，提取 gzip 数据
+          echo "--- Extract gzip from offset 8 ---"
+          dd if="$BIMG" of=/tmp/boot_payload.gz bs=1 skip=8 status=none
+          file /tmp/boot_payload.gz
+          ls -la /tmp/boot_payload.gz
+          echo ""
+          echo "--- Decompress and inspect ---"
+          mkdir -p /tmp/boot_extract
+          cd /tmp/boot_extract
+          if zcat /tmp/boot_payload.gz > /tmp/boot_extracted 2>/dev/null; then
+            echo "Decompressed size: $(stat -c%s /tmp/boot_extracted)"
+            echo "--- First 64 bytes of decompressed ---"
+            xxd -l 64 /tmp/boot_extracted
+            echo ""
+            echo "--- File type ---"
+            file /tmp/boot_extracted
+            echo ""
+            echo "--- Magic check ---"
+            echo "Magic: $(xxd -l 4 -p /tmp/boot_extracted)"
+            echo ""
+            # 判断是否是 ext4
+            if [ "$(xxd -l 2 -p /tmp/boot_extracted)" = "53ef" ]; then
+              echo ">>> This is ext4 filesystem (offset 0x438 magic)"
+              # 挂载需要 loop
+              cp /tmp/boot_extracted /tmp/boot_fs.img
+              mkdir -p /tmp/boot_mnt2
+              if sudo mount -o loop,ro /tmp/boot_fs.img /tmp/boot_mnt2 2>&1; then
+                echo "--- boot.img mountable, contents: ---"
+                sudo ls -la /tmp/boot_mnt2/
+                sudo find /tmp/boot_mnt2 -maxdepth 2 | head -30
+                sudo umount /tmp/boot_mnt2
+              fi
+            fi
+          else
+            echo "Not gzip at offset 8"
+            # 尝试 7z
+            7z x "$BIMG" -o/tmp/boot_7z 2>&1 | tail -20
+            ls -la /tmp/boot_7z/ 2>/dev/null
+          fi
 
-      - name: Deep inspect resource.img and dtbo.img
+      - name: Step 4 - Analyze partition sizes from parameter.txt
         run: |
           cd /tmp/existing
           IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
-          for name in resource.img dtbo.img parameter.txt; do
-            F="$IMG_DIR/$name"
-            [ -f "$F" ] || continue
-            echo "########## $name ##########"
-            ls -la "$F"
-            file "$F"
-            if [[ "$name" == "parameter.txt" ]]; then
-              cat "$F"
-            else
-              xxd "$F" | head -8
-              strings "$F" | head -10
-            fi
-          done
+          echo "########## STEP 4: Partition layout ##########"
+          cat "$IMG_DIR/parameter.txt"
+          echo ""
+          echo "--- Parse and calculate partition sizes in MB ---"
+          python3 << 'PYEOF'
+          import re, glob
+          params = glob.glob("/tmp/existing/friendlywrt*/parameter.txt")
+          if not params:
+            print("parameter.txt not found")
+          else:
+            with open(params[0]) as f:
+              content = f.read()
+            m = re.search(r'CMDLINE:\s*mtdparts=([^:]+):(.+)$', content, re.M)
+            if m:
+              parts = m.group(2)
+              print(f"{'Partition':<15} {'Offset':>12} {'Size':>12} {'Size(MB)':>10}")
+              print("-" * 55)
+              for p in parts.split(','):
+                pm = re.match(r'(-|0x[0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(([^)]+)\)', p)
+                if pm:
+                  size = pm.group(1)
+                  offset = pm.group(2)
+                  name = pm.group(3)
+                  if size == '-':
+                    print(f"{name:<15} {offset:>12} {'rest':>12} {'-':>10}")
+                  else:
+                    size_bytes = int(size, 16) * 512
+                    size_mb = size_bytes / (1024*1024)
+                    print(f"{name:<15} {offset:>12} {size:>12} {size_mb:>10.2f}")
+          PYEOF
 
-      - name: Download and inspect flippy kernel package
+      - name: Step 5 - Inspect flippy vmlinuz PE/EFI structure
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p /tmp/flippy
-          cd /tmp/flippy
+          mkdir -p /tmp/flippy && cd /tmp/flippy
           ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
-          VERSIONS=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V)
-          LATEST=$(echo "$VERSIONS" | tail -1)
-          echo "Latest flippy kernel: $LATEST"
+          LATEST=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1)
+          echo "Latest flippy: $LATEST"
           wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${LATEST}.tar.gz" -O flippy.tar.gz
           tar xzf flippy.tar.gz
           KDIR="$LATEST"
-          echo "########## Contents of $KDIR ##########"
-          ls -la "$KDIR"
-
-          BOOT_TAR=$(find "$KDIR" -name "boot-*.tar.gz" | head -1)
-          DTB_TAR=$(find "$KDIR" -name "dtb-rockchip-*.tar.gz" | head -1)
-
-          echo ""
-          echo "########## Extracting boot package ##########"
           mkdir -p boot
-          tar xzf "$BOOT_TAR" -C boot
-          echo "Contents:"
-          ls -la boot/
-          echo ""
-          echo "########## File types ##########"
-          for f in boot/*; do
-            echo "--- $(basename $f)"
-            file "$f"
-          done
-          echo ""
-          VMLINUZ=$(find boot -name "vmlinuz-*" | head -1)
-          echo "########## vmlinuz size ##########"
-          ls -la "$VMLINUZ"
-          echo "########## vmlinuz first 256 bytes ##########"
-          xxd "$VMLINUZ" | head -16
-          echo "########## vmlinuz strings (first 20) ##########"
-          strings "$VMLINUZ" | head -20
-          VMLINUZ_MAGIC=$(xxd -l 4 -p "$VMLINUZ")
-          echo "vmlinuz magic: $VMLINUZ_MAGIC"
-          if [[ "$VMLINUZ_MAGIC" == 1f8b* ]]; then
-            echo ">>> gzip compressed, decompressing to check ARM64 header"
-            zcat "$VMLINUZ" > /tmp/Image_decomp 2>/dev/null || true
-            ls -la /tmp/Image_decomp
-            echo "########## Decompressed Image first 64 bytes ##########"
-            xxd /tmp/Image_decomp | head -4
-            echo "########## ARM64 Image magic at 0x38 ##########"
-            xxd -s 0x38 -l 16 /tmp/Image_decomp
-          fi
-
-          echo ""
-          UINITRD=$(find boot -name "uInitrd-*" | head -1)
-          echo "########## uInitrd info ##########"
-          ls -la "$UINITRD"
-          file "$UINITRD"
-          xxd "$UINITRD" | head -8
-
-          echo ""
-          echo "########## Extracting dtb package ##########"
-          mkdir -p dtb
-          tar xzf "$DTB_TAR" -C dtb
-          echo "Total dtb files: $(ls dtb/*.dtb 2>/dev/null | wc -l)"
-          echo "R5S/R5C related dtb files:"
-          ls dtb/ | grep -iE "r5s|r5c|rk3568" | head -30
-
-      - name: Compare and generate recommendation
-        run: |
-          echo ""
-          echo "==================================================================="
-          echo "                       FINAL DIAGNOSTIC SUMMARY"
-          echo "==================================================================="
+          tar xzf "$(find $KDIR -name 'boot-*.tar.gz' | head -1)" -C boot
           
+          echo "########## STEP 5: flippy vmlinuz structure ##########"
+          VMLINUZ=$(find boot -name "vmlinuz-*" | head -1)
+          echo "vmlinuz: $VMLINUZ"
+          echo "Size: $(stat -c%s "$VMLINUZ")"
+          echo ""
+          echo "--- First 128 bytes ---"
+          xxd -l 128 "$VMLINUZ"
+          echo ""
+          echo "--- PE header analysis (DOS + PE) ---"
+          echo "MZ at 0x00: $(xxd -l 2 -p "$VMLINUZ")"
+          pe_offset=$(xxd -s 0x3c -l 4 -p "$VMLINUZ")
+          echo "PE header offset (LE): 0x$pe_offset"
+          pe_off_dec=$((16#${pe_offset:6:2}${pe_offset:4:2}${pe_offset:2:2}${pe_offset:0:2}))
+          echo "PE offset decimal: $pe_off_dec"
+          echo "PE magic at that offset:"
+          xxd -s $pe_off_dec -l 4 "$VMLINUZ"
+          echo ""
+          echo "--- ARM64 Image magic at 0x38 ---"
+          xxd -s 0x38 -l 16 "$VMLINUZ"
+          echo ""
+          echo "--- PE section headers ---"
+          python3 << PYEOF
+          with open("$VMLINUZ", 'rb') as f:
+              # 读 DOS 头
+              f.seek(0x3c)
+              pe_off = int.from_bytes(f.read(4), 'little')
+              print(f"PE header offset: 0x{pe_off:x}")
+              # 读 PE 头
+              f.seek(pe_off)
+              pe_sig = f.read(4)
+              print(f"PE signature: {pe_sig.hex()} (should be 50450000)")
+              # COFF header
+              coff = f.read(20)
+              machine = int.from_bytes(coff[0:2], 'little')
+              num_sections = int.from_bytes(coff[2:4], 'little')
+              print(f"Machine: 0x{machine:04x} (0xaa64 = ARM64)")
+              print(f"Number of sections: {num_sections}")
+              # Optional header
+              opt_size = int.from_bytes(coff[16:18], 'little')
+              print(f"Optional header size: {opt_size}")
+              # section headers
+              f.seek(pe_off + 24 + opt_size)
+              print("\nSections:")
+              for i in range(num_sections):
+                  sec = f.read(40)
+                  name = sec[0:8].rstrip(b'\x00').decode('ascii', 'ignore')
+                  vsize = int.from_bytes(sec[8:12], 'little')
+                  vaddr = int.from_bytes(sec[12:16], 'little')
+                  raw_size = int.from_bytes(sec[16:20], 'little')
+                  raw_off = int.from_bytes(sec[20:24], 'little')
+                  print(f"  {name:<8} VSize=0x{vsize:08x} VAddr=0x{vaddr:08x} RawSize=0x{raw_size:08x} RawOff=0x{raw_off:08x}")
+          PYEOF
+
+      - name: Step 6 - Compare and build final answer
+        run: |
+          echo "########## STEP 6: FINAL COMPARISON SUMMARY ##########"
+          echo ""
           cd /tmp/existing
           IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
           KIMG="$IMG_DIR/kernel.img"
+          BIMG="$IMG_DIR/boot.img"
           
+          echo "================= FriendlyWrt ================="
+          echo "kernel.img:"
+          echo "  - size: $(stat -c%s "$KIMG")"
+          echo "  - magic: $(xxd -l 4 -p "$KIMG")"
+          echo "  - first 12 bytes: $(xxd -l 12 -p "$KIMG")"
+          echo "  - ARM64 magic position: $(python3 -c "print(open('$KIMG','rb').read(2048).find(b'ARM\x64'))")"
           echo ""
-          echo "FriendlyWrt kernel.img magic: $(xxd -l 4 -p "$KIMG")"
-          echo "FriendlyWrt kernel.img size:  $(stat -c%s "$KIMG")"
+          echo "boot.img:"
+          echo "  - size: $(stat -c%s "$BIMG")"
+          echo "  - magic: $(xxd -l 4 -p "$BIMG")"
+          echo "  - gzip at offset: $(python3 -c "print(open('$BIMG','rb').read(1024).find(b'\x1f\x8b'))")"
+          echo ""
           
           cd /tmp/flippy
           VMLINUZ=$(find boot -name "vmlinuz-*" | head -1)
-          echo "flippy vmlinuz magic:         $(xxd -l 4 -p "$VMLINUZ")"
-          echo "flippy vmlinuz size:          $(stat -c%s "$VMLINUZ")"
+          echo "================= flippy ================="
+          echo "vmlinuz:"
+          echo "  - size: $(stat -c%s "$VMLINUZ")"
+          echo "  - first 12 bytes: $(xxd -l 12 -p "$VMLINUZ")"
+          echo "  - ARM64 magic position: $(python3 -c "print(open('$VMLINUZ','rb').read(2048).find(b'ARM\x64'))")"
           echo ""
           
-          echo "Please copy the FULL log output back to determine the exact"
-          echo "kernel replacement strategy."
+          echo "================= CONCLUSION ================="
+          KIMG_SIZE=$(stat -c%s "$KIMG")
+          VMLINUZ_SIZE=$(stat -c%s "$VMLINUZ")
+          echo "FriendlyWrt kernel.img  = $KIMG_SIZE bytes"
+          echo "flippy vmlinuz          = $VMLINUZ_SIZE bytes"
+          echo "Size difference         = $((VMLINUZ_SIZE - KIMG_SIZE)) bytes"
+          echo ""
+          echo "kernel partition in parameter.txt:"
+          grep -oE 'kernel\([^)]*\)' "$IMG_DIR/parameter.txt" || true
+          grep "CMDLINE" "$IMG_DIR/parameter.txt" | grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' || true
