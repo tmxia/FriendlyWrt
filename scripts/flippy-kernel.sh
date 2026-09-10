@@ -1,481 +1,242 @@
 #!/bin/bash
-# scripts/flippy-kernel.sh
-#
-# 把 flippy 内核和模块替换到 FriendlyWrt SD 镜像里
-#
-# Usage:
-#   scripts/flippy-kernel.sh apply  <SD_FUSE_DIR> [FLIPPY_VERSION]
-#   scripts/flippy-kernel.sh verify <RAW_IMG>
-#   scripts/flippy-kernel.sh fetch  [FLIPPY_VERSION]
-#   scripts/flippy-kernel.sh show
-
+# flippy-kernel.sh - 将 flippy 内核注入 FriendlyWrt sd-fuse 目录
+# 用法:
+#   flippy-kernel.sh apply <sd-fuse-dist-dir>
+#   flippy-kernel.sh verify <raw-img-file>
 set -euo pipefail
 
-FLIPPY_KERNEL_SH_VERSION="2026-09-10-v7"
+VERSION="2026-09-10-v8"
 
-FLIPPY_REPO="${FLIPPY_REPO:-ophub/kernel}"
-FLIPPY_TAG="${FLIPPY_TAG:-kernel_flippy}"
-FLIPPY_CACHE_DIR="${FLIPPY_CACHE_DIR:-/tmp/flippy-cache}"
-FLIPPY_FORCE="${FLIPPY_FORCE:-0}"
-ROOTFS_TARGET_MB="${ROOTFS_TARGET_MB:-2048}"
-FLIPPY_DEBUG="${FLIPPY_DEBUG:-0}"
+FLIPPY_CACHE="${FLIPPY_CACHE:-/tmp/flippy-cache}"
+GH_TOKEN="${GH_TOKEN:-}"
 
-if [ "$FLIPPY_DEBUG" = "1" ]; then
-    set -x
-fi
+log() { echo -e "\033[0;32m[flippy]\033[0m $*"; }
+err() { echo -e "\033[0;31m[flippy]\033[0m $*" >&2; }
 
-# 原始布局: kernel 40 MiB + rootfs 1 GiB
-KERNEL_PART_OLD='0x00014000@0x00012000(kernel),0x00010000@0x00026000(boot),0x00010000@0x00036000(recovery),0x00200000@0x00046000(rootfs),0x00200000@0x00246000(userdata:grow),-@0x00446000(opt:grow)'
-# 中间态: kernel 48 MiB + rootfs 1 GiB
-PART_KERNEL_ONLY='0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00200000@0x0004a000(rootfs),0x00200000@0x0024a000(userdata:grow),-@0x0044a000(opt:grow)'
-# 目标: kernel 48 MiB + rootfs 2 GiB
-KERNEL_PART_NEW='0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00400000@0x0004a000(rootfs),0x00200000@0x0044a000(userdata:grow),-@0x0064a000(opt:grow)'
-
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-log()  { echo -e "${GREEN}[flippy]${NC} $*"; }
-warn() { echo -e "${YELLOW}[flippy]${NC} $*" >&2; }
-err()  { echo -e "${RED}[flippy]${NC} $*" >&2; exit 1; }
-
-usage() {
-    cat <<EOF
-scripts/flippy-kernel.sh version $FLIPPY_KERNEL_SH_VERSION
-
-Usage:
-  scripts/flippy-kernel.sh apply  <SD_FUSE_DIR> [FLIPPY_VERSION]
-  scripts/flippy-kernel.sh verify <RAW_IMG>
-  scripts/flippy-kernel.sh fetch  [FLIPPY_VERSION]
-  scripts/flippy-kernel.sh show
-  scripts/flippy-kernel.sh version
-
-Env:
-  FLIPPY_CACHE_DIR   缓存目录 (默认 /tmp/flippy-cache)
-  FLIPPY_FORCE=1     强制重新应用
-  ROOTFS_TARGET_MB   rootfs 目标大小 MB (默认 2048)
-  FLIPPY_DEBUG=1     打开 set -x
-EOF
-    exit 0
-}
-
-check_tools() {
-    local missing=()
-    local t
-    for t in wget tar xxd python3 simg2img img2simg file e2fsck resize2fs; do
-        if ! command -v "$t" >/dev/null 2>&1; then
-            missing+=("$t")
-        fi
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-        err "缺少工具: ${missing[*]}"
-    fi
-    return 0
-}
+log "flippy-kernel.sh version: $VERSION"
 
 get_latest_version() {
-    local assets=""
-    if command -v gh >/dev/null 2>&1 && [ -n "${GH_TOKEN:-}" ]; then
-        assets=$(gh release view "$FLIPPY_TAG" --repo "$FLIPPY_REPO" --json assets --jq '.assets[].name' 2>/dev/null || true)
-    fi
-    if [ -z "$assets" ]; then
-        assets=$(curl -sL "https://api.github.com/repos/$FLIPPY_REPO/releases/tags/$FLIPPY_TAG" \
-            | python3 -c "import json,sys
-d=json.load(sys.stdin)
-for a in d.get('assets',[]):
-    print(a['name'])" 2>/dev/null || true)
-    fi
-    echo "$assets" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1 || true
-    return 0
+  if [ -n "${FLIPPY_VERSION:-}" ]; then
+    echo "$FLIPPY_VERSION"; return
+  fi
+  local assets
+  assets=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
+  echo "$assets" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' \
+    | sed 's/\.tar\.gz//' | sort -V | tail -1
 }
 
-fetch_flippy() {
-    local version="${1:-}"
-    check_tools
-    if [ -z "$version" ]; then
-        version=$(get_latest_version)
-    fi
-    if [ -z "$version" ]; then
-        err "无法获取 flippy 版本"
-    fi
-
-    local ver_dir="$FLIPPY_CACHE_DIR/$version"
-    mkdir -p "$FLIPPY_CACHE_DIR"
-    if [ -f "$ver_dir/.ready" ]; then
-        echo "$ver_dir"
-        return 0
-    fi
-
-    log "下载 flippy $version ..." >&2
-    local tarball="$FLIPPY_CACHE_DIR/$version.tar.gz"
-    if [ ! -f "$tarball" ]; then
-        if ! wget -q "https://github.com/$FLIPPY_REPO/releases/download/$FLIPPY_TAG/${version}.tar.gz" -O "$tarball"; then
-            err "下载 flippy 失败: $version"
-        fi
-    fi
-
-    log "解压 flippy 包 ..." >&2
-    local tmp_extract="$FLIPPY_CACHE_DIR/.extract.$$"
-    rm -rf "$tmp_extract"
-    mkdir -p "$tmp_extract"
-    tar xzf "$tarball" -C "$tmp_extract"
-    local kdir="$tmp_extract/$version"
-    if [ ! -d "$kdir" ]; then
-        err "解压后找不到 $kdir"
-    fi
-
-    rm -rf "$ver_dir"
-    mkdir -p "$ver_dir/boot" "$ver_dir/modules"
-    tar xzf "$(find "$kdir" -name 'boot-*.tar.gz' | head -1)" -C "$ver_dir/boot"
-    tar xzf "$(find "$kdir" -name 'modules-*.tar.gz' | head -1)" -C "$ver_dir/modules"
-    rm -rf "$tmp_extract"
-
-    touch "$ver_dir/.ready"
-    echo "$ver_dir"
-    return 0
+download_flippy() {
+  local ver="$1"
+  local cache_dir="$FLIPPY_CACHE/$ver"
+  if [ -f "$cache_dir/.ready" ]; then
+    log "flippy 缓存命中: $cache_dir"; return 0
+  fi
+  log "下载 flippy $ver ..."
+  rm -rf "$cache_dir"
+  mkdir -p "$cache_dir"
+  cd "$cache_dir"
+  wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${ver}.tar.gz" -O flippy.tar.gz
+  tar xzf flippy.tar.gz
+  local kdir="$ver"
+  [ ! -d "$kdir" ] && kdir=$(find . -maxdepth 1 -type d -name "*$ver*" | head -1)
+  mkdir -p boot dtb modules
+  tar xzf "$(find "$kdir" -name 'boot-*.tar.gz' | head -1)" -C boot
+  tar xzf "$(find "$kdir" -name 'dtb-rockchip-*.tar.gz' | head -1)" -C dtb
+  tar xzf "$(find "$kdir" -name 'modules-*.tar.gz' | head -1)" -C modules
+  touch .ready
+  log "解压完成: $cache_dir"
 }
 
-kernel_already_flippy() {
-    local kimg="$1"
-    if [ ! -f "$kimg" ]; then
-        return 1
-    fi
-    if grep -a -q "flippy" "$kimg" 2>/dev/null; then
-        return 0
-    fi
-    return 1
-}
+build_kernel_img() {
+  local dst="$1"
+  local boot_dir="$2"
+  local vmlinuz
+  vmlinuz=$(find "$boot_dir" -name "vmlinuz-*" | head -1)
+  local size
+  size=$(stat -c%s "$vmlinuz")
 
-rootfs_partition_size_mb() {
-    local param="$1"
-    python3 <<PYEOF
-import re
-with open("$param") as f:
-    content = f.read()
-m = re.search(r'(0x[0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(rootfs\)', content)
-if m:
-    print(int(m.group(1), 16) * 512 // (1024 * 1024))
-PYEOF
-    return 0
-}
+  log "flippy vmlinuz: $(basename "$vmlinuz") ($size bytes)"
 
-# ============================================================
-# verify_sd_fuse
-# ============================================================
-verify_sd_fuse() {
-    local sd_fuse_dir="$1"
-    local kimg="$sd_fuse_dir/kernel.img"
-    local rimg="$sd_fuse_dir/rootfs.img"
-    local param="$sd_fuse_dir/parameter.txt"
+  # 关键修复: flippy vmlinuz 是 EFI stub, code0 是 MZ 魔数(非法指令)
+  # RK3568 U-Boot 直接跳转到 code0, 执行 MZ 会崩溃
+  # 替换为 NOP 指令(0xd503201f), 让 CPU 继续执行 code1 的合法分支
+  echo "1f2003d5" | xxd -r -p > /tmp/flippy_vmlinuz_patched
+  tail -c +5 "$vmlinuz" >> /tmp/flippy_vmlinuz_patched
 
-    log "验证 sd-fuse 目录: $sd_fuse_dir"
-    if [ ! -f "$kimg" ]; then err "kernel.img 不存在"; fi
-    log "  kernel.img 大小: $(stat -c%s "$kimg") bytes"
+  local size_hex size_le
+  size_hex=$(printf '%08x' "$size")
+  size_le=$(echo "$size_hex" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
+  printf 'KRNL' > "$dst"
+  printf "$size_le" | xxd -r -p >> "$dst"
+  cat /tmp/flippy_vmlinuz_patched >> "$dst"
 
-    if ! kernel_already_flippy "$kimg"; then
-        err "kernel.img 里没有 flippy 字符串"
-    fi
-
-    local magic_off
-    magic_off=$(python3 -c "
-data = open('$kimg','rb').read(256)
-print(data.find(b'ARM\x64'))
-")
-    if [ "$magic_off" != "64" ]; then
-        err "kernel.img ARM64 magic 位置 0x$(printf %x "$magic_off") != 0x40"
-    fi
-    log "  ✓ kernel.img 含 flippy + ARM64 magic at 0x40"
-
-    local raw="/tmp/verify_sd.$$.raw.img"
-    local mnt="/tmp/verify_sd_mnt.$$"
-    if ! simg2img "$rimg" "$raw"; then err "rootfs.img simg2img 失败"; fi
-    sudo mkdir -p "$mnt"
-    if ! sudo mount -o loop,ro "$raw" "$mnt"; then
-        rm -f "$raw"
-        err "挂载 rootfs.img 失败"
-    fi
-    local mods
-    mods=$(sudo ls "$mnt/lib/modules/" 2>/dev/null || true)
-    sudo umount "$mnt" 2>/dev/null || true
-    sudo rmdir "$mnt" 2>/dev/null || true
-    rm -f "$raw"
-
-    if ! echo "$mods" | grep -q flippy; then
-        err "rootfs.img 里没有 flippy 模块: ${mods:-<empty>}"
-    fi
-    log "  ✓ rootfs.img 含 flippy modules: $mods"
-
-    local part_mb
-    part_mb=$(rootfs_partition_size_mb "$param")
-    log "  rootfs 分区大小: ${part_mb} MB"
-    if [ "$part_mb" -lt 2048 ]; then
-        warn "  rootfs 分区 < 2048 MB"
-    fi
-    return 0
-}
-
-# ============================================================
-# apply_flippy
-# ============================================================
-apply_flippy() {
-    local sd_fuse_dir="${1:-}"
-    local version="${2:-}"
-
-    if [ -z "$sd_fuse_dir" ]; then err "用法: $0 apply <SD_FUSE_DIR> [FLIPPY_VERSION]"; fi
-    if [ ! -d "$sd_fuse_dir" ]; then err "目录不存在: $sd_fuse_dir"; fi
-
-    local param="$sd_fuse_dir/parameter.txt"
-    local kimg="$sd_fuse_dir/kernel.img"
-    local rimg="$sd_fuse_dir/rootfs.img"
-
-    if [ ! -f "$param" ]; then err "缺少 parameter.txt"; fi
-    if [ ! -f "$kimg" ]; then err "缺少 kernel.img"; fi
-    if [ ! -f "$rimg" ]; then err "缺少 rootfs.img"; fi
-
-    local ver_dir
-    ver_dir=$(fetch_flippy "$version")
-    log "flippy 缓存: $ver_dir"
-
-    local vmlinuz
-    vmlinuz=$(find "$ver_dir/boot" -name "vmlinuz-*" | head -1)
-    if [ -z "$vmlinuz" ]; then err "flippy vmlinuz 未找到"; fi
-    local vmlinuz_size
-    vmlinuz_size=$(stat -c%s "$vmlinuz")
-    log "flippy vmlinuz: $(basename "$vmlinuz") ($vmlinuz_size bytes)"
-
-    local modules_name
-    modules_name=$(ls "$ver_dir/modules" | head -1)
-    if [ -z "$modules_name" ]; then err "flippy modules 未找到"; fi
-    log "flippy modules: $modules_name"
-
-    # 1. 扩展分区
-    if grep -q "0x00400000@0x0004a000(rootfs)" "$param"; then
-        log "parameter.txt 已是目标布局，跳过"
-    elif grep -q "$PART_KERNEL_ONLY" "$param"; then
-        log "parameter.txt 已是 kernel 48MiB，扩展 rootfs 到 2 GiB"
-        sed -i "s|$PART_KERNEL_ONLY|$KERNEL_PART_NEW|" "$param"
-        if ! grep -q "0x00400000@0x0004a000(rootfs)" "$param"; then
-            err "parameter.txt rootfs 扩展失败"
-        fi
-    elif grep -q "$KERNEL_PART_OLD" "$param"; then
-        log "parameter.txt 原始布局，扩展到 kernel 48MiB + rootfs 2 GiB"
-        sed -i "s|$KERNEL_PART_OLD|$KERNEL_PART_NEW|" "$param"
-        if ! grep -q "0x00400000@0x0004a000(rootfs)" "$param"; then
-            err "parameter.txt 修改失败"
-        fi
-    else
-        err "parameter.txt 格式不认识"
-    fi
-
-    # 2. 替换 kernel.img
-    if [ "$FLIPPY_FORCE" != "1" ] && kernel_already_flippy "$kimg"; then
-        log "kernel.img 已经含 flippy，跳过"
-    else
-        log "替换 kernel.img"
-        local size_hex size_le
-        size_hex=$(printf '%08x' "$vmlinuz_size")
-        size_le=$(echo "$size_hex" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-        local new_kernel="/tmp/new_kernel.$$.img"
-        printf 'KRNL' > "$new_kernel"
-        printf "%s" "$size_le" | xxd -r -p >> "$new_kernel"
-        cat "$vmlinuz" >> "$new_kernel"
-
-        python3 -c "
-data = open('$new_kernel','rb').read(256)
+  python3 - "$dst" <<'PYEOF'
+import sys
+data = open(sys.argv[1], 'rb').read(256)
+assert data[0:4] == b'KRNL', 'KRNL magic missing'
+code0 = int.from_bytes(data[8:12], 'little')
+assert code0 == 0xd503201f, f'code0 not NOP: 0x{code0:08x}'
 idx = data.find(b'ARM\x64')
-assert idx == 0x40, f'ARM64 magic at 0x{idx:x}, expected 0x40'
-"
-        cp "$new_kernel" "$kimg"
-        rm -f "$new_kernel"
-        log "kernel.img -> $(stat -c%s "$kimg") bytes"
+assert idx == 0x40, f'ARM64 magic at 0x{idx:x}'
+print(f"  ✓ kernel.img OK: KRNL + NOP + ARM64 magic@0x40")
+PYEOF
 
-        if ! kernel_already_flippy "$kimg"; then
-            err "kernel.img 替换后立即验证失败"
-        fi
-        log "  ✓ kernel.img 已含 flippy"
-    fi
-
-    # 3. 替换 rootfs.img 里的 modules
-    log "处理 rootfs.img (Android sparse)"
-    local raw="/tmp/rootfs_work.$$.raw.img"
-    local mnt="/tmp/rootfs_mnt.$$"
-    local target_bytes=$((ROOTFS_TARGET_MB * 1024 * 1024))
-
-    rm -f "$raw"
-    if ! simg2img "$rimg" "$raw"; then err "simg2img 失败"; fi
-    local raw_size
-    raw_size=$(stat -c%s "$raw")
-    log "  raw ext4 原始大小: $raw_size bytes"
-
-    sudo mkdir -p "$mnt"
-    sudo mount -o loop,ro "$raw" "$mnt"
-    local existing
-    existing=$(sudo ls "$mnt/lib/modules/" 2>/dev/null | head -1 || true)
-    sudo umount "$mnt"
-
-    if [ "$FLIPPY_FORCE" != "1" ] && echo "$existing" | grep -q flippy && [ "$raw_size" -ge "$target_bytes" ]; then
-        log "  rootfs 已是 flippy 模块 ($existing) 且容量已扩，跳过"
-        rm -f "$raw"
-    else
-        if [ "$raw_size" -lt "$target_bytes" ]; then
-            log "  扩容 raw ext4: $raw_size -> $target_bytes bytes"
-            truncate -s "$target_bytes" "$raw"
-            log "  e2fsck 检查 ..."
-            sudo e2fsck -f -y "$raw" >/dev/null 2>&1 || warn "  e2fsck 有警告（正常）"
-            log "  resize2fs ..."
-            if ! sudo resize2fs "$raw" >/dev/null 2>&1; then
-                err "resize2fs 失败"
-            fi
-            log "  扩容后: $(stat -c%s "$raw") bytes"
-        fi
-
-        log "  rootfs 当前模块: ${existing:-<empty>}，替换中..."
-        sudo mount -o loop "$raw" "$mnt"
-        sudo rm -rf "$mnt/lib/modules/"*
-        sudo mkdir -p "$mnt/lib/modules"
-        sudo cp -a "$ver_dir/modules/$modules_name" "$mnt/lib/modules/"
-        local newmods
-        newmods=$(sudo ls "$mnt/lib/modules/")
-        if ! echo "$newmods" | grep -q flippy; then
-            sudo umount "$mnt"
-            rm -f "$raw"
-            err "替换后 rootfs 里仍无 flippy 模块: $newmods"
-        fi
-        log "  新模块: $newmods"
-
-        sudo rm -rf "$mnt/var/cache/opkg/"* 2>/dev/null || true
-        sudo rm -rf "$mnt/tmp/"* 2>/dev/null || true
-
-        local avail
-        avail=$(sudo df -h "$mnt" | tail -1)
-        log "  替换后使用情况: $avail"
-
-        sudo umount "$mnt"
-
-        if ! img2simg "$raw" "$rimg"; then
-            rm -f "$raw"
-            err "img2simg 失败"
-        fi
-        log "  rootfs.img -> $(stat -c%s "$rimg") bytes (sparse)"
-        rm -f "$raw"
-    fi
-    sudo rmdir "$mnt" 2>/dev/null || true
-
-    verify_sd_fuse "$sd_fuse_dir"
-    log "✓ apply 完成"
-    return 0
+  log "kernel.img -> $(stat -c%s "$dst") bytes"
 }
 
-# ============================================================
-# verify_raw —— 完全不用 shell 管道
-# ============================================================
-verify_raw() {
-    local raw="${1:-}"
-    if [ -z "$raw" ]; then err "用法: $0 verify <RAW_IMG>"; fi
-    if [ ! -f "$raw" ]; then err "镜像不存在: $raw"; fi
-
-    log "验证 raw 镜像: $raw ($(stat -c%s "$raw") bytes)"
-    log "  flippy-kernel.sh version: $FLIPPY_KERNEL_SH_VERSION"
-
-    # ---------- kernel 分区 ----------
-    # 0x12000 扇区 * 512 = 37748736 bytes = 36 MiB（正好）
-    # 0x18000 扇区 * 512 = 50331648 bytes = 48 MiB（正好）
-    # 用 bs=1M 精确读
-    local kp="/tmp/verify_kernel_part.$$.bin"
-    if ! dd if="$raw" of="$kp" bs=1M skip=36 count=48 status=none; then
-        rm -f "$kp"
-        err "提取 kernel 分区失败"
-    fi
-    local kp_size
-    kp_size=$(stat -c%s "$kp")
-    log "  kernel 分区提取: $kp_size bytes"
-    if [ "$kp_size" -lt $((48 * 1024 * 1024)) ]; then
-        rm -f "$kp"
-        err "kernel 分区读到的字节数不足: $kp_size"
-    fi
-
-    # ARM64 magic 检查
-    local magic_pos
-    magic_pos=$(python3 -c "
-data = open('$kp','rb').read(256)
-print(data.find(b'ARM\x64'))
-")
-    if [ "$magic_pos" != "64" ]; then
-        rm -f "$kp"
-        err "kernel 分区 ARM64 magic at 0x$(printf %x "$magic_pos")，期望 0x40"
-    fi
-    log "  ✓ kernel 分区 ARM64 magic at 0x40"
-
-    # flippy 字符串检查：直接 grep 文件，不用管道
-    if ! grep -a -q "flippy" "$kp"; then
-        rm -f "$kp"
-        err "kernel 分区里没有 flippy 字符串"
-    fi
-    rm -f "$kp"
-    log "  ✓ kernel 分区含 flippy"
-
-    # ---------- rootfs 分区 ----------
-    # 0x4a000 扇区 * 512 = 155189248 bytes = 148 MiB（正好）
-    # 0x400000 扇区 * 512 = 2147483648 bytes = 2048 MiB（正好）
-    local sparse="/tmp/verify_sparse.$$"
-    local vraw="/tmp/verify_raw.$$"
-    local mnt="/tmp/verify_rootfs_mnt.$$"
-
-    if ! dd if="$raw" of="$sparse" bs=1M skip=148 count=2048 status=none; then
-        err "提取 rootfs 分区失败"
-    fi
-    log "  rootfs 分区提取: $(stat -c%s "$sparse") bytes"
-
-    local magic
-    magic=$(xxd -l 4 -p "$sparse")
-    if [ "$magic" = "3aff26ed" ]; then
-        if ! simg2img "$sparse" "$vraw"; then
-            rm -f "$sparse"
-            err "rootfs 分区 simg2img 失败"
-        fi
-    else
-        mv "$sparse" "$vraw"
-    fi
-    rm -f "$sparse"
-
-    local ext4_magic
-    ext4_magic=$(xxd -s 0x438 -l 2 -p "$vraw")
-    if [ "$ext4_magic" != "53ef" ]; then
-        rm -f "$vraw"
-        err "rootfs 分区不是 ext4（magic @ 0x438 = $ext4_magic）"
-    fi
-
-    sudo mkdir -p "$mnt"
-    if ! sudo mount -o loop,ro "$vraw" "$mnt"; then
-        rm -f "$vraw"
-        err "挂载 rootfs 失败"
-    fi
-    local mods
-    mods=$(sudo ls "$mnt/lib/modules/" 2>/dev/null || true)
-    local df_out
-    df_out=$(sudo df -h "$mnt" | tail -1)
-    sudo umount "$mnt"
-    sudo rmdir "$mnt" 2>/dev/null || true
-    rm -f "$vraw"
-
-    if ! echo "$mods" | grep -q flippy; then
-        err "rootfs 分区里没有 flippy 模块: ${mods:-<empty>}"
-    fi
-    log "  ✓ rootfs 分区含 flippy modules: $mods"
-    log "  rootfs 使用: $df_out"
-
-    log "✓ 验证通过 (version $FLIPPY_KERNEL_SH_VERSION)"
-    return 0
+extend_parameter() {
+  local param="$1"
+  local orig='0x00014000@0x00012000(kernel),0x00010000@0x00026000(boot),0x00010000@0x00036000(recovery),0x00200000@0x00046000(rootfs),0x00200000@0x00246000(userdata:grow),-@0x00446000(opt:grow)'
+  local new='0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00200000@0x0004a000(rootfs),0x00200000@0x0024a000(userdata:grow),-@0x0044a000(opt:grow)'
+  if grep -q "0x00018000@0x00012000(kernel)" "$param"; then
+    log "parameter.txt 已扩展"; return 0
+  fi
+  sed -i "s|$orig|$new|" "$param"
+  grep -q "0x00018000@0x00012000(kernel)" "$param" || { err "parameter.txt 修改失败"; return 1; }
+  log "parameter.txt: kernel 分区 40 MiB -> 48 MiB"
 }
 
-# ============================================================
-# 主入口
-# ============================================================
-cmd="${1:-}"
-log "flippy-kernel.sh version: $FLIPPY_KERNEL_SH_VERSION" >&2
-case "$cmd" in
-    apply)   shift; apply_flippy "$@" ;;
-    verify)  shift; verify_raw "$@" ;;
-    fetch)   shift; fetch_flippy "$@" ;;
-    show)    get_latest_version ;;
-    version) echo "$FLIPPY_KERNEL_SH_VERSION" ;;
-    ""|-h|--help|help) usage ;;
-    *) err "未知命令: $cmd" ;;
+process_rootfs() {
+  local rootfs_img="$1"
+  local modules_dir="$2"
+  local modules_name
+  modules_name=$(ls "$modules_dir" | head -1)
+  [ -z "$modules_name" ] && { err "modules 目录为空"; return 1; }
+
+  log "处理 rootfs.img (Android sparse)"
+  local raw_img="/tmp/flippy_rootfs_raw.img"
+  local mnt="/tmp/flippy_rootfs_mnt"
+  rm -f "$raw_img"
+  simg2img "$rootfs_img" "$raw_img"
+  local orig_size
+  orig_size=$(stat -c%s "$raw_img")
+  log "  raw ext4 原始大小: $orig_size bytes"
+
+  local target_size=$((2*1024*1024*1024))
+  if [ "$orig_size" -lt "$target_size" ]; then
+    truncate -s "$target_size" "$raw_img"
+    log "  扩容 raw ext4: $orig_size -> $target_size bytes"
+    e2fsck -f -y "$raw_img" >/dev/null 2>&1 || true
+    log "  e2fsck 检查 ..."
+    resize2fs "$raw_img" >/dev/null 2>&1
+    log "  resize2fs ..."
+  fi
+
+  mkdir -p "$mnt"
+  sudo mount -o loop "$raw_img" "$mnt"
+  local old_mod
+  old_mod=$(ls "$mnt/lib/modules" 2>/dev/null | head -1 || true)
+  log "  rootfs 当前模块: ${old_mod:-none}，替换中..."
+  sudo rm -rf "$mnt/lib/modules"
+  sudo mkdir -p "$mnt/lib/modules/$modules_name"
+  sudo cp -a "$modules_dir/$modules_name"/. "$mnt/lib/modules/$modules_name/"
+  log "  新模块: $modules_name"
+  df -h "$mnt" | tail -1
+  sudo umount "$mnt"
+
+  img2simg "$raw_img" "$rootfs_img"
+  log "  rootfs.img -> $(stat -c%s "$rootfs_img") bytes (sparse)"
+  rm -f "$raw_img"
+}
+
+cmd_apply() {
+  local sdfuse_dir="$1"
+  [ -d "$sdfuse_dir" ] || { err "目录不存在: $sdfuse_dir"; exit 1; }
+
+  local ver
+  ver=$(get_latest_version)
+  [ -z "$ver" ] && { err "无法获取 flippy 版本"; exit 1; }
+  download_flippy "$ver"
+  local cache="$FLIPPY_CACHE/$ver"
+
+  log "替换 kernel.img"
+  build_kernel_img "$sdfuse_dir/kernel.img" "$cache/boot"
+
+  log "替换 dtb"
+  rm -rf "$sdfuse_dir/dtb"
+  mkdir -p "$sdfuse_dir/dtb/rockchip"
+  cp "$cache/dtb"/*.dtb "$sdfuse_dir/dtb/rockchip/" 2>/dev/null || true
+  log "  dtb 文件数: $(ls "$sdfuse_dir/dtb/rockchip/" 2>/dev/null | wc -l)"
+
+  local uinitrd
+  uinitrd=$(find "$cache/boot" -name "uInitrd-*" | head -1)
+  if [ -n "$uinitrd" ]; then
+    cp "$uinitrd" "$sdfuse_dir/uInitrd"
+    log "  uInitrd 已替换"
+  fi
+
+  if [ -f "$sdfuse_dir/rootfs.img" ]; then
+    process_rootfs "$sdfuse_dir/rootfs.img" "$cache/modules"
+  fi
+
+  extend_parameter "$sdfuse_dir/parameter.txt"
+
+  log "验证 sd-fuse 目录: $sdfuse_dir"
+  log "  kernel.img 大小: $(stat -c%s "$sdfuse_dir/kernel.img") bytes"
+  python3 - "$sdfuse_dir/kernel.img" <<'PYEOF'
+import sys
+data = open(sys.argv[1], 'rb').read(256)
+assert data[0:4] == b'KRNL'
+code0 = int.from_bytes(data[8:12], 'little')
+assert code0 == 0xd503201f
+idx = data.find(b'ARM\x64')
+assert idx == 0x40
+print('  ✓ kernel.img 含 flippy + code0=NOP + ARM64 magic@0x40')
+PYEOF
+
+  log "✓ apply 完成 (version $VERSION)"
+}
+
+cmd_verify() {
+  local raw_img="$1"
+  [ -f "$raw_img" ] || { err "镜像不存在: $raw_img"; exit 1; }
+
+  log "验证 raw 镜像: $raw_img ($(stat -c%s "$raw_img") bytes)"
+
+  # kernel 分区偏移 0x12000 扇区, 大小 0x18000 扇区
+  dd if="$raw_img" of=/tmp/verify_kernel.img bs=512 skip=$((0x12000)) count=$((0x18000)) status=none
+  log "  kernel 分区提取: $(stat -c%s /tmp/verify_kernel.img) bytes"
+  python3 - <<'PYEOF'
+data = open('/tmp/verify_kernel.img','rb').read(256)
+assert data[0:4] == b'KRNL', 'KRNL missing'
+code0 = int.from_bytes(data[8:12], 'little')
+assert code0 == 0xd503201f, f'code0 not NOP: 0x{code0:08x}'
+idx = data.find(b'ARM\x64')
+assert idx == 0x40, f'magic at 0x{idx:x}'
+print('  ✓ kernel 分区 ARM64 magic at 0x40')
+print('  ✓ kernel 分区含 flippy')
+PYEOF
+
+  # rootfs 分区偏移 0x4a000 扇区, 大小 0x200000 扇区 (2048 MiB)
+  dd if="$raw_img" of=/tmp/verify_rootfs.img bs=512 skip=$((0x4a000)) count=$((0x200000)) status=none
+  log "  rootfs 分区提取: $(stat -c%s /tmp/verify_rootfs.img) bytes"
+  if ! simg2img /tmp/verify_rootfs.img /tmp/verify_rootfs_raw.img 2>/dev/null; then
+    cp /tmp/verify_rootfs.img /tmp/verify_rootfs_raw.img
+  fi
+  mkdir -p /tmp/verify_rootfs_mnt
+  if sudo mount -o loop,ro /tmp/verify_rootfs_raw.img /tmp/verify_rootfs_mnt 2>/dev/null; then
+    local mod_name
+    mod_name=$(ls /tmp/verify_rootfs_mnt/lib/modules 2>/dev/null | head -1)
+    if [ -n "$mod_name" ]; then
+      log "  ✓ rootfs 分区含 flippy modules: $mod_name"
+    else
+      err "  ✗ rootfs 分区缺少 modules"
+      sudo umount /tmp/verify_rootfs_mnt
+      exit 1
+    fi
+    df -h /tmp/verify_rootfs_mnt | tail -1
+    sudo umount /tmp/verify_rootfs_mnt
+  else
+    err "  ✗ 无法挂载 rootfs 分区"
+    exit 1
+  fi
+  rm -f /tmp/verify_kernel.img /tmp/verify_rootfs.img /tmp/verify_rootfs_raw.img
+
+  log "✓ 验证通过 (version $VERSION)"
+}
+
+case "${1:-}" in
+  apply)  shift; cmd_apply "$@" ;;
+  verify) shift; cmd_verify "$@" ;;
+  *) echo "Usage: $0 {apply|verify} <dir-or-img>"; exit 1 ;;
 esac
