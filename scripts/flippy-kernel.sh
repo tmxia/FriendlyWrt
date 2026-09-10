@@ -5,7 +5,7 @@
 #   flippy-kernel.sh verify <raw-img-file>
 set -euo pipefail
 
-VERSION="2026-09-10-v8"
+VERSION="2026-09-10-v9"
 
 FLIPPY_CACHE="${FLIPPY_CACHE:-/tmp/flippy-cache}"
 GH_TOKEN="${GH_TOKEN:-}"
@@ -57,9 +57,9 @@ build_kernel_img() {
 
   log "flippy vmlinuz: $(basename "$vmlinuz") ($size bytes)"
 
-  # 关键修复: flippy vmlinuz 是 EFI stub, code0 是 MZ 魔数(非法指令)
-  # RK3568 U-Boot 直接跳转到 code0, 执行 MZ 会崩溃
-  # 替换为 NOP 指令(0xd503201f), 让 CPU 继续执行 code1 的合法分支
+  # 关键修复: flippy vmlinuz 的 code0 是 MZ 魔数(非法 ARM64 指令)
+  # RK3568 U-Boot 直接跳到 code0, 执行 MZ 会崩溃
+  # 替换为 NOP(0xd503201f), 让 CPU 继续执行 code1 的合法分支
   echo "1f2003d5" | xxd -r -p > /tmp/flippy_vmlinuz_patched
   tail -c +5 "$vmlinuz" >> /tmp/flippy_vmlinuz_patched
 
@@ -86,6 +86,8 @@ PYEOF
 
 extend_parameter() {
   local param="$1"
+  # kernel 40 MiB -> 48 MiB, 后续分区偏移 +8 MiB
+  # rootfs 保持 1 GiB 不变
   local orig='0x00014000@0x00012000(kernel),0x00010000@0x00026000(boot),0x00010000@0x00036000(recovery),0x00200000@0x00046000(rootfs),0x00200000@0x00246000(userdata:grow),-@0x00446000(opt:grow)'
   local new='0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00200000@0x0004a000(rootfs),0x00200000@0x0024a000(userdata:grow),-@0x0044a000(opt:grow)'
   if grep -q "0x00018000@0x00012000(kernel)" "$param"; then
@@ -93,7 +95,7 @@ extend_parameter() {
   fi
   sed -i "s|$orig|$new|" "$param"
   grep -q "0x00018000@0x00012000(kernel)" "$param" || { err "parameter.txt 修改失败"; return 1; }
-  log "parameter.txt: kernel 分区 40 MiB -> 48 MiB"
+  log "parameter.txt: kernel 40 MiB -> 48 MiB (rootfs 保持 1 GiB)"
 }
 
 process_rootfs() {
@@ -110,23 +112,57 @@ process_rootfs() {
   simg2img "$rootfs_img" "$raw_img"
   local orig_size
   orig_size=$(stat -c%s "$raw_img")
-  log "  raw ext4 原始大小: $orig_size bytes"
+  local orig_mb=$((orig_size/1024/1024))
+  log "  raw ext4 原始大小: $orig_size bytes (${orig_mb} MiB)"
 
-  local target_size=$((2*1024*1024*1024))
-  if [ "$orig_size" -lt "$target_size" ]; then
-    truncate -s "$target_size" "$raw_img"
-    log "  扩容 raw ext4: $orig_size -> $target_size bytes"
-    e2fsck -f -y "$raw_img" >/dev/null 2>&1 || true
-    log "  e2fsck 检查 ..."
-    resize2fs "$raw_img" >/dev/null 2>&1
-    log "  resize2fs ..."
-  fi
+  # flippy modules 大小
+  local mods_mb
+  mods_mb=$(du -sm "$modules_dir/$modules_name" | awk '{print $1}')
+  log "  flippy modules 大小: ${mods_mb} MiB"
 
   mkdir -p "$mnt"
   sudo mount -o loop "$raw_img" "$mnt"
-  local old_mod
-  old_mod=$(ls "$mnt/lib/modules" 2>/dev/null | head -1 || true)
-  log "  rootfs 当前模块: ${old_mod:-none}，替换中..."
+
+  # 检查原 modules 大小
+  local old_mb=0
+  if [ -d "$mnt/lib/modules" ]; then
+    old_mb=$(sudo du -sm "$mnt/lib/modules" | awk '{print $1}')
+    log "  原 modules 大小: ${old_mb} MiB"
+  fi
+
+  # 检查可用空间
+  local avail_kb
+  avail_kb=$(df --output=avail "$mnt" | tail -1 | tr -d ' ')
+  local avail_mb=$((avail_kb/1024))
+  log "  当前可用空间: ${avail_mb} MiB"
+
+  # 预估替换后所需空间 (新 modules - 旧 modules + 50 MiB 余量)
+  local needed_mb=$((mods_mb - old_mb + 50))
+
+  local resize_needed=false
+  if [ "$needed_mb" -gt "$avail_mb" ]; then
+    log "  空间不足 (需要 ${needed_mb} MiB, 可用 ${avail_mb} MiB)，需要扩容"
+    resize_needed=true
+  else
+    log "  ✓ 空间充足，无需扩容"
+  fi
+
+  sudo umount "$mnt"
+
+  # 仅在需要时扩容
+  if [ "$resize_needed" = "true" ]; then
+    # 扩容到 1.5 GiB（比 2 GiB 小，够用就行）
+    local target_size=$((1536*1024*1024))
+    if [ "$orig_size" -lt "$target_size" ]; then
+      truncate -s "$target_size" "$raw_img"
+      log "  扩容: ${orig_mb} MiB -> 1536 MiB"
+      e2fsck -f -y "$raw_img" >/dev/null 2>&1 || true
+      resize2fs "$raw_img" >/dev/null 2>&1
+      log "  resize2fs 完成"
+    fi
+  fi
+
+  sudo mount -o loop "$raw_img" "$mnt"
   sudo rm -rf "$mnt/lib/modules"
   sudo mkdir -p "$mnt/lib/modules/$modules_name"
   sudo cp -a "$modules_dir/$modules_name"/. "$mnt/lib/modules/$modules_name/"
@@ -135,7 +171,9 @@ process_rootfs() {
   sudo umount "$mnt"
 
   img2simg "$raw_img" "$rootfs_img"
-  log "  rootfs.img -> $(stat -c%s "$rootfs_img") bytes (sparse)"
+  local new_size
+  new_size=$(stat -c%s "$rootfs_img")
+  log "  rootfs.img -> $new_size bytes (sparse)"
   rm -f "$raw_img"
 }
 
@@ -184,6 +222,12 @@ assert idx == 0x40
 print('  ✓ kernel.img 含 flippy + code0=NOP + ARM64 magic@0x40')
 PYEOF
 
+  # 汇总大小
+  log "最终产物大小:"
+  for f in kernel.img rootfs.img boot.img parameter.txt; do
+    [ -f "$sdfuse_dir/$f" ] && log "  $f: $(stat -c%s "$sdfuse_dir/$f") bytes"
+  done
+
   log "✓ apply 完成 (version $VERSION)"
 }
 
@@ -193,7 +237,7 @@ cmd_verify() {
 
   log "验证 raw 镜像: $raw_img ($(stat -c%s "$raw_img") bytes)"
 
-  # kernel 分区偏移 0x12000 扇区, 大小 0x18000 扇区
+  # kernel 分区偏移 0x12000 扇区, 大小 0x18000 扇区 (48 MiB)
   dd if="$raw_img" of=/tmp/verify_kernel.img bs=512 skip=$((0x12000)) count=$((0x18000)) status=none
   log "  kernel 分区提取: $(stat -c%s /tmp/verify_kernel.img) bytes"
   python3 - <<'PYEOF'
@@ -207,7 +251,7 @@ print('  ✓ kernel 分区 ARM64 magic at 0x40')
 print('  ✓ kernel 分区含 flippy')
 PYEOF
 
-  # rootfs 分区偏移 0x4a000 扇区, 大小 0x200000 扇区 (2048 MiB)
+  # rootfs 分区偏移 0x4a000 扇区, 大小 0x200000 扇区 (1 GiB)
   dd if="$raw_img" of=/tmp/verify_rootfs.img bs=512 skip=$((0x4a000)) count=$((0x200000)) status=none
   log "  rootfs 分区提取: $(stat -c%s /tmp/verify_rootfs.img) bytes"
   if ! simg2img /tmp/verify_rootfs.img /tmp/verify_rootfs_raw.img 2>/dev/null; then
