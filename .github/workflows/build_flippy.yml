@@ -110,10 +110,11 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -qq --no-install-recommends \
           build-essential libncurses5-dev libncursesw5-dev \
-          gawk git rsync wget time file unzip bc bzip2 \
+          gawk git rsync wget curl time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
           flex bison qemu-user-static debootstrap \
-          dosfstools e2fsprogs parted xxd
+          dosfstools e2fsprogs parted xxd \
+          android-sdk-libsparse-utils
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git config --global color.ui false
@@ -122,6 +123,8 @@ jobs:
         mkdir -p ./artifact
         sudo swapoff -a || true
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
+        which simg2img img2simg || { echo "ERROR: simg2img/img2simg not found"; exit 1; }
+        bash $GITHUB_WORKSPACE/scripts/flippy-kernel.sh show
         echo "cores: $(nproc)"
 
     - name: Download source
@@ -226,114 +229,30 @@ jobs:
         fi
         ./build.sh kernel
         ./build.sh sd-img
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        echo "=== sd-fuse/${DIST_DIR} contents ==="
+        ls -la "scripts/sd-fuse/${DIST_DIR}/"
 
-    - name: Get latest flippy kernel version
-      id: flippy_version
+    - name: Apply flippy kernel and modules
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
-        LATEST=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1)
-        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" apply \
+          "$GITHUB_WORKSPACE/project/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}"
 
-    - name: Download flippy kernel
-      run: |
-        cd $GITHUB_WORKSPACE/project
-        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz" -O /tmp/flippy.tar.gz
-        mkdir -p /tmp/flippy && tar xzf /tmp/flippy.tar.gz -C /tmp/flippy
-        KDIR="/tmp/flippy/$KERNEL_VER"
-        mkdir -p /tmp/flippy_boot /tmp/flippy_dtb /tmp/flippy_modules
-        tar xzf "$(find $KDIR -name 'boot-*.tar.gz' | head -1)" -C /tmp/flippy_boot
-        tar xzf "$(find $KDIR -name 'dtb-rockchip-*.tar.gz' | head -1)" -C /tmp/flippy_dtb
-        tar xzf "$(find $KDIR -name 'modules-*.tar.gz' | head -1)" -C /tmp/flippy_modules
-        echo "flippy boot:"; ls -la /tmp/flippy_boot/
-
-    - name: Extend kernel partition in parameter.txt
-      run: |
-        cd $GITHUB_WORKSPACE/project
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        PARAM="scripts/sd-fuse/${DIST_DIR}/parameter.txt"
-        echo "=== Original parameter.txt ==="
-        cat "$PARAM"
-        # 原 kernel 分区大小 0x14000 (40 MiB)，扩大到 0x18000 (48 MiB)，偏移 +0x4000
-        # 原: 0x00014000@0x00012000(kernel),0x00010000@0x00026000(boot),0x00010000@0x00036000(recovery),0x00200000@0x00046000(rootfs),0x00200000@0x00246000(userdata:grow),-@0x00446000(opt:grow)
-        # 新: 0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00200000@0x0004a000(rootfs),0x00200000@0x0024a000(userdata:grow),-@0x0044a000(opt:grow)
-        sed -i 's|0x00014000@0x00012000(kernel),0x00010000@0x00026000(boot),0x00010000@0x00036000(recovery),0x00200000@0x00046000(rootfs),0x00200000@0x00246000(userdata:grow),-@0x00446000(opt:grow)|0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00200000@0x0004a000(rootfs),0x00200000@0x0024a000(userdata:grow),-@0x0044a000(opt:grow)|' "$PARAM"
-        echo "=== Modified parameter.txt ==="
-        cat "$PARAM"
-        # 验证
-        if ! grep -q "0x00018000@0x00012000(kernel)" "$PARAM"; then
-          echo "ERROR: parameter.txt modification failed"
-          exit 1
-        fi
-        echo "✓ kernel partition extended to 48 MiB"
-
-    - name: Replace kernel.img with flippy kernel
-      run: |
-        cd $GITHUB_WORKSPACE/project
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        KERNEL_IMG="scripts/sd-fuse/${DIST_DIR}/kernel.img"
-        VMLINUZ=$(find /tmp/flippy_boot -name "vmlinuz-*" | head -1)
-        VMLINUZ_SIZE=$(stat -c%s "$VMLINUZ")
-        echo "flippy vmlinuz: $VMLINUZ ($VMLINUZ_SIZE bytes)"
-        # 构造 KRNL + size(LE 4) + vmlinuz
-        SIZE_HEX=$(printf '%08x' $VMLINUZ_SIZE)
-        SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-        printf 'KRNL' > /tmp/new_kernel.img
-        printf "$SIZE_LE" | xxd -r -p >> /tmp/new_kernel.img
-        cat "$VMLINUZ" >> /tmp/new_kernel.img
-        # 验证 ARM64 magic 位置
-        python3 -c "
-        data = open('/tmp/new_kernel.img','rb').read(256)
-        idx = data.find(b'ARM\x64')
-        assert idx == 0x40, f'Magic at 0x{idx:x}, expected 0x40'
-        print('✓ ARM64 magic at 0x40')
-        "
-        cp /tmp/new_kernel.img "$KERNEL_IMG"
-        echo "New kernel.img size: $(stat -c%s "$KERNEL_IMG")"
-        # 替换 dtb
-        rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-        mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-        cp /tmp/flippy_dtb/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
-        echo "dtb files: $(ls scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/ | wc -l)"
-        # 替换 uInitrd（如存在）
-        UINITRD=$(find /tmp/flippy_boot -name "uInitrd-*" | head -1)
-        [ -n "$UINITRD" ] && cp "$UINITRD" "scripts/sd-fuse/${DIST_DIR}/uInitrd" && echo "uInitrd replaced"
-
-    - name: Replace modules in rootfs with flippy modules
-      run: |
-        cd $GITHUB_WORKSPACE/project
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        # flippy modules 目录名（如 6.18.49-flippy-95+）
-        MODULES_NAME=$(ls /tmp/flippy_modules | head -1)
-        echo "Flippy modules dir: $MODULES_NAME"
-        if [ -z "$MODULES_NAME" ]; then
-          echo "WARNING: flippy modules not found, skipping"
-          exit 0
-        fi
-        # 找到 rootfs 里的 lib/modules
-        ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
-        if [ -d "$ROOTFS_SRC/lib/modules" ]; then
-          echo "Old modules:"
-          ls "$ROOTFS_SRC/lib/modules/"
-          sudo rm -rf "$ROOTFS_SRC/lib/modules"
-        fi
-        mkdir -p "$ROOTFS_SRC/lib/modules/$MODULES_NAME"
-        cp -a "/tmp/flippy_modules/$MODULES_NAME"/. "$ROOTFS_SRC/lib/modules/$MODULES_NAME/"
-        echo "Modules replaced."
-
-    - name: Build final image and upload
+    - name: Build final image and verify
       id: build_sd_image
       run: |
         cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
-        # 打包 tgz
+
+        # 打包 tgz（内含修改后的 kernel.img / rootfs.img / parameter.txt）
         tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C . "$DIST_DIR"
         echo "tgz created"
-        # 重新生成镜像
+
+        # 重新生成 raw 镜像
         set +e
         yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
@@ -341,6 +260,7 @@ jobs:
         echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
         [ $MK_EXIT -eq 0 ] || { echo "FAILED"; exit 1; }
+
         # 重命名
         if [ ! -f "out/${IMG_FILE}" ]; then
           ORIG=$(find out -maxdepth 1 -name "*.img" -print -quit)
@@ -348,19 +268,10 @@ jobs:
         fi
         [ -f "out/$IMG_FILE" ] || { echo "No .img"; ls -la out; exit 1; }
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
-        # 验证最终 raw 镜像的 kernel 分区
-        RAW="$ARTIFACT_DIR/$IMG_FILE"
-        KERNEL_OFFSET=$((0x12000 * 512))
-        echo "=== Verify kernel in raw image at offset $KERNEL_OFFSET ==="
-        python3 -c "
-        with open('$RAW','rb') as f:
-          f.seek($KERNEL_OFFSET)
-          data = f.read(256)
-        idx = data.find(b'ARM\x64')
-        print(f'ARM64 magic at partition offset: 0x{idx:x}')
-        assert idx == 0x40, f'FAIL: magic at 0x{idx:x}, expected 0x40'
-        print('✓ Raw image contains flippy kernel')
-        "
+
+        # 验证 raw 镜像
+        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" verify "$ARTIFACT_DIR/$IMG_FILE"
+
         # 压缩
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
@@ -405,10 +316,11 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -qq --no-install-recommends \
           build-essential libncurses5-dev libncursesw5-dev \
-          gawk git rsync wget time file unzip bc bzip2 \
+          gawk git rsync wget curl time file unzip bc bzip2 \
           cpio python3 python3-pyelftools device-tree-compiler \
           flex bison qemu-user-static debootstrap \
-          dosfstools e2fsprogs parted xxd
+          dosfstools e2fsprogs parted xxd \
+          android-sdk-libsparse-utils
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git config --global color.ui false
@@ -416,6 +328,8 @@ jobs:
         sudo -E cp repo/repo /usr/bin/
         mkdir -p ./artifact
         sudo swapoff -a || true
+        which simg2img img2simg || { echo "ERROR: simg2img/img2simg not found"; exit 1; }
+        bash $GITHUB_WORKSPACE/scripts/flippy-kernel.sh show
 
     - name: Download source
       run: |
@@ -510,101 +424,48 @@ jobs:
         }
         ./build.sh kernel
         ./build.sh sd-img
+        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
+        echo "=== sd-fuse/${DIST_DIR} ==="
+        ls -la "scripts/sd-fuse/${DIST_DIR}/"
 
-    - name: Get flippy kernel
-      id: flippy_version
+    - name: Apply flippy kernel and modules
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        ASSETS=$(gh release view kernel_flippy --repo ophub/kernel --json assets --jq '.assets[].name')
-        LATEST=$(echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V | tail -1)
-        echo "version=$LATEST" >> $GITHUB_OUTPUT
+        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" apply \
+          "$GITHUB_WORKSPACE/project/scripts/sd-fuse/${{ steps.config.outputs.dist_dir }}"
 
-    - name: Download flippy kernel
-      run: |
-        cd $GITHUB_WORKSPACE/project
-        KERNEL_VER="${{ steps.flippy_version.outputs.version }}"
-        wget -q "https://github.com/ophub/kernel/releases/download/kernel_flippy/${KERNEL_VER}.tar.gz" -O /tmp/flippy.tar.gz
-        mkdir -p /tmp/flippy && tar xzf /tmp/flippy.tar.gz -C /tmp/flippy
-        KDIR="/tmp/flippy/$KERNEL_VER"
-        mkdir -p /tmp/flippy_boot /tmp/flippy_dtb /tmp/flippy_modules
-        tar xzf "$(find $KDIR -name 'boot-*.tar.gz' | head -1)" -C /tmp/flippy_boot
-        tar xzf "$(find $KDIR -name 'dtb-rockchip-*.tar.gz' | head -1)" -C /tmp/flippy_dtb
-        tar xzf "$(find $KDIR -name 'modules-*.tar.gz' | head -1)" -C /tmp/flippy_modules
-
-    - name: Extend kernel partition
-      run: |
-        cd $GITHUB_WORKSPACE/project
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        PARAM="scripts/sd-fuse/${DIST_DIR}/parameter.txt"
-        sed -i 's|0x00014000@0x00012000(kernel),0x00010000@0x00026000(boot),0x00010000@0x00036000(recovery),0x00200000@0x00046000(rootfs),0x00200000@0x00246000(userdata:grow),-@0x00446000(opt:grow)|0x00018000@0x00012000(kernel),0x00010000@0x0002a000(boot),0x00010000@0x0003a000(recovery),0x00200000@0x0004a000(rootfs),0x00200000@0x0024a000(userdata:grow),-@0x0044a000(opt:grow)|' "$PARAM"
-        grep -q "0x00018000@0x00012000(kernel)" "$PARAM" || { echo "ERROR: parameter.txt modification failed"; exit 1; }
-        echo "✓ kernel partition extended"
-
-    - name: Replace kernel and modules
-      run: |
-        cd $GITHUB_WORKSPACE/project
-        DIST_DIR="${{ steps.config.outputs.dist_dir }}"
-        KERNEL_IMG="scripts/sd-fuse/${DIST_DIR}/kernel.img"
-        VMLINUZ=$(find /tmp/flippy_boot -name "vmlinuz-*" | head -1)
-        VMLINUZ_SIZE=$(stat -c%s "$VMLINUZ")
-        SIZE_HEX=$(printf '%08x' $VMLINUZ_SIZE)
-        SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-        printf 'KRNL' > /tmp/new_kernel.img
-        printf "$SIZE_LE" | xxd -r -p >> /tmp/new_kernel.img
-        cat "$VMLINUZ" >> /tmp/new_kernel.img
-        python3 -c "
-        data = open('/tmp/new_kernel.img','rb').read(256)
-        idx = data.find(b'ARM\x64')
-        assert idx == 0x40, f'Magic at 0x{idx:x}'
-        print('✓ magic at 0x40')
-        "
-        cp /tmp/new_kernel.img "$KERNEL_IMG"
-        rm -rf "scripts/sd-fuse/${DIST_DIR}/dtb"
-        mkdir -p "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip"
-        cp /tmp/flippy_dtb/*.dtb "scripts/sd-fuse/${DIST_DIR}/dtb/rockchip/" 2>/dev/null || true
-        UINITRD=$(find /tmp/flippy_boot -name "uInitrd-*" | head -1)
-        [ -n "$UINITRD" ] && cp "$UINITRD" "scripts/sd-fuse/${DIST_DIR}/uInitrd"
-        # modules
-        MODULES_NAME=$(ls /tmp/flippy_modules | head -1)
-        if [ -n "$MODULES_NAME" ]; then
-          ROOTFS_SRC="friendlywrt/build_dir/target-aarch64_generic_musl/root-rockchip"
-          [ -d "$ROOTFS_SRC/lib/modules" ] && sudo rm -rf "$ROOTFS_SRC/lib/modules"
-          mkdir -p "$ROOTFS_SRC/lib/modules/$MODULES_NAME"
-          cp -a "/tmp/flippy_modules/$MODULES_NAME"/. "$ROOTFS_SRC/lib/modules/$MODULES_NAME/"
-        fi
-
-    - name: Build final image
+    - name: Build final image and verify
       id: build_sd_image
       run: |
         cd $GITHUB_WORKSPACE/project/scripts/sd-fuse
         DIST_DIR="${{ steps.config.outputs.dist_dir }}"
         IMG_FILE="${{ steps.config.outputs.img_filename }}"
         ARTIFACT_DIR="$GITHUB_WORKSPACE/artifact"
+
         tar czf "$ARTIFACT_DIR/${{ steps.config.outputs.archive_filename }}" -C . "$DIST_DIR"
+        echo "tgz created"
+
         set +e
         yes | ./mk-sd-image.sh "$DIST_DIR" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
+        echo "mk-sd-image.sh exit code: $MK_EXIT"
         cat /tmp/mk-sd.log
-        [ $MK_EXIT -eq 0 ] || exit 1
+        [ $MK_EXIT -eq 0 ] || { echo "FAILED"; exit 1; }
+
         if [ ! -f "out/${IMG_FILE}" ]; then
           ORIG=$(find out -maxdepth 1 -name "*.img" -print -quit)
           [ -n "$ORIG" ] && mv "$ORIG" "out/$IMG_FILE"
         fi
+        [ -f "out/$IMG_FILE" ] || { echo "No .img"; ls -la out; exit 1; }
         mv "out/$IMG_FILE" "$ARTIFACT_DIR/"
-        RAW="$ARTIFACT_DIR/$IMG_FILE"
-        KERNEL_OFFSET=$((0x12000 * 512))
-        python3 -c "
-        with open('$RAW','rb') as f:
-          f.seek($KERNEL_OFFSET)
-          data = f.read(256)
-        idx = data.find(b'ARM\x64')
-        assert idx == 0x40, f'FAIL: magic at 0x{idx:x}'
-        print('✓ Raw image contains flippy kernel')
-        "
+
+        bash "$GITHUB_WORKSPACE/scripts/flippy-kernel.sh" verify "$ARTIFACT_DIR/$IMG_FILE"
+
         cd "$ARTIFACT_DIR"
         gzip -f "$IMG_FILE"
+        echo "Compressed: $IMG_FILE.gz"
 
     - name: Upload images-XYZ.tgz
       uses: svenstaro/upload-release-action@v2
