@@ -32,17 +32,17 @@ jobs:
             file xxd binwalk p7zip-full u-boot-tools \
             device-tree-compiler cpio gzip xz-utils lz4 zstd
 
-      - name: Find latest release with images tgz
+      - name: Find latest release with any images tgz
         id: find_release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           SUFFIX=""
           [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-          PATTERN="images-R5S-R5C-Series-FriendlyWrt-flippy-${{ inputs.version }}${SUFFIX}.tgz"
+          # 只匹配 images- 开头、包含版本、包含类型后缀
+          PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
           echo "Looking for: $PATTERN"
 
-          # 遍历最近 30 个 release，找到包含该文件的最新一个
           TAGS=$(gh release list --limit 30 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
           FOUND=""
           for TAG in $TAGS; do
@@ -83,7 +83,6 @@ jobs:
           echo "########## Top-level contents ##########"
           ls -la
 
-          # 找到解压出来的顶层目录
           IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
           echo "IMG_DIR=$IMG_DIR"
           echo "########## Contents of $IMG_DIR ##########"
@@ -103,27 +102,28 @@ jobs:
           KIMG="$IMG_DIR/kernel.img"
           echo "########## kernel.img size ##########"
           ls -la "$KIMG"
-          echo "########## kernel.img first 256 bytes (hex) ##########"
-          xxd "$KIMG" | head -16
+          echo "########## kernel.img first 512 bytes (hex) ##########"
+          xxd "$KIMG" | head -32
           echo "########## kernel.img strings (first 40 lines) ##########"
           strings "$KIMG" | head -40
-          echo "########## kernel.img FIT header check ##########"
-          # FIT image magic is 0xd00dfeed
+          echo "########## kernel.img magic check ##########"
           MAGIC=$(xxd -l 4 -p "$KIMG")
           echo "Magic: $MAGIC"
           if [ "$MAGIC" = "d00dfeed" ]; then
-            echo ">>> This is a FIT image (Device Tree format)"
-            echo "########## FIT structure ##########"
-            fdtdump "$KIMG" 2>/dev/null | head -100 || true
-            echo "########## Fit image content with dumpimage ##########"
-            dumpimage -l "$KIMG" 2>&1 | head -50 || true
+            echo ">>> FIT image (Device Tree format)"
+            echo "########## FIT structure via fdtdump ##########"
+            fdtdump "$KIMG" 2>/dev/null | head -150 || true
+            echo "########## FIT content via dumpimage -l ##########"
+            dumpimage -l "$KIMG" 2>&1 | head -80 || true
           elif [[ "$MAGIC" == 1f8b* ]]; then
-            echo ">>> This is gzip compressed"
+            echo ">>> gzip compressed"
+            echo "Try decompress and inspect:"
+            zcat "$KIMG" 2>/dev/null | head -c 128 | xxd | head -8
           elif [[ "$MAGIC" == fd377a58* ]]; then
-            echo ">>> This is xz compressed"
+            echo ">>> xz compressed"
           else
-            echo ">>> Unknown format, trying binwalk"
-            binwalk "$KIMG" | head -30
+            echo ">>> Unknown, running binwalk"
+            binwalk "$KIMG" | head -40 || true
           fi
 
       - name: Deep inspect boot.img
@@ -135,25 +135,29 @@ jobs:
           ls -la "$BIMG"
           echo "########## boot.img first 256 bytes ##########"
           xxd "$BIMG" | head -16
-          echo "########## boot.img strings ##########"
+          echo "########## boot.img strings (first 20) ##########"
           strings "$BIMG" | head -20
-          echo "########## Try 7z listing ##########"
+          echo "########## 7z list ##########"
           7z l "$BIMG" 2>&1 | head -40 || true
-          echo "########## Try binwalk ##########"
+          echo "########## binwalk ##########"
           binwalk "$BIMG" | head -30 || true
 
       - name: Deep inspect resource.img and dtbo.img
         run: |
           cd /tmp/existing
           IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
-          for name in resource.img dtbo.img; do
+          for name in resource.img dtbo.img parameter.txt; do
             F="$IMG_DIR/$name"
             [ -f "$F" ] || continue
             echo "########## $name ##########"
             ls -la "$F"
             file "$F"
-            xxd "$F" | head -8
-            strings "$F" | head -10
+            if [[ "$name" == "parameter.txt" ]]; then
+              cat "$F"
+            else
+              xxd "$F" | head -8
+              strings "$F" | head -10
+            fi
           done
 
       - name: Download and inspect flippy kernel package
@@ -174,7 +178,6 @@ jobs:
 
           BOOT_TAR=$(find "$KDIR" -name "boot-*.tar.gz" | head -1)
           DTB_TAR=$(find "$KDIR" -name "dtb-rockchip-*.tar.gz" | head -1)
-          MODULES_TAR=$(find "$KDIR" -name "modules-*.tar.gz" | head -1)
 
           echo ""
           echo "########## Extracting boot package ##########"
@@ -189,26 +192,31 @@ jobs:
             file "$f"
           done
           echo ""
-          echo "########## vmlinuz first 256 bytes ##########"
           VMLINUZ=$(find boot -name "vmlinuz-*" | head -1)
+          echo "########## vmlinuz size ##########"
+          ls -la "$VMLINUZ"
+          echo "########## vmlinuz first 256 bytes ##########"
           xxd "$VMLINUZ" | head -16
           echo "########## vmlinuz strings (first 20) ##########"
           strings "$VMLINUZ" | head -20
-          echo "########## vmlinuz decompressed first bytes ##########"
-          # 尝试解压
           VMLINUZ_MAGIC=$(xxd -l 4 -p "$VMLINUZ")
-          echo "Magic: $VMLINUZ_MAGIC"
+          echo "vmlinuz magic: $VMLINUZ_MAGIC"
           if [[ "$VMLINUZ_MAGIC" == 1f8b* ]]; then
-            echo ">>> gzip compressed, decompressing first 1MB to check"
-            zcat "$VMLINUZ" 2>/dev/null | head -c 65536 | xxd | head -8
+            echo ">>> gzip compressed, decompressing to check ARM64 header"
+            zcat "$VMLINUZ" > /tmp/Image_decomp 2>/dev/null || true
+            ls -la /tmp/Image_decomp
+            echo "########## Decompressed Image first 64 bytes ##########"
+            xxd /tmp/Image_decomp | head -4
+            echo "########## ARM64 Image magic at 0x38 ##########"
+            xxd -s 0x38 -l 16 /tmp/Image_decomp
           fi
 
           echo ""
-          echo "########## uInitrd first 256 bytes ##########"
           UINITRD=$(find boot -name "uInitrd-*" | head -1)
-          xxd "$UINITRD" | head -16
-          echo "########## uInitrd file type ##########"
+          echo "########## uInitrd info ##########"
+          ls -la "$UINITRD"
           file "$UINITRD"
+          xxd "$UINITRD" | head -8
 
           echo ""
           echo "########## Extracting dtb package ##########"
@@ -218,45 +226,26 @@ jobs:
           echo "R5S/R5C related dtb files:"
           ls dtb/ | grep -iE "r5s|r5c|rk3568" | head -30
 
-      - name: Check if flippy kernel can be converted to FIT
+      - name: Compare and generate recommendation
         run: |
+          echo ""
+          echo "==================================================================="
+          echo "                       FINAL DIAGNOSTIC SUMMARY"
+          echo "==================================================================="
+          
+          cd /tmp/existing
+          IMG_DIR=$(find . -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+          KIMG="$IMG_DIR/kernel.img"
+          
+          echo ""
+          echo "FriendlyWrt kernel.img magic: $(xxd -l 4 -p "$KIMG")"
+          echo "FriendlyWrt kernel.img size:  $(stat -c%s "$KIMG")"
+          
           cd /tmp/flippy
-          echo "########## Check for mkimage tool ##########"
-          which mkimage
-          mkimage -V 2>&1 || true
+          VMLINUZ=$(find boot -name "vmlinuz-*" | head -1)
+          echo "flippy vmlinuz magic:         $(xxd -l 4 -p "$VMLINUZ")"
+          echo "flippy vmlinuz size:          $(stat -c%s "$VMLINUZ")"
+          echo ""
           
-          echo ""
-          echo "########## Try to convert flippy vmlinuz to FIT ##########"
-          KDIR=$(find . -maxdepth 1 -type d -name "6.*" | head -1)
-          VMLINUZ=$(find "$KDIR/boot" -name "vmlinuz-*" | head -1)
-          echo "vmlinuz: $VMLINUZ"
-          
-          # 尝试解压 vmlinuz（如果是 gzip）
-          if [[ "$(xxd -l 2 -p "$VMLINUZ")" == "1f8b" ]]; then
-            echo ">>> vmlinuz is gzip compressed, decompressing..."
-            zcat "$VMLINUZ" > /tmp/Image 2>/dev/null || true
-            file /tmp/Image
-            ls -la /tmp/Image
-            echo "########## Decompressed Image first 32 bytes ##########"
-            xxd /tmp/Image | head -2
-            # ARM64 Image magic is "ARM\x64" at offset 0x38
-            echo "########## ARM64 Image magic at offset 0x38 ##########"
-            xxd -s 0x38 -l 4 /tmp/Image
-          fi
-
-      - name: Summary report
-        run: |
-          echo ""
-          echo "==================================================================="
-          echo "                       DIAGNOSTIC SUMMARY"
-          echo "==================================================================="
-          echo ""
-          echo "This diagnostic run has collected information about:"
-          echo "  1. Existing FriendlyWrt image structure (from release)"
-          echo "  2. kernel.img format (FIT / raw / compressed)"
-          echo "  3. boot.img format (ext4 / FIT / other)"
-          echo "  4. flippy kernel package contents"
-          echo "  5. Whether flippy vmlinuz can be converted to FIT"
-          echo ""
-          echo "Please provide the full log output to determine the correct"
+          echo "Please copy the FULL log output back to determine the exact"
           echo "kernel replacement strategy."
