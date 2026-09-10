@@ -55,7 +55,6 @@ on:
 env:
   AUTO_REPLACE_TAG: 'false'
   KERNEL_REPO: 'breakingbadboy/OpenWrt'
-  KERNEL_RELEASE: 'kernel_stable'
 
 jobs:
   prepare_release:
@@ -130,7 +129,7 @@ jobs:
         sudo rm -rf /etc/apt/sources.list.d
         sudo apt-get update -qq
         sudo apt-get install -qq --no-install-recommends \
-          wget git rsync time file unzip bc bzip2 xxd \
+          wget curl git rsync time file unzip bc bzip2 xxd \
           python3 dosfstools e2fsprogs parted \
           android-sdk-libsparse-utils u-boot-tools
         git config --global user.name 'GitHub Actions'
@@ -140,7 +139,7 @@ jobs:
         mkdir -p $GITHUB_WORKSPACE/artifact
         chmod +x scripts/*.sh
         echo "=== 工具检查 ==="
-        which xxd simg2img img2simg mkfs.ext4 mkimage
+        which xxd simg2img img2simg mkfs.ext4 mkimage curl
         echo "cores: $(nproc)"
 
     - name: Fetch sd-fuse scripts
@@ -184,7 +183,6 @@ jobs:
         TARGET_MODEL: ${{ inputs.model }}
         SLIM_MODE: ${{ inputs.slim }}
         KERNEL_REPO: ${{ env.KERNEL_REPO }}
-        KERNEL_RELEASE: ${{ env.KERNEL_RELEASE }}
         KERNEL_VERSION: ${{ inputs.kernel_version }}
       run: |
         SUFFIX=""
