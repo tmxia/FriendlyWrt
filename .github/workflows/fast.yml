@@ -35,9 +35,79 @@ on:
         options:
           - 'true'
           - 'false'
+      replace_existing:
+        description: 'Replace existing release tag (overwrite)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+env:
+  AUTO_REPLACE_TAG: 'false'
 
 jobs:
+  prepare_release:
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.tag }}
+    steps:
+      - name: Generate unique release tag
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_TAG="FriendlyWrt-flippy-$(date +%Y-%m-%d)"
+          FORCE_BASE=false
+          if [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
+            FORCE_BASE=true
+          fi
+
+          if [ "$FORCE_BASE" = "true" ]; then
+            # 只删本次触发相关的前缀（避免误删同日期的正式构建）
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
+              | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            for tag in $EXISTING_TAGS; do
+              echo "Deleting release and tag: $tag"
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+              git push origin --delete "refs/tags/$tag" || true
+            done
+            TAG="$BASE_TAG"
+          else
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
+              | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            if [ -z "$EXISTING_TAGS" ]; then
+              TAG="$BASE_TAG"
+            else
+              MAX_NUM=0
+              for t in $EXISTING_TAGS; do
+                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                  NUM=${BASH_REMATCH[1]}
+                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+                fi
+              done
+              NEXT=$((MAX_NUM + 1))
+              TAG="${BASE_TAG}-${NEXT}"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated release tag: $TAG"
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          allow_updates: true
+          overwrite: true
+
   quick_verify:
+    needs: prepare_release
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     steps:
@@ -128,7 +198,16 @@ jobs:
         echo "=== 压缩后 ==="
         ls -la
 
-    - name: Upload artifact
+    - name: Upload img.gz to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/${{ env.img_name }}.gz
+        asset_name: ${{ env.img_name }}.gz
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
+    - name: Upload img.gz as workflow artifact (backup)
       uses: actions/upload-artifact@v4
       with:
         name: flippy-img-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
