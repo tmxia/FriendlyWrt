@@ -62,12 +62,22 @@ jobs:
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
     steps:
+      - name: Compute kernel short name
+        id: kernel_short
+        run: |
+          if [ "${{ inputs.kernel_release }}" == "kernel_rk35xx" ]; then
+            echo "short=rk35xx" >> $GITHUB_OUTPUT
+          else
+            echo "short=flippy" >> $GITHUB_OUTPUT
+          fi
+
       - name: Generate unique release tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KERNEL_SHORT: ${{ steps.kernel_short.outputs.short }}
         run: |
-          BASE_TAG="FriendlyWrt-${KERNEL_RELEASE_SHORT:-rk35xx}-$(date +%Y-%m-%d)"
+          BASE_TAG="FriendlyWrt-${KERNEL_SHORT}-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -100,9 +110,6 @@ jobs:
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Generated release tag: $TAG"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KERNEL_RELEASE_SHORT: ${{ inputs.kernel_release == 'kernel_rk35xx' && 'rk35xx' || 'flippy' }}
 
       - name: Create or update release
         uses: softprops/action-gh-release@v1
@@ -160,6 +167,7 @@ jobs:
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
+        echo "查找: $PATTERN"
 
         TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
         FOUND=""
@@ -187,6 +195,7 @@ jobs:
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
+
         if [ "${{ inputs.kernel_release }}" == "kernel_rk35xx" ]; then
           KERNEL_SHORT="rk35xx"
         else
@@ -205,8 +214,10 @@ jobs:
     - name: Compress image
       run: |
         cd $GITHUB_WORKSPACE/artifact
+        echo "=== 压缩前 ==="
         ls -la
         gzip -f *.img
+        echo "=== 压缩后 ==="
         ls -la
 
     - name: Upload img.gz to release
