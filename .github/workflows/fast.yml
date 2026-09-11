@@ -61,9 +61,6 @@ env:
   AUTO_REPLACE_TAG: 'false'
 
 jobs:
-  # ============================================================
-  # 阶段一：构建（含验证门禁）
-  # ============================================================
   build:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
@@ -90,6 +87,7 @@ jobs:
         git clone https://github.com/friendlyarm/repo /tmp/repo
         sudo -E cp /tmp/repo/repo /usr/bin/
         mkdir -p $GITHUB_WORKSPACE/artifact
+        chmod +x $GITHUB_WORKSPACE/scripts/verify-against-official.sh || true
         echo "cores: $(nproc)"
 
     - name: Fetch sd-fuse scripts
@@ -124,7 +122,6 @@ jobs:
         gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
-    # 下载官方固件到 /tmp/official 用于后续对比
     - name: Download official reference image
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -133,17 +130,15 @@ jobs:
       run: |
         mkdir -p /tmp/official
         cd /tmp/official
-        gh release download "$REF_TAG" --repo "$GITHUB_REPOSITORY" \
-          --pattern "$REF_ASSET" --dir . || {
-            echo "⚠ 官方参考固件下载失败，跳过对比验证"
-            touch /tmp/official/.no_reference
-            exit 0
-          }
-        ls -la
-        gunzip -k *.img.gz 2>/dev/null || true
-        IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
-        if [ -n "$IMG" ]; then
-          echo "官方参考镜像: $IMG ($(stat -c%s "$IMG") bytes)"
+        if gh release download "$REF_TAG" --repo "$GITHUB_REPOSITORY" \
+             --pattern "$REF_ASSET" --dir .; then
+          ls -la
+          gunzip -k *.img.gz 2>/dev/null || true
+          IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
+          [ -n "$IMG" ] && echo "官方参考镜像: $IMG ($(stat -c%s "$IMG") bytes)"
+        else
+          echo "⚠ 官方参考固件下载失败，跳过对比验证"
+          touch /tmp/official/.no_reference
         fi
 
     - name: Scan and select kernel
@@ -195,12 +190,6 @@ jobs:
           exit 1
         fi
 
-        echo ""
-        echo "Available versions:"
-        for v in $(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V); do
-          echo "  $v <- ${VER_TO_SOURCE[$v]}"
-        done
-
         SELECTED_VER=$(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V | tail -1)
         SELECTED_SOURCE="${VER_TO_SOURCE[$SELECTED_VER]}"
         SELECTED_REPO="${SELECTED_SOURCE%%:*}"
@@ -231,9 +220,11 @@ jobs:
         ls dtb_extract/ | grep -E "rk3568-nanopi-r5[sc]" || echo "no r5s/r5c dtb"
 
     # ============================================================
-    # 修复后的 PE → KRNL 转换
+    # 关键修复：PE → KRNL 转换
+    # 方案：优先直接透传 PE 的 .text 段（内含完整 ARM64 Image header）
+    #       fallback：按 PE 的 AddressOfEntryPoint 精确构造 code1
     # ============================================================
-    - name: Convert kernel to KRNL (official-aligned)
+    - name: Convert kernel to KRNL (official-aligned, entry-accurate)
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
@@ -255,70 +246,142 @@ jobs:
             open(dst, 'wb').write(raw)
             sys.exit(0)
 
-        if raw[:2] == b'MZ':
-            pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
-            assert raw[pe_off:pe_off+4] == b'PE\x00\x00', "PE 签名错误"
-            print("PE header @ 0x%x" % pe_off)
-
-            coff = pe_off + 4
-            nsec = struct.unpack_from('<H', raw, coff + 2)[0]
-            opt_size = struct.unpack_from('<H', raw, coff + 16)[0]
-            sec_base = coff + 20 + opt_size
-
-            secs = []
-            for i in range(nsec):
-                o = sec_base + i * 40
-                name = raw[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
-                roff  = struct.unpack_from('<I', raw, o + 20)[0]
-                rsize = struct.unpack_from('<I', raw, o + 16)[0]
-                secs.append((name, roff, rsize))
-                print("  Section %-8s file_off=0x%08x size=%d" % (name, roff, rsize))
-
-            payload = b''
-            for wanted in ('.text', '.rodata', '.data'):
-                for sname, roff, rsize in secs:
-                    if sname == wanted:
-                        payload += raw[roff:roff + rsize]
-                        print("  + %s: %d bytes" % (wanted, rsize))
-
-            if not payload:
-                secs.sort(key=lambda x: -x[2])
-                payload = raw[secs[0][1]:secs[0][1] + secs[0][2]]
-                print("  (fallback) 取最大节 %s: %d bytes" % (secs[0][0], secs[0][2]))
-
-            print("payload 总大小: %d bytes" % len(payload))
-
-            if len(payload) >= 0x40 and payload[0x38:0x3c] == ARM64_MAGIC:
-                print("payload 已是标准 ARM64 Image")
-                image = payload
-            else:
-                print("构造 ARM64 Image 头: code0=NOP, code1=B +0x40")
-                b_insn = 0x14000000 | (0x40 // 4)
-                hdr = bytearray(0x40)
-                struct.pack_into('<I', hdr, 0x00, 0xd503201f)
-                struct.pack_into('<I', hdr, 0x04, b_insn)
-                struct.pack_into('<Q', hdr, 0x08, 0)
-                struct.pack_into('<Q', hdr, 0x10, len(payload))
-                struct.pack_into('<Q', hdr, 0x18, 0x0a)
-                hdr[0x38:0x3c] = ARM64_MAGIC
-                image = bytes(hdr) + payload
-        else:
+        # 非 PE：直接当裸机 Image
+        if raw[:2] != b'MZ':
+            print("非 PE 格式")
             idx = raw.find(ARM64_MAGIC)
-            print("非 PE/KRNL，magic @ 0x%x" % idx)
-            if idx == 0x38:
-                image = raw
+            if idx == 0x38 and raw[0:4] == b'\x1f\x20\x03\xd5':
+                print("标准 ARM64 Image")
+                knl = b'KRNL' + struct.pack('<I', len(raw)) + raw
+                open(dst, 'wb').write(knl)
+                sys.exit(0)
             else:
                 print("未知格式"); sys.exit(1)
 
-        knl = b'KRNL' + struct.pack('<I', len(image)) + image
+        # ============ PE 解析 ============
+        pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
+        assert raw[pe_off:pe_off+4] == b'PE\x00\x00', "PE 签名错误"
+        print("PE header @ 0x%x" % pe_off)
+
+        coff = pe_off + 4
+        nsec = struct.unpack_from('<H', raw, coff + 2)[0]
+        opt_size = struct.unpack_from('<H', raw, coff + 16)[0]
+        opt_off = coff + 20
+        sec_base = opt_off + opt_size
+
+        entry_rva = struct.unpack_from('<I', raw, opt_off + 0x10)[0]
+        image_base = struct.unpack_from('<Q', raw, opt_off + 0x18)[0]
+        print("ImageBase=0x%x  EntryRVA=0x%x  Sections=%d  OptSize=%d"
+              % (image_base, entry_rva, nsec, opt_size))
+
+        sections = []
+        for i in range(nsec):
+            o = sec_base + i * 40
+            name = raw[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
+            vsize = struct.unpack_from('<I', raw, o + 8)[0]
+            vaddr = struct.unpack_from('<I', raw, o + 12)[0]
+            rsize = struct.unpack_from('<I', raw, o + 16)[0]
+            roff  = struct.unpack_from('<I', raw, o + 20)[0]
+            sections.append((name, vaddr, vsize, roff, rsize))
+            print("  %-8s  RVA=0x%08x  VSize=0x%08x  FileOff=0x%08x  RawSize=0x%08x"
+                  % (name, vaddr, vsize, roff, rsize))
+
+        # ============ 取 .text ============
+        text = None
+        text_vaddr = text_fileoff = None
+        for name, vaddr, vsize, roff, rsize in sections:
+            if name == '.text':
+                text = raw[roff:roff + rsize]
+                text_vaddr = vaddr
+                text_fileoff = roff
+                break
+
+        if text is None:
+            print("找不到 .text 段"); sys.exit(1)
+
+        print("  .text 提取: %d bytes" % len(text))
+
+        # ============ 判断 .text 是否含完整 Image header ============
+        has_image_header = (
+            len(text) >= 0x40
+            and text[0x38:0x3c] == ARM64_MAGIC
+            and text[0:4] == b'\x1f\x20\x03\xd5'
+        )
+
+        if has_image_header:
+            code0_t = struct.unpack_from('<I', text, 0x00)[0]
+            code1_t = struct.unpack_from('<I', text, 0x04)[0]
+            isize_t = struct.unpack_from('<Q', text, 0x10)[0]
+            print("  .text 内含完整 ARM64 Image:")
+            print("    code0 = 0x%08x (NOP)" % code0_t)
+            print("    code1 = 0x%08x" % code1_t)
+            print("    image_size = %d" % isize_t)
+
+            # 检查 code1 是否合法 B 指令
+            if (code1_t & 0xFC000000) != 0x14000000:
+                print("  ⚠ code1 不是 B 指令，回退到构造模式")
+                has_image_header = False
+
+        if has_image_header:
+            # ============ 方案 1：直接透传 .text ============
+            print("  >>> 方案 1：直接拼接 KRNL + size + .text")
+            knl_payload = text
+        else:
+            # ============ 方案 2：构造 header + 计算 code1 ============
+            print("  >>> 方案 2：按 PE EntryPoint 构造 header")
+
+            # 定位 entry 在哪个段
+            entry_fileoff = None
+            for name, vaddr, vsize, roff, rsize in sections:
+                if vaddr <= entry_rva < vaddr + vsize:
+                    entry_fileoff = roff + (entry_rva - vaddr)
+                    print("  entry 位于 %s 段，文件偏移 0x%x" % (name, entry_fileoff))
+                    break
+
+            if entry_fileoff is None:
+                print("  entry 不在任何段内，使用 .text 起点")
+                entry_fileoff = text_fileoff
+
+            entry_in_text = entry_fileoff - text_fileoff
+            print("  entry 在 .text 内偏移: 0x%x" % entry_in_text)
+
+            # KRNL 布局：
+            #   0x00-0x04 KRNL magic
+            #   0x04-0x08 size
+            #   0x08-0x48 Image header (0x40 字节)
+            #   0x48+   .text
+            header_len = 0x40
+            text_krnl_start = 0x08 + header_len       # = 0x48
+            entry_in_krnl = text_krnl_start + entry_in_text
+            code1_pos = 0x0c
+            rel = entry_in_krnl - code1_pos
+            assert rel % 4 == 0, "code1 相对偏移未对齐"
+            imm26 = (rel // 4) & 0x03FFFFFF
+            code1 = 0x14000000 | imm26
+
+            print("  text_krnl_start=0x%x  entry_in_krnl=0x%x" % (text_krnl_start, entry_in_krnl))
+            print("  code1 相对偏移=0x%x  code1=0x%08x" % (rel, code1))
+
+            hdr = bytearray(header_len)
+            struct.pack_into('<I', hdr, 0x00, 0xd503201f)   # code0=NOP
+            struct.pack_into('<I', hdr, 0x04, code1)        # code1=B entry
+            struct.pack_into('<Q', hdr, 0x08, 0)            # text_offset
+            struct.pack_into('<Q', hdr, 0x10, len(text))    # image_size
+            struct.pack_into('<Q', hdr, 0x18, 0x0a)         # flags
+            hdr[0x38:0x3c] = ARM64_MAGIC
+            knl_payload = bytes(hdr) + text
+
+        # ============ 最终 KRNL ============
+        knl = b'KRNL' + struct.pack('<I', len(knl_payload)) + knl_payload
         open(dst, 'wb').write(knl)
 
+        # 校验
         out = open(dst, 'rb').read(0x80)
-        assert out[0:4] == b'KRNL'
+        assert out[0:4] == b'KRNL', "KRNL magic 缺失"
         assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 必须是 NOP"
         assert out[0x40:0x44] == ARM64_MAGIC, "magic 必须在 0x40"
 
-        print("✓ 官方格式对齐验证通过")
+        print("✓ KRNL 结构验证通过")
         print("  KRNL size @ 0x04 = %d" % struct.unpack_from('<I', out, 4)[0])
         print("  code0 @ 0x08     = %s (NOP)" % out[0x08:0x0c].hex())
         print("  code1 @ 0x0c     = %s" % out[0x0c:0x10].hex())
@@ -383,7 +446,7 @@ jobs:
 
         with open(param_file, 'w') as f:
             f.write(content)
-        print(f"[param] 已更新 (delta={delta} sectors)")
+        print(f"[param] 已更新 (delta={delta} sectors = {delta*512/1024/1024:.1f} MiB)")
         PARAM_PYEOF
         echo "===== After ====="; cat "$PARAM_FILE"
 
@@ -419,9 +482,6 @@ jobs:
         mv "$FOUND_IMG" "$GITHUB_WORKSPACE/artifact/$IMG_FILE"
         echo "img_name=$IMG_FILE" >> $GITHUB_ENV
 
-    # ============================================================
-    # 核心新增：与官方固件对比验证
-    # ============================================================
     - name: Verify against official firmware
       id: verify
       run: |
@@ -442,9 +502,6 @@ jobs:
           exit $RC
         fi
 
-    # ============================================================
-    # 压缩（仅在验证通过后运行）
-    # ============================================================
     - name: Compress image to gz
       run: |
         cd $GITHUB_WORKSPACE/artifact
@@ -466,9 +523,6 @@ jobs:
         path: ./artifact/${{ env.img_name }}.gz
         retention-days: 7
 
-  # ============================================================
-  # 阶段二：发布（依赖 build 阶段验证通过）
-  # ============================================================
   publish:
     needs: build
     runs-on: ubuntu-22.04
