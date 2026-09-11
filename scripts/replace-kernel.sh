@@ -4,7 +4,7 @@
 # 环境变量: KERNEL_VERSION, OFFICIAL_DIR
 set -euo pipefail
 
-VERSION="2026-09-11-v27-all-in-one"
+VERSION="2026-09-11-v28-sparse-aware"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -108,8 +108,8 @@ IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "vmlinuz-*" | head -
 log "  文件: $(basename "$IMAGE_FILE") ($(stat -c%s "$IMAGE_FILE") bytes)"
 
 SYSTEM_MAP=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "System.map-*" | head -1)
-[ -n "$SYSTEM_MAP" ] && log "  System.map: $(basename "$SYSTEM_MAP")"
-[ -z "$SYSTEM_MAP" ] && { err "无 System.map，无法可靠定位入口"; exit 1; }
+[ -z "$SYSTEM_MAP" ] && { err "无 System.map"; exit 1; }
+log "  System.map: $(basename "$SYSTEM_MAP")"
 
 OFFICIAL_PAYLOAD="$WORK_DIR/official_krnl.bin"
 OFFICIAL_IMG=$(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.img" 2>/dev/null | head -1 || true)
@@ -333,7 +333,7 @@ print("\n  SUCCESS")
 PYEOF
 
 # ============================================================
-# 5.3 注入内核模块到 rootfs.img
+# 5.3 注入内核模块到 rootfs.img（支持 sparse / ext4 / squashfs）
 # ============================================================
 log "[5.3/8] 注入内核模块到 rootfs.img"
 
@@ -345,16 +345,16 @@ PARAM_FILE="$TARGET_DIR/parameter.txt"
 [ ! -f "$ROOTFS_IMG" ] && { err "  rootfs.img 不存在"; exit 1; }
 [ ! -f "$PARAM_FILE" ] && { err "  parameter.txt 不存在"; exit 1; }
 
-command -v unsquashfs >/dev/null || { err "  缺少 unsquashfs（请装 squashfs-tools）"; exit 1; }
-command -v mksquashfs >/dev/null || { err "  缺少 mksquashfs（请装 squashfs-tools）"; exit 1; }
+command -v simg2img >/dev/null || { err "  缺少 simg2img（请装 android-sdk-libsparse-utils）"; exit 1; }
+command -v img2simg >/dev/null || { err "  缺少 img2simg（请装 android-sdk-libsparse-utils）"; exit 1; }
 
 log "  modules: $(basename "$MODULES_TAR") ($(stat -c%s "$MODULES_TAR") bytes)"
 log "  rootfs:  $(stat -c%s "$ROOTFS_IMG") bytes"
 
+# 解压模块
 MOD_EX="$WORK_DIR/modules_extract"
 mkdir -p "$MOD_EX"
 tar xzf "$MODULES_TAR" -C "$MOD_EX"
-
 MOD_LIB=$(find "$MOD_EX" -maxdepth 5 -type d -path "*/lib/modules/6.*" | head -1)
 [ -z "$MOD_LIB" ] && MOD_LIB=$(find "$MOD_EX" -maxdepth 5 -type d -name "6.*" | head -1)
 [ -z "$MOD_LIB" ] && { err "  模块目录未找到"; find "$MOD_EX" -maxdepth 3 -type d | head; exit 1; }
@@ -362,72 +362,155 @@ KVER=$(basename "$MOD_LIB")
 KO_COUNT=$(find "$MOD_LIB" -name "*.ko*" 2>/dev/null | wc -l)
 log "  内核版本: $KVER"
 log "  模块数:   $KO_COUNT"
-[ "$KO_COUNT" -lt 10 ] && { err "  模块数过少（$KO_COUNT）"; exit 1; }
+[ "$KO_COUNT" -lt 10 ] && { err "  模块数过少"; exit 1; }
 
-ROOTFS_FMT=$(file -b "$ROOTFS_IMG")
-log "  rootfs 格式: $ROOTFS_FMT"
-if ! echo "$ROOTFS_FMT" | grep -qi "squashfs"; then
-  err "  只支持 squashfs（实际: $ROOTFS_FMT）"
+ORIG_FMT=$(file -b "$ROOTFS_IMG")
+log "  rootfs 原始格式: $ORIG_FMT"
+
+# ---------- sparse → raw ----------
+WORK_ROOTFS=""
+IS_SPARSE=0
+if echo "$ORIG_FMT" | grep -qi "Android sparse"; then
+  log "  → 转换 Android sparse → raw"
+  WORK_ROOTFS="$WORK_DIR/rootfs.raw"
+  simg2img "$ROOTFS_IMG" "$WORK_ROOTFS"
+  IS_SPARSE=1
+  log "  raw 大小: $(stat -c%s "$WORK_ROOTFS") bytes ($(python3 -c "print(f'{$(( $(stat -c%s "$WORK_ROOTFS") ))/1024/1024:.1f}')") MiB)"
+else
+  cp "$ROOTFS_IMG" "$WORK_ROOTFS"
+fi
+
+RAW_FMT=$(file -b "$WORK_ROOTFS")
+log "  raw 格式: $RAW_FMT"
+
+# ---------- 分派处理 ----------
+if echo "$RAW_FMT" | grep -qi "squashfs"; then
+  # ===================== squashfs =====================
+  command -v unsquashfs >/dev/null || { err "  缺少 unsquashfs"; exit 1; }
+  command -v mksquashfs >/dev/null || { err "  缺少 mksquashfs"; exit 1; }
+
+  COMP=$(unsquashfs -s "$WORK_ROOTFS" 2>/dev/null | grep -i 'compression' | awk '{print tolower($2)}')
+  [ -z "$COMP" ] && COMP="xz"
+  log "  压缩算法: $COMP"
+  case "$COMP" in
+    gzip) MK_COMP="-comp gzip" ;;
+    lzo)  MK_COMP="-comp lzo"  ;;
+    lz4)  MK_COMP="-comp lz4"  ;;
+    xz)   MK_COMP="-comp xz"   ;;
+    zstd) MK_COMP="-comp zstd" ;;
+    *)    MK_COMP="-comp xz"   ;;
+  esac
+
+  ROOT_EX="$WORK_DIR/rootfs_extract"
+  mkdir -p "$ROOT_EX"
+  log "  解包 squashfs..."
+  set +e
+  unsquashfs -d "$ROOT_EX" -no-progress "$WORK_ROOTFS" > "$WORK_DIR/unsquashfs.log" 2>&1
+  RC=$?
+  set -e
+  [ $RC -ne 0 ] && { err "  unsquashfs 失败"; tail -20 "$WORK_DIR/unsquashfs.log"; exit 1; }
+
+  EXISTING=$(ls "$ROOT_EX/lib/modules/" 2>/dev/null | tr '\n' ' ' || echo "(空)")
+  log "  现有 /lib/modules: $EXISTING"
+
+  mkdir -p "$ROOT_EX/lib/modules/$KVER"
+  cp -a "$MOD_LIB/." "$ROOT_EX/lib/modules/$KVER/"
+  INJECTED=$(find "$ROOT_EX/lib/modules/$KVER" -name '*.ko*' | wc -l)
+  log "  已注入: $INJECTED 个模块"
+
+  ROOTFS_NEW_RAW="$WORK_DIR/rootfs.new.raw"
+  log "  重打包 squashfs..."
+  set +e
+  mksquashfs "$ROOT_EX" "$ROOTFS_NEW_RAW" $MK_COMP -b 128K -noappend -no-progress > "$WORK_DIR/mksquashfs.log" 2>&1
+  RC=$?
+  set -e
+  [ $RC -ne 0 ] && { err "  mksquashfs 失败"; tail -20 "$WORK_DIR/mksquashfs.log"; exit 1; }
+
+  ORIG_RAW=$(stat -c%s "$WORK_ROOTFS")
+  NEW_RAW=$(stat -c%s "$ROOTFS_NEW_RAW")
+  log "  原 raw: $ORIG_RAW bytes"
+  log "  新 raw: $NEW_RAW bytes"
+
+  mv "$ROOTFS_NEW_RAW" "$WORK_ROOTFS"
+
+elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
+  # ===================== ext4 =====================
+  log "  检测为 ext4，使用 loop mount"
+  MNT="$WORK_DIR/mnt"
+  mkdir -p "$MNT"
+
+  MNT_OK=0
+  if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
+    MNT_OK=1
+  elif sudo mount -t ext4 -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
+    MNT_OK=1
+  elif sudo mount -o loop,rw,noatime "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
+    MNT_OK=1
+  fi
+  [ "$MNT_OK" = "0" ] && { err "  无法 loop mount"; exit 1; }
+  log "  已挂载到 $MNT"
+
+  # 检查空间
+  AVAIL=$(df -B1 --output=avail "$MNT" 2>/dev/null | tail -1 | tr -d ' ')
+  NEED=$(du -sb "$MOD_LIB" | awk '{print $1}')
+  log "  可用空间: $AVAIL bytes / 需要: $NEED bytes"
+  if [ -n "$AVAIL" ] && [ "$AVAIL" -lt "$NEED" ]; then
+    warn "  空间不足，尝试 resize2fs 扩展"
+    sudo umount "$MNT" 2>/dev/null || true
+    CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
+    # 扩展到 max(原大小 * 2, 原大小 + 200MiB)
+    EXTRA=$(( 200 * 1024 * 1024 ))
+    NEW_TARGET=$(( CURRENT_RAW + EXTRA ))
+    # 按 4MiB 对齐
+    NEW_TARGET=$(( (NEW_TARGET / (4*1024*1024) + 1) * (4*1024*1024) ))
+    truncate -s "$NEW_TARGET" "$WORK_ROOTFS"
+    resize2fs "$WORK_ROOTFS" 2>&1 | tail -3
+    if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
+      log "  扩展后重新挂载成功，新大小: $NEW_TARGET bytes"
+    else
+      err "  扩展后无法挂载"; exit 1
+    fi
+  fi
+
+  EXISTING=$(ls "$MNT/lib/modules/" 2>/dev/null | tr '\n' ' ' || echo "(空)")
+  log "  现有 /lib/modules: $EXISTING"
+
+  sudo mkdir -p "$MNT/lib/modules/$KVER"
+  sudo cp -a "$MOD_LIB/." "$MNT/lib/modules/$KVER/"
+  sync
+  INJECTED=$(sudo find "$MNT/lib/modules/$KVER" -name '*.ko*' | wc -l)
+  log "  已注入: $INJECTED 个模块"
+
+  sudo umount "$MNT"
+  log "  已卸载"
+
+else
+  err "  不支持的 raw 格式: $RAW_FMT"
   exit 1
 fi
 
-COMP=$(unsquashfs -s "$ROOTFS_IMG" 2>/dev/null | grep -i 'compression' | awk '{print tolower($2)}')
-[ -z "$COMP" ] && COMP="xz"
-log "  压缩算法: $COMP"
-case "$COMP" in
-  gzip) MK_COMP="-comp gzip" ;;
-  lzo)  MK_COMP="-comp lzo"  ;;
-  lz4)  MK_COMP="-comp lz4"  ;;
-  xz)   MK_COMP="-comp xz"   ;;
-  zstd) MK_COMP="-comp zstd" ;;
-  *)    MK_COMP="-comp xz"   ;;
-esac
-
-ROOT_EX="$WORK_DIR/rootfs_extract"
-mkdir -p "$ROOT_EX"
-log "  解包 squashfs（1-3 分钟）..."
-set +e
-unsquashfs -d "$ROOT_EX" -no-progress "$ROOTFS_IMG" > "$WORK_DIR/unsquashfs.log" 2>&1
-UNSQ_RC=$?
-set -e
-[ $UNSQ_RC -ne 0 ] && { err "  unsquashfs 失败:"; tail -20 "$WORK_DIR/unsquashfs.log"; exit 1; }
-
-EXISTING=$(ls "$ROOT_EX/lib/modules/" 2>/dev/null | tr '\n' ' ' || echo "(空)")
-log "  现有 /lib/modules: $EXISTING"
-
-mkdir -p "$ROOT_EX/lib/modules/$KVER"
-cp -a "$MOD_LIB/." "$ROOT_EX/lib/modules/$KVER/"
-INJECTED=$(find "$ROOT_EX/lib/modules/$KVER" -name '*.ko*' 2>/dev/null | wc -l)
-log "  已注入: $INJECTED 个模块"
-
-ROOTFS_NEW="$WORK_DIR/rootfs.img.new"
-log "  重打包 squashfs（2-5 分钟）..."
-set +e
-mksquashfs "$ROOT_EX" "$ROOTFS_NEW" $MK_COMP -b 128K -noappend -no-progress > "$WORK_DIR/mksquashfs.log" 2>&1
-MKSQ_RC=$?
-set -e
-[ $MKSQ_RC -ne 0 ] && { err "  mksquashfs 失败:"; tail -20 "$WORK_DIR/mksquashfs.log"; exit 1; }
-
-ORIG_SIZE=$(stat -c%s "$ROOTFS_IMG")
-NEW_SIZE=$(stat -c%s "$ROOTFS_NEW")
-log "  原大小: $ORIG_SIZE bytes ($(python3 -c "print(f'{$ORIG_SIZE/1024/1024:.1f}')") MiB)"
-log "  新大小: $NEW_SIZE bytes ($(python3 -c "print(f'{$NEW_SIZE/1024/1024:.1f}')") MiB)"
-
-if ! unsquashfs -l "$ROOTFS_NEW" 2>/dev/null | grep -q "lib/modules/$KVER/"; then
-  err "  重打包校验失败"
-  exit 1
+# ---------- raw → sparse（如果原来是 sparse） ----------
+if [ "$IS_SPARSE" = "1" ]; then
+  log "  转换 raw → Android sparse"
+  ROOTFS_FINAL="$WORK_DIR/rootfs.final.img"
+  img2simg "$WORK_ROOTFS" "$ROOTFS_FINAL"
+  FINAL_SIZE=$(stat -c%s "$ROOTFS_FINAL")
+  log "  最终 sparse 大小: $FINAL_SIZE bytes"
+  mv "$ROOTFS_FINAL" "$ROOTFS_IMG"
+else
+  mv "$WORK_ROOTFS" "$ROOTFS_IMG"
 fi
-log "  ✓ 重打包校验通过"
 
+# ---------- 校验 rootfs 分区是否够 ----------
+RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS" 2>/dev/null || stat -c%s "$ROOTFS_IMG")
 ROOTFS_PART=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" | head -1)
 if [ -n "$ROOTFS_PART" ]; then
   PART_SECTORS=$(echo "$ROOTFS_PART" | sed -E 's/0x([0-9a-fA-F]+)@.*/\1/')
   PART_BYTES=$(( 0x$PART_SECTORS * 512 ))
   log "  parameter.txt rootfs 分区: $PART_SECTORS sectors = $PART_BYTES bytes"
-
-  if [ "$NEW_SIZE" -gt "$PART_BYTES" ]; then
-    warn "  新 rootfs 超出分区，扩展 parameter.txt..."
-    python3 - "$PARAM_FILE" "$NEW_SIZE" <<'PARAM_EXPAND'
+  if [ "$RAW_SIZE_FINAL" -gt "$PART_BYTES" ]; then
+    warn "  raw 超出分区，扩展 parameter.txt..."
+    python3 - "$PARAM_FILE" "$RAW_SIZE_FINAL" <<'PARAM_EXPAND'
 import re, sys
 param_file, new_bytes = sys.argv[1], int(sys.argv[2])
 content = open(param_file).read()
@@ -450,26 +533,12 @@ content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 open(param_file, 'w').write(content)
 print(f"[param] 已调整")
 PARAM_EXPAND
-    ROOTFS_PART=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" | head -1)
-    PART_SECTORS=$(echo "$ROOTFS_PART" | sed -E 's/0x([0-9a-fA-F]+)@.*/\1/')
-    PART_BYTES=$(( 0x$PART_SECTORS * 512 ))
-    log "  新分区大小: $PART_BYTES bytes"
+  else
+    log "  ✓ raw ($RAW_SIZE_FINAL) ≤ 分区 ($PART_BYTES)"
   fi
-
-  mv "$ROOTFS_IMG" "$ROOTFS_IMG.orig"
-  mv "$ROOTFS_NEW" "$ROOTFS_IMG"
-  rm -f "$ROOTFS_IMG.orig"
-  if [ "$(stat -c%s "$ROOTFS_IMG")" -lt "$PART_BYTES" ]; then
-    truncate -s "$PART_BYTES" "$ROOTFS_IMG"
-    log "  已补齐到分区大小: $PART_BYTES bytes"
-  fi
-  log "  ✓ rootfs.img 替换完成"
-else
-  warn "  无 rootfs 分区定义，直接替换"
-  mv "$ROOTFS_IMG" "$ROOTFS_IMG.orig"
-  mv "$ROOTFS_NEW" "$ROOTFS_IMG"
-  rm -f "$ROOTFS_IMG.orig"
 fi
+
+log "  ✓ rootfs.img 处理完成"
 
 # ============================================================
 # 5.5 扩容 kernel 分区
