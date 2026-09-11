@@ -1,5 +1,6 @@
 #!/bin/bash
-# verify-against-official.sh - 修复字节序问题
+# verify-against-official.sh
+# 对比自建固件与官方固件的 KRNL 结构，关键项不一致则 exit 1
 # 用法: verify-against-official.sh <自建img> <官方目录> [内核版本]
 
 set -uo pipefail
@@ -29,23 +30,16 @@ echo ""
 
 KERNEL_OFFSET=$((0x12000 * 512))
 
-# ============================================================
-# 用 Python 一次性读取所有关键字段（正确处理小端序）
-# ============================================================
+# 读取自建 KRNL 头关键字段
 read -r MAGIC CODE0 CODE1 KRNL_SIZE MAGIC_OFFSET < <(
   python3 - "$SELF_IMG" "$KERNEL_OFFSET" <<'PYEOF'
 import sys
 img, off = sys.argv[1], int(sys.argv[2])
 with open(img, 'rb') as f:
     f.seek(off); d = f.read(256)
-
-magic = d[0:4].hex()
-code0 = d[8:12].hex()
-code1 = d[12:16].hex()
-size  = int.from_bytes(d[4:8], 'little')       # 关键：小端序
-mpos  = d.find(b'ARM\x64')
-
-print(magic, code0, code1, size, mpos if mpos >= 0 else -1)
+print(d[0:4].hex(), d[8:12].hex(), d[12:16].hex(),
+      int.from_bytes(d[4:8], 'little'),
+      d.find(b'ARM\x64') if d.find(b'ARM\x64') >= 0 else -1)
 PYEOF
 )
 
@@ -56,13 +50,13 @@ echo "  code1:  $CODE1"
 echo "  size:   $KRNL_SIZE bytes ($(python3 -c "print(f'{$KRNL_SIZE/1024/1024:.1f}')") MiB)"
 echo "  magic@: $(printf '0x%x' "$MAGIC_OFFSET")"
 
-if [ "$MAGIC" = "4b524e4c" ]; then ok "KRNL magic 正确"; else bad "KRNL magic 错误: $MAGIC"; fi
-if [ "$CODE0" = "1f2003d5" ]; then ok "code0 = NOP (1f2003d5) 与官方一致"; else bad "code0 不是 NOP: $CODE0"; fi
+[ "$MAGIC" = "4b524e4c" ]      && ok "KRNL magic 正确"             || bad "KRNL magic 错误: $MAGIC"
+[ "$CODE0" = "1f2003d5" ]      && ok "code0 = NOP (1f2003d5)"     || bad "code0 不是 NOP: $CODE0"
 
 CODE1_TOP=$(echo "$CODE1" | cut -c7-8)
-if [ "$CODE1_TOP" = "14" ]; then ok "code1 是 B 指令 (top byte = 0x14)"; else warn "code1 非标准 B: top=0x$CODE1_TOP"; fi
+[ "$CODE1_TOP" = "14" ]        && ok "code1 是 B 指令 (top byte = 0x14)" || warn "code1 非标准 B: top=0x$CODE1_TOP"
 
-if [ "$MAGIC_OFFSET" = "64" ]; then ok "ARM64 magic 位于 0x40"; else bad "ARM64 magic 位置错误: $(printf '0x%x' "$MAGIC_OFFSET")"; fi
+[ "$MAGIC_OFFSET" = "64" ]     && ok "ARM64 magic 位于 0x40"       || bad "ARM64 magic 位置错误: $(printf '0x%x' "$MAGIC_OFFSET")"
 
 echo ""
 echo "── [2] 内核大小合理性 ──"
@@ -94,14 +88,27 @@ PYEOF
 
   echo "  官方 magic: $OFF_MAGIC  code0: $OFF_CODE0  code1: $OFF_CODE1  magic@: $(printf '0x%x' "$OFF_MAGIC_POS")"
 
-  [ "$MAGIC" = "$OFF_MAGIC" ]      && ok "KRNL magic 与官方一致"       || bad "KRNL magic 不一致（$MAGIC vs $OFF_MAGIC）"
-  [ "$CODE0" = "$OFF_CODE0" ]      && ok "code0 与官方完全一致（$CODE0）" || bad "code0 不一致（$CODE0 vs $OFF_CODE0）"
+  [ "$MAGIC" = "$OFF_MAGIC" ]  && ok "KRNL magic 与官方一致"                || bad "KRNL magic 不一致（$MAGIC vs $OFF_MAGIC）"
+  [ "$CODE0" = "$OFF_CODE0" ]  && ok "code0 与官方完全一致（$CODE0）"       || bad "code0 不一致（$CODE0 vs $OFF_CODE0）"
   [ "$CODE1_TOP" = "$(echo "$OFF_CODE1" | cut -c7-8)" ] \
-    && ok "code1 指令类型与官方一致（B）" \
+    && ok "code1 指令类型与官方一致（B 指令）" \
     || warn "code1 指令类型不同（self=0x$CODE1_TOP off=0x$(echo "$OFF_CODE1" | cut -c7-8)）"
   [ "$MAGIC_OFFSET" = "$OFF_MAGIC_POS" ] \
     && ok "ARM64 magic 位置与官方一致（$(printf '0x%x' "$MAGIC_OFFSET")）" \
     || bad "ARM64 magic 位置不一致（self=$(printf '0x%x' "$MAGIC_OFFSET") off=$(printf '0x%x' "$OFF_MAGIC_POS")）"
+
+  # 关键：code1 精确值对比（如果 .text 透传成功，应当完全一致）
+  echo ""
+  echo "  ─ code1 精确值对比 ─"
+  echo "    自建 code1 = 0x$CODE1"
+  echo "    官方 code1 = 0x$OFF_CODE1"
+  if [ "$CODE1" = "$OFF_CODE1" ]; then
+    ok "code1 与官方完全一致（B 指令目标位置相同）"
+  else
+    warn "code1 精确值不同（可能通过不同路径达到相同效果，非硬性失败）"
+    echo "    自建目标偏移: $((0x$CODE1 & 0x03FFFFFF)) 条指令"
+    echo "    官方目标偏移: $((0x$OFF_CODE1 & 0x03FFFFFF)) 条指令"
+  fi
 fi
 
 echo ""
