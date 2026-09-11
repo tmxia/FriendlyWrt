@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 + boot.img 重建 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v42-rootfs-partition-expand"
+VERSION="2026-09-11-v43-ext4-magic-check"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -349,9 +349,7 @@ else
 fi
 
 # ============================================================
-# ★★★ 5.4 rootfs 分区大小检查 + 自动扩展 ★★★
-# 修复：rootfs.img 是 2GiB，但 parameter.txt 里 rootfs 分区只有 1GiB
-#       mk-sd-image.sh 会拒绝写入，导致最终 img 里 rootfs 是空的
+# 5.4 rootfs 分区大小检查 + 扩展
 # ============================================================
 log "[5.4/9] 检查/扩展 rootfs 分区"
 
@@ -363,7 +361,7 @@ if [ -n "$ROOTFS_PART" ]; then
   log "  rootfs raw 大小: $RAW_SIZE_FINAL bytes ($((RAW_SIZE_FINAL/1024/1024)) MiB)"
 
   if [ "$RAW_SIZE_FINAL" -gt "$PART_BYTES" ]; then
-    warn "  ★ rootfs raw ($((RAW_SIZE_FINAL/1024/1024)) MiB) > 分区 ($((PART_BYTES/1024/1024)) MiB)，扩展 parameter.txt"
+    warn "  ★ rootfs raw > 分区，扩展 parameter.txt"
     python3 - "$PARAM_FILE" "$RAW_SIZE_FINAL" <<'PARAM_EXPAND'
 import re, sys
 param_file, new_bytes = sys.argv[1], int(sys.argv[2])
@@ -378,23 +376,18 @@ new_size = max(rounded, old_size)
 if new_size == old_size:
     print("[param] rootfs 无需扩展"); sys.exit(0)
 delta = new_size - old_size
-print(f"[param] rootfs: {old_size*512/1024/1024:.1f}MiB → {new_size*512/1024/1024:.1f}MiB (delta={delta} sectors)")
-# 替换 rootfs size
+print(f"[param] rootfs: {old_size*512/1024/1024:.1f}MiB → {new_size*512/1024/1024:.1f}MiB (delta={delta})")
 content = content[:m.start()] + f'0x{new_size:08x}@{m.group(2)}(rootfs)' + content[m.end():]
-# 调整 rootfs 之后所有分区的偏移
 def shift(mt):
     off = int(mt.group(1), 16)
     return f'@0x{off + delta:08x}' if off >= rootfs_end else mt.group(0)
 content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 open(param_file, 'w').write(content)
-print(f"[param] 后续分区偏移 +{delta} sectors")
 PARAM_EXPAND
     log "  ✓ rootfs 分区已扩展"
   else
-    log "  ✓ rootfs raw ($RAW_SIZE_FINAL) ≤ 分区 ($PART_BYTES)"
+    log "  ✓ rootfs raw ≤ 分区"
   fi
-else
-  warn "  parameter.txt 无 rootfs 分区定义"
 fi
 
 log "  ✓ rootfs.img 处理完成"
@@ -422,10 +415,9 @@ def shift(mt):
     return f'@0x{off + delta:08x}' if off >= kernel_end else mt.group(0)
 content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 open(param_file, 'w').write(content)
-print(f"[param] kernel: {old_size*512//1024//1024}→{new_size*512//1024//1024} MiB (delta={delta} sectors)")
+print(f"[param] kernel: {old_size*512//1024//1024}→{new_size*512//1024//1024} MiB")
 PARAM_PYEOF
 
-# 打印最终 parameter.txt 诊断
 log "  parameter.txt CMDLINE:"
 grep -E '^CMDLINE:' "$PARAM_FILE" | head -1 | sed 's/^/    /'
 
@@ -499,29 +491,28 @@ else
 
     case "$PAYLOAD_MAGIC" in
       1f8b08*)
-        log "  ✓ payload 已是 gzip，保持"
+        log "  ✓ payload 已是 gzip"
         RAMDISK="$RAW_PAYLOAD"
         ;;
       fd377a58*)
-        log "  ★ payload 是 XZ，转码为 gzip（U-Boot 兼容）..."
+        log "  ★ payload 是 XZ，转码为 gzip..."
+        mkdir -p "$WORK_DIR/boot_extract"
         set +e
         unxz -c "$RAW_PAYLOAD" > "$WORK_DIR/boot_extract/raw" 2>/dev/null
         RC1=$?
         set -e
         if [ $RC1 -eq 0 ] && [ -s "$WORK_DIR/boot_extract/raw" ]; then
-          RAW_SIZE=$(stat -c%s "$WORK_DIR/boot_extract/raw")
-          log "    XZ 解压成功: $RAW_SIZE bytes"
+          log "    XZ 解压: $(stat -c%s "$WORK_DIR/boot_extract/raw") bytes"
           gzip -9 -c "$WORK_DIR/boot_extract/raw" > "$WORK_DIR/boot_extract/raw.gz"
-          GZ_SIZE=$(stat -c%s "$WORK_DIR/boot_extract/raw.gz")
-          log "    gzip 压缩完成: $GZ_SIZE bytes"
+          log "    gzip 压缩: $(stat -c%s "$WORK_DIR/boot_extract/raw.gz") bytes"
           RAMDISK="$WORK_DIR/boot_extract/raw.gz"
         else
-          warn "    XZ 解压失败"
           RAMDISK="$RAW_PAYLOAD"
         fi
         ;;
       04224d18*)
         log "  ★ payload 是 LZ4，转码为 gzip..."
+        mkdir -p "$WORK_DIR/boot_extract"
         set +e
         lz4 -d -c "$RAW_PAYLOAD" > "$WORK_DIR/boot_extract/raw" 2>/dev/null
         RC1=$?
@@ -530,12 +521,11 @@ else
           gzip -9 -c "$WORK_DIR/boot_extract/raw" > "$WORK_DIR/boot_extract/raw.gz"
           RAMDISK="$WORK_DIR/boot_extract/raw.gz"
         else
-          warn "    LZ4 解压失败"
           RAMDISK="$RAW_PAYLOAD"
         fi
         ;;
       *)
-        warn "  ⚠ 未知压缩格式 ($PAYLOAD_MAGIC)，保留原样"
+        warn "  ⚠ 未知压缩格式 ($PAYLOAD_MAGIC)"
         RAMDISK="$RAW_PAYLOAD"
         ;;
     esac
@@ -579,9 +569,6 @@ BOOT_BUILD
       err "  ✗ 重建失败，恢复官方 boot.img"
       [ -f "$WORK_DIR/boot.img.orig" ] && cp "$WORK_DIR/boot.img.orig" "$BOOT_IMG"
     fi
-  else
-    warn "  无有效数据源，保留官方 boot.img"
-    [ -f "$WORK_DIR/boot.img.orig" ] && cp "$WORK_DIR/boot.img.orig" "$BOOT_IMG"
   fi
 fi
 
@@ -626,26 +613,33 @@ APPARENT=$(du -B1 --apparent-size "$FOUND_IMG" 2>/dev/null | awk '{print $1}')
 PHYSICAL=$(du -B1 "$FOUND_IMG" 2>/dev/null | awk '{print $1}')
 log "  img 逻辑大小: $APPARENT bytes / 物理占用: $PHYSICAL bytes"
 
+# ★★★ v43 修复：只检查 ext4 magic，不再检查前 1KB 非零 ★★★
+# 原因: ext4 前 1024 字节是引导扇区（合法为零）
+#       真正的超级块在偏移 0x400 处，magic 在 0x438
 ROOTFS_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(rootfs\)/\1/')
 if [ -n "$ROOTFS_OFFSET" ]; then
   ROOTFS_BYTE_OFF=$(( ROOTFS_OFFSET * 512 ))
   log "  rootfs 分区 @ $ROOTFS_BYTE_OFF bytes"
 
-  ROOTFS_HEAD_HEX=$(dd if="$FOUND_IMG" bs=1 skip="$ROOTFS_BYTE_OFF" count=1024 2>/dev/null | xxd -p | tr -d '\n')
+  # 诊断（不再触发失败）
+  ROOTFS_HEAD_HEX=$(dd if="$FOUND_IMG" bs=1 skip="$ROOTFS_BYTE_OFF" count=4096 2>/dev/null | xxd -p | tr -d '\n')
   NONZERO=$(echo "$ROOTFS_HEAD_HEX" | tr -d '0' | wc -c)
-  log "  rootfs 前 1KB 非零字节数: $NONZERO"
+  log "  rootfs 前 4KB 非零半字节数: $NONZERO (诊断用)"
 
-  if [ "$NONZERO" -lt 100 ]; then
-    err "  ✗ rootfs 分区前 1KB 几乎全零"
+  # 决定性检查：ext4 超级块 magic @ +0x438
+  ROOTFS_MAGIC2=$(dd if="$FOUND_IMG" bs=1 skip=$(( ROOTFS_BYTE_OFF + 0x438 )) count=2 2>/dev/null | xxd -p)
+  log "  rootfs 分区 @ +0x438 ext4 magic: $ROOTFS_MAGIC2"
+
+  if [ "$ROOTFS_MAGIC2" != "53ef" ]; then
+    err "  ✗ rootfs 分区缺少 ext4 magic（magic=$ROOTFS_MAGIC2）"
+    err "  分区前 64 字节:"
+    dd if="$FOUND_IMG" bs=1 skip="$ROOTFS_BYTE_OFF" count=64 2>/dev/null | xxd | sed 's/^/    /'
+    err "  分区 +0x400 起 64 字节:"
+    dd if="$FOUND_IMG" bs=1 skip=$(( ROOTFS_BYTE_OFF + 0x400 )) count=64 2>/dev/null | xxd | sed 's/^/    /'
     exit 1
   fi
-
-  ROOTFS_MAGIC2=$(dd if="$FOUND_IMG" bs=1 skip=$(( ROOTFS_BYTE_OFF + 0x438 )) count=2 2>/dev/null | xxd -p)
-  log "  rootfs 分区 @ +0x438 magic: $ROOTFS_MAGIC2"
-  if [ "$ROOTFS_MAGIC2" = "53ef" ]; then
-    log "  ✓ rootfs 分区含 ext4 magic"
-  fi
+  log "  ✓ rootfs 分区含 ext4 magic"
 fi
 
 mv "$FOUND_IMG" "$OUTPUT_IMG"
