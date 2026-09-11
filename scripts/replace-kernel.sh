@@ -1,8 +1,8 @@
 #!/bin/bash
-# replace-kernel.sh - Flippy 内核 + 模块注入 → 官方 KRNL 结构
+# replace-kernel.sh - Flippy 内核 + 模块注入 + DTB 替换 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v34-rootfs-2g"
+VERSION="2026-09-11-v35-resource-dtb-patch"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -30,7 +30,7 @@ trap _cleanup EXIT
 # ============================================================
 # 1. 解压 images.tgz
 # ============================================================
-log "[1/8] 解压 images.tgz"
+log "[1/9] 解压 images.tgz"
 mkdir -p "$WORK_DIR/base"
 tar xzf "$IMAGES_TGZ" -C "$WORK_DIR/base"
 BASE_DIR=$(find "$WORK_DIR/base" -maxdepth 2 -type d -name "friendlywrt*" | head -1)
@@ -39,7 +39,7 @@ BASE_DIR=$(find "$WORK_DIR/base" -maxdepth 2 -type d -name "friendlywrt*" | head
 # ============================================================
 # 2. 扫描内核
 # ============================================================
-log "[2/8] 扫描 $KERNEL_VERSION"
+log "[2/9] 扫描 $KERNEL_VERSION"
 case "$KERNEL_VERSION" in
   6.18*|6.18.y) PREFIX="6.18" ;;
   6.12*|6.12.y) PREFIX="6.12" ;;
@@ -74,9 +74,9 @@ SELECTED_REPO="${SELECTED_SOURCE%%:*}"; SELECTED_RELEASE="${SELECTED_SOURCE##*:}
 log "  选中: $SELECTED_VER ($SELECTED_REPO/$SELECTED_RELEASE)"
 
 # ============================================================
-# 3. 下载内核（带缓存）
+# 3. 下载内核
 # ============================================================
-log "[3/8] 下载内核"
+log "[3/9] 下载内核"
 KERNEL_CACHE="/tmp/kernel-cache-${SELECTED_RELEASE}/${SELECTED_VER}"
 if [ ! -f "$KERNEL_CACHE/.ready" ]; then
   rm -rf "$KERNEL_CACHE"; mkdir -p "$KERNEL_CACHE"; cd "$KERNEL_CACHE"
@@ -102,7 +102,7 @@ KERNEL_TOPDIR=$(cat "$KERNEL_CACHE/.topdir")
 # ============================================================
 # 4. 复制骨架
 # ============================================================
-log "[4/8] 复制骨架"
+log "[4/9] 复制骨架"
 TARGET_DIR="$SDFUSE_DIR/$DIST_NAME"
 rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
@@ -110,7 +110,7 @@ cp -a "$BASE_DIR" "$TARGET_DIR"
 # ============================================================
 # 5. KRNL 构造
 # ============================================================
-log "[5/8] 构造 kernel.img"
+log "[5/9] 构造 kernel.img"
 
 IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "vmlinuz-*" | head -1)
 [ -z "$IMAGE_FILE" ] && IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "Image*" | head -1)
@@ -304,14 +304,13 @@ print("\n  SUCCESS")
 PYEOF
 
 KERNEL_IMG="$TARGET_DIR/kernel.img"
-KERNEL_IMG_MAGIC=$(dd if="$KERNEL_IMG" bs=1 count=4 2>/dev/null)
-[ "$KERNEL_IMG_MAGIC" != "KRNL" ] && { err "kernel.img 头部不是 KRNL"; exit 1; }
+[ "$(dd if="$KERNEL_IMG" bs=1 count=4 2>/dev/null)" != "KRNL" ] && { err "kernel.img 头部不是 KRNL"; exit 1; }
 log "  ✓ kernel.img KNL magic 校验通过 ($(stat -c%s "$KERNEL_IMG") bytes)"
 
 # ============================================================
 # 5.3 注入内核模块到 rootfs.img
 # ============================================================
-log "[5.3/8] 注入内核模块到 rootfs.img"
+log "[5.3/9] 注入内核模块到 rootfs.img"
 
 MODULES_TAR=$(find "$KERNEL_CACHE" -maxdepth 2 -name "modules-*.tar.gz" | head -1)
 ROOTFS_IMG="$TARGET_DIR/rootfs.img"
@@ -382,9 +381,7 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
   [ $RC -ne 0 ] && { err "  unsquashfs 失败"; tail -20 "$WORK_DIR/unsquashfs.log"; exit 1; }
 
   log "  清理旧内核模块"
-  ls -la "$ROOT_EX/lib/modules/" 2>/dev/null | sed 's/^/    /' || true
   rm -rf "$ROOT_EX/lib/modules/"*
-
   mkdir -p "$ROOT_EX/lib/modules/$KVER"
   cp -a "$MOD_LIB/." "$ROOT_EX/lib/modules/$KVER/"
   INJECTED=$(find "$ROOT_EX/lib/modules/$KVER" -name '*.ko*' | wc -l)
@@ -397,74 +394,45 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
   RC=$?
   set -e
   [ $RC -ne 0 ] && { err "  mksquashfs 失败"; tail -20 "$WORK_DIR/mksquashfs.log"; exit 1; }
-
-  log "  原 raw: $(stat -c%s "$WORK_ROOTFS") bytes"
-  log "  新 raw: $(stat -c%s "$ROOTFS_NEW_RAW") bytes"
   mv "$ROOTFS_NEW_RAW" "$WORK_ROOTFS"
 
 elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   log "  检测为 ext4"
   CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
-
-  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-  # 【关键修复】预扩展 2GB 而非 3GB
-  #   3GB rootfs → 分区表总和超过 4GB img 容量 → "Partitions layout exceds disk size"
-  #   2GB 足够容纳 3086 个模块（实测物理占用 ~170MB）+ ext4 元数据
-  #   分区总和: 3.17 GiB < 3.73 GiB img 容量 ✓
-  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
   TARGET_RAW=$(( 2 * 1024 * 1024 * 1024 ))
   if [ "$CURRENT_RAW" -lt "$TARGET_RAW" ]; then
     log "  ★ 预扩展 raw: $(( CURRENT_RAW / 1024 / 1024 )) MiB → $(( TARGET_RAW / 1024 / 1024 )) MiB"
     truncate -s "$TARGET_RAW" "$WORK_ROOTFS"
-    log "  e2fsck 检查..."
     sudo e2fsck -f -y "$WORK_ROOTFS" 2>&1 | tail -3 || true
-    log "  resize2fs 扩展..."
     sudo resize2fs "$WORK_ROOTFS" 2>&1 | tail -3 || true
   fi
 
   MNT="$WORK_DIR/mnt"
   mkdir -p "$MNT"
-
   MNT_OK=0
   if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then MNT_OK=1
   elif sudo mount -t ext4 -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then MNT_OK=1
   fi
   [ "$MNT_OK" = "0" ] && { err "  无法 loop mount"; exit 1; }
-  log "  已挂载到 $MNT"
-
-  log "  初始磁盘使用:"
-  df -h "$MNT" | sed 's/^/    /'
 
   log "  ★ 清理旧内核模块"
   sudo rm -rf "$MNT/lib/modules/"*
   sync
-  log "  清理后磁盘使用:"
-  df -h "$MNT" | sed 's/^/    /'
-
   AVAIL=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
   NEED=$(du -sb "$MOD_LIB" | awk '{print $1}')
   NEED_SAFE=$(( NEED * 3 ))
-  log "  可用: $AVAIL bytes / 逻辑需要: $NEED bytes / 保守需要: $NEED_SAFE bytes"
+  log "  可用: $AVAIL bytes / 保守需要: $NEED_SAFE bytes"
 
-  if [ "$AVAIL" -lt "$NEED_SAFE" ]; then
-    err "  空间不足"; exit 1
-  fi
+  [ "$AVAIL" -lt "$NEED_SAFE" ] && { err "  空间不足"; exit 1; }
 
-  log "  注入 $KO_COUNT 个模块到 $KVER..."
   sudo mkdir -p "$MNT/lib/modules/$KVER"
   set +e
   sudo cp -a "$MOD_LIB/." "$MNT/lib/modules/$KVER/" 2>&1 | head -20
   set -e
   sync
-
   INJECTED=$(sudo find "$MNT/lib/modules/$KVER" -name '*.ko*' | wc -l)
   log "  已注入: $INJECTED / $KO_COUNT 个模块"
-  log "  注入后磁盘使用:"
-  df -h "$MNT" | sed 's/^/    /'
-
-  if [ "$INJECTED" -lt "$KO_COUNT" ]; then
-    err "  模块注入不完整（$INJECTED < $KO_COUNT）"; exit 1
-  fi
+  [ "$INJECTED" -lt "$KO_COUNT" ] && { err "  模块注入不完整"; exit 1; }
 
   sync
   sudo umount -f "$MNT" 2>/dev/null || umount -f "$MNT" 2>/dev/null || true
@@ -479,7 +447,6 @@ if [ "$IS_SPARSE" = "1" ]; then
   img2simg "$WORK_ROOTFS" "$ROOTFS_FINAL" 4096
   RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS")
   log "  最终 sparse 大小: $(stat -c%s "$ROOTFS_FINAL") bytes"
-  log "  对应 raw 大小: $RAW_SIZE_FINAL bytes"
   mv "$ROOTFS_FINAL" "$ROOTFS_IMG"
 else
   RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS")
@@ -507,7 +474,7 @@ new_size = max(rounded, old_size)
 if new_size == old_size:
     print("[param] rootfs 无需扩展"); sys.exit(0)
 delta = new_size - old_size
-print(f"[param] rootfs: {old_size*512/1024/1024:.1f}MiB → {new_size*512/1024/1024:.1f}MiB (delta={delta})")
+print(f"[param] rootfs: {old_size*512/1024/1024:.1f}MiB → {new_size*512/1024/1024:.1f}MiB")
 content = content[:m.start()] + f'0x{new_size:08x}@{m.group(2)}(rootfs)' + content[m.end():]
 def shift(mt):
     off = int(mt.group(1), 16)
@@ -516,17 +483,14 @@ content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 open(param_file, 'w').write(content)
 print(f"[param] 已调整")
 PARAM_EXPAND
-  else
-    log "  ✓ raw ($RAW_SIZE_FINAL) ≤ 分区 ($PART_BYTES)"
   fi
 fi
-
 log "  ✓ rootfs.img 处理完成"
 
 # ============================================================
 # 5.5 扩容 kernel 分区
 # ============================================================
-log "[5.5/8] 扩容 kernel 分区"
+log "[5.5/9] 扩容 kernel 分区"
 python3 - "$PARAM_FILE" "$(stat -c%s "$TARGET_DIR/kernel.img")" <<'PARAM_PYEOF'
 import re, sys
 param_file, kernel_size = sys.argv[1], int(sys.argv[2])
@@ -541,11 +505,11 @@ kernel_end = kernel_off + old_size
 need = (kernel_size + 511) // 512
 rounded = ((need + 0x3FFF) // 0x4000) * 0x4000
 new_size = max(rounded, old_size)
-print("[param] kernel: old=%.1f MiB  need=%.1f MiB  new=%.1f MiB" %
-      (old_size*512/1024/1024, need*512/1024/1024, new_size*512/1024/1024))
 if new_size == old_size:
     print("[param] kernel 无需扩容"); sys.exit(0)
 delta = new_size - old_size
+print("[param] kernel: %.1f→%.1f MiB (delta=%d)" %
+      (old_size*512/1024/1024, new_size*512/1024/1024, delta))
 content = content[:m.start()] + f'0x{new_size:08x}@{m.group(2)}(kernel)' + content[m.end():]
 def shift(mt):
     off = int(mt.group(1), 16)
@@ -553,51 +517,15 @@ def shift(mt):
 content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 with open(param_file, 'w') as f:
     f.write(content)
-print(f"[param] kernel 已扩容 delta={delta} sectors")
+print(f"[param] kernel 已扩容")
 PARAM_PYEOF
-
-log "  parameter.txt CMDLINE:"
-grep -E '^CMDLINE:' "$PARAM_FILE" | head -1 | sed 's/^/    /'
-
-# ★ 分区总和检查
-python3 - "$PARAM_FILE" <<'CHECK_TOTAL' || true
-import re, sys
-param_file = sys.argv[1]
-content = open(param_file).read()
-m = re.search(r'CMDLINE:\s*mtdparts=[^:]+:(.+?)(?:\s|$)', content)
-if not m: sys.exit(0)
-layout = m.group(1)
-items = layout.split(',')
-total_end = 0
-for it in items:
-    mm = re.match(r'0x([0-9a-fA-F]+)@0x([0-9a-fA-F]+)\(([^)]+)\)', it)
-    if not mm: continue
-    size = int(mm.group(1), 16)
-    off  = int(mm.group(2), 16)
-    name = mm.group(3)
-    end = off + size
-    if end > total_end: total_end = end
-img_capacity_sectors = 4000000000 // 512
-total_bytes = total_end * 512
-pct = 100.0 * total_end / img_capacity_sectors if img_capacity_sectors else 0
-print("  [分区检查] 最后固定分区结束 @ sector 0x%x = %d bytes (%.1f MiB)" %
-      (total_end, total_bytes, total_bytes/1024/1024))
-print("  [分区检查] img 容量 sector = 0x%x = %d bytes (%.1f MiB)" %
-      (img_capacity_sectors, img_capacity_sectors*512, img_capacity_sectors*512/1024/1024))
-print("  [分区检查] 占用 = %.1f%%" % pct)
-if total_end >= img_capacity_sectors:
-    print("  [分区检查] ✗ 分区总和超出 img 容量！需缩减 rootfs")
-    sys.exit(2)
-else:
-    print("  [分区检查] ✓ 分区总和 < img 容量，余量 %.1f MiB" %
-          ((img_capacity_sectors - total_end) * 512 / 1024 / 1024))
-CHECK_TOTAL
 
 # ============================================================
 # 6. dtb + uInitrd
 # ============================================================
-log "[6/8] dtb + uInitrd"
+log "[6/9] dtb + uInitrd"
 DTB_TAR=$(find "$KERNEL_CACHE" -maxdepth 2 -name "dtb-rockchip-*.tar.gz" | head -1)
+R5S_DTB=""
 if [ -n "$DTB_TAR" ]; then
   mkdir -p "$TARGET_DIR/dtb/rockchip"
   for board in r5s r5c; do
@@ -605,23 +533,132 @@ if [ -n "$DTB_TAR" ]; then
     if [ -n "$ENTRY" ]; then
       tar xzf "$DTB_TAR" -C "$WORK_DIR" "$ENTRY"
       cp "$WORK_DIR/$ENTRY" "$TARGET_DIR/dtb/rockchip/rk3568-nanopi-${board}.dtb"
+      [ "$board" = "r5s" ] && R5S_DTB="$TARGET_DIR/dtb/rockchip/rk3568-nanopi-r5s.dtb"
       log "  ✓ $board dtb"
-    else
-      warn "  ✗ $board dtb 未找到"
     fi
   done
 fi
 UINITRD=$(find "$KERNEL_CACHE" -type f -name "uInitrd-*" | head -1)
-if [ -n "$UINITRD" ]; then
-  cp "$UINITRD" "$TARGET_DIR/uInitrd"; log "  ✓ uInitrd"
+[ -n "$UINITRD" ] && { cp "$UINITRD" "$TARGET_DIR/uInitrd"; log "  ✓ uInitrd"; }
+
+# ============================================================
+# 6.5 更新 resource.img 中的 DTB ★★★ 关键修复 ★★★
+# ============================================================
+log "[6.5/9] 更新 resource.img 中的 DTB"
+
+RESOURCE_IMG="$TARGET_DIR/resource.img"
+
+if [ ! -f "$RESOURCE_IMG" ]; then
+  warn "  resource.img 不存在，跳过"
+elif [ -z "$R5S_DTB" ] || [ ! -f "$R5S_DTB" ]; then
+  warn "  Flippy DTB 不存在，跳过"
 else
-  warn "  ✗ uInitrd 未找到"
+  log "  resource.img: $(stat -c%s "$RESOURCE_IMG") bytes"
+  log "  Flippy DTB:   $(stat -c%s "$R5S_DTB") bytes"
+
+  python3 - "$RESOURCE_IMG" "$R5S_DTB" <<'DTB_PATCH' || warn "  ⚠ DTB 替换失败，保留官方 resource.img"
+import sys, struct, os
+
+res_path = sys.argv[1]
+dtb_path = sys.argv[2]
+
+raw = bytearray(open(res_path, 'rb').read())
+print(f"  resource.img magic: {raw[0:4]!r}")
+
+if raw[0:4] != b'RSCE':
+    print(f"  ✗ 不是 RSCE 格式，跳过")
+    sys.exit(0)
+
+version = struct.unpack_from('<I', raw, 4)[0]
+print(f"  RSCE version: {version}")
+
+# RSCE header（Rockchip 标准格式）
+header_size  = struct.unpack_from('<I', raw, 8)[0]
+index_offset = struct.unpack_from('<I', raw, 12)[0]
+data_offset  = struct.unpack_from('<I', raw, 16)[0]
+print(f"  header_size=0x{header_size:x} index_offset=0x{index_offset:x} data_offset=0x{data_offset:x}")
+
+# 尝试多种 entry 大小
+# 版本1: 8(offset+size) + 256(name) = 264
+# 版本2: 4+4+4+4+4+256 = 276
+# 版本3: 8(offset+size) + 4(flags) + 256(name) = 268
+for entry_size in (264, 268, 276):
+    entries = []
+    pos = index_offset
+    ok = True
+    while pos + entry_size <= data_offset:
+        try:
+            entry_offset = struct.unpack_from('<I', raw, pos)[0]
+            entry_sz     = struct.unpack_from('<I', raw, pos + 4)[0]
+        except struct.error:
+            ok = False; break
+        name_bytes = raw[pos + 8:pos + 8 + 256]
+        name = name_bytes.split(b'\x00')[0].decode('ascii', 'ignore')
+        if not name or entry_offset == 0 or entry_sz == 0:
+            break
+        entries.append((pos, name, entry_offset, entry_sz))
+        pos += entry_size
+    if ok and entries:
+        print(f"  使用 entry_size={entry_size}，解析到 {len(entries)} 个 entry")
+        for epos, name, eoff, esz in entries:
+            print(f"    {name} @ 0x{eoff:x} size={esz}")
+        break
+else:
+    print(f"  ✗ 无法解析 entry 结构")
+    sys.exit(0)
+
+# 找 rk-kernel.dtb
+target = None
+for epos, name, eoff, esz in entries:
+    if name == 'rk-kernel.dtb' or ('kernel' in name.lower() and 'dtb' in name.lower()):
+        target = (epos, name, eoff, esz); break
+
+if target is None:
+    for epos, name, eoff, esz in entries:
+        if 'dtb' in name.lower():
+            target = (epos, name, eoff, esz); break
+
+if target is None:
+    print(f"  ✗ 未找到 DTB entry")
+    sys.exit(0)
+
+epos, ename, eoff, esz = target
+print(f"  → 替换 {ename} (原 offset=0x{eoff:x} size={esz})")
+
+new_dtb = open(dtb_path, 'rb').read()
+if new_dtb[:4] != b'\xd0\x0d\xfe\xed':
+    print(f"  ✗ 新 DTB magic 错误: {new_dtb[:4].hex()}")
+    sys.exit(1)
+
+# 追加到末尾（不受原 size 限制）
+new_offset = len(raw)
+raw.extend(new_dtb)
+print(f"  → 新 DTB({len(new_dtb)} bytes) 追加到 0x{new_offset:x}")
+
+# 修改 entry 的 offset + size
+struct.pack_into('<I', raw, epos, new_offset)
+struct.pack_into('<I', raw, epos + 4, len(new_dtb))
+print(f"  → entry 已更新")
+
+# 修改 header 总大小（尝试多个可能位置）
+for hdr_pos in (20, 24):
+    try:
+        old = struct.unpack_from('<I', raw, hdr_pos)[0]
+        if old > 0 and old < len(raw):
+            struct.pack_into('<I', raw, hdr_pos, len(raw))
+            print(f"  → header[0x{hdr_pos:x}] 总大小: {old} → {len(raw)}")
+    except:
+        pass
+
+open(res_path, 'wb').write(raw)
+print(f"  ✓ resource.img 更新完成 ({len(raw)} bytes)")
+DTB_PATCH
 fi
 
 # ============================================================
-# 7. 生成镜像（严格判定成功）
+# 7. 生成镜像
 # ============================================================
-log "[7/8] 生成镜像"
+log "[7/9] 生成镜像"
 cd "$SDFUSE_DIR"
 chmod +x mk-sd-image.sh
 rm -f out/*.img /tmp/mk-sd.log
@@ -633,62 +670,35 @@ MK_EXIT=$?
 set -o pipefail
 set -e
 
-log "  ── mk-sd-image.sh 输出 ($(wc -l < /tmp/mk-sd.log) 行，仅关键行) ──"
-grep -E 'Creating RAW|RAW image successfully|Partitions layout|capacity|error|Error|fail' /tmp/mk-sd.log | sed 's/^/    /'
-log "  ── 输出结束 ──"
+log "  ── mk-sd-image.sh 关键行 ──"
+grep -E 'Creating RAW|RAW image successfully|Partitions layout|capacity|error|Error' /tmp/mk-sd.log | sed 's/^/    /'
 log "  mk-sd-image.sh exit=$MK_EXIT"
 
 if ! grep -q "RAW image successfully created" /tmp/mk-sd.log; then
   err "  mk-sd-image.sh 未报告成功"
-  err "  完整日志已保存到 /tmp/mk-sd.log，尾部 30 行："
   tail -30 /tmp/mk-sd.log | sed 's/^/    /'
   exit 1
 fi
 
 FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
-if [ -z "$FOUND_IMG" ]; then
-  err "  out/*.img 不存在"; exit 1
-fi
-
-FOUND_SIZE=$(stat -c%s "$FOUND_IMG")
-log "  img 大小: $FOUND_SIZE bytes"
+[ -z "$FOUND_IMG" ] && { err "  out/*.img 不存在"; exit 1; }
+log "  img 大小: $(stat -c%s "$FOUND_IMG") bytes"
 
 KERNEL_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(kernel\)/\1/')
 KERNEL_BYTE_OFF=$(( KERNEL_OFFSET * 512 ))
-log "  期望 KNL 在 offset 0x${KERNEL_OFFSET#0x}*512 = $KERNEL_BYTE_OFF"
 
 MAGIC_AT_OFFSET=$(dd if="$FOUND_IMG" bs=1 skip=$KERNEL_BYTE_OFF count=4 2>/dev/null || echo "")
-log "  实际字节 @ $KERNEL_BYTE_OFF: $(printf '%s' "$MAGIC_AT_OFFSET" | xxd -p)"
+log "  KNL magic @ $KERNEL_BYTE_OFF: $(printf '%s' "$MAGIC_AT_OFFSET" | xxd -p)"
 
-if [ "$MAGIC_AT_OFFSET" != "KRNL" ]; then
-  err "  ✗ img 中 KNL magic 缺失！"
-  python3 - "$FOUND_IMG" <<'SCAN'
-import sys
-img = sys.argv[1]
-with open(img, 'rb') as f:
-    data = f.read()
-idxs = []
-i = 0
-while True:
-    j = data.find(b'KRNL', i)
-    if j < 0: break
-    idxs.append(j)
-    i = j + 1
-    if len(idxs) > 20: break
-print("  KRNL magic 出现在:", [hex(x) for x in idxs[:20]])
-SCAN
-  exit 1
-fi
-
+[ "$MAGIC_AT_OFFSET" != "KRNL" ] && { err "  ✗ KNL magic 缺失"; exit 1; }
 log "  ✓ KNL magic 校验通过"
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
 # ============================================================
 # 8. 最终验证
 # ============================================================
-log "[8/8] 最终验证"
-
+log "[8/9] 最终验证"
 python3 - "$OUTPUT_IMG" "$KERNEL_BYTE_OFF" <<'PYEOF'
 import sys, struct
 img, off = sys.argv[1], int(sys.argv[2])
@@ -703,9 +713,17 @@ code1 = struct.unpack_from('<I', d, 0x0C)[0]
 imm26 = code1 & 0x03FFFFFF
 if imm26 & 0x02000000: imm26 -= 0x04000000
 target = 0x0C + imm26 * 4
-print("  KRNL size=%d  code0=%s  code1=%s" % (size, d[0x08:0x0c].hex(), d[0x0c:0x10].hex()))
-print("  code1 → 0x%x" % target)
+print("  KRNL size=%d  code1=%s  → 0x%x" % (size, d[0x0c:0x10].hex(), target))
 print("  ✓✓✓")
 PYEOF
+
+# ============================================================
+# 9. 汇总
+# ============================================================
+log "[9/9] 汇总"
+RES_SIZE=$(stat -c%s "$TARGET_DIR/resource.img" 2>/dev/null || echo 0)
+log "  resource.img: $RES_SIZE bytes"
+log "  kernel.img:   $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
+log "  rootfs.img:   $(stat -c%s "$TARGET_DIR/rootfs.img") bytes"
 
 log "完成 (version $VERSION, 内核 $SELECTED_VER)"
