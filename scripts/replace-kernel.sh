@@ -4,7 +4,7 @@
 # 环境变量: KERNEL_VERSION, OFFICIAL_DIR
 set -euo pipefail
 
-VERSION="2026-09-11-v22-pipefail-fix"
+VERSION="2026-09-11-v23-system-map"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -98,7 +98,7 @@ rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
 
 # ============================================================
-# 5. KRNL 构造
+# 5. KRNL 构造（System.map 精确定位入口）
 # ============================================================
 log "[5/7] 构造 kernel.img"
 
@@ -107,7 +107,15 @@ IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "vmlinuz-*" | head -
 [ -z "$IMAGE_FILE" ] && { err "找不到内核 Image"; exit 1; }
 log "  文件: $(basename "$IMAGE_FILE") ($(stat -c%s "$IMAGE_FILE") bytes)"
 
-# 抓取官方完整 KNL payload（用于入口锚点匹配）
+# 找 System.map（在 boot 目录里）
+SYSTEM_MAP=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "System.map-*" | head -1)
+if [ -n "$SYSTEM_MAP" ]; then
+  log "  System.map: $(basename "$SYSTEM_MAP") ($(stat -c%s "$SYSTEM_MAP") bytes)"
+else
+  warn "  未找到 System.map，将回退到模式匹配（不推荐）"
+fi
+
+# 抓取官方 KNL（用于对比验证）
 OFFICIAL_PAYLOAD="$WORK_DIR/official_krnl.bin"
 OFFICIAL_IMG=$(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.img" 2>/dev/null | head -1 || true)
 if [ -n "$OFFICIAL_IMG" ] && [ -f "$OFFICIAL_IMG" ]; then
@@ -118,19 +126,20 @@ with open(img, 'rb') as f:
     buf = f.read(64 * 1024 * 1024)
 idx = buf.find(b'KRNL')
 if idx >= 0:
-    end = min(len(buf), idx + 40 * 1024 * 1024)
+    end = min(len(buf), idx + 64 * 1024 * 1024)
     open(out, 'wb').write(buf[idx:end])
-    print("  官方 KNL: 0x%x, 抓取 %d 字节" % (idx, end-idx))
+    print("  官方 KNL @ 0x%x, 抓取 %d 字节" % (idx, end - idx))
 else:
     sys.exit(1)
 EXTRACT
 fi
 
-python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" "$OFFICIAL_PAYLOAD" <<'PYEOF'
+python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" "$OFFICIAL_PAYLOAD" "$SYSTEM_MAP" <<'PYEOF'
 import sys, struct, os
 
 src, dst = sys.argv[1], sys.argv[2]
 off_path = sys.argv[3] if len(sys.argv) > 3 else None
+sysmap_path = sys.argv[4] if len(sys.argv) > 4 else None
 raw = open(src, 'rb').read()
 
 # ---------- 输入校验 ----------
@@ -175,100 +184,110 @@ assert len(payload_tail) >= text_s['rsize']
 for s in sorted([x for x in secs if x['vaddr'] > text_s['vaddr']], key=lambda x: x['vaddr']):
     print("    + 附加段 %-10s vaddr=0x%08x size=%d" % (s['name'], s['vaddr'], s['rsize']))
 
-# ---------- ★ 入口定位：多策略 ----------
+# ============================================================
+# ★ 入口定位：System.map 优先
+# ============================================================
 entry = None
 entry_method = None
 
-# 特征：mrs x19, currentel; cmp x19, #8
-PATTERN = b'\x53\x42\x38\xd5\x7f\x22\x00\xf1'
+if sysmap_path and os.path.exists(sysmap_path):
+    print("\n  ── System.map 精确解析 ──")
+    symbols = {}
+    with open(sysmap_path, 'r', errors='ignore') as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) >= 3:
+                try:
+                    addr = int(parts[0], 16)
+                    name = parts[2]
+                    # 若重名保留第一个（通常是最外层的）
+                    if name not in symbols:
+                        symbols[name] = addr
+                except (ValueError, IndexError):
+                    pass
+    print("  符号总数: %d" % len(symbols))
 
-print("\n  搜索 record_mmu_state 特征 (mrs x19, currentel; cmp x19, #8)...")
-all_matches = []
-start = 0
-while True:
-    i = text.find(PATTERN, start)
-    if i < 0: break
-    all_matches.append(i)
-    start = i + 1
+    # 关键符号
+    _text       = symbols.get('_text') or symbols.get('stext') or symbols.get('_stext')
+    primary     = symbols.get('primary_entry') or symbols.get('_primary_entry')
+    # 备用锚点
+    rec_mmu     = symbols.get('record_mmu_state')
+    preserve    = symbols.get('preserve_boot_args')
+    create_idm  = symbols.get('create_idmap')
+    el2_setup   = symbols.get('el2_setup')
 
-print("  找到 %d 处匹配:" % len(all_matches))
-for i, m in enumerate(all_matches[:30]):
-    pct = 100.0 * m / len(text) if len(text) else 0
-    print("    [%2d] .text[0x%08x]  (%.1f%%)" % (i, m, pct))
-if len(all_matches) > 30:
-    print("    ... 还有 %d 处" % (len(all_matches) - 30))
+    print("  _text             = %s" % (hex(_text) if _text else "N/A"))
+    print("  primary_entry     = %s" % (hex(primary) if primary else "N/A"))
+    print("  record_mmu_state  = %s" % (hex(rec_mmu) if rec_mmu else "N/A"))
+    print("  preserve_boot_args= %s" % (hex(preserve) if preserve else "N/A"))
+    print("  create_idmap      = %s" % (hex(create_idm) if create_idm else "N/A"))
+    print("  el2_setup         = %s" % (hex(el2_setup) if el2_setup else "N/A"))
 
-# 策略 1：官方锚点匹配（尝试小端 / 大端）
-if off_path and os.path.exists(off_path):
-    off_raw = open(off_path, 'rb').read()
-    print("\n  官方 payload: %d 字节" % len(off_raw))
+    if _text and primary:
+        entry = primary - _text
+        entry_method = "System.map: primary_entry - _text"
+        print("\n  ★ entry = primary_entry - _text = 0x%x (%d 字节, .text 的 %.2f%%)"
+              % (entry, entry, 100.0 * entry / len(text)))
+    else:
+        print("\n  ⚠ System.map 缺少 _text 或 primary_entry，尝试备用符号")
+        # 有些内核叫 stext，或者 _head
+        if _text and el2_setup:
+            entry = el2_setup - _text
+            entry_method = "System.map: el2_setup - _text"
+            print("  ★ 备用 entry = 0x%x" % entry)
 
-    KNL_HDR = 0x10000
-    for endian, fmt in [('little', '<I'), ('big', '>I')]:
-        code1_off = struct.unpack_from(fmt, off_raw, 0x0C)[0]
-        opcode = (code1_off >> 26) & 0x3F
-        if opcode != 5:
-            continue   # 不是 B 指令，跳过这个字节序
-        imm26 = code1_off & 0x03FFFFFF
-        if imm26 & 0x02000000:
-            imm26 -= 0x04000000
-        target = 0x0C + imm26 * 4
-        print("  官方 code1(%s) = 0x%08x  opcode=%d  target=0x%x" %
-              (endian, code1_off, opcode, target))
-        if not (KNL_HDR <= target < len(off_raw)):
-            continue
-        off_entry = target - KNL_HDR
-        pattern64 = off_raw[KNL_HDR + off_entry: KNL_HDR + off_entry + 64]
-        print("  官方入口前 16B: %s" % pattern64[:16].hex())
-
-        # 在 Flippy .text 里搜 32B 模式
-        all_idx = []
-        s = 0
-        while True:
-            j = text.find(pattern64[:32], s)
-            if j < 0: break
-            all_idx.append(j)
-            s = j + 1
-        if all_idx:
-            if len(all_idx) > 1:
-                print("  ⚠ 命中 %d 处，取最靠前" % len(all_idx))
-            entry = all_idx[0]
-            entry_method = "官方 code1 目标(%s端)处 32B 模式匹配" % endian
-            print("  ★ 匹配成功，Flippy entry @ .text[0x%x]" % entry)
-            break
-        else:
-            print("  ✗ Flippy 中未找到官方入口模式(%s端)" % endian)
-
-# 策略 2：最靠前的特征匹配
-if entry is None and all_matches:
-    first = all_matches[0]
-    if first >= 4:
-        prev = struct.unpack_from('<I', text, first - 4)[0]
-        if (prev & 0xFC000000) == 0x94000000:
-            imm26 = prev & 0x03FFFFFF
-            if imm26 & 0x02000000: imm26 -= 0x04000000
-            tgt = (first - 4) + imm26 * 4
-            if first <= tgt <= first + 16:
-                entry = first - 4
-                entry_method = "最早特征 + 前置 BL 回溯"
-                print("  ★ 前置 BL 回溯成功，entry @ .text[0x%x]" % entry)
-    if entry is None:
-        entry = first
-        entry_method = "最早特征匹配（无前置 BL）"
-        print("  ★ 使用最早特征位置，entry @ .text[0x%x]" % entry)
-
-# 策略 3：兜底
+# ============================================================
+# 回退：模式匹配
+# ============================================================
 if entry is None:
-    entry = 0
-    entry_method = "兜底（.text 起始）"
-    print("  ⚠ 所有策略失败，兜底 entry @ .text[0x0]")
+    print("\n  ⚠ System.map 定位失败，回退到模式匹配（风险较高）")
+    PATTERN = b'\x53\x42\x38\xd5\x7f\x22\x00\xf1'
+    all_matches = []
+    start = 0
+    while True:
+        i = text.find(PATTERN, start)
+        if i < 0: break
+        all_matches.append(i)
+        start = i + 1
+    print("  特征匹配 %d 处:" % len(all_matches))
+    for i, m in enumerate(all_matches[:20]):
+        print("    [%2d] .text[0x%08x]  (%.1f%%)" % (i, m, 100.0*m/len(text)))
+    if all_matches:
+        entry = all_matches[0]
+        entry_method = "特征匹配（回退）"
+        print("  ★ 使用最早匹配 @ 0x%x" % entry)
 
-print("\n  ★ 最终 entry: .text[0x%x]  方法: %s" % (entry, entry_method))
+if entry is None:
+    err_exit("无法定位入口，请检查内核包完整性")
+    sys.exit(1)
 
-# 可靠性检查：入口应在 .text 前部
-if entry > len(text) * 0.5:
-    print("  ⚠⚠ 警告：entry 在 .text 后半部分 (%.1f%%)，可能定位错误！" %
-          (100.0 * entry / len(text)))
+# ============================================================
+# 交叉验证：用 System.map 确认入口指令
+# ============================================================
+print("\n  ── 入口交叉验证 ──")
+
+# 读取入口处 16 字节
+entry_bytes = text[entry:entry+16]
+print("  entry 处 16 字节: %s" % entry_bytes.hex())
+
+# 逐条解码前 4 条指令的 opcode
+for i in range(4):
+    if entry + i*4 + 4 > len(text): break
+    insn = struct.unpack_from('<I', text, entry + i*4)[0]
+    op = (insn >> 26) & 0x3F
+    opname = {0x25: 'BL', 0x05: 'B', 0x24: 'BLR', 0x0b: 'ADD', 0x2a: 'MOV',
+              0x29: 'MOV', 0x28: 'MOV', 0x34: 'MOV'}.get(op, "op_0x%02x" % op)
+    print("    [%d] 0x%08x  opcode=0x%02x (%s)" % (i, insn, op, opname))
+
+# 期望：primary_entry 前几条应是 BL 或 mov
+first_insn = struct.unpack_from('<I', text, entry)[0]
+first_op = (first_insn >> 26) & 0x3F
+if first_op in (0x25, 0x24):  # BL or BLR
+    print("  ✓ 入口首指令是 BL/BLR（符合 primary_entry 特征）")
+elif first_op in (0x28, 0x29, 0x2a, 0x2b):  # MOV variants
+    print("  ⚠ 入口首指令是 MOV（可能是中间指令，谨慎）")
+else:
+    print("  ⚠ 入口首指令 opcode=0x%02x，请人工确认" % first_op)
 
 # ---------- 构造 KRNL ----------
 KNL_HDR = 0x10000
@@ -278,7 +297,7 @@ rel = target_in_knl - 0x0C
 assert rel % 4 == 0
 assert -0x8000000 <= rel <= 0x7FFFFFC, "B 偏移越界: 0x%x" % rel
 code1 = 0x14000000 | ((rel // 4) & 0x03FFFFFF)
-print("  code1=0x%08x  B %+d  → KNL[0x%x]" % (code1, rel, target_in_knl))
+print("\n  code1=0x%08x  B %+d  → KNL[0x%x]" % (code1, rel, target_in_knl))
 
 hdr = bytearray(KNL_HDR)
 struct.pack_into('<I', hdr, 0x00, 0x4c4e524b)              # "KRNL"
@@ -306,7 +325,7 @@ assert knl[target_in_knl:target_in_knl+4] == text[entry:entry+4]
 print("\n  KNL size              = %d" % len(knl))
 print("  payload (.text+.data) = %d" % len(payload))
 print("  image_size            = %d" % len(payload))
-print("  entry offset          = 0x%x" % entry)
+print("  entry offset          = 0x%x  方法: %s" % (entry, entry_method))
 print("  0x48..0x10000         = 零填充 ✓")
 print("\n  SUCCESS")
 PYEOF
@@ -371,16 +390,13 @@ else
 fi
 
 # ============================================================
-# 7. 生成镜像（★ pipefail 修复核心）
+# 7. 生成镜像（pipefail 修复）
 # ============================================================
 log "[7/7] 生成镜像"
 cd "$SDFUSE_DIR"
 chmod +x mk-sd-image.sh
 rm -f out/*.img
 
-# ★★ 关键修复：
-#   yes | ... 管道中 yes 会因 SIGPIPE 退出码 141 污染整条管道
-#   临时关闭 pipefail，用产物存在性判定成功
 set +e
 set +o pipefail
 yes 2>/dev/null | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
@@ -398,7 +414,7 @@ log "  镜像已生成: $FOUND_IMG ($(stat -c%s "$FOUND_IMG") bytes)"
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
 # ============================================================
-# 最终验证：从 parameter.txt 动态读取偏移
+# 最终验证
 # ============================================================
 KERNEL_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(kernel\)/\1/')
