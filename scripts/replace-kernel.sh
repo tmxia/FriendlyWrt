@@ -1,10 +1,8 @@
 #!/bin/bash
 # replace-kernel.sh - Flippy 内核 + 模块注入 → 官方 KRNL 结构
-# 用法: replace-kernel.sh <images.tgz> <sd-fuse目录> <dist_name> <输出img路径>
-# 环境变量: KERNEL_VERSION, OFFICIAL_DIR
 set -euo pipefail
 
-VERSION="2026-09-11-v28-sparse-aware"
+VERSION="2026-09-11-v29-cleanup-fix"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -15,7 +13,26 @@ KERNEL_VERSION="${KERNEL_VERSION:-6.18.y}"
 OFFICIAL_DIR="${OFFICIAL_DIR:-/tmp/official}"
 
 WORK_DIR=$(mktemp -d /tmp/replace-kernel.XXXXXX)
-trap "rm -rf $WORK_DIR" EXIT
+
+# ============================================================
+# 清理：先 umount 再 sudo rm（关键修复）
+# ============================================================
+_cleanup() {
+  _rc=$?
+  # 先卸载所有可能的 loop mount
+  for m in "$WORK_DIR/mnt" /tmp/fwrt-mnt-*; do
+    if [ -d "$m" ] && mountpoint -q "$m" 2>/dev/null; then
+      sudo umount -f "$m" 2>/dev/null || umount -f "$m" 2>/dev/null || true
+    fi
+  done
+  # sudo 清理（loop mount 留下的 root 文件需要 sudo）
+  sudo rm -rf "$WORK_DIR" 2>/dev/null
+  if [ -d "$WORK_DIR" ]; then
+    rm -rf "$WORK_DIR" 2>/dev/null || true
+  fi
+  exit $_rc
+}
+trap _cleanup EXIT
 
 # ============================================================
 # 1. 解压 images.tgz
@@ -333,7 +350,7 @@ print("\n  SUCCESS")
 PYEOF
 
 # ============================================================
-# 5.3 注入内核模块到 rootfs.img（支持 sparse / ext4 / squashfs）
+# 5.3 注入内核模块到 rootfs.img
 # ============================================================
 log "[5.3/8] 注入内核模块到 rootfs.img"
 
@@ -345,13 +362,12 @@ PARAM_FILE="$TARGET_DIR/parameter.txt"
 [ ! -f "$ROOTFS_IMG" ] && { err "  rootfs.img 不存在"; exit 1; }
 [ ! -f "$PARAM_FILE" ] && { err "  parameter.txt 不存在"; exit 1; }
 
-command -v simg2img >/dev/null || { err "  缺少 simg2img（请装 android-sdk-libsparse-utils）"; exit 1; }
-command -v img2simg >/dev/null || { err "  缺少 img2simg（请装 android-sdk-libsparse-utils）"; exit 1; }
+command -v simg2img >/dev/null || { err "  缺少 simg2img"; exit 1; }
+command -v img2simg >/dev/null || { err "  缺少 img2simg"; exit 1; }
 
 log "  modules: $(basename "$MODULES_TAR") ($(stat -c%s "$MODULES_TAR") bytes)"
 log "  rootfs:  $(stat -c%s "$ROOTFS_IMG") bytes"
 
-# 解压模块
 MOD_EX="$WORK_DIR/modules_extract"
 mkdir -p "$MOD_EX"
 tar xzf "$MODULES_TAR" -C "$MOD_EX"
@@ -367,7 +383,6 @@ log "  模块数:   $KO_COUNT"
 ORIG_FMT=$(file -b "$ROOTFS_IMG")
 log "  rootfs 原始格式: $ORIG_FMT"
 
-# ---------- sparse → raw ----------
 WORK_ROOTFS=""
 IS_SPARSE=0
 if echo "$ORIG_FMT" | grep -qi "Android sparse"; then
@@ -375,7 +390,7 @@ if echo "$ORIG_FMT" | grep -qi "Android sparse"; then
   WORK_ROOTFS="$WORK_DIR/rootfs.raw"
   simg2img "$ROOTFS_IMG" "$WORK_ROOTFS"
   IS_SPARSE=1
-  log "  raw 大小: $(stat -c%s "$WORK_ROOTFS") bytes ($(python3 -c "print(f'{$(( $(stat -c%s "$WORK_ROOTFS") ))/1024/1024:.1f}')") MiB)"
+  log "  raw 大小: $(stat -c%s "$WORK_ROOTFS") bytes"
 else
   cp "$ROOTFS_IMG" "$WORK_ROOTFS"
 fi
@@ -383,9 +398,7 @@ fi
 RAW_FMT=$(file -b "$WORK_ROOTFS")
 log "  raw 格式: $RAW_FMT"
 
-# ---------- 分派处理 ----------
 if echo "$RAW_FMT" | grep -qi "squashfs"; then
-  # ===================== squashfs =====================
   command -v unsquashfs >/dev/null || { err "  缺少 unsquashfs"; exit 1; }
   command -v mksquashfs >/dev/null || { err "  缺少 mksquashfs"; exit 1; }
 
@@ -426,15 +439,11 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
   set -e
   [ $RC -ne 0 ] && { err "  mksquashfs 失败"; tail -20 "$WORK_DIR/mksquashfs.log"; exit 1; }
 
-  ORIG_RAW=$(stat -c%s "$WORK_ROOTFS")
-  NEW_RAW=$(stat -c%s "$ROOTFS_NEW_RAW")
-  log "  原 raw: $ORIG_RAW bytes"
-  log "  新 raw: $NEW_RAW bytes"
-
+  log "  原 raw: $(stat -c%s "$WORK_ROOTFS") bytes"
+  log "  新 raw: $(stat -c%s "$ROOTFS_NEW_RAW") bytes"
   mv "$ROOTFS_NEW_RAW" "$WORK_ROOTFS"
 
 elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
-  # ===================== ext4 =====================
   log "  检测为 ext4，使用 loop mount"
   MNT="$WORK_DIR/mnt"
   mkdir -p "$MNT"
@@ -444,27 +453,22 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
     MNT_OK=1
   elif sudo mount -t ext4 -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
     MNT_OK=1
-  elif sudo mount -o loop,rw,noatime "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
-    MNT_OK=1
   fi
   [ "$MNT_OK" = "0" ] && { err "  无法 loop mount"; exit 1; }
   log "  已挂载到 $MNT"
 
-  # 检查空间
   AVAIL=$(df -B1 --output=avail "$MNT" 2>/dev/null | tail -1 | tr -d ' ')
   NEED=$(du -sb "$MOD_LIB" | awk '{print $1}')
   log "  可用空间: $AVAIL bytes / 需要: $NEED bytes"
   if [ -n "$AVAIL" ] && [ "$AVAIL" -lt "$NEED" ]; then
     warn "  空间不足，尝试 resize2fs 扩展"
-    sudo umount "$MNT" 2>/dev/null || true
+    sudo umount -f "$MNT" 2>/dev/null || true
     CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
-    # 扩展到 max(原大小 * 2, 原大小 + 200MiB)
     EXTRA=$(( 200 * 1024 * 1024 ))
     NEW_TARGET=$(( CURRENT_RAW + EXTRA ))
-    # 按 4MiB 对齐
     NEW_TARGET=$(( (NEW_TARGET / (4*1024*1024) + 1) * (4*1024*1024) ))
     truncate -s "$NEW_TARGET" "$WORK_ROOTFS"
-    resize2fs "$WORK_ROOTFS" 2>&1 | tail -3
+    resize2fs "$WORK_ROOTFS" 2>&1 | tail -3 || true
     if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
       log "  扩展后重新挂载成功，新大小: $NEW_TARGET bytes"
     else
@@ -481,27 +485,30 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   INJECTED=$(sudo find "$MNT/lib/modules/$KVER" -name '*.ko*' | wc -l)
   log "  已注入: $INJECTED 个模块"
 
-  sudo umount "$MNT"
-  log "  已卸载"
+  # 卸载，带 -f 强制
+  sync
+  sudo umount -f "$MNT" 2>/dev/null || umount -f "$MNT" 2>/dev/null || true
+  if mountpoint -q "$MNT" 2>/dev/null; then
+    warn "  挂载点未完全卸载，稍后由 trap 处理"
+  else
+    log "  已卸载"
+  fi
 
 else
   err "  不支持的 raw 格式: $RAW_FMT"
   exit 1
 fi
 
-# ---------- raw → sparse（如果原来是 sparse） ----------
 if [ "$IS_SPARSE" = "1" ]; then
   log "  转换 raw → Android sparse"
   ROOTFS_FINAL="$WORK_DIR/rootfs.final.img"
   img2simg "$WORK_ROOTFS" "$ROOTFS_FINAL"
-  FINAL_SIZE=$(stat -c%s "$ROOTFS_FINAL")
-  log "  最终 sparse 大小: $FINAL_SIZE bytes"
+  log "  最终 sparse 大小: $(stat -c%s "$ROOTFS_FINAL") bytes"
   mv "$ROOTFS_FINAL" "$ROOTFS_IMG"
 else
   mv "$WORK_ROOTFS" "$ROOTFS_IMG"
 fi
 
-# ---------- 校验 rootfs 分区是否够 ----------
 RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS" 2>/dev/null || stat -c%s "$ROOTFS_IMG")
 ROOTFS_PART=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" | head -1)
 if [ -n "$ROOTFS_PART" ]; then
