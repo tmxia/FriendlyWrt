@@ -134,6 +134,28 @@ jobs:
           touch /tmp/official/.no_reference
         fi
 
+    - name: Extract official KRNL for reference
+      run: |
+        OFF_IMG=$(find /tmp/official -maxdepth 1 -name "*.img" | head -1)
+        if [ -z "$OFF_IMG" ]; then
+          echo "无官方镜像，无法提取参考 KRNL"
+          touch /tmp/official/.no_krnl
+          exit 0
+        fi
+
+        echo "=== 官方 KRNL 完整头 + payload 头 ==="
+        dd if="$OFF_IMG" bs=512 skip=$((0x12000)) count=2 2>/dev/null > /tmp/official_krnl_head.bin
+        xxd -l 256 /tmp/official_krnl_head.bin
+
+        echo ""
+        echo "=== 官方 KRNL 完整 4 KB ==="
+        dd if="$OFF_IMG" bs=512 skip=$((0x12000)) count=8 2>/dev/null > /tmp/official_krnl_4k.bin
+        ls -la /tmp/official_krnl_4k.bin
+
+        echo ""
+        echo "=== 官方 KRNL payload[0x40:0x180] (真正的内核入口处) ==="
+        dd if="$OFF_IMG" bs=1 skip=$((0x12000 * 512 + 0x40)) count=0x140 2>/dev/null | xxd
+
     - name: Scan and select kernel
       id: kernel
       env:
@@ -210,9 +232,15 @@ jobs:
         tar xzf "$BOOT_TAR" -C boot_extract
         tar xzf "$DTB_TAR" -C dtb_extract
         ls -la boot_extract/
-        ls dtb_extract/ | grep -E "rk3568-nanopi-r5[sc]" || echo "no r5s/r5c dtb"
 
-    - name: 'Convert kernel to KRNL (entry = .text[0x00])'
+    # ============================================================
+    # 自适应 KRNL 转换：
+    #   1) 提取官方 KRNL 的 payload[0x40:0x80]（真入口字节模式）
+    #   2) 在 Flippy .text 里搜索该模式
+    #   3) 根据位置自动计算 code1
+    #   4) 若官方无参考，则回退到 .text[0x00] (B +0x3C)
+    # ============================================================
+    - name: 'Convert kernel to KRNL (adaptive to official entry)'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
@@ -220,10 +248,12 @@ jobs:
         echo "输入: $VMLINUZ ($(stat -c%s "$VMLINUZ") bytes)"
         xxd -l 64 "$VMLINUZ"
 
-        python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
-        import sys, struct
+        OFF_KRNL=/tmp/official_krnl_4k.bin
+        python3 - "$VMLINUZ" /tmp/kernel.img "$OFF_KRNL" <<'PYEOF'
+        import sys, struct, os
 
         src, dst = sys.argv[1], sys.argv[2]
+        official_krnl_path = sys.argv[3] if len(sys.argv) > 3 else ""
         raw = open(src, 'rb').read()
         ARM64_MAGIC = b'ARM\x64'
 
@@ -241,8 +271,6 @@ jobs:
         opt_size = struct.unpack_from('<H', raw, coff + 16)[0]
         sec_base = coff + 20 + opt_size
 
-        print("PE @ 0x%x, %d sections" % (pe_off, nsec))
-
         sections = []
         for i in range(nsec):
             o = sec_base + i * 40
@@ -250,7 +278,6 @@ jobs:
             rsize = struct.unpack_from('<I', raw, o + 16)[0]
             roff  = struct.unpack_from('<I', raw, o + 20)[0]
             sections.append((name, roff, rsize))
-            print("  %s: fileoff=0x%x size=%d" % (name, roff, rsize))
 
         text_off = text_size = None
         for name, roff, rsize in sections:
@@ -258,13 +285,12 @@ jobs:
                 text_off = roff; text_size = rsize; break
         assert text_off is not None, "无 .text"
 
-        # ========== Dump .text 前 128 字节（关键信息）==========
-        print("Dump .text[0:128]:")
+        print("Dump Flippy .text[0:128]:")
         for i in range(0, 128, 16):
             ch = raw[text_off+i:text_off+i+16]
             print("  %04x: %s" % (i, ' '.join('%02x' % b for b in ch)))
 
-        # ========== payload = .text + .data ==========
+        # payload = .text + .data
         payload = b''
         for wanted in ('.text', '.data'):
             for name, roff, rsize in sections:
@@ -273,24 +299,80 @@ jobs:
                     print("  + %s: %d bytes" % (name, rsize))
                     break
 
-        print("payload 总大小: %d bytes" % len(payload))
+        # 决定 code1
+        code1 = None
+        reason = ""
 
-        # ========== 构造 ARM64 Image header ==========
-        # 内核入口 = payload[0x40]（即 .text 起点，第一条指令是 PACIASP）
-        # code1 位置 = payload[0x04]
-        # 目标 = payload[0x40]
-        # B 指令相对偏移 = 0x40 - 0x04 = 0x3C
-        # imm26 = 0x3C / 4 = 0xF
-        # code1 = 0x14000000 | 0xF = 0x1400000F
-        code1 = 0x1400000F
-        print("code1 = 0x%08x (B +0x3C, 跳到 .text[0x00]=PACIASP)" % code1)
+        # ========== 方案 A：与官方对比入口模式 ==========
+        if os.path.exists(official_krnl_path):
+            off_krnl = open(official_krnl_path, 'rb').read()
+            if len(off_krnl) >= 0x48 + 0x100:
+                # 官方 KRNL 结构: [0:4]KRNL [4:8]size [8:0x48]image header [0x48:...]内核
+                # 官方 image header 里 code1 @ payload[0x04] (等价 KRNL[0x08+4])
+                off_code1 = struct.unpack_from('<I', off_krnl, 0x08 + 0x04)[0]
+                off_magic_pos = off_krnl.find(ARM64_MAGIC, 0x08, 0x08 + 0x100)
+                print("")
+                print("官方 KRNL code1 = 0x%08x" % off_code1)
+                print("官方 KRNL ARM64 magic @ 0x%x (KRNL 内偏移)" % off_magic_pos)
+                print("官方 KRNL image_size @ [0x10] = 0x%x" %
+                      struct.unpack_from('<Q', off_krnl, 0x08 + 0x10)[0])
 
+                # 计算官方 code1 目标（相对 payload 起点）
+                # payload 起点 = KRNL[0x08]
+                # code1 位置 = KRNL[0x0C]，即 payload[0x04]
+                # B 指令 target = code1_addr + imm26*4
+                imm26_off = off_code1 & 0x03FFFFFF
+                # 符号扩展
+                if imm26_off & 0x02000000:
+                    imm26_off -= 0x04000000
+                official_target_in_payload = 0x04 + imm26_off * 4
+                print("官方 code1 目标 = payload[0x%x]" % official_target_in_payload)
+
+                # 官方 payload[0x40] 处的字节模式
+                off_payload_start = 0x08
+                if official_target_in_payload >= 0x40 and \
+                   off_payload_start + official_target_in_payload + 32 <= len(off_krnl):
+                    off_pattern = off_krnl[off_payload_start + official_target_in_payload :
+                                           off_payload_start + official_target_in_payload + 32]
+                    print("官方 payload[0x%x:0x%x] 模式: %s" %
+                          (official_target_in_payload, official_target_in_payload + 32,
+                           off_pattern.hex()))
+                else:
+                    off_pattern = b''
+                    print("官方 target 越界，无法提取模式")
+
+                # 在 Flippy payload 里搜官方 target 处的模式
+                if off_pattern:
+                    found = payload.find(off_pattern)
+                    if found >= 0:
+                        print("在 Flippy payload[0x%x] 找到匹配模式！" % found)
+                        # 我们要让 code1 (payload[0x04]) 跳到 payload[found]
+                        rel = found - 0x04
+                        if rel % 4 == 0:
+                            imm26 = (rel // 4) & 0x03FFFFFF
+                            code1 = 0x14000000 | imm26
+                            reason = "matched official pattern @ payload[0x%x]" % found
+                        else:
+                            print("  偏移不对齐")
+                    else:
+                        print("在 Flippy payload 里未找到官方模式")
+
+        # ========== 方案 B：回退 ==========
+        if code1 is None:
+            # 使用 .text[0x00] 作为入口 (code0=NOP, code1=B +0x3C)
+            code1 = 0x1400000F
+            reason = "fallback to payload[0x40] (Flippy .text[0x00])"
+
+        print("")
+        print("选择 code1 = 0x%08x  (%s)" % (code1, reason))
+
+        # 构造 ARM64 Image header
         hdr = bytearray(0x40)
-        struct.pack_into('<I', hdr, 0x00, 0xd503201f)     # code0 = NOP
-        struct.pack_into('<I', hdr, 0x04, code1)          # code1 = B +0x3C
-        struct.pack_into('<Q', hdr, 0x08, 0)              # text_offset = 0
-        struct.pack_into('<Q', hdr, 0x10, len(payload))   # image_size
-        struct.pack_into('<Q', hdr, 0x18, 0x0a)           # flags
+        struct.pack_into('<I', hdr, 0x00, 0xd503201f)
+        struct.pack_into('<I', hdr, 0x04, code1)
+        struct.pack_into('<Q', hdr, 0x08, 0)
+        struct.pack_into('<Q', hdr, 0x10, len(payload))
+        struct.pack_into('<Q', hdr, 0x18, 0x0a)
         hdr[0x38:0x3c] = ARM64_MAGIC
         knl_payload = bytes(hdr) + payload
 
@@ -299,15 +381,25 @@ jobs:
 
         out = open(dst, 'rb').read(0x80)
         assert out[0:4] == b'KRNL'
-        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 必须为 NOP"
-        assert out[0x40:0x44] == ARM64_MAGIC, "magic 必须在 0x40"
+        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5'
+        assert out[0x40:0x44] == ARM64_MAGIC
+
+        # 关键：验证 code1 目标处的字节
+        imm26_v = code1 & 0x03FFFFFF
+        if imm26_v & 0x02000000:
+            imm26_v -= 0x04000000
+        target_in_payload = 0x04 + imm26_v * 4
+        target_in_knl = 0x08 + target_in_payload
+        print("")
+        print("code1 目标: KRNL[0x%x] = payload[0x%x]" % (target_in_knl, target_in_payload))
+        if target_in_knl + 16 <= len(knl):
+            print("  目标处字节: %s" % knl[target_in_knl:target_in_knl+16].hex())
 
         print("KRNL 结构验证")
         print("  size    = %d" % struct.unpack_from('<I', out, 4)[0])
         print("  code0   = %s (NOP)" % out[0x08:0x0c].hex())
         print("  code1   = %s" % out[0x0c:0x10].hex())
         print("  magic   @ 0x40 = %s" % out[0x40:0x44])
-        print("  payload[0x40] (原 .text[0x00]) = %s" % out[0x48:0x4c].hex())
         print("SUCCESS")
         PYEOF
         echo "kernel.img: $(stat -c%s /tmp/kernel.img) bytes"
@@ -389,7 +481,7 @@ jobs:
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit=$MK_EXIT"
-        tail -40 /tmp/mk-sd.log
+        tail -30 /tmp/mk-sd.log
 
         FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
         [ -z "$FOUND_IMG" ] && { echo "No image"; exit 1; }
