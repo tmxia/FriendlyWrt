@@ -2,7 +2,7 @@
 # replace-kernel.sh - 内核替换 + 模块注入 + boot.img 重建 + resource.img DTB 替换 + 静态验证
 set -euo pipefail
 
-VERSION="2026-09-11-v49-rsce-fix"
+VERSION="2026-09-11-v50-name-len-fix"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -545,7 +545,8 @@ BOOT_BUILD
 fi
 
 # ============================================================
-# ★★★ 6.7 替换 resource.img 里的 DTB（v49：正确 RSCE 结构）★★★
+# ★★★ 6.7 替换 resource.img 里的 DTB ★★★
+# v50：修正断言长度（14 → len(new_name)=13）
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
@@ -576,28 +577,19 @@ if raw[:4] != b'RSCE':
 entry_count = struct.unpack_from('<I', raw, 0x0C)[0]
 print(f"  RSCE entry_count = {entry_count}")
 
-# RSCE entry 结构（512 字节）:
-#   [0x00-0x03] "ENTR"
-#   [0x04-0xDF] name[220]
-#   [0xE0-0xFF] sha256[32]
-#   [0x100-0x103] version
-#   [0x104-0x107] offset (sector)
-#   [0x108-0x10B] size (byte)
 ENTRY_SIZE = 512
 NAME_OFFSET = 4
 NAME_SIZE = 220
 SHA256_OFFSET = 0xE0
 
-# 列出前 3 个 entry
 for i in range(min(3, entry_count)):
     off = 0x200 + i * ENTRY_SIZE
     magic = raw[off:off+4]
     name = raw[off+NAME_OFFSET:off+NAME_OFFSET+NAME_SIZE].rstrip(b'\x00').decode('ascii', 'ignore')
     sector = struct.unpack_from('<I', raw, off + 0x104)[0]
     size = struct.unpack_from('<I', raw, off + 0x108)[0]
-    print(f"  [{i:2d}] magic={magic} name='{name}' sector=0x{sector:x} size={size}")
+    print(f"  [{i:2d}] magic={bytes(magic)} name='{name}' sector=0x{sector:x} size={size}")
 
-# 找现有的 rk-kernel.dtb
 found_idx = -1
 for i in range(entry_count):
     off = 0x200 + i * ENTRY_SIZE
@@ -605,7 +597,6 @@ for i in range(entry_count):
     if name == 'rk-kernel.dtb':
         found_idx = i; break
 
-# 决定目标 entry：优先用已有 rk-kernel.dtb，否则用 entry[0]
 if found_idx >= 0:
     target_idx = found_idx
     print(f"  → 使用已有 entry[{target_idx}] (rk-kernel.dtb)")
@@ -627,8 +618,9 @@ new_sector = new_offset_bytes // 512
 raw.extend(dtb)
 print(f"  DTB 追加: offset=0x{new_offset_bytes:x} sector={new_sector} size={len(dtb)}")
 
-# 保留 ENTR magic，只改 name（从 off+4 起）
 new_name = b'rk-kernel.dtb'
+
+# 保留 ENTR magic（off:off+4），只改 name
 raw[off+NAME_OFFSET:off+NAME_OFFSET+NAME_SIZE] = b'\x00' * NAME_SIZE
 raw[off+NAME_OFFSET:off+NAME_OFFSET+len(new_name)] = new_name
 
@@ -636,22 +628,21 @@ raw[off+NAME_OFFSET:off+NAME_OFFSET+len(new_name)] = new_name
 new_sha256 = hashlib.sha256(dtb).digest()
 raw[off+SHA256_OFFSET:off+SHA256_OFFSET+32] = new_sha256
 
-# version = 20
+# version
 struct.pack_into('<I', raw, off + 0x100, 20)
 
-# 更新 offset + size
+# offset + size
 struct.pack_into('<I', raw, off + 0x104, new_sector)
 struct.pack_into('<I', raw, off + 0x108, len(dtb))
 
-# 校验：magic 应该还在
-assert raw[off:off+4] == b'ENTR', f"ENTR magic 丢失: {raw[off:off+4]!r}"
-assert raw[off+NAME_OFFSET:off+NAME_OFFSET+14] == b'rk-kernel.dtb', "name 写入失败"
+# ★ v50 修正：14 → len(new_name)（=13）
+assert raw[off:off+4] == b'ENTR', f"ENTR magic 丢失: {bytes(raw[off:off+4])!r}"
+assert raw[off+NAME_OFFSET:off+NAME_OFFSET+len(new_name)] == new_name, "name 写入失败"
 
 open(res_path, 'wb').write(raw)
 print(f"  ✓ resource.img 更新: 新大小={len(raw)}")
 RES_PATCH
 
-  # 验证
   NEW_SIZE=$(stat -c%s "$RESOURCE_IMG")
   RK3568_FOUND=$(grep -abo "rk-kernel.dtb" "$RESOURCE_IMG" | head -1 || echo "")
   log "  新 resource.img: $NEW_SIZE bytes"
@@ -773,22 +764,20 @@ ROOTFS_OFF=$(( ${PART_OFF[rootfs]:-0} * 512 ))
   [ "$RM2" = "53ef" ] && ok "rootfs ext4 magic=53ef" || bad "rootfs magic=$RM2"
 }
 
-# 8.3 resource 分区内 rk-kernel.dtb 校验（★ 修正 dd 命令）
+# 8.3 resource 分区内 rk-kernel.dtb 校验
 log ""
 log "── 8.3 resource 分区内 rk-kernel.dtb 校验 ──"
 RES_OFF_SECTOR=${PART_OFF[resource]:-0}
 RES_SECTORS=${PART_SIZE[resource]:-0}
 if [ "$RES_OFF_SECTOR" -gt 0 ] && [ "$RES_SECTORS" -gt 0 ]; then
   RES_DATA="$WORK_DIR/res_from_img.bin"
-  # ★ 正确用法：bs=512, skip=扇区数, count=扇区数
   dd if="$IMG" bs=512 skip=$RES_OFF_SECTOR count=$RES_SECTORS of="$RES_DATA" 2>/dev/null
 
   if [ -s "$RES_DATA" ] && grep -q "rk-kernel.dtb" "$RES_DATA"; then
     ok "resource 分区含 'rk-kernel.dtb' 字符串"
     python3 -c "
 raw = open('$RES_DATA','rb').read()
-if raw[:4] != b'RSCE':
-    print('    ✗ 不是 RSCE'); exit(0)
+if raw[:4] != b'RSCE': exit(0)
 entry_count = int.from_bytes(raw[0x0C:0x10], 'little')
 for i in range(entry_count):
     off = 0x200 + i * 512
@@ -798,12 +787,11 @@ for i in range(entry_count):
         sector = int.from_bytes(raw[off+0x104:off+0x108], 'little')
         size = int.from_bytes(raw[off+0x108:off+0x10C], 'little')
         data_off = sector * 512
-        print(f'    entry[{i}] magic={magic} name=\"{name}\" sector={sector} size={size}')
+        print(f'    entry[{i}] magic={bytes(magic)} name=\"{name}\" sector={sector} size={size}')
         if data_off + 4 <= len(raw) and raw[data_off:data_off+4] == b'\xd0\x0d\xfe\xed':
             print(f'    ✓ 该 offset 处是 FDT magic')
         else:
             print(f'    ✗ offset 处不是 FDT')
-        # 验证 FDT 内含 rk3568 或 nanopi 字符串
         dtb_data = raw[data_off:data_off+size]
         if b'nanopi-r5s' in dtb_data or b'nanopi-r5c' in dtb_data or b'rk3568' in dtb_data:
             print(f'    ✓ DTB 内含 RK3568/Nanopi 字符串')
@@ -814,7 +802,6 @@ for i in range(entry_count):
     bad "resource 分区缺 'rk-kernel.dtb'"
     if [ -f "$RES_DATA" ]; then
       log "    RES_DATA 大小: $(stat -c%s "$RES_DATA") bytes"
-      log "    RES_DATA 前 32 字节: $(xxd -l 32 "$RES_DATA" | head -1)"
     fi
   fi
 fi
