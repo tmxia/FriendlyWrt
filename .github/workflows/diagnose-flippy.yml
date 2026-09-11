@@ -1,0 +1,286 @@
+name: Diagnose Flippy vs Official Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      official_release_tag:
+        description: '官方内核固件的 Release tag（如 FriendlyWrt-2026-09-04）'
+        required: true
+        type: string
+      official_asset:
+        description: '官方 images tgz 文件名'
+        required: true
+        default: 'images-R5S-R5C-Series-FriendlyWrt-24.10-docker.tgz'
+        type: string
+      flippy_kernel_version:
+        description: '要对比的 Flippy 内核版本'
+        required: true
+        default: '6.1.y'
+        type: choice
+        options:
+          - '6.1.y'
+          - '6.6.y'
+          - '6.18.y'
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq --no-install-recommends \
+            wget curl git file xxd bc python3 \
+            device-tree-compiler binutils-aarch64-linux-gnu \
+            cpio gzip xz-utils lz4 zstd
+
+      # ==================================================
+      # 1. 下载官方固件
+      # ==================================================
+      - name: Download official firmware tgz
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/official
+          cd /tmp/official
+          gh release download "${{ inputs.official_release_tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "${{ inputs.official_asset }}" --dir .
+          tar xzf "${{ inputs.official_asset }}"
+          BASE=$(find . -maxdepth 2 -type d -name "friendlywrt*" | head -1)
+          echo "OFFICIAL_BASE=$BASE" >> $GITHUB_ENV
+          echo "=== 官方固件顶层 ==="
+          ls -la "$BASE"
+
+      # ==================================================
+      # 2. 下载 Flippy 内核并转换为 KRNL
+      # ==================================================
+      - name: Download Flippy kernel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/flippy
+          cd /tmp/flippy
+          # 从 breakingbadboy 的 kernel_rk35xx release 中找匹配版本
+          VERS=$(gh release view kernel_rk35xx --repo breakingbadboy/OpenWrt \
+                 --json assets --jq '.assets[].name' \
+                 | grep -E '^${{ inputs.flippy_kernel_version }}\.[0-9]+\.tar\.gz$' \
+                 | sed 's/\.tar\.gz//' | sort -V)
+          [ -z "$VERS" ] && { echo "无匹配版本"; exit 1; }
+          SEL=$(echo "$VERS" | tail -1)
+          echo "选中 Flippy 内核: $SEL"
+          URL="https://github.com/breakingbadboy/OpenWrt/releases/download/kernel_rk35xx/${SEL}.tar.gz"
+          wget -q "$URL" -O kernel.tar.gz
+          tar xzf kernel.tar.gz
+          echo "FLIPPY_VER=$SEL" >> $GITHUB_ENV
+
+          # 解包 boot / dtb
+          LDIR=$(find . -maxdepth 1 -type d -name "*${SEL}*" | head -1)
+          [ -z "$LDIR" ] && LDIR="$SEL"
+          BOOT_TAR=$(find "$LDIR" -name "boot-*.tar.gz" | head -1)
+          DTB_TAR=$(find "$LDIR" -name "dtb-rockchip-*.tar.gz" | head -1)
+          mkdir -p boot dtb
+          tar xzf "$BOOT_TAR" -C boot
+          tar xzf "$DTB_TAR" -C dtb
+          ls -la boot/ dtb/ | head -40
+
+      - name: Convert Flippy kernel to KRNL
+        run: |
+          cd /tmp/flippy
+          VMLINUZ=$(find boot -name "vmlinuz-*" | head -1)
+          [ -z "$VMLINUZ" ] && { echo "vmlinuz 缺失"; exit 1; }
+          echo "输入: $VMLINUZ ($(stat -c%s "$VMLINUZ") bytes)"
+          xxd -l 64 "$VMLINUZ"
+
+          python3 - "$VMLINUZ" /tmp/flippy/kernel.img <<'PY'
+import sys, struct
+src, dst = sys.argv[1], sys.argv[2]
+data = bytearray(open(src, 'rb').read())
+MAGIC = b'ARM\x64'
+if data[:4] == b'KRNL':
+    open(dst, 'wb').write(data); print("已是 KRNL"); sys.exit(0)
+if data[:2] == b'MZ':
+    pe_off = struct.unpack_from('<I', data, 0x3C)[0]
+    assert data[pe_off:pe_off+4] == b'PE\x00\x00'
+    coff = pe_off + 4
+    nsec = struct.unpack_from('<H', data, coff + 2)[0]
+    opt = struct.unpack_from('<H', data, coff + 16)[0]
+    sec0 = coff + 20 + opt
+    text_off = None
+    for i in range(nsec):
+        o = sec0 + i*40
+        name = data[o:o+8].rstrip(b'\x00').decode('ascii','ignore')
+        roff = struct.unpack_from('<I', data, o+20)[0]
+        print(f"  Section {name} @ 0x{roff:x}")
+        if name == '.text': text_off = roff
+    imm26 = text_off // 4
+    code0 = 0x14000000 | imm26
+    file_size = len(data)
+    hdr = bytearray(64)
+    struct.pack_into('<I', hdr, 0x00, code0)
+    struct.pack_into('<Q', hdr, 0x10, file_size)
+    struct.pack_into('<Q', hdr, 0x18, 0x0a)
+    hdr[0x38:0x3c] = MAGIC
+    data[0:0x40] = hdr
+    knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
+    open(dst, 'wb').write(knl)
+    print(f"生成 KRNL: code0=0x{code0:08x} size={file_size}")
+PY
+          echo "Flippy kernel.img: $(stat -c%s /tmp/flippy/kernel.img) bytes"
+
+      # ==================================================
+      # 3. 从官方固件中提取各组件
+      # ==================================================
+      - name: Extract official components from raw image
+        run: |
+          cd /tmp/official
+          # 官方 tgz 是 "images" 包，里面通常已经是各分区的 raw 文件
+          # 直接找 kernel.img / boot.img / dtb / uInitrd
+          BASE=$(find . -maxdepth 2 -type d -name "friendlywrt*" | head -1)
+          echo "=== 官方组件清单 ==="
+          find "$BASE" -type f \( -name "*.img" -o -name "*.dtb" -o -name "uInitrd*" \) \
+            -exec ls -la {} \;
+
+          # 如果 images 包不含 GPT，就需要完整镜像；尝试从 release 找 .img.gz
+          echo ""
+          echo "=== 是否含完整镜像? ==="
+          gh release view "${{ inputs.official_release_tag }}" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' | grep -iE '\.img\.gz$' || \
+            echo "（无 img.gz，仅能对比 images 包内组件）"
+
+      # ==================================================
+      # 4. 关键对比 —— 逐项打印差异
+      # ==================================================
+      - name: Compare kernel.img headers
+        run: |
+          echo "═══════════════════════════════════════════════════════════"
+          echo "  对比 #1: kernel.img 头部结构"
+          echo "═══════════════════════════════════════════════════════════"
+          OFF="/tmp/official/$(find /tmp/official -maxdepth 3 -type f -name 'kernel.img' | head -1 | sed 's|/tmp/official/||')"
+          OFF=$(find /tmp/official -maxdepth 4 -type f -name "kernel.img" | head -1)
+          FLP="/tmp/flippy/kernel.img"
+
+          echo ""
+          echo "--- 官方 kernel.img ---"
+          [ -n "$OFF" ] && stat -c "size=%s bytes" "$OFF"
+          [ -n "$OFF" ] && xxd -l 96 "$OFF"
+
+          echo ""
+          echo "--- Flippy kernel.img ---"
+          stat -c "size=%s bytes" "$FLP"
+          xxd -l 96 "$FLP"
+
+          echo ""
+          echo "--- 关键字段解析 ---"
+          python3 - <<PY
+import struct
+def inspect(path, label):
+    print(f"\n[{label}] {path}")
+    try:
+        with open(path,'rb') as f: d = f.read(0x200)
+    except: return
+    print(f"  magic[0:4]      = {d[:4]}")
+    print(f"  size_field[4:8] = {int.from_bytes(d[4:8],'little')}")
+    print(f"  code0[8:12]     = 0x{int.from_bytes(d[8:12],'little'):08x}")
+    print(f"  code1[12:16]    = 0x{int.from_bytes(d[12:16],'little'):08x}")
+    print(f"  text_off[16:24] = 0x{int.from_bytes(d[16:24],'little'):x}")
+    print(f"  image_size[24:32]= 0x{int.from_bytes(d[24:32],'little'):x}")
+    print(f"  flags[32:40]    = 0x{int.from_bytes(d[32:40],'little'):x}")
+    # 找 ARM64 magic 位置
+    idx = d.find(b'ARM\x64')
+    print(f"  'ARM\\x64' @     = 0x{idx:x}")
+inspect("$OFF", "OFFICIAL")
+inspect("$FLP", "FLIPPY")
+PY
+
+      - name: Compare DTB
+        run: |
+          echo "═══════════════════════════════════════════════════════════"
+          echo "  对比 #2: rk3568-nanopi-r5s.dtb"
+          echo "═══════════════════════════════════════════════════════════"
+          OFF=$(find /tmp/official -name "rk3568-nanopi-r5s.dtb" | head -1)
+          FLP=$(find /tmp/flippy/dtb -name "rk3568-nanopi-r5s.dtb" | head -1)
+          echo "官方: $OFF"
+          echo "Flippy: $FLP"
+          [ -z "$OFF" ] || [ -z "$FLP" ] && { echo "有一方缺 DTB，跳过"; exit 0; }
+
+          stat -c "  官方大小: %s" "$OFF"
+          stat -c "  Flippy大小: %s" "$FLP"
+
+          mkdir -p /tmp/dtbcmp
+          dtc -I dtb -O dts -o /tmp/dtbcmp/official.dts "$OFF" 2>/dev/null
+          dtc -I dtb -O dts -o /tmp/dtbcmp/flippy.dts "$FLP" 2>/dev/null
+
+          echo ""
+          echo "--- bootargs / chosen 节点差异 ---"
+          echo "【官方】"
+          grep -A2 'chosen {' /tmp/dtbcmp/official.dts | head -20
+          echo ""
+          echo "【Flippy】"
+          grep -A2 'chosen {' /tmp/dtbcmp/flippy.dts | head -20
+
+          echo ""
+          echo "--- 完整 DTS 差异（前 100 行）---"
+          diff /tmp/dtbcmp/official.dts /tmp/dtbcmp/flippy.dts | head -100
+
+          echo ""
+          echo "--- 差异行数统计 ---"
+          diff /tmp/dtbcmp/official.dts /tmp/dtbcmp/flippy.dts | grep -c '^[<>]' || echo 0
+
+      - name: Compare boot.img and uInitrd
+        run: |
+          echo "═══════════════════════════════════════════════════════════"
+          echo "  对比 #3: boot.img / uInitrd"
+          echo "═══════════════════════════════════════════════════════════"
+          OFF_BOOT=$(find /tmp/official -name "boot.img" | head -1)
+          FLP_UI=$(find /tmp/flippy -name "uInitrd-*" | head -1)
+
+          if [ -n "$OFF_BOOT" ]; then
+            echo "官方 boot.img: $(stat -c%s "$OFF_BOOT") bytes"
+            echo "头 96 字节:"
+            xxd -l 96 "$OFF_BOOT"
+            echo ""
+            echo "类型: $(file "$OFF_BOOT")"
+          fi
+          echo ""
+          if [ -n "$FLP_UI" ]; then
+            echo "Flippy uInitrd: $(stat -c%s "$FLP_UI") bytes"
+            echo "头 64 字节:"
+            xxd -l 64 "$FLP_UI"
+            echo "类型: $(file "$FLP_UI")"
+          fi
+
+      # ==================================================
+      # 5. 打包所有分析结果，作为 artifact 上传
+      # ==================================================
+      - name: Collect analysis results
+        run: |
+          mkdir -p /tmp/analysis
+          # 官方 vs Flippy 关键文件
+          cp -f /tmp/flippy/kernel.img /tmp/analysis/flippy-kernel.img 2>/dev/null || true
+          OFF=$(find /tmp/official -maxdepth 4 -name "kernel.img" | head -1)
+          [ -n "$OFF" ] && cp -f "$OFF" /tmp/analysis/official-kernel.img
+          cp -f /tmp/dtbcmp/official.dts /tmp/analysis/ 2>/dev/null || true
+          cp -f /tmp/dtbcmp/flippy.dts /tmp/analysis/ 2>/dev/null || true
+          [ -n "$OFF" ] && cp -f "$OFF" /tmp/analysis/ 2>/dev/null || true
+
+          # 汇总一份报告
+          {
+            echo "=== 对比摘要 ==="
+            echo "Flippy 内核版本: $FLIPPY_VER"
+            echo ""
+            echo "== kernel.img 大小 =="
+            [ -f /tmp/analysis/official-kernel.img ] && stat -c "官方: %s bytes" /tmp/analysis/official-kernel.img
+            stat -c "Flippy: %s bytes" /tmp/analysis/flippy-kernel.img 2>/dev/null || true
+          } > /tmp/analysis/REPORT.txt
+
+          ls -la /tmp/analysis/
+
+      - name: Upload analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: flippy-diagnosis-${{ inputs.flippy_kernel_version }}
+          path: /tmp/analysis/
+          retention-days: 14
