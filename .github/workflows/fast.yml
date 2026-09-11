@@ -8,27 +8,19 @@ on:
         required: true
         default: '24.10'
         type: choice
-        options:
-          - '24.10'
-          - '25.12'
+        options: ['24.10', '25.12']
       set:
         description: 'Build type'
         required: true
         default: 'docker'
         type: choice
-        options:
-          - docker
-          - non-docker
+        options: ['docker', 'non-docker']
       kernel_version:
         description: 'Kernel version'
         required: true
         default: '6.18.y'
         type: choice
-        options:
-          - '6.18.y'
-          - '6.12.y'
-          - '6.6.y'
-          - '6.1.y'
+        options: ['6.18.y', '6.12.y', '6.6.y', '6.1.y']
       official_release_tag:
         description: '官方固件 Release tag'
         required: true
@@ -44,9 +36,7 @@ on:
         required: false
         default: 'true'
         type: choice
-        options:
-          - 'false'
-          - 'true'
+        options: ['false', 'true']
 
 env:
   AUTO_REPLACE_TAG: 'false'
@@ -59,10 +49,9 @@ jobs:
       verified: ${{ steps.verify.outputs.passed }}
       img_name: ${{ env.img_name }}
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    - name: Initialization environment
+    - name: Init env
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
@@ -72,8 +61,7 @@ jobs:
           wget curl git rsync time file unzip bc bzip2 xxd \
           python3 python3-pip dosfstools e2fsprogs parted \
           android-sdk-libsparse-utils u-boot-tools \
-          gzip xz-utils zstd lz4 \
-          binutils-aarch64-linux-gnu
+          gzip xz-utils zstd lz4 binutils-aarch64-linux-gnu
         pip3 install --quiet zstandard lz4
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
@@ -83,7 +71,7 @@ jobs:
         chmod +x $GITHUB_WORKSPACE/scripts/verify-against-official.sh || true
         echo "cores: $(nproc)"
 
-    - name: Fetch sd-fuse scripts
+    - name: Fetch sd-fuse
       run: |
         cd /tmp
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests \
@@ -92,7 +80,7 @@ jobs:
         repo sync -c scripts/sd-fuse --no-clone-bundle
         ls -la /tmp/scripts/sd-fuse/
 
-    - name: Download official images tgz
+    - name: Download tgz
       id: images
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -107,30 +95,29 @@ jobs:
             FOUND="$TAG"; break
           fi
         done
-        [ -z "$FOUND" ] && { echo "ERROR: not found $PATTERN"; exit 1; }
+        [ -z "$FOUND" ] && { echo "ERROR: not found"; exit 1; }
         mkdir -p /tmp/inputs && cd /tmp/inputs
         gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
-    - name: Download official reference image
+    - name: Download official
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         REF_TAG: ${{ inputs.official_release_tag }}
         REF_ASSET: ${{ inputs.official_asset }}
       run: |
-        mkdir -p /tmp/official
-        cd /tmp/official
+        mkdir -p /tmp/official && cd /tmp/official
         if gh release download "$REF_TAG" --repo "$GITHUB_REPOSITORY" \
              --pattern "$REF_ASSET" --dir .; then
           ls -la
           gunzip -k *.img.gz 2>/dev/null || true
           IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
-          [ -n "$IMG" ] && echo "官方参考镜像: $IMG ($(stat -c%s "$IMG") bytes)"
+          [ -n "$IMG" ] && echo "官方参考: $IMG"
         else
           touch /tmp/official/.no_reference
         fi
 
-    - name: Scan and select kernel
+    - name: Scan kernel
       id: kernel
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -141,25 +128,17 @@ jobs:
           6.12*|6.12.y) PREFIX="6.12" ;;
           6.6*|6.6.y)   PREFIX="6.6" ;;
           6.1*|6.1.y)   PREFIX="6.1" ;;
-          auto|"")      PREFIX="" ;;
           *)            PREFIX="$KERNEL_VERSION" ;;
         esac
         declare -A VER_TO_SOURCE
-        SCAN_LIST=(
-          "ophub/kernel:kernel_flippy"
-          "ophub/kernel:kernel_rk35xx"
-          "breakingbadboy/OpenWrt:kernel_rk35xx"
-          "breakingbadboy/OpenWrt:kernel_stable"
-        )
-        for target in "${SCAN_LIST[@]}"; do
+        for target in \
+          "ophub/kernel:kernel_flippy" \
+          "ophub/kernel:kernel_rk35xx" \
+          "breakingbadboy/OpenWrt:kernel_rk35xx"; do
           REPO="${target%%:*}"; RELEASE="${target##*:}"
           ASSETS=$(gh release view "$RELEASE" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || echo "")
           [ -z "$ASSETS" ] && continue
-          if [ -n "$PREFIX" ]; then
-            VERS=$(echo "$ASSETS" | grep -E "^${PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V || echo "")
-          else
-            VERS=$(echo "$ASSETS" | grep -E '^6\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V || echo "")
-          fi
+          VERS=$(echo "$ASSETS" | grep -E "^${PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V || echo "")
           [ -z "$VERS" ] && continue
           for v in $VERS; do
             [ -z "${VER_TO_SOURCE[$v]:-}" ] && VER_TO_SOURCE["$v"]="$REPO:$RELEASE"
@@ -191,195 +170,200 @@ jobs:
         tar xzf "$DTB_TAR" -C dtb_extract
         ls -la boot_extract/
 
-    # ============================================================
-    # 完整诊断 + 直接套用官方 KRNL 结构
-    # ============================================================
-    - name: 'Build KRNL with Flippy payload at official payload offset'
+    - name: 'Extract real kernel from EFI zboot'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
         [ -z "$VMLINUZ" ] && { echo "vmlinuz not found"; exit 1; }
         echo "输入: $VMLINUZ ($(stat -c%s "$VMLINUZ") bytes)"
 
-        # 提取官方 KRNL 32 MB 作为参考
-        OFF_IMG=$(find /tmp/official -maxdepth 1 -name "*.img" | head -1)
-        if [ -n "$OFF_IMG" ]; then
-          # 读取 32 MB (跳过 0x12000*512 字节)
-          dd if="$OFF_IMG" of=/tmp/official_krnl_32mb.bin \
-             bs=1M skip=$((0x12000 * 512 / 0x100000)) count=32 2>/dev/null
-          ls -la /tmp/official_krnl_32mb.bin
-        fi
-
-        python3 - "$VMLINUZ" /tmp/kernel.img /tmp/official_krnl_32mb.bin <<'PYEOF'
-        import sys, struct, os
+        python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
+        import sys, struct, gzip, bz2, lzma
 
         src, dst = sys.argv[1], sys.argv[2]
-        official_path = sys.argv[3] if len(sys.argv) > 3 else ""
+        raw = open(src, 'rb').read()
         ARM64_MAGIC = b'ARM\x64'
 
-        # ============================================================
-        # 1. 分析官方 KRNL (如果可用)
-        # ============================================================
-        official_payload_offset = None
-        official_size_field = None
-        official_image_size = None
-
-        if os.path.exists(official_path):
-            off = open(official_path, 'rb').read()
-            print("=" * 70)
-            print("官方 KRNL 32MB 分析 (共 %d 字节)" % len(off))
-            print("=" * 70)
-
-            # 头部信息
-            print("头 0x00:0x48:")
-            for i in range(0, 0x48, 16):
-                print("  %04x: %s" % (i, off[i:i+16].hex()))
-
-            official_size_field = struct.unpack_from('<I', off, 4)[0]
-            official_image_size = struct.unpack_from('<Q', off, 0x18)[0]
-            print("  size 字段 [4:8]     = %d (0x%x)" % (official_size_field, official_size_field))
-            print("  image_size [0x18]   = 0x%x (%d)" % (official_image_size, official_image_size))
-
-            # 找第一个非零 4 KB 块 (跳过头部)
-            print("")
-            print("寻找 payload 起点 (第一个非零 4KB 块, 从 0x1000 起):")
-            for pos in range(0x1000, min(len(off), 32 * 1024 * 1024), 0x1000):
-                chunk = off[pos:pos+0x1000]
-                nz = sum(1 for b in chunk if b != 0)
-                if nz > 0:
-                    print("  第一个非零块 @ 0x%08x (nonzero=%d/4096)" % (pos, nz))
-                    print("  该块前 64 字节: %s" % chunk[:64].hex())
-                    official_payload_offset = pos
-                    break
-            if official_payload_offset is None:
-                print("  未找到非零块 (32MB 内全零?)")
-
-            # 找 PACIASP
-            paciasp = b'\x3f\x23\x03\xd5'
-            p = off.find(paciasp, 0x1000)
-            print("  第一个 PACIASP @ 0x%x" % p)
-
-            # code1 target 处的字节
-            if official_image_size:
-                code1 = struct.unpack_from('<I', off, 0x0c)[0]
-                imm26 = code1 & 0x03FFFFFF
-                if imm26 & 0x02000000:
-                    imm26 -= 0x04000000
-                # code1 位于 KRNL[0x0c] = payload[0x04]
-                # 目标 = payload[0x04] + imm26*4
-                target_in_payload = 0x04 + imm26 * 4
-                target_in_knl = 0x08 + target_in_payload
-                print("")
-                print("官方 code1 = 0x%08x" % code1)
-                print("  目标 = payload[0x%x] = KRNL[0x%x]" % (target_in_payload, target_in_knl))
-                if target_in_knl + 64 <= len(off):
-                    print("  目标处 64 字节: %s" % off[target_in_knl:target_in_knl+64].hex())
-                else:
-                    print("  目标越界 (> 32MB)")
-
-        # ============================================================
-        # 2. 提取 Flippy .text
-        # ============================================================
-        raw = open(src, 'rb').read()
+        # PE parse
         pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
         coff = pe_off + 4
         nsec = struct.unpack_from('<H', raw, coff + 2)[0]
         opt_size = struct.unpack_from('<H', raw, coff + 16)[0]
         sec_base = coff + 20 + opt_size
 
-        flippy_text = None
+        sections = {}
         for i in range(nsec):
             o = sec_base + i * 40
             name = raw[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
             rsize = struct.unpack_from('<I', raw, o + 16)[0]
             roff  = struct.unpack_from('<I', raw, o + 20)[0]
-            if name == '.text':
-                flippy_text = raw[roff:roff+rsize]
-                break
+            sections[name] = (roff, rsize)
+            print("  section %s: off=0x%x size=%d" % (name, roff, rsize))
 
+        text_off, text_size = sections.get('.text', (0, 0))
+        data_off, data_size = sections.get('.data', (0, 0))
+        payload = raw[text_off:text_off + text_size] + raw[data_off:data_off + data_size]
+        print("payload total: %d bytes" % len(payload))
+
+        # 搜 zboot magic
         print("")
-        print("=" * 70)
-        print("Flippy .text: %d bytes (0x%x)" % (len(flippy_text), len(flippy_text)))
-        print("  .text[0:16]: %s" % flippy_text[:16].hex())
-        print("=" * 70)
+        print("=" * 60)
+        print("搜 zboot magic (0x7a6f6f62 各种字节序)")
+        print("=" * 60)
+        ZB_VARIANTS = [
+            ("LE('booz')", b'\x62\x6f\x6f\x7a'),
+            ("BE('zoob')", b'\x7a\x6f\x6f\x62'),
+            ("str'zboot'", b'zboot'),
+        ]
 
-        # ============================================================
-        # 3. 构建 KRNL
-        #    - KRNL magic + size
-        #    - ARM64 头 (64 字节): code0=NOP, code1=B 到 payload 起点, ...
-        #    - 填充到 payload 起点
-        #    - Flippy .text
-        # ============================================================
-        if official_payload_offset is not None and official_payload_offset >= 0x1000:
-            PAYLOAD_OFF = official_payload_offset
+        zboot_hits = []
+        for label, magic in ZB_VARIANTS:
+            p = 0
+            count = 0
+            while count < 10:
+                p = payload.find(magic, p)
+                if p < 0: break
+                # 验证 header 合理性
+                ok = False
+                if p + 0x60 <= len(payload):
+                    hv = struct.unpack_from('<I', payload, p + 4)[0]
+                    poff = struct.unpack_from('<I', payload, p + 12)[0]
+                    psz = struct.unpack_from('<I', payload, p + 16)[0]
+                    if 0 < hv < 16 and 0 < poff < 0x100000 and 0x10000 < psz < 0x10000000:
+                        ok = True
+                        print("  ★ %s @ 0x%x: hv=%d poff=0x%x psz=%d" % (label, p, hv, poff, psz))
+                        zboot_hits.append(p)
+                if not ok:
+                    print("    %s @ 0x%x (验证失败)" % (label, p))
+                p += 1
+                count += 1
+
+        # 逐个尝试 zboot 解压
+        best_img = None
+        for p in zboot_hits:
+            hv = struct.unpack_from('<I', payload, p + 4)[0]
+            kv = struct.unpack_from('<I', payload, p + 8)[0]
+            poff = struct.unpack_from('<I', payload, p + 12)[0]
+            psz = struct.unpack_from('<I', payload, p + 16)[0]
+            isz = struct.unpack_from('<I', payload, p + 20)[0]
+            ct_bytes = payload[p + 44:p + 76]
+            ct = ct_bytes.split(b'\x00')[0].decode('ascii', 'ignore')
+            kn_bytes = payload[p + 76:p + 92]
+            kn = kn_bytes.split(b'\x00')[0].decode('ascii', 'ignore')
+
             print("")
-            print("使用官方 payload 起点: 0x%x" % PAYLOAD_OFF)
-        else:
-            PAYLOAD_OFF = 0x10000  # fallback 64KB
+            print("=" * 60)
+            print("zboot @ payload[0x%x]" % p)
+            print("  hdr_ver=%d kernel_ver=0x%08x" % (hv, kv))
+            print("  payload_offset=0x%x payload_size=%d image_size=%d" % (poff, psz, isz))
+            print("  compression='%s'" % ct)
+            print("  kernel_file_name='%s'" % kn)
+
+            comp_off = p + poff
+            if comp_off + psz > len(payload):
+                print("  压缩数据越界")
+                continue
+            comp_data = payload[comp_off:comp_off + psz]
+            print("  压缩数据 @ payload[0x%x], %d bytes" % (comp_off, len(comp_data)))
+            print("  前 16 字节: %s" % comp_data[:16].hex())
+
+            img = None
+            for c in [ct, 'gzip', 'zstd', 'lz4', 'lzma', 'xz', 'bzip2']:
+                if not c or img is not None: continue
+                try:
+                    if c in ('gzip', 'gz'):
+                        img = gzip.decompress(comp_data)
+                    elif c == 'zstd':
+                        import zstandard
+                        img = zstandard.ZstdDecompressor().decompress(
+                            comp_data, max_output_size=200*1024*1024)
+                    elif c in ('lz4', 'lz4legacy'):
+                        import lz4.frame
+                        img = lz4.frame.decompress(comp_data)
+                    elif c in ('lzma', 'xz'):
+                        img = lzma.decompress(comp_data)
+                    elif c == 'bzip2':
+                        img = bz2.decompress(comp_data)
+                    if img:
+                        print("  ✓ 解压(%s): %d bytes" % (c, len(img)))
+                except Exception as e:
+                    print("  %s: %s" % (c, str(e)[:50]))
+
+            if img is None:
+                continue
+
+            # 检查结果
+            if img[0x38:0x3c] != ARM64_MAGIC:
+                idx = img.find(ARM64_MAGIC, 0, 0x2000)
+                if idx >= 0x38:
+                    print("  对齐 magic @ 0x%x" % idx)
+                    img = img[idx-0x38:]
+
+            if img[0x38:0x3c] == ARM64_MAGIC:
+                if best_img is None or len(img) > len(best_img):
+                    best_img = img
+                    print("  ★ 有效 ARM64 Image, 长度 %d" % len(img))
+
+        # Fallback: 直接尝试 gzip magic 位置
+        if best_img is None:
             print("")
-            print("使用 fallback payload 起点: 0x%x" % PAYLOAD_OFF)
+            print("=" * 60)
+            print("Fallback: 直接尝试 gzip magic 位置")
+            print("=" * 60)
+            i = 0
+            while True:
+                p = payload.find(b'\x1f\x8b\x08', i)
+                if p < 0: break
+                print("  gzip @ 0x%x" % p)
+                try:
+                    img = gzip.decompress(payload[p:])
+                    print("    解压: %d bytes" % len(img))
+                    idx = img.find(ARM64_MAGIC, 0, 0x2000)
+                    if idx >= 0x38:
+                        img2 = img[idx-0x38:]
+                        if best_img is None or len(img2) > len(best_img):
+                            best_img = img2
+                            print("    ★ 有效 ARM64 Image @ 对齐 0x%x" % idx)
+                except Exception as e:
+                    print("    失败: %s" % str(e)[:50])
+                i = p + 1
+                if i >= len(payload): break
 
-        # 构造 knl_payload 缓冲区
-        # 结构: [0:0x40]=ARM64 header, [0x40:PAYLOAD_OFF - 8]=零填充, [PAYLOAD_OFF - 8:]=Flippy .text
-        # 因为 knl = "KRNL" + size(4) + knl_payload，所以 knl[8:] = knl_payload
-        # knl[PAYLOAD_OFF] 对应 knl_payload[PAYLOAD_OFF - 8]
-        knl_payload_off = PAYLOAD_OFF - 8
+        if best_img is None:
+            print("")
+            print("!!! 无法提取内核 !!!")
+            sys.exit(1)
 
-        hdr = bytearray(knl_payload_off)
-        # ARM64 header @ hdr[0:0x40] (即 KRNL[0x08:0x48])
-        struct.pack_into('<I', hdr, 0x00, 0xd503201f)   # code0 = NOP
-        # code1: B 从 KRNL[0x0c] 跳到 KRNL[PAYLOAD_OFF]
-        # 偏移 = PAYLOAD_OFF - 0x0c
-        rel = PAYLOAD_OFF - 0x0c
-        assert rel % 4 == 0, "code1 偏移未对齐: 0x%x" % rel
-        imm26 = (rel // 4) & 0x03FFFFFF
-        code1 = 0x14000000 | imm26
-        print("code1 = 0x%08x (B +0x%x, 从 KRNL[0xc] 跳到 KRNL[0x%x])" % (code1, rel, PAYLOAD_OFF))
-        struct.pack_into('<I', hdr, 0x04, code1)
-        # text_offset = 0
-        struct.pack_into('<Q', hdr, 0x08, 0)
-        # image_size = Flippy .text 长度
-        struct.pack_into('<Q', hdr, 0x10, len(flippy_text))
-        # flags = 0x0a
-        struct.pack_into('<Q', hdr, 0x18, 0x0a)
-        # ARM64 magic
-        hdr[0x38:0x3c] = ARM64_MAGIC
+        # 构造 KRNL
+        print("")
+        print("=" * 60)
+        print("构造 KRNL")
+        print("=" * 60)
+        print("  内核大小: %d bytes" % len(best_img))
+        print("  code0 @ 0x00: %s" % best_img[0:4].hex())
+        print("  code1 @ 0x04: %s" % best_img[4:8].hex())
+        print("  magic @ 0x38: %s" % best_img[0x38:0x3c])
 
-        knl_payload = bytes(hdr) + flippy_text
-        knl = b'KRNL' + struct.pack('<I', len(knl_payload)) + knl_payload
+        knl = b'KRNL' + struct.pack('<I', len(best_img)) + best_img
         open(dst, 'wb').write(knl)
 
-        # ============================================================
-        # 4. 校验
-        # ============================================================
-        out = open(dst, 'rb').read(min(len(knl), PAYLOAD_OFF + 16))
+        out = open(dst, 'rb').read(0x80)
         assert out[0:4] == b'KRNL'
-        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5', 'code0 NOP'
-        assert out[0x40:0x44] == ARM64_MAGIC, 'magic @ 0x40'
+        assert out[0x40:0x44] == ARM64_MAGIC
 
         print("")
-        print("=" * 70)
         print("KRNL 结构验证")
-        print("=" * 70)
-        print("  KRNL total size       = %d (0x%x)" % (len(knl), len(knl)))
-        print("  size 字段 [4:8]       = %d" % struct.unpack_from('<I', out, 4)[0])
-        print("  code0 [0x08:0x0C]     = %s (NOP)" % out[0x08:0x0c].hex())
-        print("  code1 [0x0C:0x10]     = %s" % out[0x0c:0x10].hex())
-        print("  image_size [0x18]     = 0x%x" % struct.unpack_from('<Q', out, 0x18)[0])
-        print("  magic [0x40:0x44]     = %s" % out[0x40:0x44])
-        print("  payload @ KRNL[0x%x] = %s" % (PAYLOAD_OFF, out[PAYLOAD_OFF:PAYLOAD_OFF+8].hex()))
-        print("  期望 .text[0:8]      = %s" % flippy_text[:8].hex())
-
-        assert out[PAYLOAD_OFF:PAYLOAD_OFF+8] == flippy_text[:8], "payload 位置错"
+        print("  size    = %d" % struct.unpack_from('<I', out, 4)[0])
+        print("  code0   = %s" % out[0x08:0x0c].hex())
+        print("  code1   = %s" % out[0x0c:0x10].hex())
+        print("  magic   @ 0x40 = %s" % out[0x40:0x44])
         print("SUCCESS")
         PYEOF
         echo ""
         echo "kernel.img: $(stat -c%s /tmp/kernel.img) bytes"
-        echo ""
-        echo "=== 头 96 字节 ==="
         xxd -l 96 /tmp/kernel.img
 
-    - name: Prepare sd-fuse directory
+    - name: Prepare sd-fuse
       run: |
         cd /tmp
         mkdir -p /tmp/work
@@ -394,45 +378,39 @@ jobs:
         NEW_KERNEL_SIZE=$(stat -c%s "$TARGET/kernel.img")
 
         PARAM_FILE="$TARGET/parameter.txt"
-        [ -f "$PARAM_FILE" ] || { echo "缺少 parameter.txt"; exit 1; }
-        python3 - "$PARAM_FILE" "$NEW_KERNEL_SIZE" <<'PARAM_PYEOF'
+        python3 - "$PARAM_FILE" "$NEW_KERNEL_SIZE" <<'PYEOF'
         import re, sys
         param_file, kernel_size = sys.argv[1], int(sys.argv[2])
-        with open(param_file) as f:
-            content = f.read()
+        content = open(param_file).read()
         m = re.search(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(kernel\)', content, re.IGNORECASE)
-        if not m:
-            print("[param] 未找到 kernel"); sys.exit(0)
+        if not m: sys.exit(0)
         old_size = int(m.group(1), 16)
         kernel_off = int(m.group(2), 16)
         kernel_end = kernel_off + old_size
         need = (kernel_size + 511) // 512
         rounded = ((need + 0x3FFF) // 0x4000) * 0x4000
         new_size = max(rounded, old_size)
-        print(f"[param] old={old_size*512/1024/1024:.1f} MiB need={need*512/1024/1024:.1f} MiB new={new_size*512/1024/1024:.1f} MiB")
-        if new_size == old_size:
-            sys.exit(0)
+        print("[param] old=%.1f MiB need=%.1f MiB new=%.1f MiB" % (old_size*512/1024/1024, need*512/1024/1024, new_size*512/1024/1024))
+        if new_size == old_size: sys.exit(0)
         delta = new_size - old_size
         content = content[:m.start()] + f'0x{new_size:08x}@{m.group(2)}(kernel)' + content[m.end():]
         def shift(mt):
             off = int(mt.group(1), 16)
             return f'@0x{off + delta:08x}' if off >= kernel_end else mt.group(0)
         content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
-        with open(param_file, 'w') as f:
-            f.write(content)
-        print(f"[param] 已更新 delta={delta} sectors")
-        PARAM_PYEOF
+        open(param_file, 'w').write(content)
+        print(f"[param] 扩容 delta={delta}")
+        PYEOF
 
         mkdir -p "$TARGET/dtb/rockchip"
         DTB_R5S=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5s.dtb" | head -1)
         DTB_R5C=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5c.dtb" | head -1)
         [ -n "$DTB_R5S" ] && cp "$DTB_R5S" "$TARGET/dtb/rockchip/rk3568-nanopi-r5s.dtb"
         [ -n "$DTB_R5C" ] && cp "$DTB_R5C" "$TARGET/dtb/rockchip/rk3568-nanopi-r5c.dtb"
-
         UINITRD=$(find /tmp/boot_extract -name "uInitrd-*" | head -1)
         [ -n "$UINITRD" ] && cp "$UINITRD" "$TARGET/uInitrd"
 
-    - name: Build final image
+    - name: Build image
       run: |
         cd /tmp/scripts/sd-fuse
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')$([ "${{ inputs.set }}" = "docker" ] && echo "-docker")"
@@ -442,26 +420,22 @@ jobs:
         yes | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
         MK_EXIT=$?
         set -e
-        echo "mk-sd-image.sh exit=$MK_EXIT"
         tail -20 /tmp/mk-sd.log
-
         FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
         [ -z "$FOUND_IMG" ] && { echo "No image"; exit 1; }
-
         KV_SHORT="${{ inputs.kernel_version }}"
         [ "$KV_SHORT" = "auto" ] || KV_SHORT="${KV_SHORT%.y}"
         IMG_FILE="R5S-R5C-Series-FriendlyWrt-kv${KV_SHORT}-${{ inputs.version }}$([ "${{ inputs.set }}" = "docker" ] && echo "-docker").img"
         mv "$FOUND_IMG" "$GITHUB_WORKSPACE/artifact/$IMG_FILE"
         echo "img_name=$IMG_FILE" >> $GITHUB_ENV
 
-    - name: Verify against official firmware
+    - name: Verify
       id: verify
       run: |
         set +e
         bash $GITHUB_WORKSPACE/scripts/verify-against-official.sh \
           "$GITHUB_WORKSPACE/artifact/${{ env.img_name }}" \
-          "/tmp/official" \
-          "${{ steps.kernel.outputs.version }}"
+          "/tmp/official" "${{ steps.kernel.outputs.version }}"
         RC=$?
         set -e
         if [ $RC -eq 0 ]; then
@@ -471,7 +445,7 @@ jobs:
           exit $RC
         fi
 
-    - name: Compress image to gz
+    - name: Compress
       run: |
         cd $GITHUB_WORKSPACE/artifact
         gzip -f *.img
@@ -479,12 +453,10 @@ jobs:
         for f in *.img.gz; do
           SIZE=$(stat -c%s "$f")
           echo "$f -> $SIZE bytes"
-          if [ "$SIZE" -ge 2147483648 ]; then
-            echo "ERROR: 超过 2GiB"; exit 1
-          fi
+          [ "$SIZE" -ge 2147483648 ] && { echo "ERROR: >2GiB"; exit 1; }
         done
 
-    - name: Upload artifact
+    - name: Upload
       uses: actions/upload-artifact@v4
       with:
         name: firmware-${{ env.img_name }}
@@ -503,9 +475,8 @@ jobs:
       with:
         name: firmware-${{ needs.build.outputs.img_name }}
         path: ./artifact
-
-    - name: Generate tag
-      id: release_tag
+    - name: Tag
+      id: tag
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
@@ -520,18 +491,14 @@ jobs:
             gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
             git push origin --delete "refs/tags/$tag" || true
           done
-          TAG="$BASE_TAG"
-        else
-          TAG="$BASE_TAG"
         fi
-        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-    - name: Create Release
+        echo "tag=$BASE_TAG" >> "$GITHUB_OUTPUT"
+    - name: Release
       uses: softprops/action-gh-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ steps.release_tag.outputs.tag }}
+        tag_name: ${{ steps.tag.outputs.tag }}
         name: "R5S/R5C FriendlyWrt ${{ inputs.version }} + Flippy KV ${{ inputs.kernel_version }}"
         draft: false
         prerelease: false
