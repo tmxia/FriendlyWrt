@@ -1,8 +1,8 @@
 #!/bin/bash
-# replace-kernel.sh - Flippy 内核 + 模块注入 + DTB 探测 → 官方 KRNL 结构
+# replace-kernel.sh - Flippy 内核 + 模块注入 + boot.img 重建 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v36-bootimg-diagnose"
+VERSION="2026-09-11-v37-build-boot-img"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -141,7 +141,6 @@ python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" "$OFFICIAL_PAYLOAD" "$SYSTEM_MA
 import sys, struct, os
 
 src, dst = sys.argv[1], sys.argv[2]
-off_path = sys.argv[3] if len(sys.argv) > 3 else None
 sysmap_path = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
 raw = open(src, 'rb').read()
 
@@ -392,138 +391,54 @@ if [ -n "$DTB_TAR" ]; then
   done
 fi
 UINITRD=$(find "$KERNEL_CACHE" -type f -name "uInitrd-*" | head -1)
-[ -n "$UINITRD" ] && { cp "$UINITRD" "$TARGET_DIR/uInitrd"; log "  ✓ uInitrd"; }
-
-# ============================================================
-# 6.5 更新 resource.img DTB（保守方案）
-# ============================================================
-log "[6.5/9] 尝试更新 resource.img DTB"
-RESOURCE_IMG="$TARGET_DIR/resource.img"
-if [ -f "$RESOURCE_IMG" ]; then
-  log "  resource.img: $(stat -c%s "$RESOURCE_IMG") bytes"
-  log "  前 64 字节:"
-  xxd -l 64 "$RESOURCE_IMG" | sed 's/^/    /'
-  # RSCE 真实结构仍未确认，保守起见不动
-  warn "  RSCE 格式未确认，跳过修改（v36 仅探测）"
+if [ -n "$UINITRD" ]; then
+  cp "$UINITRD" "$TARGET_DIR/uInitrd"
+  log "  ✓ uInitrd ($(stat -c%s "$TARGET_DIR/uInitrd") bytes)"
 fi
 
 # ============================================================
-# ★★★ 6.7 探测 boot.img 内部结构 ★★★
+# ★★★ 6.9 重建 boot.img ★★★
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
-log "  ★ [6.7/9] 关键诊断: boot.img 内部结构"
+log "  ★ [6.9/9] 重建 boot.img (调用官方 build-boot-img.sh)"
 log "════════════════════════════════════════════════════════"
 
-BOOT_IMG="$TARGET_DIR/boot.img"
-if [ -f "$BOOT_IMG" ]; then
-  BOOT_SIZE=$(stat -c%s "$BOOT_IMG")
-  log "  boot.img 大小: $BOOT_SIZE bytes"
-  log ""
-  log "  ── 前 256 字节 hex ──"
-  xxd -l 256 "$BOOT_IMG" | sed 's/^/    /'
-  log ""
-  log "  ── 前 32 字节 ASCII ──"
-  head -c 32 "$BOOT_IMG" | xxd | sed 's/^/    /'
-  log ""
+BOOT_IMG_OLD_SIZE=$(stat -c%s "$TARGET_DIR/boot.img" 2>/dev/null || echo 0)
+log "  旧 boot.img 大小: $BOOT_IMG_OLD_SIZE bytes"
+log "  旧 boot.img 前 16 字节:"
+xxd -l 16 "$TARGET_DIR/boot.img" 2>/dev/null | sed 's/^/    /' || echo "    (无)"
 
-  # 检测 magic
-  MAGIC4=$(dd if="$BOOT_IMG" bs=1 count=4 2>/dev/null | xxd -p)
-  MAGIC8=$(dd if="$BOOT_IMG" bs=1 count=8 2>/dev/null | xxd -p)
-  log "  magic (前 4 字节 hex): $MAGIC4"
-  log "  magic (前 8 字节 hex): $MAGIC8"
+cd "$SDFUSE_DIR"
 
-  # file 类型
-  BOOT_FILE=$(file -b "$BOOT_IMG")
-  log "  file 输出: $BOOT_FILE"
-  log ""
-
-  # 按 magic 判断格式
-  case "$MAGIC8" in
-    414e44524f494421*)
-      log "  ★ 检测到 Android boot image (ANDROID! magic)"
-      ;;
-    d00dfeed*)
-      log "  ★ 检测到 FIT image (d00dfeed magic)"
-      ;;
-    27051956*)
-      log "  ★ 检测到 U-Boot legacy image (27051956 magic)"
-      ;;
-    *)
-      log "  ⚠ 未知 magic，可能是 RK 特有格式"
-      ;;
-  esac
-  log ""
-
-  # 尝试 mkimage -l（U-Boot legacy image）
-  if command -v mkimage >/dev/null 2>&1; then
-    log "  ── mkimage -l 输出 ──"
-    mkimage -l "$BOOT_IMG" 2>&1 | head -30 | sed 's/^/    /'
-    log ""
-  fi
-
-  # 尝试 dumpimage -l（更详细）
-  if command -v dumpimage >/dev/null 2>&1; then
-    log "  ── dumpimage -l 输出 ──"
-    dumpimage -l "$BOOT_IMG" 2>&1 | head -40 | sed 's/^/    /'
-    log ""
-  fi
-
-  # 搜索内部特殊 magic
-  log "  ── 内部 magic 搜索 ──"
-  python3 -c "
-raw = open('$BOOT_IMG','rb').read()
-magics = {
-    'FDT (d00dfeed)': b'\xd0\x0d\xfe\xed',
-    'Gzip (1f8b08)': b'\x1f\x8b\x08',
-    'LZ4 (04224d18)': b'\x04\x22\x4d\x18',
-    'LZMA (5d0000)': b'\x5d\x00\x00',
-    'XZ (fd377a58)': b'\xfd\x37\x7a\x58',
-    'Zstd (28b52ffd)': b'\x28\xb5\x2f\xfd',
-    'Squashfs (hsqs)': b'hsqs',
-    'Ext4 (53ef)': b'\x53\xef',
-    'Android dtb (ANDROID!)': b'ANDROID!',
-    'RKDTB (RKDT)': b'RKDT',
-}
-for name, m in magics.items():
-    idx = raw.find(m)
-    if idx >= 0:
-        print(f'    {name} @ 0x{idx:x}')
-"
-  log ""
-
-  # 如果识别出是 legacy image，尝试解包
-  if [ "$(dd if="$BOOT_IMG" bs=1 count=4 2>/dev/null | xxd -p)" = "27051956" ]; then
-    log "  ── 尝试 dumpimage 解包 ──"
-    mkdir -p "$WORK_DIR/boot_extracted"
-    dumpimage -i "$BOOT_IMG" -o "$WORK_DIR/boot_extracted/kernel" -T kernel "$BOOT_IMG" 2>&1 | head -5 | sed 's/^/    /' || true
-    if [ -f "$WORK_DIR/boot_extracted/kernel" ]; then
-      KSIZE=$(stat -c%s "$WORK_DIR/boot_extracted/kernel")
-      log "    kernel 提取: $KSIZE bytes"
-      log "    前 32 字节:"
-      xxd -l 32 "$WORK_DIR/boot_extracted/kernel" | sed 's/^/      /'
-    fi
-  fi
-
-  # 如果是 FIT image，尝试提取
-  FDT_OFF=$(python3 -c "
-raw = open('$BOOT_IMG','rb').read()
-print(raw.find(b'\xd0\x0d\xfe\xed'))
-")
-  if [ "$FDT_OFF" != "-1" ] && [ "$FDT_OFF" -lt 1000 ]; then
-    log "  ── 是 FIT image，尝试提取 device tree 结构 ──"
-    dd if="$BOOT_IMG" bs=1 skip=0 count=$(( BOOT_SIZE > 65536 ? 65536 : BOOT_SIZE )) of="$WORK_DIR/boot_fdt.dtb" 2>/dev/null || true
-    if command -v dtc >/dev/null 2>&1; then
-      dtc -I dtb -O dts "$WORK_DIR/boot_fdt.dtb" 2>/dev/null | head -100 | sed 's/^/    /' || true
-    fi
-  fi
+if [ -x ./build-boot-img.sh ]; then
+  log "  ▶ 调用 ./build-boot-img.sh $DIST_NAME"
+  set +e
+  ./build-boot-img.sh "$DIST_NAME" > "$WORK_DIR/build-boot.log" 2>&1
+  BOOT_RC=$?
+  set -e
+  log "  build-boot-img.sh exit=$BOOT_RC"
+  log "  ── 输出 ──"
+  cat "$WORK_DIR/build-boot.log" | sed 's/^/    /'
+  log "  ── 输出结束 ──"
 else
-  warn "  boot.img 不存在！"
+  warn "  ✗ build-boot-img.sh 不存在或不可执行"
+  log "  sd-fuse 目录内容:"
+  ls -la "$SDFUSE_DIR" | sed 's/^/    /'
 fi
 
-log ""
-log "════════════════════════════════════════════════════════"
-log "  [6.7/9] 诊断结束"
+if [ -f "$TARGET_DIR/boot.img" ]; then
+  NEW_BOOT_SIZE=$(stat -c%s "$TARGET_DIR/boot.img")
+  log "  新 boot.img 大小: $NEW_BOOT_SIZE bytes (旧: $BOOT_IMG_OLD_SIZE)"
+  log "  新 boot.img 前 32 字节:"
+  xxd -l 32 "$TARGET_DIR/boot.img" | sed 's/^/    /'
+  if [ "$NEW_BOOT_SIZE" != "$BOOT_IMG_OLD_SIZE" ]; then
+    log "  ✓ boot.img 已更新（大小变化）"
+  else
+    warn "  ⚠ boot.img 大小未变 —— 可能 build-boot-img.sh 没生效"
+  fi
+fi
+
 log "════════════════════════════════════════════════════════"
 log ""
 
@@ -565,6 +480,15 @@ MAGIC=$(dd if="$OUTPUT_IMG" bs=1 skip=$KERNEL_BYTE_OFF count=4 2>/dev/null)
 [ "$MAGIC" != "KRNL" ] && { err "  KNL magic 缺失"; exit 1; }
 log "  ✓ KNL magic @ $KERNEL_BYTE_OFF"
 
+# 验证 boot 分区的 boot.img
+BOOT_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(boot\)' "$PARAM_FILE" \
+  | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(boot\)/\1/')
+if [ -n "$BOOT_OFFSET" ]; then
+  BOOT_BYTE_OFF=$(( BOOT_OFFSET * 512 ))
+  BOOT_MAGIC=$(dd if="$OUTPUT_IMG" bs=1 skip=$BOOT_BYTE_OFF count=4 2>/dev/null)
+  log "  boot 分区 @ $BOOT_BYTE_OFF: magic=$(printf '%s' "$BOOT_MAGIC" | xxd -p)"
+fi
+
 # ============================================================
 # 9. 汇总
 # ============================================================
@@ -573,8 +497,7 @@ log "  resource.img: $(stat -c%s "$TARGET_DIR/resource.img" 2>/dev/null || echo 
 log "  kernel.img:   $(stat -c%s "$TARGET_DIR/kernel.img")"
 log "  boot.img:     $(stat -c%s "$TARGET_DIR/boot.img" 2>/dev/null || echo 'N/A')"
 log "  rootfs.img:   $(stat -c%s "$TARGET_DIR/rootfs.img")"
+log "  uInitrd:      $(stat -c%s "$TARGET_DIR/uInitrd" 2>/dev/null || echo 'N/A')"
 
-log ""
-log "★ 请把 [6.7/9] 段的完整输出贴给我 ★"
 log ""
 log "完成 (version $VERSION, 内核 $SELECTED_VER)"
