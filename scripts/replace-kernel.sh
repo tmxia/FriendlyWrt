@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 + boot.img 重建 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v37-build-boot-img"
+VERSION="2026-09-11-v38-bootimg-args-fix"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -398,6 +398,9 @@ fi
 
 # ============================================================
 # ★★★ 6.9 重建 boot.img ★★★
+# 修复: build-boot-img.sh 需要 2 个参数
+#   用法: ./build-boot-img.sh <boot dir> <img filename>
+#   例:   ./build-boot-img.sh friendlywrt24-docker friendlywrt24-docker/boot.img
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
@@ -405,37 +408,52 @@ log "  ★ [6.9/9] 重建 boot.img (调用官方 build-boot-img.sh)"
 log "════════════════════════════════════════════════════════"
 
 BOOT_IMG_OLD_SIZE=$(stat -c%s "$TARGET_DIR/boot.img" 2>/dev/null || echo 0)
+BOOT_IMG_OLD_MD5=$(md5sum "$TARGET_DIR/boot.img" 2>/dev/null | awk '{print $1}' || echo "N/A")
 log "  旧 boot.img 大小: $BOOT_IMG_OLD_SIZE bytes"
+log "  旧 boot.img md5:  $BOOT_IMG_OLD_MD5"
 log "  旧 boot.img 前 16 字节:"
 xxd -l 16 "$TARGET_DIR/boot.img" 2>/dev/null | sed 's/^/    /' || echo "    (无)"
 
 cd "$SDFUSE_DIR"
 
 if [ -x ./build-boot-img.sh ]; then
-  log "  ▶ 调用 ./build-boot-img.sh $DIST_NAME"
+  # 删除旧的 boot.img（防止脚本因文件存在而跳过）
+  log "  ▶ 删除旧 boot.img"
+  rm -f "$DIST_NAME/boot.img"
+
+  log "  ▶ 调用 ./build-boot-img.sh $DIST_NAME $DIST_NAME/boot.img"
   set +e
-  ./build-boot-img.sh "$DIST_NAME" > "$WORK_DIR/build-boot.log" 2>&1
+  ./build-boot-img.sh "$DIST_NAME" "$DIST_NAME/boot.img" > "$WORK_DIR/build-boot.log" 2>&1
   BOOT_RC=$?
   set -e
   log "  build-boot-img.sh exit=$BOOT_RC"
   log "  ── 输出 ──"
   cat "$WORK_DIR/build-boot.log" | sed 's/^/    /'
   log "  ── 输出结束 ──"
+
+  if [ ! -f "$DIST_NAME/boot.img" ]; then
+    err "  ✗ build-boot-img.sh 执行后 boot.img 仍不存在"
+    exit 1
+  fi
 else
-  warn "  ✗ build-boot-img.sh 不存在或不可执行"
-  log "  sd-fuse 目录内容:"
-  ls -la "$SDFUSE_DIR" | sed 's/^/    /'
+  err "  ✗ build-boot-img.sh 不存在或不可执行"
+  exit 1
 fi
 
 if [ -f "$TARGET_DIR/boot.img" ]; then
   NEW_BOOT_SIZE=$(stat -c%s "$TARGET_DIR/boot.img")
+  NEW_BOOT_MD5=$(md5sum "$TARGET_DIR/boot.img" | awk '{print $1}')
   log "  新 boot.img 大小: $NEW_BOOT_SIZE bytes (旧: $BOOT_IMG_OLD_SIZE)"
+  log "  新 boot.img md5:  $NEW_BOOT_MD5"
   log "  新 boot.img 前 32 字节:"
   xxd -l 32 "$TARGET_DIR/boot.img" | sed 's/^/    /'
+
   if [ "$NEW_BOOT_SIZE" != "$BOOT_IMG_OLD_SIZE" ]; then
     log "  ✓ boot.img 已更新（大小变化）"
+  elif [ "$NEW_BOOT_MD5" != "$BOOT_IMG_OLD_MD5" ]; then
+    log "  ✓ boot.img 已更新（md5 变化，大小相同）"
   else
-    warn "  ⚠ boot.img 大小未变 —— 可能 build-boot-img.sh 没生效"
+    warn "  ⚠ boot.img 未变化 —— 请检查 build-boot-img.sh 输出"
   fi
 fi
 
