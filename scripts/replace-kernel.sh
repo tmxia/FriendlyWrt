@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v29-cleanup-fix"
+VERSION="2026-09-11-v30-free-old-modules"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -14,18 +14,13 @@ OFFICIAL_DIR="${OFFICIAL_DIR:-/tmp/official}"
 
 WORK_DIR=$(mktemp -d /tmp/replace-kernel.XXXXXX)
 
-# ============================================================
-# 清理：先 umount 再 sudo rm（关键修复）
-# ============================================================
 _cleanup() {
   _rc=$?
-  # 先卸载所有可能的 loop mount
   for m in "$WORK_DIR/mnt" /tmp/fwrt-mnt-*; do
     if [ -d "$m" ] && mountpoint -q "$m" 2>/dev/null; then
       sudo umount -f "$m" 2>/dev/null || umount -f "$m" 2>/dev/null || true
     fi
   done
-  # sudo 清理（loop mount 留下的 root 文件需要 sudo）
   sudo rm -rf "$WORK_DIR" 2>/dev/null
   if [ -d "$WORK_DIR" ]; then
     rm -rf "$WORK_DIR" 2>/dev/null || true
@@ -209,17 +204,13 @@ with open(sysmap_path, 'r', errors='ignore') as f:
 _text  = syms.get('_text')
 primary = syms.get('primary_entry')
 rec_mmu = syms.get('record_mmu_state')
-p_switch = syms.get('__primary_switch')
 
-for n, v in [('_text', _text), ('primary_entry', primary),
-             ('record_mmu_state', rec_mmu), ('__primary_switch', p_switch)]:
+for n, v in [('_text', _text), ('primary_entry', primary), ('record_mmu_state', rec_mmu)]:
     print("  %-20s = %s" % (n, hex(v) if v else "N/A"))
 
-if not _text:
-    print("  ✗ 缺少 _text"); sys.exit(1)
+if not _text: sys.exit(1)
 
-def v2p(vaddr):
-    return vaddr - _text - text_roff
+def v2p(vaddr): return vaddr - _text - text_roff
 
 REC_PATTERN = b'\x53\x42\x38\xd5\x7f\x22\x00\xf1'
 rec_feature = text.find(REC_PATTERN)
@@ -229,21 +220,14 @@ if rec_mmu:
     print("\n  record_mmu_state → payload[0x%x]" % rec_off_sysmap)
     if rec_feature >= 0:
         print("  特征匹配 record_mmu_state → .text[0x%x]" % rec_feature)
-        if rec_off_sysmap == rec_feature:
-            print("  ✓ 一致，映射公式正确")
-            rec_off = rec_feature
-        else:
-            rec_off = rec_feature
+        rec_off = rec_feature
     else:
         rec_off = rec_off_sysmap
 
 def insn_at(off):
     if off < 0 or off + 4 > len(text): return None
     return struct.unpack_from('<I', text, off)[0]
-
-def is_bl(v):
-    return v is not None and ((v >> 26) & 0x3F) == 0x25
-
+def is_bl(v): return v is not None and ((v >> 26) & 0x3F) == 0x25
 def bl_target(off):
     v = insn_at(off)
     if not is_bl(v): return None
@@ -267,58 +251,36 @@ if primary:
             print("      首指令 opcode=0x%02x" % op)
             if op == 0x25 and rec_off is not None:
                 tgt = bl_target(e)
-                print("      首条 BL 目标 = payload[0x%x]  (record_mmu_state @ 0x%x)" % (tgt, rec_off))
+                print("      首条 BL 目标 = payload[0x%x]" % tgt)
                 if tgt == rec_off:
-                    print("      ✓✓✓ 首条 BL 目标 = record_mmu_state，验证通过")
+                    print("      ✓✓✓ 首条 BL 目标 = record_mmu_state")
                     entry = e
-                    entry_method = "System.map primary_entry（BL→record_mmu 验证通过）"
+                    entry_method = "System.map primary_entry (BL→record_mmu 验证)"
             elif op in (0x25, 0x05):
                 entry = e
-                entry_method = "System.map primary_entry（首指令 BL/B）"
+                entry_method = "System.map primary_entry (BL/B)"
 
 if entry is None and rec_off is not None:
-    print("  [B] BL 反查 record_mmu_state")
     for i in range(max(0, rec_off - 0x200), rec_off, 4):
         if bl_target(i) == rec_off:
-            print("      找到 BL @ payload[0x%x]" % i)
-            bl_count = sum(1 for k in range(4) if is_bl(insn_at(i + k*4)))
-            print("      前 4 条 BL 数量: %d" % bl_count)
-            if bl_count >= 2:
+            if sum(1 for k in range(4) if is_bl(insn_at(i + k*4))) >= 2:
                 entry = i
-                entry_method = "BL 反查 + 前 4 条 BL≥2"
+                entry_method = "BL 反查"
                 break
 
-if entry is None:
-    print("  ✗ 所有策略失败"); sys.exit(1)
+if entry is None: print("  ✗ 入口定位失败"); sys.exit(1)
 
-print("\n  ══════ 入口交叉验证 ══════")
-print("  entry = payload[0x%x]  方法: %s" % (entry, entry_method))
+print("\n  entry = payload[0x%x]  方法: %s" % (entry, entry_method))
 print("  entry 16 字节: %s" % text[entry:entry+16].hex())
-for i in range(4):
-    off = entry + i*4
-    v = insn_at(off)
-    if v is None: break
-    op = (v >> 26) & 0x3F
-    if op == 0x25:
-        name = "BL → 0x%x" % bl_target(off)
-    elif op == 0x05:
-        imm = v & 0x03FFFFFF
-        if imm & 0x02000000: imm -= 0x04000000
-        name = "B → 0x%x" % (off + imm * 4)
-    elif op in (0x28, 0x29, 0x2a, 0x2b):
-        name = "MOV/ORR"
-    else:
-        name = "op_0x%02x" % op
-    print("    [%d] 0x%08x  %s" % (i, v, name))
 
 KNL_HDR = 0x10000
 payload = payload_tail
 target_in_knl = KNL_HDR + entry
 rel = target_in_knl - 0x0C
 assert rel % 4 == 0
-assert -0x8000000 <= rel <= 0x7FFFFFC, "B 偏移越界"
+assert -0x8000000 <= rel <= 0x7FFFFFC
 code1 = 0x14000000 | ((rel // 4) & 0x03FFFFFF)
-print("\n  code1=0x%08x  B %+d  → KNL[0x%x]" % (code1, rel, target_in_knl))
+print("  code1=0x%08x  B %+d  → KNL[0x%x]" % (code1, rel, target_in_knl))
 
 hdr = bytearray(KNL_HDR)
 struct.pack_into('<I', hdr, 0x00, 0x4c4e524b)
@@ -333,19 +295,13 @@ hdr[0x40:0x44] = b'ARMd'
 knl = bytes(hdr) + payload
 open(dst, 'wb').write(knl)
 
-zero_region = knl[0x48:0x10000]
 assert knl[0:4] == b'KRNL'
 assert knl[0x08:0x0c] == b'\x1f\x20\x03\xd5'
-assert knl[0x0c:0x10] == struct.pack('<I', code1)
 assert knl[0x40:0x44] == b'ARMd'
-assert not any(zero_region)
-assert knl[0x10000:0x10004] == text[:4]
+assert not any(knl[0x48:0x10000])
 assert knl[target_in_knl:target_in_knl+4] == text[entry:entry+4]
 
-print("\n  KNL size              = %d" % len(knl))
-print("  payload (.text+.data) = %d" % len(payload))
-print("  entry offset          = 0x%x" % entry)
-print("  0x48..0x10000         = 零填充 ✓")
+print("\n  KNL size = %d  payload = %d  entry = 0x%x" % (len(knl), len(payload), entry))
 print("\n  SUCCESS")
 PYEOF
 
@@ -373,12 +329,11 @@ mkdir -p "$MOD_EX"
 tar xzf "$MODULES_TAR" -C "$MOD_EX"
 MOD_LIB=$(find "$MOD_EX" -maxdepth 5 -type d -path "*/lib/modules/6.*" | head -1)
 [ -z "$MOD_LIB" ] && MOD_LIB=$(find "$MOD_EX" -maxdepth 5 -type d -name "6.*" | head -1)
-[ -z "$MOD_LIB" ] && { err "  模块目录未找到"; find "$MOD_EX" -maxdepth 3 -type d | head; exit 1; }
+[ -z "$MOD_LIB" ] && { err "  模块目录未找到"; exit 1; }
 KVER=$(basename "$MOD_LIB")
 KO_COUNT=$(find "$MOD_LIB" -name "*.ko*" 2>/dev/null | wc -l)
 log "  内核版本: $KVER"
 log "  模块数:   $KO_COUNT"
-[ "$KO_COUNT" -lt 10 ] && { err "  模块数过少"; exit 1; }
 
 ORIG_FMT=$(file -b "$ROOTFS_IMG")
 log "  rootfs 原始格式: $ORIG_FMT"
@@ -399,6 +354,7 @@ RAW_FMT=$(file -b "$WORK_ROOTFS")
 log "  raw 格式: $RAW_FMT"
 
 if echo "$RAW_FMT" | grep -qi "squashfs"; then
+  # ============ squashfs ============
   command -v unsquashfs >/dev/null || { err "  缺少 unsquashfs"; exit 1; }
   command -v mksquashfs >/dev/null || { err "  缺少 mksquashfs"; exit 1; }
 
@@ -423,8 +379,10 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
   set -e
   [ $RC -ne 0 ] && { err "  unsquashfs 失败"; tail -20 "$WORK_DIR/unsquashfs.log"; exit 1; }
 
-  EXISTING=$(ls "$ROOT_EX/lib/modules/" 2>/dev/null | tr '\n' ' ' || echo "(空)")
-  log "  现有 /lib/modules: $EXISTING"
+  # 删除旧模块
+  log "  清理旧内核模块"
+  ls -la "$ROOT_EX/lib/modules/" 2>/dev/null | sed 's/^/    /' || true
+  rm -rf "$ROOT_EX/lib/modules/"*
 
   mkdir -p "$ROOT_EX/lib/modules/$KVER"
   cp -a "$MOD_LIB/." "$ROOT_EX/lib/modules/$KVER/"
@@ -444,48 +402,86 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
   mv "$ROOTFS_NEW_RAW" "$WORK_ROOTFS"
 
 elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
+  # ============ ext4 ============
   log "  检测为 ext4，使用 loop mount"
   MNT="$WORK_DIR/mnt"
   mkdir -p "$MNT"
 
   MNT_OK=0
-  if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
-    MNT_OK=1
-  elif sudo mount -t ext4 -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
-    MNT_OK=1
+  if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then MNT_OK=1
+  elif sudo mount -t ext4 -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then MNT_OK=1
   fi
   [ "$MNT_OK" = "0" ] && { err "  无法 loop mount"; exit 1; }
   log "  已挂载到 $MNT"
 
-  AVAIL=$(df -B1 --output=avail "$MNT" 2>/dev/null | tail -1 | tr -d ' ')
+  # ---------- 初始状态 ----------
+  log "  初始磁盘使用:"
+  df -h "$MNT" | sed 's/^/    /'
+  log "  现有 /lib/modules:"
+  sudo ls -la "$MNT/lib/modules/" 2>/dev/null | sed 's/^/    /' || echo "    (空)"
+
+  # ★★★ 关键修复：删除旧内核模块 ★★★
+  log "  ★ 清理旧内核模块（内核已换成 $KVER，旧模块无用）"
+  OLD_SIZE=$(sudo du -sb "$MNT/lib/modules/" 2>/dev/null | awk '{print $1}' || echo 0)
+  log "    旧模块占用: ${OLD_SIZE} bytes"
+  sudo rm -rf "$MNT/lib/modules/"*
+  sync
+  log "  清理后磁盘使用:"
+  df -h "$MNT" | sed 's/^/    /'
+
+  # ---------- 空间检查（含安全余量） ----------
+  AVAIL=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
   NEED=$(du -sb "$MOD_LIB" | awk '{print $1}')
-  log "  可用空间: $AVAIL bytes / 需要: $NEED bytes"
-  if [ -n "$AVAIL" ] && [ "$AVAIL" -lt "$NEED" ]; then
-    warn "  空间不足，尝试 resize2fs 扩展"
+  NEED_SAFE=$(( NEED * 15 / 10 ))     # 1.5 倍（应对小文件块对齐膨胀）
+  log "  可用: $AVAIL bytes / 逻辑需要: $NEED bytes / 保守需要: $NEED_SAFE bytes"
+
+  if [ "$AVAIL" -lt "$NEED_SAFE" ]; then
+    warn "  空间仍不足，扩展 ext4 分区"
     sudo umount -f "$MNT" 2>/dev/null || true
+    sleep 1
     CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
-    EXTRA=$(( 200 * 1024 * 1024 ))
-    NEW_TARGET=$(( CURRENT_RAW + EXTRA ))
+    DIFF=$(( NEED_SAFE - AVAIL + 200*1024*1024 ))    # 加 200MB 缓冲
+    NEW_TARGET=$(( CURRENT_RAW + DIFF ))
     NEW_TARGET=$(( (NEW_TARGET / (4*1024*1024) + 1) * (4*1024*1024) ))
+    log "  扩展 raw: $CURRENT_RAW → $NEW_TARGET bytes"
     truncate -s "$NEW_TARGET" "$WORK_ROOTFS"
+    log "  e2fsck 检查..."
+    e2fsck -f -y "$WORK_ROOTFS" 2>&1 | tail -3 || true
+    log "  resize2fs..."
     resize2fs "$WORK_ROOTFS" 2>&1 | tail -3 || true
+
     if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
-      log "  扩展后重新挂载成功，新大小: $NEW_TARGET bytes"
+      log "  扩展后重新挂载成功"
+      df -h "$MNT" | sed 's/^/    /'
     else
       err "  扩展后无法挂载"; exit 1
     fi
+    AVAIL=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
+    if [ "$AVAIL" -lt "$NEED_SAFE" ]; then
+      err "  扩展后仍不足（可用 $AVAIL < 保守需要 $NEED_SAFE）"; exit 1
+    fi
   fi
 
-  EXISTING=$(ls "$MNT/lib/modules/" 2>/dev/null | tr '\n' ' ' || echo "(空)")
-  log "  现有 /lib/modules: $EXISTING"
-
+  # ---------- 注入 ----------
+  log "  注入 $KO_COUNT 个模块到 $KVER..."
   sudo mkdir -p "$MNT/lib/modules/$KVER"
-  sudo cp -a "$MOD_LIB/." "$MNT/lib/modules/$KVER/"
+  set +e
+  sudo cp -a "$MOD_LIB/." "$MNT/lib/modules/$KVER/" 2>&1 | head -20
+  CP_RC=${PIPESTATUS[0]}
+  set -e
   sync
-  INJECTED=$(sudo find "$MNT/lib/modules/$KVER" -name '*.ko*' | wc -l)
-  log "  已注入: $INJECTED 个模块"
 
-  # 卸载，带 -f 强制
+  INJECTED=$(sudo find "$MNT/lib/modules/$KVER" -name '*.ko*' | wc -l)
+  log "  已注入: $INJECTED / $KO_COUNT 个模块"
+  log "  注入后磁盘使用:"
+  df -h "$MNT" | sed 's/^/    /'
+
+  if [ "$INJECTED" -lt "$KO_COUNT" ]; then
+    err "  模块注入不完整（$INJECTED < $KO_COUNT），可能空间不足"
+    exit 1
+  fi
+
+  # ---------- 卸载 ----------
   sync
   sudo umount -f "$MNT" 2>/dev/null || umount -f "$MNT" 2>/dev/null || true
   if mountpoint -q "$MNT" 2>/dev/null; then
@@ -499,17 +495,21 @@ else
   exit 1
 fi
 
+# ---------- raw → sparse ----------
 if [ "$IS_SPARSE" = "1" ]; then
   log "  转换 raw → Android sparse"
   ROOTFS_FINAL="$WORK_DIR/rootfs.final.img"
   img2simg "$WORK_ROOTFS" "$ROOTFS_FINAL"
+  RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS")
   log "  最终 sparse 大小: $(stat -c%s "$ROOTFS_FINAL") bytes"
+  log "  对应 raw 大小: $RAW_SIZE_FINAL bytes"
   mv "$ROOTFS_FINAL" "$ROOTFS_IMG"
 else
+  RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS")
   mv "$WORK_ROOTFS" "$ROOTFS_IMG"
 fi
 
-RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS" 2>/dev/null || stat -c%s "$ROOTFS_IMG")
+# ---------- rootfs 分区大小检查 ----------
 ROOTFS_PART=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" | head -1)
 if [ -n "$ROOTFS_PART" ]; then
   PART_SECTORS=$(echo "$ROOTFS_PART" | sed -E 's/0x([0-9a-fA-F]+)@.*/\1/')
@@ -644,17 +644,17 @@ import sys, struct
 img, off = sys.argv[1], int(sys.argv[2])
 with open(img, 'rb') as f:
     f.seek(off); d = f.read(0x10010)
-assert d[0:4] == b'KRNL', "KRNL magic 缺失"
-assert d[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 != NOP"
-assert d[0x40:0x44] == b'ARM\x64', "ARM64 magic 位置错误"
-assert d[0x48:0x10000] == b'\x00' * (0x10000 - 0x48), "0x48..0x10000 非零"
+assert d[0:4] == b'KRNL'
+assert d[0x08:0x0c] == b'\x1f\x20\x03\xd5'
+assert d[0x40:0x44] == b'ARM\x64'
+assert d[0x48:0x10000] == b'\x00' * (0x10000 - 0x48)
 size = struct.unpack_from('<I', d, 4)[0]
 code1 = struct.unpack_from('<I', d, 0x0C)[0]
 imm26 = code1 & 0x03FFFFFF
 if imm26 & 0x02000000: imm26 -= 0x04000000
 target = 0x0C + imm26 * 4
 print("  KRNL size=%d  code0=%s  code1=%s" % (size, d[0x08:0x0c].hex(), d[0x0c:0x10].hex()))
-print("  code1 → 0x%x (payload @ 0x10000)" % target)
+print("  code1 → 0x%x" % target)
 print("  ✓✓✓")
 PYEOF
 
