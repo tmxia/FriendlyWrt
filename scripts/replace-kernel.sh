@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v30-free-old-modules"
+VERSION="2026-09-11-v31-extend-first"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -22,9 +22,7 @@ _cleanup() {
     fi
   done
   sudo rm -rf "$WORK_DIR" 2>/dev/null
-  if [ -d "$WORK_DIR" ]; then
-    rm -rf "$WORK_DIR" 2>/dev/null || true
-  fi
+  if [ -d "$WORK_DIR" ]; then rm -rf "$WORK_DIR" 2>/dev/null || true; fi
   exit $_rc
 }
 trap _cleanup EXIT
@@ -379,7 +377,6 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
   set -e
   [ $RC -ne 0 ] && { err "  unsquashfs 失败"; tail -20 "$WORK_DIR/unsquashfs.log"; exit 1; }
 
-  # 删除旧模块
   log "  清理旧内核模块"
   ls -la "$ROOT_EX/lib/modules/" 2>/dev/null | sed 's/^/    /' || true
   rm -rf "$ROOT_EX/lib/modules/"*
@@ -403,7 +400,27 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
 
 elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   # ============ ext4 ============
-  log "  检测为 ext4，使用 loop mount"
+  log "  检测为 ext4"
+
+  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+  # 【关键修复】mount 前无条件扩展 raw 到至少 3GB
+  #   原因：ext4 journal + 小文件块对齐 + inode + 目录膨胀
+  #         令 3086 个 .ko 文件的瞬时峰值占用远大于逻辑大小
+  #   反正 raw 最终写进 4GB SD 卡，1GB → 3GB 无负担
+  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+  CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
+  TARGET_RAW=$(( 3 * 1024 * 1024 * 1024 ))   # 3GB
+  if [ "$CURRENT_RAW" -lt "$TARGET_RAW" ]; then
+    log "  ★ 预扩展 raw: $(( CURRENT_RAW / 1024 / 1024 )) MiB → $(( TARGET_RAW / 1024 / 1024 )) MiB"
+    truncate -s "$TARGET_RAW" "$WORK_ROOTFS"
+    log "  e2fsck 检查..."
+    sudo e2fsck -f -y "$WORK_ROOTFS" 2>&1 | tail -3 || true
+    log "  resize2fs 扩展..."
+    sudo resize2fs "$WORK_ROOTFS" 2>&1 | tail -3 || true
+  else
+    log "  raw 已 ≥ 3GB，无需预扩展"
+  fi
+
   MNT="$WORK_DIR/mnt"
   mkdir -p "$MNT"
 
@@ -414,14 +431,12 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   [ "$MNT_OK" = "0" ] && { err "  无法 loop mount"; exit 1; }
   log "  已挂载到 $MNT"
 
-  # ---------- 初始状态 ----------
   log "  初始磁盘使用:"
   df -h "$MNT" | sed 's/^/    /'
   log "  现有 /lib/modules:"
   sudo ls -la "$MNT/lib/modules/" 2>/dev/null | sed 's/^/    /' || echo "    (空)"
 
-  # ★★★ 关键修复：删除旧内核模块 ★★★
-  log "  ★ 清理旧内核模块（内核已换成 $KVER，旧模块无用）"
+  log "  ★ 清理旧内核模块"
   OLD_SIZE=$(sudo du -sb "$MNT/lib/modules/" 2>/dev/null | awk '{print $1}' || echo 0)
   log "    旧模块占用: ${OLD_SIZE} bytes"
   sudo rm -rf "$MNT/lib/modules/"*
@@ -429,45 +444,20 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   log "  清理后磁盘使用:"
   df -h "$MNT" | sed 's/^/    /'
 
-  # ---------- 空间检查（含安全余量） ----------
   AVAIL=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
   NEED=$(du -sb "$MOD_LIB" | awk '{print $1}')
-  NEED_SAFE=$(( NEED * 15 / 10 ))     # 1.5 倍（应对小文件块对齐膨胀）
+  NEED_SAFE=$(( NEED * 3 ))    # 3 倍冗余，彻底避免 journal 峰值问题
   log "  可用: $AVAIL bytes / 逻辑需要: $NEED bytes / 保守需要: $NEED_SAFE bytes"
 
   if [ "$AVAIL" -lt "$NEED_SAFE" ]; then
-    warn "  空间仍不足，扩展 ext4 分区"
-    sudo umount -f "$MNT" 2>/dev/null || true
-    sleep 1
-    CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
-    DIFF=$(( NEED_SAFE - AVAIL + 200*1024*1024 ))    # 加 200MB 缓冲
-    NEW_TARGET=$(( CURRENT_RAW + DIFF ))
-    NEW_TARGET=$(( (NEW_TARGET / (4*1024*1024) + 1) * (4*1024*1024) ))
-    log "  扩展 raw: $CURRENT_RAW → $NEW_TARGET bytes"
-    truncate -s "$NEW_TARGET" "$WORK_ROOTFS"
-    log "  e2fsck 检查..."
-    e2fsck -f -y "$WORK_ROOTFS" 2>&1 | tail -3 || true
-    log "  resize2fs..."
-    resize2fs "$WORK_ROOTFS" 2>&1 | tail -3 || true
-
-    if sudo mount -o loop,rw "$WORK_ROOTFS" "$MNT" 2>/dev/null; then
-      log "  扩展后重新挂载成功"
-      df -h "$MNT" | sed 's/^/    /'
-    else
-      err "  扩展后无法挂载"; exit 1
-    fi
-    AVAIL=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
-    if [ "$AVAIL" -lt "$NEED_SAFE" ]; then
-      err "  扩展后仍不足（可用 $AVAIL < 保守需要 $NEED_SAFE）"; exit 1
-    fi
+    err "  即使扩展到 3GB 仍不足（可用 $AVAIL < 保守需要 $NEED_SAFE）"
+    exit 1
   fi
 
-  # ---------- 注入 ----------
   log "  注入 $KO_COUNT 个模块到 $KVER..."
   sudo mkdir -p "$MNT/lib/modules/$KVER"
   set +e
   sudo cp -a "$MOD_LIB/." "$MNT/lib/modules/$KVER/" 2>&1 | head -20
-  CP_RC=${PIPESTATUS[0]}
   set -e
   sync
 
@@ -477,11 +467,10 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   df -h "$MNT" | sed 's/^/    /'
 
   if [ "$INJECTED" -lt "$KO_COUNT" ]; then
-    err "  模块注入不完整（$INJECTED < $KO_COUNT），可能空间不足"
+    err "  模块注入不完整（$INJECTED < $KO_COUNT）"
     exit 1
   fi
 
-  # ---------- 卸载 ----------
   sync
   sudo umount -f "$MNT" 2>/dev/null || umount -f "$MNT" 2>/dev/null || true
   if mountpoint -q "$MNT" 2>/dev/null; then
