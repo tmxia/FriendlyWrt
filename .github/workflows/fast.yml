@@ -27,6 +27,17 @@ on:
         options:
           - r5s
           - r5c
+      kernel_version:
+        description: 'Kernel version'
+        required: true
+        default: '6.18.y'
+        type: choice
+        options:
+          - '6.18.y'
+          - '6.12.y'
+          - '6.6.y'
+          - '6.1.y'
+          - 'auto'
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
@@ -51,17 +62,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="FriendlyWrt-rk35xx-$(date +%Y-%m-%d)"
+          KV="${{ github.event.inputs.kernel_version }}"
+          KV_SHORT="${KV%.y}"
+          [ "$KV" = "auto" ] && KV_SHORT="auto"
+          BASE_TAG="FriendlyWrt-kv${KV_SHORT}-$(date +%Y-%m-%d)"
           FORCE_BASE=false
-          if [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
-            FORCE_BASE=true
-          fi
+          [ "${{ github.event.inputs.replace_existing }}" = "true" ] && FORCE_BASE=true
 
           if [ "$FORCE_BASE" = "true" ]; then
             EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
               | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
             for tag in $EXISTING_TAGS; do
-              echo "Deleting release and tag: $tag"
               gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
               git push origin --delete "refs/tags/$tag" || true
             done
@@ -164,11 +175,14 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         TARGET_MODEL: ${{ inputs.model }}
+        KERNEL_VERSION: ${{ inputs.kernel_version }}
       run: |
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
-        IMG_NAME="R5S-R5C-Series-FriendlyWrt-rk35xx-${{ inputs.version }}${SUFFIX}.img"
+        KV_SHORT="${KERNEL_VERSION%.y}"
+        [ "$KERNEL_VERSION" = "auto" ] && KV_SHORT="auto"
+        IMG_NAME="R5S-R5C-Series-FriendlyWrt-kv${KV_SHORT}-${{ inputs.version }}${SUFFIX}.img"
 
         bash $GITHUB_WORKSPACE/scripts/replace-kernel.sh \
           "${{ steps.images.outputs.images_tgz }}" \
@@ -199,6 +213,6 @@ jobs:
     - name: Upload img.gz as workflow artifact (backup)
       uses: actions/upload-artifact@v4
       with:
-        name: img-rk35xx-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
+        name: img-kv-${{ inputs.kernel_version }}-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
         path: ${{ github.workspace }}/artifact/*.img.gz
         retention-days: 7
