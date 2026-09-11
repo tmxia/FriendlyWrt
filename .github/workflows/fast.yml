@@ -134,22 +134,6 @@ jobs:
           touch /tmp/official/.no_reference
         fi
 
-    - name: Extract official KRNL (32 KB for reference)
-      run: |
-        OFF_IMG=$(find /tmp/official -maxdepth 1 -name "*.img" | head -1)
-        if [ -z "$OFF_IMG" ]; then
-          echo "无官方镜像"
-          touch /tmp/official/.no_krnl
-          exit 0
-        fi
-
-        echo "=== 官方 KRNL 头 256 字节 ==="
-        dd if="$OFF_IMG" bs=1 skip=$((0x12000 * 512)) count=256 2>/dev/null | xxd
-
-        # 提取 32 KB 参考
-        dd if="$OFF_IMG" of=/tmp/official_krnl.bin bs=512 skip=$((0x12000)) count=64 2>/dev/null
-        ls -la /tmp/official_krnl.bin
-
     - name: Scan and select kernel
       id: kernel
       env:
@@ -227,7 +211,10 @@ jobs:
         tar xzf "$DTB_TAR" -C dtb_extract
         ls -la boot_extract/
 
-    - name: 'Convert kernel to KRNL (use official code1 directly)'
+    # ============================================================
+    # 穷尽式诊断 + 自动提取 ARM64 Image
+    # ============================================================
+    - name: 'Extract real ARM64 Image from PE (exhaustive scan)'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
@@ -235,22 +222,26 @@ jobs:
         echo "输入: $VMLINUZ ($(stat -c%s "$VMLINUZ") bytes)"
         xxd -l 64 "$VMLINUZ"
 
-        OFF_KRNL=/tmp/official_krnl.bin
-        python3 - "$VMLINUZ" /tmp/kernel.img "$OFF_KRNL" <<'PYEOF'
-        import sys, struct, os
+        python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
+        import sys, struct, subprocess, os, gzip, bz2, lzma, io
 
         src, dst = sys.argv[1], sys.argv[2]
-        official_krnl_path = sys.argv[3] if len(sys.argv) > 3 else ""
         raw = open(src, 'rb').read()
         ARM64_MAGIC = b'ARM\x64'
 
+        print("=" * 70)
         print("输入大小: %d" % len(raw))
+        print("=" * 70)
 
         if raw[:4] == b'KRNL':
-            print("已是 KRNL"); open(dst, 'wb').write(raw); sys.exit(0)
+            print("已是 KRNL，直接使用")
+            open(dst, 'wb').write(raw); sys.exit(0)
         if raw[:2] != b'MZ':
-            print("非 PE"); sys.exit(1)
+            print("非 PE，直接当裸 Image")
+            open(dst, 'wb').write(b'KRNL' + struct.pack('<I', len(raw)) + raw)
+            sys.exit(0)
 
+        # ---------- PE 解析 ----------
         pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
         coff = pe_off + 4
         nsec = struct.unpack_from('<H', raw, coff + 2)[0]
@@ -264,94 +255,160 @@ jobs:
             rsize = struct.unpack_from('<I', raw, o + 16)[0]
             roff  = struct.unpack_from('<I', raw, o + 20)[0]
             sections.append((name, roff, rsize))
+            print("PE section %-8s fileoff=0x%08x size=%d" % (name, roff, rsize))
 
+        # ---------- 拼接 payload = .text + .data ----------
         payload = b''
-        for wanted in ('.text', '.data'):
-            for name, roff, rsize in sections:
-                if name == wanted and rsize > 0:
-                    payload += raw[roff:roff + rsize]
-                    print("  + %s: %d bytes" % (name, rsize))
-                    break
-
+        text_off = text_size = None
+        for name, roff, rsize in sections:
+            if name == '.text':
+                text_off = roff; text_size = rsize
+            if name in ('.text', '.data') and rsize > 0:
+                payload += raw[roff:roff + rsize]
+                print("  + %s: %d bytes (payload offset 0x%x)"
+                      % (name, rsize, len(payload) - rsize))
         print("payload 总大小: %d bytes" % len(payload))
 
-        # ========== 关键：直接从官方 KRNL 复制 code1 ==========
-        code1 = None
-        reason = ""
-        if os.path.exists(official_krnl_path):
-            off_krnl = open(official_krnl_path, 'rb').read()
-            if len(off_krnl) >= 0x10:
-                # 官方 KRNL 布局: [0:4]=KRNL [4:8]=size [8:0x48]=ARM64 Image header [0x48:]=payload
-                # code1 在 KRNL[0x08+0x04] = KRNL[0x0C]
-                off_code1 = struct.unpack_from('<I', off_krnl, 0x08 + 0x04)[0]
-                off_size  = struct.unpack_from('<I', off_krnl, 4)[0]
-                off_imgsz = struct.unpack_from('<Q', off_krnl, 0x08 + 0x10)[0]
-                print("")
-                print("======== 官方 KRNL 参考 ========")
-                print("  code1     = 0x%08x" % off_code1)
-                print("  size      = %d" % off_size)
-                print("  image_size= %d" % off_imgsz)
-                # 计算 code1 目标
-                imm26 = off_code1 & 0x03FFFFFF
-                if imm26 & 0x02000000:
-                    imm26 -= 0x04000000
-                off_target = 0x04 + imm26 * 4
-                print("  code1 目标 = payload[0x%x]" % off_target)
-                print("  → 直接复制官方 code1")
-                code1 = off_code1
-                reason = "从官方 KRNL 复制 code1"
+        # ============================================================
+        # 步骤 1: 反汇编 .text 前 512 字节
+        # ============================================================
+        with open('/tmp/_text_seg.bin', 'wb') as f:
+            f.write(raw[text_off:text_off + min(text_size, 0x2000)])
 
-        if code1 is None:
-            code1 = 0x1400000F
-            reason = "无官方参考, fallback B +0x3C"
+        try:
+            res = subprocess.run(
+                ['aarch64-linux-gnu-objdump', '-D', '-b', 'binary', '-m', 'aarch64',
+                 '--adjust-vma=0x0', '/tmp/_text_seg.bin'],
+                capture_output=True, text=True, timeout=30)
+            disasm_lines = res.stdout.split('\n')
+            print("")
+            print("=" * 70)
+            print("DISASM .text[0x0:0x100] (前 64 条指令)")
+            print("=" * 70)
+            cnt = 0
+            for line in disasm_lines:
+                if ':\t' in line or ': ' in line:
+                    # 只打印含实际指令的行
+                    if any(hexbyte in line for hexbyte in [':']):
+                        print(line)
+                        cnt += 1
+                        if cnt >= 80:
+                            break
+        except Exception as e:
+            print("反汇编失败: %s" % e)
+
+        # ============================================================
+        # 步骤 2: 穷尽扫描 payload 里的 ARMd magic（只要 0x38 处是 ARMd）
+        # ============================================================
+        print("")
+        print("=" * 70)
+        print("穷尽扫描 payload 里的 'ARMd' magic 位置")
+        print("=" * 70)
+        candidates = []
+        for pos in range(0, len(payload) - 0x40, 4):
+            if payload[pos + 0x38:pos + 0x3c] == ARM64_MAGIC:
+                code0  = struct.unpack_from('<I', payload, pos)[0]
+                code1  = struct.unpack_from('<I', payload, pos + 4)[0]
+                txtoff = struct.unpack_from('<Q', payload, pos + 0x08)[0]
+                imgsz  = struct.unpack_from('<Q', payload, pos + 0x10)[0]
+                flags  = struct.unpack_from('<Q', payload, pos + 0x18)[0]
+                # 合法性检查
+                valid_code0 = (code0 == 0xd503201f or (code0 & 0xFC000000) == 0x14000000)
+                valid_code1 = ((code1 & 0xFC000000) == 0x14000000)
+                valid_size  = (0x100000 < imgsz < 0x10000000)
+                mark = ""
+                if valid_code0 and valid_code1 and valid_size:
+                    mark = "  ★ 候选"
+                    candidates.append((pos, code0, code1, txtoff, imgsz, flags))
+                print("  payload[0x%08x]: code0=0x%08x code1=0x%08x txtoff=0x%x imgsz=0x%x flags=0x%x%s"
+                      % (pos, code0, code1, txtoff, imgsz, flags, mark))
 
         print("")
-        print("选择 code1 = 0x%08x  (%s)" % (code1, reason))
+        print("找到 %d 个候选 ARM64 Image header" % len(candidates))
 
-        # 构造 ARM64 Image header
-        hdr = bytearray(0x40)
-        struct.pack_into('<I', hdr, 0x00, 0xd503201f)
-        struct.pack_into('<I', hdr, 0x04, code1)
-        struct.pack_into('<Q', hdr, 0x08, 0)
-        struct.pack_into('<Q', hdr, 0x10, len(payload))
-        struct.pack_into('<Q', hdr, 0x18, 0x0a)
-        hdr[0x38:0x3c] = ARM64_MAGIC
-        knl_payload = bytes(hdr) + payload
+        # ============================================================
+        # 步骤 3: 选最佳候选（image_size 最大的）
+        # ============================================================
+        img = None
+        if candidates:
+            best = max(candidates, key=lambda c: c[4])
+            pos, code0, code1, txtoff, imgsz, flags = best
+            print("")
+            print("=" * 70)
+            print("★ 选择最佳候选: payload[0x%x]" % pos)
+            print("  code0=0x%08x code1=0x%08x imgsz=0x%x" % (code0, code1, imgsz))
+            print("=" * 70)
 
-        knl = b'KRNL' + struct.pack('<I', len(knl_payload)) + knl_payload
+            # 内核 = payload[pos : pos + imgsz]
+            if pos + imgsz <= len(payload):
+                img = payload[pos:pos + imgsz]
+                print("  提取内核: %d bytes" % len(img))
+                # 校验提取结果
+                assert img[0x38:0x3c] == ARM64_MAGIC, "提取的内核 magic 不对"
+                assert img[0x00:0x04] == payload[pos:pos+4], "code0 不一致"
+            else:
+                # 内核可能跨越 payload 末尾，取剩下的部分
+                img = payload[pos:]
+                print("  内核越过 payload 末尾，取剩余 %d bytes" % len(img))
+
+        # ============================================================
+        # 步骤 4: 兜底 - 搜索压缩 magic
+        # ============================================================
+        if img is None:
+            print("")
+            print("=" * 70)
+            print("未找到 ARM64 Image header，扫描压缩 magic")
+            print("=" * 70)
+
+            SIGS = [
+                ('gzip',  b'\x1f\x8b\x08'),
+                ('zstd',  b'\x28\xb5\x2f\xfd'),
+                ('xz',    b'\xfd\x37\x7a\x58\x5a\x00'),
+                ('lz4',   b'\x04\x22\x4d\x18'),
+                ('bzip2', b'\x42\x5a\x68'),
+            ]
+            for signame, sig in SIGS:
+                p = payload.find(sig)
+                count = 0
+                while p >= 0 and count < 5:
+                    print("  %s magic @ payload[0x%x]" % (signame, p))
+                    p = payload.find(sig, p + 1)
+                    count += 1
+
+        # ============================================================
+        # 步骤 5: 最终结果
+        # ============================================================
+        if img is None:
+            print("")
+            print("!!! 无法提取内核 !!!")
+            print("诊断信息:")
+            print("  - payload 大小: %d bytes" % len(payload))
+            print("  - .text 段从 payload 偏移 0x0 开始，长 %d 字节" % text_size)
+            print("  - .text[0:16] = %s" % payload[:16].hex())
+            print("  - payload 中 ARMd magic 出现次数: %d" % payload.count(ARM64_MAGIC))
+            sys.exit(1)
+
+        # ============================================================
+        # 构造 KRNL
+        # ============================================================
+        # img 是完整的 ARM64 Image（含 64 字节 header）
+        knl = b'KRNL' + struct.pack('<I', len(img)) + img
         open(dst, 'wb').write(knl)
 
-        # 校验
+        # 最终校验
         out = open(dst, 'rb').read(0x80)
         assert out[0:4] == b'KRNL'
-        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5'
-        assert out[0x40:0x44] == ARM64_MAGIC
-
-        # 计算 code1 目标 & 打印目标处字节（关键诊断）
-        imm26 = code1 & 0x03FFFFFF
-        if imm26 & 0x02000000:
-            imm26 -= 0x04000000
-        target_in_payload = 0x04 + imm26 * 4
-        target_in_knl = 0x08 + target_in_payload
+        assert out[0x40:0x44] == ARM64_MAGIC, "magic 必须在 0x40"
 
         print("")
-        print("======== code1 目标验证 ========")
-        print("  code1 目标: KRNL[0x%x] = payload[0x%x]" % (target_in_knl, target_in_payload))
-        if 0 <= target_in_knl and target_in_knl + 32 <= len(knl):
-            print("  目标处 32 字节: %s" % knl[target_in_knl:target_in_knl+32].hex())
-            # 尝试解读前几条指令
-            for i in range(0, 16, 4):
-                insn = struct.unpack_from('<I', knl, target_in_knl + i)[0]
-                print("    +%02x: 0x%08x" % (i, insn))
-        else:
-            print("  目标越界")
-
-        print("")
+        print("=" * 70)
         print("KRNL 结构验证")
         print("  size    = %d" % struct.unpack_from('<I', out, 4)[0])
-        print("  code0   = %s (NOP)" % out[0x08:0x0c].hex())
+        print("  code0   = %s" % out[0x08:0x0c].hex())
         print("  code1   = %s" % out[0x0c:0x10].hex())
         print("  magic   @ 0x40 = %s" % out[0x40:0x44])
+        print("  kernel[0:16] = %s" % out[0x48:0x58].hex())
+        print("=" * 70)
         print("SUCCESS")
         PYEOF
         echo "kernel.img: $(stat -c%s /tmp/kernel.img) bytes"
@@ -374,7 +431,6 @@ jobs:
 
         PARAM_FILE="$TARGET/parameter.txt"
         [ -f "$PARAM_FILE" ] || { echo "缺少 parameter.txt"; exit 1; }
-        echo "===== Before ====="; cat "$PARAM_FILE"
         python3 - "$PARAM_FILE" "$NEW_KERNEL_SIZE" <<'PARAM_PYEOF'
         import re, sys
         param_file, kernel_size = sys.argv[1], int(sys.argv[2])
@@ -408,9 +464,8 @@ jobs:
 
         with open(param_file, 'w') as f:
             f.write(content)
-        print(f"[param] 已更新 delta={delta} sectors = {delta*512/1024/1024:.1f} MiB")
+        print(f"[param] 已更新 delta={delta} sectors")
         PARAM_PYEOF
-        echo "===== After ====="; cat "$PARAM_FILE"
 
         mkdir -p "$TARGET/dtb/rockchip"
         DTB_R5S=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5s.dtb" | head -1)
@@ -457,10 +512,10 @@ jobs:
 
         if [ $RC -eq 0 ]; then
           echo "passed=true" >> $GITHUB_OUTPUT
-          echo "验证通过，允许上传"
+          echo "验证通过"
         else
           echo "passed=false" >> $GITHUB_OUTPUT
-          echo "验证失败 (exit=$RC)，禁止上传"
+          echo "验证失败 (exit=$RC)"
           exit $RC
         fi
 
