@@ -129,7 +129,7 @@ jobs:
           IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
           [ -n "$IMG" ] && echo "官方参考镜像: $IMG ($(stat -c%s "$IMG") bytes)"
         else
-          echo "⚠ 官方参考固件下载失败，跳过对比验证"
+          echo "官方参考固件下载失败，跳过对比验证"
           touch /tmp/official/.no_reference
         fi
 
@@ -211,13 +211,7 @@ jobs:
         ls -la boot_extract/
         ls dtb_extract/ | grep -E "rk3568-nanopi-r5[sc]" || echo "no r5s/r5c dtb"
 
-    # ============================================================
-    # 关键修复：PE → KRNL 转换
-    #   1) 拼接 .text + .data (不丢 .data)
-    #   2) 保留 payload 里原始 ARM64 Image header（如果有）
-    #   3) 无 header 时按 PE AddressOfEntryPoint 精算 code1
-    # ============================================================
-    - name: Convert kernel to KRNL (final fix: keep .data + entry-accurate)
+    - name: 'Convert kernel to KRNL (final fix: keep .data + entry-accurate)'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
@@ -248,7 +242,6 @@ jobs:
                 sys.exit(0)
             print("未知格式"); sys.exit(1)
 
-        # PE 解析
         pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
         assert raw[pe_off:pe_off+4] == b'PE\x00\x00'
         coff = pe_off + 4
@@ -272,20 +265,19 @@ jobs:
             print("  %-8s RVA=0x%08x VSize=0x%08x FileOff=0x%08x RawSize=0x%08x"
                   % (name, vaddr, vsize, roff, rsize))
 
-        # ===== 拼接 .text + .data（key fix）=====
         payload = b''
-        seg_offsets = []  # (name, krnl_payload_offset)
+        seg_offsets = []
         for wanted in ('.text', '.data'):
             for name, vaddr, vsize, roff, rsize in sections:
                 if name == wanted and rsize > 0:
                     seg_offsets.append((wanted, len(payload)))
                     payload += raw[roff:roff + rsize]
-                    print("  + %s: %d bytes (payload offset 0x%x)" % (wanted, rsize, seg_offsets[-1][1]))
+                    print("  + %s: %d bytes (payload offset 0x%x)"
+                          % (wanted, rsize, seg_offsets[-1][1]))
                     break
 
         print("payload 总大小: %d bytes" % len(payload))
 
-        # ===== 判断 payload 是否含标准 ARM64 Image header =====
         has_header = (len(payload) >= 0x40 and payload[0x38:0x3c] == ARM64_MAGIC)
         if has_header:
             code0_t = struct.unpack_from('<I', payload, 0x00)[0]
@@ -293,16 +285,13 @@ jobs:
             print("  payload[0:4] = 0x%08x, payload[0x38] = ARMd" % code0_t)
             if code0_t == 0xd503201f and (code1_t & 0xFC000000) == 0x14000000:
                 print("  >>> payload 已含标准 ARM64 Image header")
-                image = payload
-                knl_payload = image
+                knl_payload = payload
             else:
                 has_header = False
 
         if not has_header:
-            # ===== 构造 header，精算 code1 =====
             print("  >>> 构造 ARM64 Image header")
 
-            # entry 在 payload 里的偏移
             entry_in_payload = None
             for name, seg_off in seg_offsets:
                 for sname, vaddr, vsize, roff, rsize in sections:
@@ -310,7 +299,8 @@ jobs:
                         continue
                     if vaddr <= entry_rva < vaddr + vsize:
                         entry_in_payload = seg_off + (entry_rva - vaddr)
-                        print("  entry 位于 %s 段, payload 内偏移 0x%x" % (name, entry_in_payload))
+                        print("  entry 位于 %s 段, payload 内偏移 0x%x"
+                              % (name, entry_in_payload))
                         break
                 if entry_in_payload is not None:
                     break
@@ -319,13 +309,8 @@ jobs:
                 print("  entry 未找到，回退到 payload 起点")
                 entry_in_payload = 0
 
-            # KRNL 布局:
-            #   0x00-0x04 KRNL magic
-            #   0x04-0x08 size
-            #   0x08-0x48 Image header (0x40 字节)
-            #   0x48+   payload
             header_len = 0x40
-            payload_in_krnl = 0x08 + header_len      # 0x48
+            payload_in_krnl = 0x08 + header_len
             entry_in_krnl = payload_in_krnl + entry_in_payload
 
             code1_pos = 0x0c
@@ -338,11 +323,11 @@ jobs:
                   % (payload_in_krnl, entry_in_krnl, code1))
 
             hdr = bytearray(header_len)
-            struct.pack_into('<I', hdr, 0x00, 0xd503201f)   # code0=NOP
-            struct.pack_into('<I', hdr, 0x04, code1)        # code1=B
-            struct.pack_into('<Q', hdr, 0x08, 0)            # text_offset
-            struct.pack_into('<Q', hdr, 0x10, len(payload)) # image_size
-            struct.pack_into('<Q', hdr, 0x18, 0x0a)         # flags
+            struct.pack_into('<I', hdr, 0x00, 0xd503201f)
+            struct.pack_into('<I', hdr, 0x04, code1)
+            struct.pack_into('<Q', hdr, 0x08, 0)
+            struct.pack_into('<Q', hdr, 0x10, len(payload))
+            struct.pack_into('<Q', hdr, 0x18, 0x0a)
             hdr[0x38:0x3c] = ARM64_MAGIC
             knl_payload = bytes(hdr) + payload
 
@@ -354,7 +339,7 @@ jobs:
         assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5'
         assert out[0x40:0x44] == ARM64_MAGIC
 
-        print("✓ KRNL 结构验证")
+        print("KRNL 结构验证")
         print("  size   = %d" % struct.unpack_from('<I', out, 4)[0])
         print("  code0  = %s" % out[0x08:0x0c].hex())
         print("  code1  = %s" % out[0x0c:0x10].hex())
@@ -464,10 +449,10 @@ jobs:
 
         if [ $RC -eq 0 ]; then
           echo "passed=true" >> $GITHUB_OUTPUT
-          echo "✅ 验证通过，允许上传"
+          echo "验证通过，允许上传"
         else
           echo "passed=false" >> $GITHUB_OUTPUT
-          echo "❌ 验证失败（exit=$RC），禁止上传"
+          echo "验证失败 (exit=$RC)，禁止上传"
           exit $RC
         fi
 
