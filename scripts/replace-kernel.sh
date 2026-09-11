@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v32-strict-success-check"
+VERSION="2026-09-11-v33-img2simg-fix"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -303,7 +303,6 @@ print("\n  KNL size = %d  payload = %d  entry = 0x%x" % (len(knl), len(payload),
 print("\n  SUCCESS")
 PYEOF
 
-# ---------- sanity: 校验 kernel.img 中的 KNL ----------
 KERNEL_IMG="$TARGET_DIR/kernel.img"
 KERNEL_IMG_MAGIC=$(dd if="$KERNEL_IMG" bs=1 count=4 2>/dev/null)
 [ "$KERNEL_IMG_MAGIC" != "KRNL" ] && { err "kernel.img 头部不是 KRNL"; exit 1; }
@@ -467,10 +466,12 @@ else
   err "  不支持的 raw 格式: $RAW_FMT"; exit 1
 fi
 
+# ---------- raw → sparse ----------
+# ★★★ 关键修复：img2simg 的 block_size 是位置参数，不是 -b 选项 ★★★
 if [ "$IS_SPARSE" = "1" ]; then
   log "  转换 raw → Android sparse"
   ROOTFS_FINAL="$WORK_DIR/rootfs.final.img"
-  img2simg -b 4096 "$WORK_ROOTFS" "$ROOTFS_FINAL"
+  img2simg "$WORK_ROOTFS" "$ROOTFS_FINAL" 4096
   RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS")
   log "  最终 sparse 大小: $(stat -c%s "$ROOTFS_FINAL") bytes"
   log "  对应 raw 大小: $RAW_SIZE_FINAL bytes"
@@ -550,7 +551,6 @@ with open(param_file, 'w') as f:
 print(f"[param] kernel 已扩容 delta={delta} sectors")
 PARAM_PYEOF
 
-# ---------- 打印 parameter.txt 用于诊断 ----------
 log "  parameter.txt CMDLINE:"
 grep -E '^CMDLINE:' "$PARAM_FILE" | head -1 | sed 's/^/    /'
 
@@ -579,12 +579,11 @@ else
   warn "  ✗ uInitrd 未找到"
 fi
 
-# ---------- 列出 TARGET_DIR 内容（诊断） ----------
 log "  TARGET_DIR 内容:"
 ls -la "$TARGET_DIR" | sed 's/^/    /'
 
 # ============================================================
-# 7. 生成镜像（★ 严格判定成功）
+# 7. 生成镜像（严格判定成功）
 # ============================================================
 log "[7/8] 生成镜像"
 cd "$SDFUSE_DIR"
@@ -598,16 +597,13 @@ MK_EXIT=$?
 set -o pipefail
 set -e
 
-# ★ 总是打印 mk-sd-image.sh 完整输出
 log "  ── mk-sd-image.sh 输出 ($(wc -l < /tmp/mk-sd.log) 行) ──"
 cat /tmp/mk-sd.log | sed 's/^/    /'
 log "  ── 输出结束 ──"
 log "  mk-sd-image.sh exit=$MK_EXIT"
 
-# ★ 严格判定：日志必须包含成功标志
 if ! grep -q "RAW image successfully created" /tmp/mk-sd.log; then
-  err "  mk-sd-image.sh 未报告成功（缺少 'RAW image successfully created'）"
-  err "  可能原因：分区大小超出 img 容量 / parameter.txt 布局错误"
+  err "  mk-sd-image.sh 未报告成功"
   exit 1
 fi
 
@@ -619,7 +615,6 @@ fi
 FOUND_SIZE=$(stat -c%s "$FOUND_IMG")
 log "  img 大小: $FOUND_SIZE bytes"
 
-# ★ 立刻校验 img 内的 KNL magic
 KERNEL_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(kernel\)/\1/')
 KERNEL_BYTE_OFF=$(( KERNEL_OFFSET * 512 ))
@@ -630,7 +625,6 @@ log "  实际字节 @ $KERNEL_BYTE_OFF: $(printf '%s' "$MAGIC_AT_OFFSET" | xxd -
 
 if [ "$MAGIC_AT_OFFSET" != "KRNL" ]; then
   err "  ✗ img 中 KNL magic 缺失！"
-  err "  扫描整个 img 寻找 KRNL magic..."
   python3 - "$FOUND_IMG" <<'SCAN'
 import sys
 img = sys.argv[1]
