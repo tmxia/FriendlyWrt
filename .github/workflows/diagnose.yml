@@ -48,108 +48,89 @@ jobs:
         tar xzf /tmp/inputs/$PATTERN -C /tmp/work
         echo "BASE=$(find /tmp/work -maxdepth 1 -type d -name 'friendlywrt*' | head -1)"
 
-    - name: Diagnose
+    - name: Section 1 - sd-fuse directory structure
       run: |
-        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
         SDFUSE="/tmp/scripts/sd-fuse"
-
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 1. sd-fuse 目录结构                                    ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+        echo "===== 1.1 sd-fuse top ====="
         ls -la "$SDFUSE"
         echo ""
-        echo "─── tools/ ───"
+        echo "===== 1.2 tools/ ====="
         ls -laR "$SDFUSE/tools/" 2>&1 | head -100
         echo ""
-        echo "─── files/ ───"
+        echo "===== 1.3 files/ ====="
         ls -laR "$SDFUSE/files/" 2>&1 | head -80
         echo ""
-        echo "─── prebuilt/ ───"
+        echo "===== 1.4 prebuilt/ ====="
         ls -laR "$SDFUSE/prebuilt/" 2>&1 | head -80
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 2. build-kernel.sh（完整）                             ║"
-        echo "╚════════════════════════════════════════════════════════╝"
-        cat "$SDFUSE/build-kernel.sh" 2>/dev/null || echo "NOT FOUND"
+    - name: Section 2 - build-kernel.sh
+      run: |
+        echo "===== 2. build-kernel.sh ====="
+        cat /tmp/scripts/sd-fuse/build-kernel.sh 2>/dev/null || echo "NOT FOUND"
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 3. build-boot-img.sh（完整）                           ║"
-        echo "╚════════════════════════════════════════════════════════╝"
-        cat "$SDFUSE/build-boot-img.sh" 2>/dev/null || echo "NOT FOUND"
+    - name: Section 3 - build-boot-img.sh
+      run: |
+        echo "===== 3. build-boot-img.sh ====="
+        cat /tmp/scripts/sd-fuse/build-boot-img.sh 2>/dev/null || echo "NOT FOUND"
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 4. mk-sd-image.sh（完整）                              ║"
-        echo "╚════════════════════════════════════════════════════════╝"
-        cat "$SDFUSE/mk-sd-image.sh" 2>/dev/null || echo "NOT FOUND"
+    - name: Section 4 - mk-sd-image.sh
+      run: |
+        echo "===== 4. mk-sd-image.sh ====="
+        cat /tmp/scripts/sd-fuse/mk-sd-image.sh 2>/dev/null || echo "NOT FOUND"
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 5. build-rootfs-img.sh（完整）                         ║"
-        echo "╚════════════════════════════════════════════════════════╝"
-        cat "$SDFUSE/build-rootfs-img.sh" 2>/dev/null || echo "NOT FOUND"
+    - name: Section 5 - build-rootfs-img.sh
+      run: |
+        echo "===== 5. build-rootfs-img.sh ====="
+        cat /tmp/scripts/sd-fuse/build-rootfs-img.sh 2>/dev/null || echo "NOT FOUND"
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 6. images.tgz 顶层文件                                 ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+    - name: Section 6 - images.tgz top-level
+      run: |
+        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        echo "===== 6. images.tgz 顶层 ====="
         ls -la "$BASE"
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 7. resource.img 头部 + 内部 FDT 扫描                   ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+    - name: Section 7 - resource.img structure
+      run: |
+        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        echo "===== 7. resource.img ====="
         if [ -f "$BASE/resource.img" ]; then
-          echo "═══ 文件信息 ═══"
           stat -c "%n: %s bytes" "$BASE/resource.img"
           file -b "$BASE/resource.img"
-          echo ""
-          echo "═══ 前 256 字节 ═══"
+          echo "--- 前 256 字节 ---"
           xxd -l 256 "$BASE/resource.img"
-          echo ""
-          echo "═══ 搜索 DTB magic (d00dfeed) ═══"
-          python3 - "$BASE/resource.img" <<'PYEOF'
-import sys
-raw = open(sys.argv[1], 'rb').read()
-magic = b'\xd0\x0d\xfe\xed'
-idxs = []
-i = 0
+          echo "--- FDT magic (d00dfeed) 位置 ---"
+          python3 -c "import sys; raw=open(sys.argv[1],'rb').read(); magic=b'\xd0\x0d\xfe\xed'; idxs=[]; i=0
 while True:
-    j = raw.find(magic, i)
-    if j < 0: break
-    idxs.append(j)
-    i = j + 1
-    if len(idxs) > 30: break
-print(f"  找到 {len(idxs)} 个 FDT magic：")
-for off in idxs[:30]:
-    print(f"    @ 0x{off:x}")
-PYEOF
+    j=raw.find(magic,i)
+    if j<0: break
+    idxs.append(j); i=j+1
+    if len(idxs)>30: break
+print(f'  找到 {len(idxs)} 个 FDT magic:')
+for off in idxs: print(f'    @ 0x{off:x}')" "$BASE/resource.img"
         else
           echo "resource.img 不存在"
         fi
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 8. boot.img 类型识别                                   ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+    - name: Section 8 - boot.img structure
+      run: |
+        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        echo "===== 8. boot.img ====="
         if [ -f "$BASE/boot.img" ]; then
           stat -c "%n: %s bytes" "$BASE/boot.img"
           file -b "$BASE/boot.img"
-          echo "前 64 字节:"
+          echo "--- 前 64 字节 ---"
           xxd -l 64 "$BASE/boot.img"
         else
           echo "boot.img 不存在"
         fi
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 9. kernel.img / dtbo.img / uboot.img                   ║"
-        echo "╚════════════════════════════════════════════════════════╝"
-        for f in kernel.img dtbo.img uboot.img idbloader.img; do
+    - name: Section 9 - kernel dtbo uboot idbloader
+      run: |
+        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        echo "===== 9. 关键 img 文件 ====="
+        for f in kernel.img dtbo.img uboot.img idbloader.img misc.img; do
           if [ -f "$BASE/$f" ]; then
-            echo "═══ $f ═══"
+            echo "--- $f ---"
             stat -c "  size: %s bytes" "$BASE/$f"
             file -b "$BASE/$f"
             xxd -l 32 "$BASE/$f" | head -2
@@ -157,30 +138,41 @@ PYEOF
           fi
         done
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 10. dtb/rockchip 目录内容                              ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+    - name: Section 10 - dtb directory
+      run: |
+        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        echo "===== 10. dtb 目录 ====="
         ls -la "$BASE/dtb/" 2>/dev/null
         echo ""
         ls -la "$BASE/dtb/rockchip/" 2>/dev/null | head -30
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 11. parameter.txt（原始）                              ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+    - name: Section 11 - parameter.txt
+      run: |
+        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        echo "===== 11. parameter.txt ====="
         cat "$BASE/parameter.txt" 2>/dev/null
 
-        echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 12. tools 里所有可执行文件                             ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+    - name: Section 12 - available tools
+      run: |
+        SDFUSE="/tmp/scripts/sd-fuse"
+        echo "===== 12.1 相关工具文件 ====="
         find "$SDFUSE" -maxdepth 4 -type f \( -name "*resource*" -o -name "*dtb*" -o -name "*img*tool*" -o -name "mkimage" -o -name "dtc" \) 2>/dev/null
         echo ""
-        echo "─── 所有 executable ───"
+        echo "===== 12.2 所有可执行文件 ====="
         find "$SDFUSE" -maxdepth 4 -type f -executable 2>/dev/null | head -50
-
         echo ""
-        echo "╔════════════════════════════════════════════════════════╗"
-        echo "║ 诊断完成                                                ║"
-        echo "╚════════════════════════════════════════════════════════╝"
+        echo "===== 12.3 系统工具 ====="
+        for t in mkimage dtc simg2img img2simg lz4; do
+          if command -v $t >/dev/null 2>&1; then
+            echo "$t: $(command -v $t)"
+          else
+            echo "$t: NOT FOUND"
+          fi
+        done
+
+    - name: Summary
+      run: |
+        echo "=============================================="
+        echo "   诊断完成"
+        echo "=============================================="
+        echo "请把上述全部输出贴给我"
