@@ -52,7 +52,7 @@ jobs:
     - uses: actions/checkout@v4
 
     # ============================================================
-    # 1. 环境初始化（无 heredoc）
+    # 1. 环境初始化
     # ============================================================
     - name: Init env
       env:
@@ -64,7 +64,8 @@ jobs:
           wget curl git rsync time file unzip bc bzip2 xxd \
           python3 python3-pip dosfstools e2fsprogs parted \
           android-sdk-libsparse-utils u-boot-tools \
-          gzip xz-utils zstd lz4 binutils-aarch64-linux-gnu
+          gzip xz-utils zstd lz4 binutils-aarch64-linux-gnu \
+          squashfs-tools
         pip3 install --quiet zstandard lz4
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
@@ -95,7 +96,7 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         SUFFIX=""
-        [ "${{ inputs.set }}" = "docker" ] && SUFFIX="-docker"
+        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
         TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
         FOUND=""
@@ -110,7 +111,7 @@ jobs:
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
     # ============================================================
-    # 4. 下载官方参考（无 heredoc）
+    # 4. 下载官方参考固件
     # ============================================================
     - name: Download official
       env:
@@ -129,69 +130,9 @@ jobs:
         fi
 
     # ============================================================
-    # 5. 扫描内核版本
+    # 5. 替换内核 + 注入模块 + 生成镜像（一体化脚本）
     # ============================================================
-    - name: Scan kernel
-      id: kernel
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        KERNEL_VERSION="${{ inputs.kernel_version }}"
-        case "$KERNEL_VERSION" in
-          6.18*|6.18.y) PREFIX="6.18" ;;
-          6.12*|6.12.y) PREFIX="6.12" ;;
-          6.6*|6.6.y)   PREFIX="6.6" ;;
-          6.1*|6.1.y)   PREFIX="6.1" ;;
-          *)            PREFIX="$KERNEL_VERSION" ;;
-        esac
-        declare -A VER_TO_SOURCE
-        for target in \
-          "ophub/kernel:kernel_flippy" \
-          "ophub/kernel:kernel_rk35xx" \
-          "breakingbadboy/OpenWrt:kernel_rk35xx"; do
-          REPO="${target%%:*}"; RELEASE="${target##*:}"
-          ASSETS=$(gh release view "$RELEASE" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || echo "")
-          [ -z "$ASSETS" ] && continue
-          VERS=$(echo "$ASSETS" | grep -E "^${PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V || echo "")
-          [ -z "$VERS" ] && continue
-          for v in $VERS; do
-            [ -z "${VER_TO_SOURCE[$v]:-}" ] && VER_TO_SOURCE["$v"]="$REPO:$RELEASE"
-          done
-        done
-        [ ${#VER_TO_SOURCE[@]} -eq 0 ] && { echo "ERROR: no kernel"; exit 1; }
-        SELECTED_VER=$(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V | tail -1)
-        SELECTED_SOURCE="${VER_TO_SOURCE[$SELECTED_VER]}"
-        SELECTED_REPO="${SELECTED_SOURCE%%:*}"
-        SELECTED_RELEASE="${SELECTED_SOURCE##*:}"
-        echo "Selected: $SELECTED_VER from $SELECTED_REPO/$SELECTED_RELEASE"
-        echo "version=$SELECTED_VER" >> $GITHUB_OUTPUT
-        echo "repo=$SELECTED_REPO" >> $GITHUB_OUTPUT
-        echo "release=$SELECTED_RELEASE" >> $GITHUB_OUTPUT
-
-    # ============================================================
-    # 6. 下载内核（★ 移除全部 heredoc）
-    # ============================================================
-    - name: Download kernel
-      run: |
-        cd /tmp
-        URL="https://github.com/${{ steps.kernel.outputs.repo }}/releases/download/${{ steps.kernel.outputs.release }}/${{ steps.kernel.outputs.version }}.tar.gz"
-        wget -q --timeout=120 "$URL" -O kernel.tar.gz || curl -L -f --max-time 300 "$URL" -o kernel.tar.gz
-        tar xzf kernel.tar.gz
-        KERNEL_VER="${{ steps.kernel.outputs.version }}"
-        LOCAL_DIR=$(find . -maxdepth 1 -type d -name "*${KERNEL_VER}*" | head -1)
-        [ -z "$LOCAL_DIR" ] && LOCAL_DIR="$KERNEL_VER"
-        BOOT_TAR=$(find "$LOCAL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
-        DTB_TAR=$(find "$LOCAL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-        mkdir -p boot_extract dtb_extract
-        tar xzf "$BOOT_TAR" -C boot_extract
-        tar xzf "$DTB_TAR" -C dtb_extract
-        echo "boot_extract:"; ls -la boot_extract/ | head
-        echo "dtb_extract:";  ls -la dtb_extract/ | head
-
-    # ============================================================
-    # 7. 替换内核 + 生成镜像（只调脚本，无 heredoc）
-    # ============================================================
-    - name: Replace kernel & build image
+    - name: Replace kernel & inject modules & build image
       env:
         KERNEL_VERSION: ${{ inputs.kernel_version }}
         OFFICIAL_DIR: /tmp/official
@@ -209,7 +150,7 @@ jobs:
         echo "img_name=$IMG_FILE" >> $GITHUB_ENV
 
     # ============================================================
-    # 8. 验证
+    # 6. 验证
     # ============================================================
     - name: Verify
       id: verify
@@ -217,7 +158,7 @@ jobs:
         set +e
         bash $GITHUB_WORKSPACE/scripts/verify-against-official.sh \
           "$GITHUB_WORKSPACE/artifact/${{ env.img_name }}" \
-          "/tmp/official" "${{ steps.kernel.outputs.version }}"
+          "/tmp/official" "${{ inputs.kernel_version }}"
         RC=$?
         set -e
         if [ $RC -eq 0 ]; then
@@ -228,7 +169,7 @@ jobs:
         fi
 
     # ============================================================
-    # 9. 压缩 + 上传
+    # 7. 压缩 + 上传
     # ============================================================
     - name: Compress
       run: |
