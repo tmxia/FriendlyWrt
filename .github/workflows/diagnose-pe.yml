@@ -1,4 +1,4 @@
-name: Build KRNL from PE Kernel
+name: Convert PE Kernel to KRNL
 
 on:
   workflow_dispatch:
@@ -57,34 +57,26 @@ jobs:
         echo "===== boot_extract ====="
         ls -la boot_extract/
 
-    - name: Convert PE to KRNL
+    - name: Convert PE to KRNL (preserve layout)
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
-        SYS_MAP=$(find boot_extract -name "System.map-*" | head -1)
         [ -z "$VMLINUZ" ] && { echo "vmlinuz not found"; exit 1; }
 
         echo "VMLINUZ: $VMLINUZ"
-        echo "SYS_MAP: $SYS_MAP"
+        echo "Size: $(stat -c%s "$VMLINUZ") bytes"
 
-        echo ""
-        echo "===== System.map 关键符号 ====="
-        if [ -n "$SYS_MAP" ]; then
-          grep -E " (_text|_stext|primary_entry|_data|_edata|__init_begin)$" "$SYS_MAP" | head -20
-        fi
-
-        echo ""
-        echo "===== 开始转换 ====="
         python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
-        import sys, struct, os
+        import sys, struct
 
         src, dst = sys.argv[1], sys.argv[2]
-        data = open(src, 'rb').read()
+        data = bytearray(open(src, 'rb').read())
+        ARM64_MAGIC = bytes([0x41, 0x52, 0x4d, 0x64])  # "ARMd"
 
         print("Input size: %d bytes" % len(data))
         print("First 16 bytes: %s" % data[:16].hex())
 
-        # ---- 1. 解析 PE 头 ----
+        # ---- 1. 解析 PE 头（诊断用） ----
         pe_off = struct.unpack_from('<I', data, 0x3C)[0]
         assert data[pe_off:pe_off+4] == b'PE\x00\x00', "Not PE at 0x%x" % pe_off
         print("PE header at 0x%x" % pe_off)
@@ -94,112 +86,106 @@ jobs:
         opt_hdr_size = struct.unpack_from('<H', data, coff + 16)[0]
         sec_start = coff + 20 + opt_hdr_size
 
-        # ---- 2. 收集 sections ----
-        secs = {}
         for i in range(num_sections):
             off = sec_start + i * 40
             name = data[off:off+8].rstrip(b'\x00').decode('ascii', 'ignore')
             raw_size = struct.unpack_from('<I', data, off + 16)[0]
             raw_off = struct.unpack_from('<I', data, off + 20)[0]
-            secs[name] = (raw_off, raw_size)
-            print("Section %s: off=0x%x size=%d" % (name, raw_off, raw_size))
+            print("Section %s: raw_off=0x%x size=%d" % (name, raw_off, raw_size))
 
-        if '.text' not in secs:
-            print("ERROR: no .text section")
-            sys.exit(1)
+        # ---- 2. 关键：检测 _stext 位置 ----
+        # System.map 显示 _stext = _text + 0x10000
+        # PE .text 段 raw offset 也是 0x10000（如果匹配）
+        # 我们从 .text section 的 raw_off 推导
 
-        text_off, text_size = secs['.text']
-        text_data = data[text_off:text_off + text_size]
+        text_section_off = None
+        for i in range(num_sections):
+            off = sec_start + i * 40
+            name = data[off:off+8].rstrip(b'\x00').decode('ascii', 'ignore')
+            if name == '.text':
+                text_section_off = struct.unpack_from('<I', data, off + 20)[0]
+                break
+
+        assert text_section_off is not None, "no .text section"
         print("")
-        print(".text size: %d bytes" % len(text_data))
-        print(".text first 16: %s" % text_data[:16].hex())
+        print("_stext offset (from PE .text section): 0x%x" % text_section_off)
 
-        # .data（可选）
-        data_data = b''
-        if '.data' in secs:
-            d_off, d_size = secs['.data']
-            data_data = data[d_off:d_off + d_size]
-            print(".data size: %d bytes" % len(data_data))
+        # ---- 3. 计算 code0 (b +_stext_offset) ----
+        offset = text_section_off
+        assert offset % 4 == 0, "offset not 4-byte aligned"
+        imm26 = offset // 4
+        assert imm26 <= 0x03FFFFFF, "offset too large for B instruction"
 
-        # ---- 3. 构造 ARM64 Image ----
-        # 布局:
-        #   [0x00-0x3F] 64-byte ARM64 Image header
-        #   [0x40-...]  .text
-        #   [...       ] .data
-        #
-        # code0 = b +0x40  (从偏移 0 跳到偏移 0x40，即 .text 起始)
-        # 编码: opcode=000101, imm26 = 0x40/4 = 0x10
-        # = 0x14000010
+        code0 = 0x14000000 | imm26
 
-        code0 = 0x14000010
+        print("code0 = 0x%08x (b +0x%x)" % (code0, offset))
 
-        payload = text_data
-        if data_data:
-            # 保持 4K 对齐（可选）
-            align = (0x1000 - len(text_data) % 0x1000) % 0x1000
-            if align:
-                print("Padding .text -> .data with %d zero bytes" % align)
-                payload = text_data + b'\x00' * align + data_data
-            else:
-                payload = text_data + data_data
+        # ---- 4. 构造新 ARM64 Image 头（保留原文件其余字节） ----
+        file_size = len(data)
 
-        image_size = 64 + len(payload)
+        new_header = bytearray(64)
+        struct.pack_into('<I', new_header, 0x00, code0)          # code0: b to _stext
+        struct.pack_into('<I', new_header, 0x04, 0)              # code1
+        struct.pack_into('<Q', new_header, 0x08, 0)              # text_offset = 0
+        struct.pack_into('<Q', new_header, 0x10, file_size)      # image_size
+        struct.pack_into('<Q', new_header, 0x18, 0x0a)           # flags = 0x0a
+        new_header[0x38:0x3c] = ARM64_MAGIC
 
-        header = bytearray(64)
-        struct.pack_into('<I', header, 0x00, code0)          # code0: b +0x40
-        struct.pack_into('<I', header, 0x04, 0)              # code1
-        struct.pack_into('<Q', header, 0x08, 0)              # text_offset = 0
-        struct.pack_into('<Q', header, 0x10, image_size)     # image_size
-        struct.pack_into('<Q', header, 0x18, 0x0a)           # flags = 0x0a (4K, LE)
-        # res2, res3, res4 保持 0
-        header[0x38:0x3c] = b'ARM\x64'                       # magic
+        # 替换前 64 字节
+        data[0:0x40] = new_header
 
-        image = bytes(header) + payload
         print("")
-        print("Image size: %d bytes" % len(image))
-        print("Image header: %s" % image[:64].hex())
+        print("New header:")
+        for i in range(0, 64, 16):
+            print("  %04x: %s" % (i, bytes(data[i:i+16]).hex()))
 
-        # ---- 4. 构造 KRNL ----
-        knl = b'KRNL' + struct.pack('<I', len(image)) + image
-        print("KRNL size: %d bytes" % len(knl))
-        print("KRNL first 16: %s" % knl[:16].hex())
-
+        # ---- 5. 构造 KRNL ----
+        knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
         open(dst, 'wb').write(knl)
+        print("")
+        print("KRNL size: %d bytes" % len(knl))
 
-        # ---- 5. 验证 ----
-        check = open(dst, 'rb').read(128)
-        assert check[0:4] == b'KRNL', "KRNL missing"
-        magic_idx = check.find(b'ARM\x64')
+        # ---- 6. 验证 ----
+        check = open(dst, 'rb').read(256)
+        assert check[0:4] == b'KRNL', "KRNL magic missing"
+        magic_idx = check.find(ARM64_MAGIC)
+        code0_read = struct.unpack_from('<I', check, 8)[0]
+
         print("")
         print("验证:")
-        print("  KRNL magic: %s" % check[0:4].decode())
-        print("  KRNL size:  %d" % struct.unpack_from('<I', check, 4)[0])
-        print("  code0:      0x%08x (b +0x40)" % struct.unpack_from('<I', check, 8)[0])
-        print("  text_offset:0x%x" % struct.unpack_from('<Q', check, 16)[0])
-        print("  image_size: %d" % struct.unpack_from('<Q', check, 24)[0])
-        print("  ARM64 magic@: 0x%x (expected 0x40)" % magic_idx)
+        print("  KRNL magic:    %s" % check[0:4].decode())
+        print("  KRNL size:     %d" % struct.unpack_from('<I', check, 4)[0])
+        print("  code0:         0x%08x" % code0_read)
+        print("  text_offset:   %d" % struct.unpack_from('<Q', check, 16)[0])
+        print("  image_size:    %d" % struct.unpack_from('<Q', check, 24)[0])
+        print("  ARM64 magic@:  0x%x" % magic_idx)
+        print("  Bytes@0x40:    %s (原 PE 头残留)" % check[0x40:0x48].hex())
+        print("  Bytes@0x10000: %s (应为 PACIASP: 3f2303d5)" % check[0x10000:0x10004].hex())
 
-        if magic_idx == 0x40:
-            print("  ✓✓✓ 转换成功，KRNL 格式完全符合 U-Boot 期望")
+        assert magic_idx == 0x40, "magic misplaced"
+        # 检查 0x10000 处是否为 PACIASP
+        at_stext = check[0x10000:0x10004].hex()
+        if at_stext == "3f2303d5":
+            print("")
+            print("  ✓✓✓ 转换成功！_stext 处代码正确")
         else:
-            print("  ✗ ARM64 magic 位置异常")
-            sys.exit(1)
+            print("")
+            print("  ⚠ 0x10000 处不是 PACIASP，实际为 %s" % at_stext)
         PYEOF
 
-    - name: Verify kernel.img
+    - name: Verify kernel.img structure
       run: |
-        echo "===== 最终 kernel.img ====="
+        echo "===== kernel.img ====="
         ls -la /tmp/kernel.img
         echo ""
-        echo "前 128 字节:"
-        xxd -l 128 /tmp/kernel.img
+        echo "偏移 0x00（新头）:"
+        xxd -l 64 /tmp/kernel.img
         echo ""
-        echo "=== 反汇编前几条指令 (可选) ==="
-        if command -v aarch64-linux-gnu-objdump >/dev/null 2>&1; then
-          # 复制前 32 字节到裸文件并反汇编
-          dd if=/tmp/kernel.img of=/tmp/head.bin bs=1 count=32 skip=8 2>/dev/null
-          aarch64-linux-gnu-objdump -D -b binary -m aarch64 /tmp/head.bin 2>/dev/null | head -20
-        fi
+        echo "偏移 0x40（原 PE 头残留，可忽略）:"
+        xxd -s 0x40 -l 64 /tmp/kernel.img
+        echo ""
+        echo "偏移 0x10000（_stext 入口，应为 PACIASP）:"
+        xxd -s 0x10000 -l 64 /tmp/kernel.img
 
     - name: Upload kernel.img artifact
       uses: actions/upload-artifact@v4
