@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v31-extend-first"
+VERSION="2026-09-11-v32-strict-success-check"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -303,6 +303,12 @@ print("\n  KNL size = %d  payload = %d  entry = 0x%x" % (len(knl), len(payload),
 print("\n  SUCCESS")
 PYEOF
 
+# ---------- sanity: 校验 kernel.img 中的 KNL ----------
+KERNEL_IMG="$TARGET_DIR/kernel.img"
+KERNEL_IMG_MAGIC=$(dd if="$KERNEL_IMG" bs=1 count=4 2>/dev/null)
+[ "$KERNEL_IMG_MAGIC" != "KRNL" ] && { err "kernel.img 头部不是 KRNL"; exit 1; }
+log "  ✓ kernel.img KNL magic 校验通过 ($(stat -c%s "$KERNEL_IMG") bytes)"
+
 # ============================================================
 # 5.3 注入内核模块到 rootfs.img
 # ============================================================
@@ -352,7 +358,6 @@ RAW_FMT=$(file -b "$WORK_ROOTFS")
 log "  raw 格式: $RAW_FMT"
 
 if echo "$RAW_FMT" | grep -qi "squashfs"; then
-  # ============ squashfs ============
   command -v unsquashfs >/dev/null || { err "  缺少 unsquashfs"; exit 1; }
   command -v mksquashfs >/dev/null || { err "  缺少 mksquashfs"; exit 1; }
 
@@ -399,17 +404,9 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
   mv "$ROOTFS_NEW_RAW" "$WORK_ROOTFS"
 
 elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
-  # ============ ext4 ============
   log "  检测为 ext4"
-
-  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
-  # 【关键修复】mount 前无条件扩展 raw 到至少 3GB
-  #   原因：ext4 journal + 小文件块对齐 + inode + 目录膨胀
-  #         令 3086 个 .ko 文件的瞬时峰值占用远大于逻辑大小
-  #   反正 raw 最终写进 4GB SD 卡，1GB → 3GB 无负担
-  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
   CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
-  TARGET_RAW=$(( 3 * 1024 * 1024 * 1024 ))   # 3GB
+  TARGET_RAW=$(( 3 * 1024 * 1024 * 1024 ))
   if [ "$CURRENT_RAW" -lt "$TARGET_RAW" ]; then
     log "  ★ 预扩展 raw: $(( CURRENT_RAW / 1024 / 1024 )) MiB → $(( TARGET_RAW / 1024 / 1024 )) MiB"
     truncate -s "$TARGET_RAW" "$WORK_ROOTFS"
@@ -417,8 +414,6 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
     sudo e2fsck -f -y "$WORK_ROOTFS" 2>&1 | tail -3 || true
     log "  resize2fs 扩展..."
     sudo resize2fs "$WORK_ROOTFS" 2>&1 | tail -3 || true
-  else
-    log "  raw 已 ≥ 3GB，无需预扩展"
   fi
 
   MNT="$WORK_DIR/mnt"
@@ -433,12 +428,8 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
 
   log "  初始磁盘使用:"
   df -h "$MNT" | sed 's/^/    /'
-  log "  现有 /lib/modules:"
-  sudo ls -la "$MNT/lib/modules/" 2>/dev/null | sed 's/^/    /' || echo "    (空)"
 
   log "  ★ 清理旧内核模块"
-  OLD_SIZE=$(sudo du -sb "$MNT/lib/modules/" 2>/dev/null | awk '{print $1}' || echo 0)
-  log "    旧模块占用: ${OLD_SIZE} bytes"
   sudo rm -rf "$MNT/lib/modules/"*
   sync
   log "  清理后磁盘使用:"
@@ -446,12 +437,11 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
 
   AVAIL=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
   NEED=$(du -sb "$MOD_LIB" | awk '{print $1}')
-  NEED_SAFE=$(( NEED * 3 ))    # 3 倍冗余，彻底避免 journal 峰值问题
+  NEED_SAFE=$(( NEED * 3 ))
   log "  可用: $AVAIL bytes / 逻辑需要: $NEED bytes / 保守需要: $NEED_SAFE bytes"
 
   if [ "$AVAIL" -lt "$NEED_SAFE" ]; then
-    err "  即使扩展到 3GB 仍不足（可用 $AVAIL < 保守需要 $NEED_SAFE）"
-    exit 1
+    err "  空间不足"; exit 1
   fi
 
   log "  注入 $KO_COUNT 个模块到 $KVER..."
@@ -467,28 +457,20 @@ elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   df -h "$MNT" | sed 's/^/    /'
 
   if [ "$INJECTED" -lt "$KO_COUNT" ]; then
-    err "  模块注入不完整（$INJECTED < $KO_COUNT）"
-    exit 1
+    err "  模块注入不完整（$INJECTED < $KO_COUNT）"; exit 1
   fi
 
   sync
   sudo umount -f "$MNT" 2>/dev/null || umount -f "$MNT" 2>/dev/null || true
-  if mountpoint -q "$MNT" 2>/dev/null; then
-    warn "  挂载点未完全卸载，稍后由 trap 处理"
-  else
-    log "  已卸载"
-  fi
-
+  log "  已卸载"
 else
-  err "  不支持的 raw 格式: $RAW_FMT"
-  exit 1
+  err "  不支持的 raw 格式: $RAW_FMT"; exit 1
 fi
 
-# ---------- raw → sparse ----------
 if [ "$IS_SPARSE" = "1" ]; then
   log "  转换 raw → Android sparse"
   ROOTFS_FINAL="$WORK_DIR/rootfs.final.img"
-  img2simg "$WORK_ROOTFS" "$ROOTFS_FINAL"
+  img2simg -b 4096 "$WORK_ROOTFS" "$ROOTFS_FINAL"
   RAW_SIZE_FINAL=$(stat -c%s "$WORK_ROOTFS")
   log "  最终 sparse 大小: $(stat -c%s "$ROOTFS_FINAL") bytes"
   log "  对应 raw 大小: $RAW_SIZE_FINAL bytes"
@@ -498,7 +480,6 @@ else
   mv "$WORK_ROOTFS" "$ROOTFS_IMG"
 fi
 
-# ---------- rootfs 分区大小检查 ----------
 ROOTFS_PART=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" | head -1)
 if [ -n "$ROOTFS_PART" ]; then
   PART_SECTORS=$(echo "$ROOTFS_PART" | sed -E 's/0x([0-9a-fA-F]+)@.*/\1/')
@@ -569,6 +550,10 @@ with open(param_file, 'w') as f:
 print(f"[param] kernel 已扩容 delta={delta} sectors")
 PARAM_PYEOF
 
+# ---------- 打印 parameter.txt 用于诊断 ----------
+log "  parameter.txt CMDLINE:"
+grep -E '^CMDLINE:' "$PARAM_FILE" | head -1 | sed 's/^/    /'
+
 # ============================================================
 # 6. dtb + uInitrd
 # ============================================================
@@ -594,13 +579,17 @@ else
   warn "  ✗ uInitrd 未找到"
 fi
 
+# ---------- 列出 TARGET_DIR 内容（诊断） ----------
+log "  TARGET_DIR 内容:"
+ls -la "$TARGET_DIR" | sed 's/^/    /'
+
 # ============================================================
-# 7. 生成镜像
+# 7. 生成镜像（★ 严格判定成功）
 # ============================================================
 log "[7/8] 生成镜像"
 cd "$SDFUSE_DIR"
 chmod +x mk-sd-image.sh
-rm -f out/*.img
+rm -f out/*.img /tmp/mk-sd.log
 
 set +e
 set +o pipefail
@@ -609,24 +598,64 @@ MK_EXIT=$?
 set -o pipefail
 set -e
 
-FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
-if [ -z "$FOUND_IMG" ]; then
-  err "mk-sd-image.sh 未生成镜像 (exit=$MK_EXIT)，日志尾部:"
-  tail -50 /tmp/mk-sd.log
+# ★ 总是打印 mk-sd-image.sh 完整输出
+log "  ── mk-sd-image.sh 输出 ($(wc -l < /tmp/mk-sd.log) 行) ──"
+cat /tmp/mk-sd.log | sed 's/^/    /'
+log "  ── 输出结束 ──"
+log "  mk-sd-image.sh exit=$MK_EXIT"
+
+# ★ 严格判定：日志必须包含成功标志
+if ! grep -q "RAW image successfully created" /tmp/mk-sd.log; then
+  err "  mk-sd-image.sh 未报告成功（缺少 'RAW image successfully created'）"
+  err "  可能原因：分区大小超出 img 容量 / parameter.txt 布局错误"
   exit 1
 fi
-log "  镜像已生成: $FOUND_IMG ($(stat -c%s "$FOUND_IMG") bytes)"
+
+FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
+if [ -z "$FOUND_IMG" ]; then
+  err "  out/*.img 不存在"; exit 1
+fi
+
+FOUND_SIZE=$(stat -c%s "$FOUND_IMG")
+log "  img 大小: $FOUND_SIZE bytes"
+
+# ★ 立刻校验 img 内的 KNL magic
+KERNEL_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM_FILE" \
+  | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(kernel\)/\1/')
+KERNEL_BYTE_OFF=$(( KERNEL_OFFSET * 512 ))
+log "  期望 KNL 在 offset 0x${KERNEL_OFFSET#0x}*512 = $KERNEL_BYTE_OFF"
+
+MAGIC_AT_OFFSET=$(dd if="$FOUND_IMG" bs=1 skip=$KERNEL_BYTE_OFF count=4 2>/dev/null || echo "")
+log "  实际字节 @ $KERNEL_BYTE_OFF: $(printf '%s' "$MAGIC_AT_OFFSET" | xxd -p)"
+
+if [ "$MAGIC_AT_OFFSET" != "KRNL" ]; then
+  err "  ✗ img 中 KNL magic 缺失！"
+  err "  扫描整个 img 寻找 KRNL magic..."
+  python3 - "$FOUND_IMG" <<'SCAN'
+import sys
+img = sys.argv[1]
+with open(img, 'rb') as f:
+    data = f.read()
+idxs = []
+i = 0
+while True:
+    j = data.find(b'KRNL', i)
+    if j < 0: break
+    idxs.append(j)
+    i = j + 1
+    if len(idxs) > 20: break
+print("  KRNL magic 出现在:", [hex(x) for x in idxs[:20]])
+SCAN
+  exit 1
+fi
+
+log "  ✓ KNL magic 校验通过"
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
 # ============================================================
 # 8. 最终验证
 # ============================================================
 log "[8/8] 最终验证"
-
-KERNEL_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM_FILE" \
-  | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(kernel\)/\1/')
-KERNEL_BYTE_OFF=$(( KERNEL_OFFSET * 512 ))
-log "  kernel 分区 @ 0x${KERNEL_OFFSET#0x} 扇区 = $KERNEL_BYTE_OFF 字节"
 
 python3 - "$OUTPUT_IMG" "$KERNEL_BYTE_OFF" <<'PYEOF'
 import sys, struct
