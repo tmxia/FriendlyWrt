@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 + boot.img 重建 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v40-xz-to-gzip"
+VERSION="2026-09-11-v41-mkimg-diagnose"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -397,9 +397,7 @@ if [ -n "$UINITRD" ]; then
 fi
 
 # ============================================================
-# ★★★ 6.9 重建 boot.img (KRNL + gzip，与官方格式完全一致) ★★★
-# 官方 boot.img 结构: KRNL头(8B) + gzip数据 + 4B padding
-# 关键: U-Boot 只认 gzip，所以 XZ 数据必须先转 gzip
+# ★★★ 6.9 重建 boot.img (KRNL + gzip) ★★★
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
@@ -421,7 +419,6 @@ else
   UINITRD_SIZE=$(stat -c%s "$UINITRD_FILE")
   log "  uInitrd: $UINITRD_SIZE bytes, magic=$UINITRD_MAGIC"
 
-  # ---------- 提取 U-Boot legacy image 内的载荷 ----------
   RAW_PAYLOAD=""
   case "$UINITRD_MAGIC" in
     27051956*)
@@ -440,7 +437,6 @@ else
       ;;
   esac
 
-  # ---------- 转码为 gzip（U-Boot RK 只支持 gzip） ----------
   RAMDISK=""
   if [ -n "$RAW_PAYLOAD" ] && [ -f "$RAW_PAYLOAD" ] && [ -s "$RAW_PAYLOAD" ]; then
     PAYLOAD_MAGIC=$(dd if="$RAW_PAYLOAD" bs=1 count=4 2>/dev/null | xxd -p)
@@ -465,7 +461,7 @@ else
           log "    gzip 压缩完成: $GZ_SIZE bytes"
           RAMDISK="$WORK_DIR/boot_extract/raw.gz"
         else
-          warn "    XZ 解压失败，保留原样（U-Boot 可能无法加载）"
+          warn "    XZ 解压失败"
           RAMDISK="$RAW_PAYLOAD"
         fi
         ;;
@@ -478,9 +474,8 @@ else
         if [ $RC1 -eq 0 ] && [ -s "$WORK_DIR/boot_extract/raw" ]; then
           gzip -9 -c "$WORK_DIR/boot_extract/raw" > "$WORK_DIR/boot_extract/raw.gz"
           RAMDISK="$WORK_DIR/boot_extract/raw.gz"
-          log "    LZ4 → gzip 完成"
         else
-          warn "    LZ4 解压失败，保留原样"
+          warn "    LZ4 解压失败"
           RAMDISK="$RAW_PAYLOAD"
         fi
         ;;
@@ -491,30 +486,23 @@ else
     esac
   fi
 
-  # ---------- 构造 KRNL boot.img ----------
   if [ -n "$RAMDISK" ] && [ -f "$RAMDISK" ] && [ -s "$RAMDISK" ]; then
     DATA_SIZE=$(stat -c%s "$RAMDISK")
     log "  构造 KRNL boot.img (数据 $DATA_SIZE bytes)"
 
     python3 - "$RAMDISK" "$BOOT_IMG" <<'BOOT_BUILD'
 import sys, struct
-
 ramdisk_path = sys.argv[1]
 boot_img_path = sys.argv[2]
-
 data = open(ramdisk_path, 'rb').read()
 print(f"    数据大小: {len(data)}")
 print(f"    数据前 4 字节: {data[:4].hex()}")
-
-# KRNL 格式: 头 8B (KRNL + size) + 数据 + 尾部 4B padding
 size_field = len(data)
 hdr = b'KRNL' + struct.pack('<I', size_field)
-
 with open(boot_img_path, 'wb') as f:
     f.write(hdr)
     f.write(data)
     f.write(b'\x00\x00\x00\x00')
-
 print(f"    新 boot.img 总大小: {8 + len(data) + 4}")
 print(f"    size 字段: {size_field} (0x{size_field:08x})")
 BOOT_BUILD
@@ -529,10 +517,10 @@ BOOT_BUILD
     log "  新 boot.img 前 16 字节:"
     xxd -l 16 "$BOOT_IMG" | sed 's/^/    /'
 
-    if [ "$NEW_MAGIC" = "KRNL" ] && [ "$NEW_DATA_MAGIC" = "1f8b0800" ] || [ "$NEW_DATA_MAGIC" = "1f8b0808" ]; then
+    if [ "$NEW_MAGIC" = "KRNL" ] && { [ "$NEW_DATA_MAGIC" = "1f8b0800" ] || [ "$NEW_DATA_MAGIC" = "1f8b0808" ]; }; then
       log "  ✓ boot.img 重建成功 (payload = gzip)"
     elif [ "$NEW_MAGIC" = "KRNL" ] && [ "$NEW_SIZE" -gt 100000 ]; then
-      warn "  ⚠ boot.img 已重建但 payload 非 gzip (magic=$NEW_DATA_MAGIC)"
+      warn "  ⚠ boot.img 已重建但 payload 非 gzip"
     else
       err "  ✗ 重建失败，恢复官方 boot.img"
       [ -f "$WORK_DIR/boot.img.orig" ] && cp "$WORK_DIR/boot.img.orig" "$BOOT_IMG"
@@ -547,28 +535,74 @@ log "═════════════════════════
 log ""
 
 # ============================================================
-# 7. 生成镜像
+# 7. 生成镜像（★★★ v41 新增完整诊断 ★★★）
 # ============================================================
 log "[7/9] 生成镜像"
 cd "$SDFUSE_DIR"
 chmod +x mk-sd-image.sh
 rm -f out/*.img /tmp/mk-sd.log
 
+# 打印 TARGET_DIR 内容
+log "  TARGET_DIR 内容（$DIST_NAME）:"
+ls -la "$DIST_NAME" | sed 's/^/    /'
+
 set +e
 set +o pipefail
 yes 2>/dev/null | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
+MK_EXIT=$?
 set -o pipefail
 set -e
 
+# ★ 完整打印 mk-sd-image.sh 全部输出
+log "  ── mk-sd-image.sh 完整输出 ($(wc -l < /tmp/mk-sd.log) 行) ──"
+cat /tmp/mk-sd.log | sed 's/^/    /'
+log "  ── 输出结束 ──"
+log "  mk-sd-image.sh exit=$MK_EXIT"
+
 if ! grep -q "RAW image successfully created" /tmp/mk-sd.log; then
-  err "  mk-sd-image.sh 未成功"
-  tail -30 /tmp/mk-sd.log | sed 's/^/    /'
+  err "  mk-sd-image.sh 未报告成功"
   exit 1
 fi
 
 FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
 [ -z "$FOUND_IMG" ] && { err "  无 img"; exit 1; }
-log "  镜像: $FOUND_IMG ($(stat -c%s "$FOUND_IMG") bytes)"
+
+FOUND_SIZE=$(stat -c%s "$FOUND_IMG")
+log "  img 文件大小: $FOUND_SIZE bytes"
+
+# 稀疏文件检测
+APPARENT=$(du -B1 --apparent-size "$FOUND_IMG" 2>/dev/null | awk '{print $1}')
+PHYSICAL=$(du -B1 "$FOUND_IMG" 2>/dev/null | awk '{print $1}')
+log "  img 逻辑大小: $APPARENT bytes / 物理占用: $PHYSICAL bytes"
+if [ -n "$PHYSICAL" ] && [ -n "$APPARENT" ] && [ "$PHYSICAL" -lt $(( APPARENT / 4 )) ]; then
+  warn "  ⚠ img 是稀疏文件（物理占用 << 逻辑大小）→ 内容大部分是零"
+fi
+
+# ★★★ 校验 rootfs 分区是否有实际数据 ★★★
+ROOTFS_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" \
+  | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(rootfs\)/\1/')
+if [ -n "$ROOTFS_OFFSET" ]; then
+  ROOTFS_BYTE_OFF=$(( ROOTFS_OFFSET * 512 ))
+  log "  rootfs 分区 @ $ROOTFS_BYTE_OFF bytes"
+
+  ROOTFS_HEAD_HEX=$(dd if="$FOUND_IMG" bs=1 skip="$ROOTFS_BYTE_OFF" count=1024 2>/dev/null | xxd -p | tr -d '\n')
+  NONZERO=$(echo "$ROOTFS_HEAD_HEX" | tr -d '0' | wc -c)
+  log "  rootfs 前 1KB 非零字节数: $NONZERO"
+
+  if [ "$NONZERO" -lt 100 ]; then
+    err "  ✗ rootfs 分区前 1KB 几乎全零 —— mk-sd-image.sh 没有写入 rootfs！"
+    err "  这就是 .img.gz 只有 ~35MB 的原因（4GB img 里 90% 是零）"
+    exit 1
+  fi
+
+  ROOTFS_MAGIC2=$(dd if="$FOUND_IMG" bs=1 skip=$(( ROOTFS_BYTE_OFF + 0x438 )) count=2 2>/dev/null | xxd -p)
+  log "  rootfs 分区 @ +0x438 magic: $ROOTFS_MAGIC2"
+  if [ "$ROOTFS_MAGIC2" = "53ef" ]; then
+    log "  ✓ rootfs 分区含 ext4 magic"
+  else
+    warn "  ⚠ rootfs 分区未识别 ext4（magic=$ROOTFS_MAGIC2）"
+  fi
+fi
 
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
@@ -591,7 +625,7 @@ if [ -n "$BOOT_OFFSET" ]; then
   BOOT_MAGIC_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip=$BOOT_BYTE_OFF count=4 2>/dev/null | xxd -p)
   BOOT_DATA_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip=$(( BOOT_BYTE_OFF + 8 )) count=4 2>/dev/null | xxd -p)
   log "  boot 分区 @ $BOOT_BYTE_OFF: magic=$BOOT_MAGIC_HEX, payload=$BOOT_DATA_HEX"
-  if [ "$BOOT_MAGIC_HEX" = "4b524e4c" ] && [ "$BOOT_DATA_HEX" = "1f8b0800" -o "$BOOT_DATA_HEX" = "1f8b0808" ]; then
+  if [ "$BOOT_MAGIC_HEX" = "4b524e4c" ] && { [ "$BOOT_DATA_HEX" = "1f8b0800" ] || [ "$BOOT_DATA_HEX" = "1f8b0808" ]; }; then
     log "  ✓ boot 分区 KRNL + gzip 正确"
   fi
 fi
