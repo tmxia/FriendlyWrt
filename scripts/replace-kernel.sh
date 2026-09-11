@@ -1,8 +1,8 @@
 #!/bin/bash
-# replace-kernel.sh - 支持6.18/6.12/6.6/6.1，PE→KRNL转换 + kernel分区自动扩容
+# replace-kernel.sh - 支持6.18/6.12/6.6/6.1，PE→KRNL转换（官方格式对齐）+ kernel分区自动扩容
 set -euo pipefail
 
-VERSION="2026-09-11-v17-pe-convert-resize"
+VERSION="2026-09-11-v18-official-aligned"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -29,14 +29,14 @@ BASE_DIR=$(find "$WORK_DIR/base" -maxdepth 2 -type d -name "friendlywrt*" | head
 log "  顶层: $BASE_DIR"
 
 # ============================================================
-# 2. 扫描内核版本 (6.18/6.12/6.6/6.1)
+# 2. 扫描内核版本
 # ============================================================
 log "========== [2/8] 扫描 $KERNEL_VERSION 内核 =========="
 
 declare -A VER_TO_SOURCE
 SCAN_LIST=(
-  "ophub/kernel:kernel_rk35xx"
   "ophub/kernel:kernel_flippy"
+  "ophub/kernel:kernel_rk35xx"
   "breakingbadboy/OpenWrt:kernel_rk35xx"
   "breakingbadboy/OpenWrt:kernel_stable"
 )
@@ -64,10 +64,7 @@ for target in "${SCAN_LIST[@]}"; do
     VERS=$(echo "$ASSETS" | grep -E '^6\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V || echo "")
   fi
 
-  if [ -z "$VERS" ]; then
-    log "    (无匹配)"
-    continue
-  fi
+  [ -z "$VERS" ] && { log "    (无匹配)"; continue; }
 
   log "    匹配版本:"
   echo "$VERS" | sed 's/^/      /'
@@ -136,9 +133,9 @@ rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
 
 # ============================================================
-# 5. 构造 kernel.img —— PE→KRNL 转换
+# 5. 构造 kernel.img —— PE→KRNL 转换（官方格式对齐）
 # ============================================================
-log "========== [5/8] 构造 kernel.img =========="
+log "========== [5/8] 构造 kernel.img（官方格式对齐） =========="
 
 IMAGE_FILE=""
 for pattern in "vmlinuz-*" "Image" "Image-*" "kernel*.img" "*.bin"; do
@@ -153,167 +150,142 @@ log "  类型: $(file -b "$IMAGE_FILE")"
 log "  前 64 字节:"
 xxd -l 64 "$IMAGE_FILE" | sed 's/^/    /'
 
-MAGIC=$(xxd -l 4 -p "$IMAGE_FILE")
-log "  magic: $MAGIC"
-
-if [ "$MAGIC" = "4b524e4c" ]; then
-  log "  >>> KRNL 格式，直接使用"
-  cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
-elif [ "$MAGIC" = "d00dfeed" ]; then
-  log "  >>> FIT 格式，直接使用"
-  cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
-else
-  log "  >>> 调用 PE 解析器..."
-  python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" <<'PYEOF'
-import sys, struct, os
+python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" <<'PYEOF'
+import sys, struct
 
 src, dst = sys.argv[1], sys.argv[2]
-data = open(src, 'rb').read()
+raw = open(src, 'rb').read()
+ARM64_MAGIC = b'ARM\x64'
 
-is_pe = data[0:2] == b'MZ'
-if is_pe:
-    print(f"    检测到 PE 格式 (MZ signature)")
-    pe_off = struct.unpack_from('<I', data, 0x3C)[0]
-    print(f"    PE header offset: 0x{pe_off:x}")
+print("  输入大小: %d" % len(raw))
 
-    if data[pe_off:pe_off+4] != b'PE\x00\x00':
-        print(f"    ✗ PE 签名不匹配，回退为裸机处理")
-        is_pe = False
+if raw[:4] == b'KRNL':
+    print("  已是 KRNL，直接使用")
+    open(dst, 'wb').write(raw)
+    sys.exit(0)
+
+if raw[:2] == b'MZ':
+    pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
+    assert raw[pe_off:pe_off+4] == b'PE\x00\x00', "PE 签名错误"
+    print("  PE header @ 0x%x" % pe_off)
+
+    coff = pe_off + 4
+    nsec = struct.unpack_from('<H', raw, coff + 2)[0]
+    opt_size = struct.unpack_from('<H', raw, coff + 16)[0]
+    sec_base = coff + 20 + opt_size
+
+    secs = []
+    for i in range(nsec):
+        o = sec_base + i * 40
+        name = raw[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
+        roff  = struct.unpack_from('<I', raw, o + 20)[0]
+        rsize = struct.unpack_from('<I', raw, o + 16)[0]
+        secs.append((name, roff, rsize))
+        print("    Section %-8s file_off=0x%08x size=%d" % (name, roff, rsize))
+
+    payload = b''
+    for wanted in ('.text', '.rodata', '.data'):
+        for sname, roff, rsize in secs:
+            if sname == wanted:
+                payload += raw[roff:roff + rsize]
+                print("    + %s: %d bytes" % (wanted, rsize))
+
+    if not payload:
+        secs.sort(key=lambda x: -x[2])
+        payload = raw[secs[0][1]:secs[0][1] + secs[0][2]]
+        print("    (fallback) 取最大节 %s: %d bytes" % (secs[0][0], secs[0][2]))
+
+    print("  payload 总大小: %d bytes" % len(payload))
+
+    if len(payload) >= 0x40 and payload[0x38:0x3c] == ARM64_MAGIC:
+        print("  payload 已是标准 ARM64 Image")
+        image = payload
     else:
-        coff = pe_off + 4
-        machine = struct.unpack_from('<H', data, coff)[0]
-        num_sections = struct.unpack_from('<H', data, coff + 2)[0]
-        opt_size = struct.unpack_from('<H', data, coff + 16)[0]
-        print(f"    Machine: 0x{machine:04x} (0xaa64 = ARM64)")
-        print(f"    Sections: {num_sections}")
-        print(f"    Optional header size: {opt_size}")
-
-        sec_start = coff + 20 + opt_size
-        sections = []
-        for i in range(num_sections):
-            sec_off = sec_start + i * 40
-            name = data[sec_off:sec_off+8].rstrip(b'\x00').decode('ascii', 'ignore')
-            raw_size = struct.unpack_from('<I', data, sec_off + 16)[0]
-            raw_off = struct.unpack_from('<I', data, sec_off + 20)[0]
-            sections.append((name, raw_off, raw_size))
-            print(f"      Section {i}: {name:<8} RawOff=0x{raw_off:08x} RawSize=0x{raw_size:08x}")
-
-        linux_sec = next((s for s in sections if s[0] == '.linux'), None)
-        text_sec = next((s for s in sections if s[0] == '.text'), None)
-        target = linux_sec or text_sec
-
-        if target:
-            name, raw_off, raw_size = target
-            print(f"    >>> 提取节 '{name}': offset=0x{raw_off:x}, size={raw_size}")
-            kernel_data = data[raw_off:raw_off + raw_size]
-            print(f"    提取大小: {len(kernel_data)} bytes")
-            magic_pos = kernel_data.find(b'ARM\x64')
-            print(f"    ARM64 magic 位置: 0x{magic_pos:x}")
-            data = kernel_data
-        else:
-            print(f"    ✗ 找不到 .linux 或 .text 节，回退为裸机处理")
-            is_pe = False
-
-if not is_pe:
-    print(f"    作为裸机 ARM64 Image 处理")
-    magic_pos = data.find(b'ARM\x64')
-    print(f"    ARM64 magic 位置: 0x{magic_pos:x}")
-
-    if magic_pos == 0x38:
-        print(f"    ✓ 标准 ARM64 Image 头")
-        code0 = struct.unpack_from('<I', data, 0x00)[0]
-        if code0 != 0xd503201f:
-            print(f"    修复 code0: 0x{code0:08x} -> NOP")
-            data = bytearray(data)
-            data[0x00:0x04] = b'\x1f\x20\x03\xd5'
-            data = bytes(data)
-    else:
-        print(f"    ⚠ magic 位置异常 (0x{magic_pos:x})，不做修改")
-
-knl_size = len(data)
-size_hex = struct.pack('<I', knl_size)
-with open(dst, 'wb') as f:
-    f.write(b'KRNL')
-    f.write(size_hex)
-    f.write(data)
-
-out = open(dst, 'rb').read(128)
-assert out[0:4] == b'KRNL', 'KRNL missing'
-out_size = struct.unpack_from('<I', out, 4)[0]
-magic_pos2 = out.find(b'ARM\x64')
-print(f"    KRNL size: {out_size}")
-print(f"    magic@:    0x{magic_pos2:x}")
-if magic_pos2 == 0x40:
-    print(f"    ✓✓✓ KRNL 转换成功")
-elif magic_pos2 > 0:
-    print(f"    ✓ KRNL 转换完成 (magic@0x{magic_pos2:x})")
+        print("  构造 ARM64 Image 头: code0=NOP, code1=B +0x40")
+        b_insn = 0x14000000 | (0x40 // 4)
+        hdr = bytearray(0x40)
+        struct.pack_into('<I', hdr, 0x00, 0xd503201f)
+        struct.pack_into('<I', hdr, 0x04, b_insn)
+        struct.pack_into('<Q', hdr, 0x08, 0)
+        struct.pack_into('<Q', hdr, 0x10, len(payload))
+        struct.pack_into('<Q', hdr, 0x18, 0x0a)
+        hdr[0x38:0x3c] = ARM64_MAGIC
+        image = bytes(hdr) + payload
 else:
-    print(f"    ⚠ KRNL 转换完成但未找到 ARM64 magic")
+    idx = raw.find(ARM64_MAGIC)
+    print("  非 PE/KRNL，magic @ 0x%x" % idx)
+    if idx == 0x38:
+        image = raw
+    else:
+        print("  ✗ 未知格式"); sys.exit(1)
+
+knl = b'KRNL' + struct.pack('<I', len(image)) + image
+open(dst, 'wb').write(knl)
+
+out = open(dst, 'rb').read(0x80)
+assert out[0:4] == b'KRNL'
+assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 必须是 NOP"
+assert out[0x40:0x44] == ARM64_MAGIC, "magic 必须在 0x40"
+
+print("  ✓ 官方格式对齐验证通过")
+print("    KRNL size @ 0x04 = %d" % struct.unpack_from('<I', out, 4)[0])
+print("    code0 @ 0x08     = %s (NOP)" % out[0x08:0x0c].hex())
+print("    code1 @ 0x0c     = %s" % out[0x0c:0x10].hex())
+print("    magic @ 0x40     = %s" % out[0x40:0x44])
+print("  SUCCESS")
 PYEOF
-fi
 
 log "  新 kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
+xxd -l 96 "$TARGET_DIR/kernel.img" | sed 's/^/    /'
 
 # ============================================================
-# 5.5 动态扩容 kernel 分区（新增关键修复）
+# 5.5 动态扩容 kernel 分区
 # ============================================================
 log "========== [5.5/8] 扩容 kernel 分区 =========="
 
 PARAM_FILE="$TARGET_DIR/parameter.txt"
 [ -f "$PARAM_FILE" ] || { err "缺少 parameter.txt"; exit 1; }
-log "  修改前:"
-sed 's/^/    /' "$PARAM_FILE"
 
 python3 - "$PARAM_FILE" "$(stat -c%s "$TARGET_DIR/kernel.img")" <<'PARAM_PYEOF'
 import re, sys
 param_file, kernel_size = sys.argv[1], int(sys.argv[2])
-
 with open(param_file) as f:
     content = f.read()
 
-# 匹配 0xSIZE@0xOFFSET(kernel)
-kernel_re = re.compile(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(kernel\)',
-                       re.IGNORECASE)
+kernel_re = re.compile(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(kernel\)', re.IGNORECASE)
 m = kernel_re.search(content)
 if not m:
-    print("[param] 未找到 kernel 分区，跳过"); sys.exit(0)
+    print("[param] 未找到 kernel 分区"); sys.exit(0)
 
 old_size   = int(m.group(1), 16)
 kernel_off = int(m.group(2), 16)
 kernel_end = kernel_off + old_size
 
 need_sectors = (kernel_size + 511) // 512
-rounded  = ((need_sectors + 0xFFF) // 0x1000) * 0x1000  # 2MiB 对齐
+rounded  = ((need_sectors + 0x3FFF) // 0x4000) * 0x4000
 new_size = max(rounded, old_size)
 
-print(f"[param] old  = 0x{old_size:x} ({old_size*512/1024/1024:.1f} MiB)")
-print(f"[param] need = 0x{need_sectors:x} sectors ({need_sectors*512/1024/1024:.1f} MiB)")
-print(f"[param] new  = 0x{new_size:x} ({new_size*512/1024/1024:.1f} MiB)")
+print(f"[param] old={old_size*512/1024/1024:.1f} MiB need={need_sectors*512/1024/1024:.1f} MiB new={new_size*512/1024/1024:.1f} MiB")
 
 if new_size == old_size:
-    print("[param] 容量足够，无需扩容"); sys.exit(0)
+    print("[param] 无需扩容"); sys.exit(0)
 
 delta = new_size - old_size
-
-# 替换 kernel 分区大小（保留原 offset）
 new_kernel = f'0x{new_size:08x}@{m.group(2)}(kernel)'
 content = content[:m.start()] + new_kernel + content[m.end():]
 
-# kernel 之后的所有 @offset 整体平移
 def shift(match):
     off = int(match.group(1), 16)
     if off >= kernel_end:
         return f'@0x{off + delta:08x}'
     return match.group(0)
-
 content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 
 with open(param_file, 'w') as f:
     f.write(content)
-print(f"[param] parameter.txt 已更新 (delta = {delta} sectors = {delta*512/1024/1024:.1f} MiB)")
+print(f"[param] 已更新 (delta={delta} sectors = {delta*512/1024/1024:.1f} MiB)")
 PARAM_PYEOF
 
-log "  修改后:"
 sed 's/^/    /' "$PARAM_FILE"
 
 # ============================================================
@@ -365,30 +337,56 @@ yes | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
 MK_EXIT=$?
 set -e
 echo "  mk-sd-image.sh exit=$MK_EXIT"
-tail -40 /tmp/mk-sd.log | sed 's/^/    /'
+tail -30 /tmp/mk-sd.log | sed 's/^/    /'
 
 FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
 [ -z "$FOUND_IMG" ] && { err "未生成镜像"; exit 1; }
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
 # ============================================================
-# 8. 最终验证
+# 8. 最终验证（含与官方对比，如果有 REF_IMG）
 # ============================================================
 log "========== [8/8] 验证 =========="
 KERNEL_OFFSET=$((0x12000 * 512))
-python3 - "$OUTPUT_IMG" "$KERNEL_OFFSET" <<'PYEOF'
-import sys
+
+python3 - "$OUTPUT_IMG" "$KERNEL_OFFSET" "${REF_IMG:-}" <<'PYEOF'
+import sys, os
 img, off = sys.argv[1], int(sys.argv[2])
+ref = sys.argv[3] if len(sys.argv) > 3 else ""
+
 with open(img, 'rb') as f:
-    f.seek(off); data = f.read(128)
+    f.seek(off); data = f.read(256)
+
 assert data[0:4] == b'KRNL', 'KRNL missing'
-knl_size = int.from_bytes(data[4:8], 'little')
-code0    = int.from_bytes(data[8:12], 'little')
-idx = data.find(b'ARM\x64')
-print(f"    KRNL size: {knl_size}")
-print(f"    code0:     0x{code0:08x} ({'NOP' if code0 == 0xd503201f else '??'})")
-print(f"    magic@:    0x{idx:x}")
-assert idx == 0x40, f'ARM64 magic 位置错误: 0x{idx:x}'
+assert data[0x08:0x0c] == b'\x1f\x20\x03\xd5', 'code0 必须是 NOP'
+magic_idx = data.find(b'ARM\x64')
+assert magic_idx == 0x40, f'magic 位置错误 0x{magic_idx:x}'
+
+print(f"    自建 KRNL size: {int.from_bytes(data[4:8],'little')}")
+print(f"    自建 code0:     {data[0x08:0x0c].hex()} (NOP)")
+print(f"    自建 code1:     {data[0x0c:0x10].hex()}")
+print(f"    自建 magic@:    0x{magic_idx:x}")
+
+if ref and os.path.exists(ref):
+    with open(ref, 'rb') as f:
+        f.seek(off); ref_data = f.read(256)
+    if ref_data[0:4] == b'KRNL':
+        print()
+        print(f"    官方 KRNL size: {int.from_bytes(ref_data[4:8],'little')}")
+        print(f"    官方 code0:     {ref_data[0x08:0x0c].hex()}")
+        print(f"    官方 code1:     {ref_data[0x0c:0x10].hex()}")
+        print(f"    官方 magic@:    0x{ref_data.find(b'ARM\x64'):x}")
+
+        if data[0x08:0x0c] == ref_data[0x08:0x0c]:
+            print("    ✅ code0 与官方一致")
+        else:
+            print("    ❌ code0 与官方不一致")
+            sys.exit(1)
+    else:
+        print(f"    ⚠ 官方参考固件在 0x{off:x} 处不是 KRNL，跳过对比")
+else:
+    print("    （无官方参考固件，跳过对比）")
+
 print("    ✓✓✓ 最终镜像含有效内核")
 PYEOF
 
