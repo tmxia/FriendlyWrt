@@ -38,6 +38,16 @@ on:
           - '6.6.y'
           - '6.1.y'
           - 'auto'
+      official_release_tag:
+        description: '官方固件 Release tag（用于结构对比）'
+        required: true
+        default: 'FriendlyWrt-2026-09-04'
+        type: string
+      official_asset:
+        description: '官方固件 asset 名（.img.gz）'
+        required: true
+        default: 'R5S-R5C-Series-FriendlyWrt-24.10-docker.img.gz'
+        type: string
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
@@ -51,65 +61,15 @@ env:
   AUTO_REPLACE_TAG: 'false'
 
 jobs:
-  prepare_release:
+  # ============================================================
+  # 阶段一：构建（含验证门禁）
+  # ============================================================
+  build:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     outputs:
-      release_tag: ${{ steps.release_tag.outputs.tag }}
-    steps:
-      - name: Generate unique release tag
-        id: release_tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          KV="${{ github.event.inputs.kernel_version }}"
-          KV_SHORT="${KV%.y}"
-          [ "$KV" = "auto" ] && KV_SHORT="auto"
-          BASE_TAG="FriendlyWrt-kv${KV_SHORT}-$(date +%Y-%m-%d)"
-          FORCE_BASE=false
-          [ "${{ github.event.inputs.replace_existing }}" = "true" ] && FORCE_BASE=true
-
-          if [ "$FORCE_BASE" = "true" ]; then
-            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
-              | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-            for tag in $EXISTING_TAGS; do
-              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
-              git push origin --delete "refs/tags/$tag" || true
-            done
-            TAG="$BASE_TAG"
-          else
-            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
-              | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-            if [ -z "$EXISTING_TAGS" ]; then
-              TAG="$BASE_TAG"
-            else
-              MAX_NUM=0
-              for t in $EXISTING_TAGS; do
-                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
-                  NUM=${BASH_REMATCH[1]}
-                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
-                fi
-              done
-              TAG="${BASE_TAG}-$((MAX_NUM+1))"
-            fi
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Create or update release
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.release_tag.outputs.tag }}
-          draft: false
-          prerelease: false
-          allow_updates: true
-          overwrite: true
-
-  build:
-    needs: prepare_release
-    runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
+      verified: ${{ steps.verify.outputs.passed }}
+      img_name: ${{ env.img_name }}
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -164,6 +124,28 @@ jobs:
         gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
+    # 下载官方固件到 /tmp/official 用于后续对比
+    - name: Download official reference image
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REF_TAG: ${{ inputs.official_release_tag }}
+        REF_ASSET: ${{ inputs.official_asset }}
+      run: |
+        mkdir -p /tmp/official
+        cd /tmp/official
+        gh release download "$REF_TAG" --repo "$GITHUB_REPOSITORY" \
+          --pattern "$REF_ASSET" --dir . || {
+            echo "⚠ 官方参考固件下载失败，跳过对比验证"
+            touch /tmp/official/.no_reference
+            exit 0
+          }
+        ls -la
+        gunzip -k *.img.gz 2>/dev/null || true
+        IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
+        if [ -n "$IMG" ]; then
+          echo "官方参考镜像: $IMG ($(stat -c%s "$IMG") bytes)"
+        fi
+
     - name: Scan and select kernel
       id: kernel
       env:
@@ -182,8 +164,8 @@ jobs:
 
         declare -A VER_TO_SOURCE
         SCAN_LIST=(
-          "ophub/kernel:kernel_rk35xx"
           "ophub/kernel:kernel_flippy"
+          "ophub/kernel:kernel_rk35xx"
           "breakingbadboy/OpenWrt:kernel_rk35xx"
           "breakingbadboy/OpenWrt:kernel_stable"
         )
@@ -248,91 +230,100 @@ jobs:
         ls -la boot_extract/
         ls dtb_extract/ | grep -E "rk3568-nanopi-r5[sc]" || echo "no r5s/r5c dtb"
 
-    - name: Convert kernel to KRNL
+    # ============================================================
+    # 修复后的 PE → KRNL 转换
+    # ============================================================
+    - name: Convert kernel to KRNL (official-aligned)
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
         [ -z "$VMLINUZ" ] && { echo "vmlinuz not found"; exit 1; }
+        echo "输入: $VMLINUZ ($(stat -c%s "$VMLINUZ") bytes)"
+        xxd -l 64 "$VMLINUZ"
+
         python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
         import sys, struct
 
         src, dst = sys.argv[1], sys.argv[2]
-        data = bytearray(open(src, 'rb').read())
-        ARM64_MAGIC = bytes([0x41, 0x52, 0x4d, 0x64])
+        raw = open(src, 'rb').read()
+        ARM64_MAGIC = b'ARM\x64'
 
-        print("Input size: %d" % len(data))
-        print("First 16 bytes: %s" % data[:16].hex())
+        print("输入大小: %d" % len(raw))
 
-        if data[:4] == b'KRNL':
-            print("Already KRNL")
-            open(dst, 'wb').write(data)
+        if raw[:4] == b'KRNL':
+            print("已是 KRNL，直接使用")
+            open(dst, 'wb').write(raw)
             sys.exit(0)
 
-        if data[:2] == b'MZ':
-            pe_off = struct.unpack_from('<I', data, 0x3C)[0]
-            assert data[pe_off:pe_off+4] == b'PE\x00\x00', "Bad PE"
-            print("PE header at 0x%x" % pe_off)
+        if raw[:2] == b'MZ':
+            pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
+            assert raw[pe_off:pe_off+4] == b'PE\x00\x00', "PE 签名错误"
+            print("PE header @ 0x%x" % pe_off)
 
             coff = pe_off + 4
-            num_sections = struct.unpack_from('<H', data, coff + 2)[0]
-            opt_hdr_size = struct.unpack_from('<H', data, coff + 16)[0]
-            sec_start = coff + 20 + opt_hdr_size
+            nsec = struct.unpack_from('<H', raw, coff + 2)[0]
+            opt_size = struct.unpack_from('<H', raw, coff + 16)[0]
+            sec_base = coff + 20 + opt_size
 
-            text_off = None
-            for i in range(num_sections):
-                off = sec_start + i * 40
-                name = data[off:off+8].rstrip(b'\x00').decode('ascii', 'ignore')
-                raw_off = struct.unpack_from('<I', data, off + 20)[0]
-                raw_size = struct.unpack_from('<I', data, off + 16)[0]
-                print("Section %s: off=0x%x size=%d" % (name, raw_off, raw_size))
-                if name == '.text':
-                    text_off = raw_off
+            secs = []
+            for i in range(nsec):
+                o = sec_base + i * 40
+                name = raw[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
+                roff  = struct.unpack_from('<I', raw, o + 20)[0]
+                rsize = struct.unpack_from('<I', raw, o + 16)[0]
+                secs.append((name, roff, rsize))
+                print("  Section %-8s file_off=0x%08x size=%d" % (name, roff, rsize))
 
-            assert text_off is not None, "no .text"
-            print("_stext offset: 0x%x" % text_off)
+            payload = b''
+            for wanted in ('.text', '.rodata', '.data'):
+                for sname, roff, rsize in secs:
+                    if sname == wanted:
+                        payload += raw[roff:roff + rsize]
+                        print("  + %s: %d bytes" % (wanted, rsize))
 
-            imm26 = text_off // 4
-            assert imm26 <= 0x03FFFFFF, "offset too large"
-            code0 = 0x14000000 | imm26
-            print("code0 = 0x%08x (b +0x%x)" % (code0, text_off))
+            if not payload:
+                secs.sort(key=lambda x: -x[2])
+                payload = raw[secs[0][1]:secs[0][1] + secs[0][2]]
+                print("  (fallback) 取最大节 %s: %d bytes" % (secs[0][0], secs[0][2]))
 
-            file_size = len(data)
-            new_header = bytearray(64)
-            struct.pack_into('<I', new_header, 0x00, code0)
-            struct.pack_into('<I', new_header, 0x04, 0)
-            struct.pack_into('<Q', new_header, 0x08, 0)
-            struct.pack_into('<Q', new_header, 0x10, file_size)
-            struct.pack_into('<Q', new_header, 0x18, 0x0a)
-            new_header[0x38:0x3c] = ARM64_MAGIC
-            data[0:0x40] = new_header
+            print("payload 总大小: %d bytes" % len(payload))
 
-            knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
-            open(dst, 'wb').write(knl)
+            if len(payload) >= 0x40 and payload[0x38:0x3c] == ARM64_MAGIC:
+                print("payload 已是标准 ARM64 Image")
+                image = payload
+            else:
+                print("构造 ARM64 Image 头: code0=NOP, code1=B +0x40")
+                b_insn = 0x14000000 | (0x40 // 4)
+                hdr = bytearray(0x40)
+                struct.pack_into('<I', hdr, 0x00, 0xd503201f)
+                struct.pack_into('<I', hdr, 0x04, b_insn)
+                struct.pack_into('<Q', hdr, 0x08, 0)
+                struct.pack_into('<Q', hdr, 0x10, len(payload))
+                struct.pack_into('<Q', hdr, 0x18, 0x0a)
+                hdr[0x38:0x3c] = ARM64_MAGIC
+                image = bytes(hdr) + payload
+        else:
+            idx = raw.find(ARM64_MAGIC)
+            print("非 PE/KRNL，magic @ 0x%x" % idx)
+            if idx == 0x38:
+                image = raw
+            else:
+                print("未知格式"); sys.exit(1)
 
-            check = open(dst, 'rb').read(0x10010)
-            assert check[0:4] == b'KRNL'
-            magic_idx = check.find(ARM64_MAGIC)
-            at_stext = check[0x10008:0x1000C].hex()
-            print("KRNL magic@: 0x%x" % magic_idx)
-            print("PACIASP check: %s" % at_stext)
-            assert magic_idx == 0x40
-            assert at_stext == "3f2303d5", "PACIASP mismatch"
-            print("SUCCESS")
-            sys.exit(0)
+        knl = b'KRNL' + struct.pack('<I', len(image)) + image
+        open(dst, 'wb').write(knl)
 
-        magic_idx = data.find(ARM64_MAGIC)
-        print("Not PE. magic@0x%x" % magic_idx)
-        if magic_idx == 0x38:
-            print("Clean ARM64 Image")
-            file_size = len(data)
-            struct.pack_into('<Q', data, 0x10, file_size)
-            knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
-            open(dst, 'wb').write(knl)
-            print("SUCCESS")
-            sys.exit(0)
+        out = open(dst, 'rb').read(0x80)
+        assert out[0:4] == b'KRNL'
+        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 必须是 NOP"
+        assert out[0x40:0x44] == ARM64_MAGIC, "magic 必须在 0x40"
 
-        print("Unknown format")
-        sys.exit(1)
+        print("✓ 官方格式对齐验证通过")
+        print("  KRNL size @ 0x04 = %d" % struct.unpack_from('<I', out, 4)[0])
+        print("  code0 @ 0x08     = %s (NOP)" % out[0x08:0x0c].hex())
+        print("  code1 @ 0x0c     = %s" % out[0x0c:0x10].hex())
+        print("  magic @ 0x40     = %s" % out[0x40:0x44])
+        print("SUCCESS")
         PYEOF
         echo "kernel.img: $(stat -c%s /tmp/kernel.img) bytes"
         xxd -l 96 /tmp/kernel.img
@@ -358,34 +349,28 @@ jobs:
         python3 - "$PARAM_FILE" "$NEW_KERNEL_SIZE" <<'PARAM_PYEOF'
         import re, sys
         param_file, kernel_size = sys.argv[1], int(sys.argv[2])
-
         with open(param_file) as f:
             content = f.read()
 
-        kernel_re = re.compile(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(kernel\)',
-                               re.IGNORECASE)
+        kernel_re = re.compile(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(kernel\)', re.IGNORECASE)
         m = kernel_re.search(content)
         if not m:
-            print("[param] 未找到 kernel 分区，跳过"); sys.exit(0)
+            print("[param] 未找到 kernel 分区"); sys.exit(0)
 
         old_size   = int(m.group(1), 16)
         kernel_off = int(m.group(2), 16)
         kernel_end = kernel_off + old_size
 
         need_sectors = (kernel_size + 511) // 512
-        # 8MiB 对齐，避免频繁扩容
-        rounded  = ((need_sectors + 0x3FFF) // 0x4000) * 0x4000
+        rounded = ((need_sectors + 0x3FFF) // 0x4000) * 0x4000
         new_size = max(rounded, old_size)
 
-        print(f"[param] old  = 0x{old_size:x} ({old_size*512/1024/1024:.1f} MiB)")
-        print(f"[param] need = 0x{need_sectors:x} sectors ({need_sectors*512/1024/1024:.1f} MiB)")
-        print(f"[param] new  = 0x{new_size:x} ({new_size*512/1024/1024:.1f} MiB)")
+        print(f"[param] old={old_size*512/1024/1024:.1f} MiB  need={need_sectors*512/1024/1024:.1f} MiB  new={new_size*512/1024/1024:.1f} MiB")
 
         if new_size == old_size:
-            print("[param] 容量足够，无需扩容"); sys.exit(0)
+            print("[param] 无需扩容"); sys.exit(0)
 
         delta = new_size - old_size
-
         new_kernel = f'0x{new_size:08x}@{m.group(2)}(kernel)'
         content = content[:m.start()] + new_kernel + content[m.end():]
 
@@ -394,12 +379,11 @@ jobs:
             if off >= kernel_end:
                 return f'@0x{off + delta:08x}'
             return match.group(0)
-
         content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 
         with open(param_file, 'w') as f:
             f.write(content)
-        print(f"[param] parameter.txt 已更新 (delta = {delta} sectors = {delta*512/1024/1024:.1f} MiB)")
+        print(f"[param] 已更新 (delta={delta} sectors)")
         PARAM_PYEOF
         echo "===== After ====="; cat "$PARAM_FILE"
 
@@ -408,12 +392,10 @@ jobs:
         DTB_R5C=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5c.dtb" | head -1)
         [ -n "$DTB_R5S" ] && cp "$DTB_R5S" "$TARGET/dtb/rockchip/rk3568-nanopi-r5s.dtb"
         [ -n "$DTB_R5C" ] && cp "$DTB_R5C" "$TARGET/dtb/rockchip/rk3568-nanopi-r5c.dtb"
-        echo "dtb/rockchip:"
         ls -la "$TARGET/dtb/rockchip/"
 
         UINITRD=$(find /tmp/boot_extract -name "uInitrd-*" | head -1)
         [ -n "$UINITRD" ] && cp "$UINITRD" "$TARGET/uInitrd"
-        echo "kernel.img: $(stat -c%s "$TARGET/kernel.img") bytes"
 
     - name: Build final image
       run: |
@@ -426,7 +408,7 @@ jobs:
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit=$MK_EXIT"
-        tail -60 /tmp/mk-sd.log
+        tail -40 /tmp/mk-sd.log
 
         FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
         [ -z "$FOUND_IMG" ] && { echo "No image"; exit 1; }
@@ -437,42 +419,32 @@ jobs:
         mv "$FOUND_IMG" "$GITHUB_WORKSPACE/artifact/$IMG_FILE"
         echo "img_name=$IMG_FILE" >> $GITHUB_ENV
 
-        # 验证最终镜像
-        python3 - "$GITHUB_WORKSPACE/artifact/$IMG_FILE" <<'PYEOF'
-        import sys, struct
-        img = sys.argv[1]
-        with open(img, 'rb') as f:
-            f.seek(0x12000 * 512)
-            data = f.read(256)
-        assert data[0:4] == b'KRNL', 'KRNL missing'
-        idx = data.find(b'ARM\x64')
-        print("Final image: KRNL magic at 0x%x" % idx)
-        assert idx == 0x40
-        print("OK")
+    # ============================================================
+    # 核心新增：与官方固件对比验证
+    # ============================================================
+    - name: Verify against official firmware
+      id: verify
+      run: |
+        set +e
+        bash $GITHUB_WORKSPACE/scripts/verify-against-official.sh \
+          "$GITHUB_WORKSPACE/artifact/${{ env.img_name }}" \
+          "/tmp/official" \
+          "${{ steps.kernel.outputs.version }}"
+        RC=$?
+        set -e
 
-        # 打印 GPT 分区表，确认 kernel 分区已扩容
-        print("=== GPT 分区表（来自镜像 LBA1） ===")
-        with open(img, 'rb') as f:
-            f.seek(512)
-            header = f.read(92)
-        assert header[0:8] == b'EFI PART', 'GPT signature missing'
-        entries_lba = struct.unpack_from('<Q', header, 72)[0]
-        num_entries = struct.unpack_from('<I', header, 80)[0]
-        entry_size  = struct.unpack_from('<I', header, 84)[0]
-        with open(img, 'rb') as f:
-            f.seek(entries_lba * 512)
-            entries = f.read(entry_size * num_entries)
-        for i in range(num_entries):
-            off = i * entry_size
-            nb = entries[off+56:off+56+72]
-            name = nb.split(b'\x00')[0].decode('utf-16-le', errors='ignore').strip()
-            if not name: continue
-            first = struct.unpack_from('<Q', entries, off+32)[0]
-            last  = struct.unpack_from('<Q', entries, off+40)[0]
-            size_mb = (last - first + 1) * 512 / 1024 / 1024
-            print(f"  {name:<12} @ LBA 0x{first:x} size={size_mb:>6.1f} MiB")
-        PYEOF
+        if [ $RC -eq 0 ]; then
+          echo "passed=true" >> $GITHUB_OUTPUT
+          echo "✅ 验证通过，允许上传发布"
+        else
+          echo "passed=false" >> $GITHUB_OUTPUT
+          echo "❌ 验证失败（exit=$RC），禁止上传"
+          exit $RC
+        fi
 
+    # ============================================================
+    # 压缩（仅在验证通过后运行）
+    # ============================================================
     - name: Compress image to gz
       run: |
         cd $GITHUB_WORKSPACE/artifact
@@ -482,16 +454,87 @@ jobs:
           SIZE=$(stat -c%s "$f")
           echo "$f -> $SIZE bytes"
           if [ "$SIZE" -ge 2147483648 ]; then
-            echo "ERROR: $f 超过 GitHub Release 2GiB 单 asset 限制"
+            echo "ERROR: $f 超过 GitHub Release 2GiB 限制"
             exit 1
           fi
         done
 
-    - name: Upload img.gz only
-      uses: svenstaro/upload-release-action@v2
+    - name: Upload artifact (only when verified)
+      uses: actions/upload-artifact@v4
       with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ env.img_name }}.gz
-        asset_name: ${{ env.img_name }}.gz
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
+        name: firmware-${{ env.img_name }}
+        path: ./artifact/${{ env.img_name }}.gz
+        retention-days: 7
+
+  # ============================================================
+  # 阶段二：发布（依赖 build 阶段验证通过）
+  # ============================================================
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    if: |
+      github.event.repository.owner.id == github.event.sender.id &&
+      needs.build.outputs.verified == 'true'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Download verified artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: firmware-${{ needs.build.outputs.img_name }}
+        path: ./artifact
+
+    - name: List artifact
+      run: ls -la ./artifact/
+
+    - name: Generate unique release tag
+      id: release_tag
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        KV="${{ github.event.inputs.kernel_version }}"
+        KV_SHORT="${KV%.y}"
+        [ "$KV" = "auto" ] && KV_SHORT="auto"
+        BASE_TAG="FriendlyWrt-kv${KV_SHORT}-$(date +%Y-%m-%d)"
+        FORCE_BASE=false
+        [ "${{ github.event.inputs.replace_existing }}" = "true" ] && FORCE_BASE=true
+
+        if [ "$FORCE_BASE" = "true" ]; then
+          EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
+            | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+          for tag in $EXISTING_TAGS; do
+            gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+            git push origin --delete "refs/tags/$tag" || true
+          done
+          TAG="$BASE_TAG"
+        else
+          EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
+            | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+          if [ -z "$EXISTING_TAGS" ]; then
+            TAG="$BASE_TAG"
+          else
+            MAX_NUM=0
+            for t in $EXISTING_TAGS; do
+              if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                NUM=${BASH_REMATCH[1]}
+                [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+              fi
+            done
+            TAG="${BASE_TAG}-$((MAX_NUM+1))"
+          fi
+        fi
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.release_tag.outputs.tag }}
+        name: "R5S/R5C FriendlyWrt ${{ inputs.version }} + Flippy KV ${{ inputs.kernel_version }}"
+        draft: false
+        prerelease: false
+        generate_release_notes: true
+        files: |
+          ./artifact/*.img.gz
