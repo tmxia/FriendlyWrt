@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 + boot.img 重建 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v41-mkimg-diagnose"
+VERSION="2026-09-11-v42-rootfs-partition-expand"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -349,6 +349,57 @@ else
 fi
 
 # ============================================================
+# ★★★ 5.4 rootfs 分区大小检查 + 自动扩展 ★★★
+# 修复：rootfs.img 是 2GiB，但 parameter.txt 里 rootfs 分区只有 1GiB
+#       mk-sd-image.sh 会拒绝写入，导致最终 img 里 rootfs 是空的
+# ============================================================
+log "[5.4/9] 检查/扩展 rootfs 分区"
+
+ROOTFS_PART=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" | head -1)
+if [ -n "$ROOTFS_PART" ]; then
+  PART_SECTORS=$(echo "$ROOTFS_PART" | sed -E 's/0x([0-9a-fA-F]+)@.*/\1/')
+  PART_BYTES=$(( 0x$PART_SECTORS * 512 ))
+  log "  parameter.txt rootfs 分区: $PART_SECTORS sectors = $PART_BYTES bytes ($((PART_BYTES/1024/1024)) MiB)"
+  log "  rootfs raw 大小: $RAW_SIZE_FINAL bytes ($((RAW_SIZE_FINAL/1024/1024)) MiB)"
+
+  if [ "$RAW_SIZE_FINAL" -gt "$PART_BYTES" ]; then
+    warn "  ★ rootfs raw ($((RAW_SIZE_FINAL/1024/1024)) MiB) > 分区 ($((PART_BYTES/1024/1024)) MiB)，扩展 parameter.txt"
+    python3 - "$PARAM_FILE" "$RAW_SIZE_FINAL" <<'PARAM_EXPAND'
+import re, sys
+param_file, new_bytes = sys.argv[1], int(sys.argv[2])
+content = open(param_file).read()
+m = re.search(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(rootfs\)', content)
+old_size = int(m.group(1), 16)
+rootfs_off = int(m.group(2), 16)
+rootfs_end = rootfs_off + old_size
+need = (new_bytes + 511) // 512
+rounded = ((need + 0x3FFF) // 0x4000) * 0x4000
+new_size = max(rounded, old_size)
+if new_size == old_size:
+    print("[param] rootfs 无需扩展"); sys.exit(0)
+delta = new_size - old_size
+print(f"[param] rootfs: {old_size*512/1024/1024:.1f}MiB → {new_size*512/1024/1024:.1f}MiB (delta={delta} sectors)")
+# 替换 rootfs size
+content = content[:m.start()] + f'0x{new_size:08x}@{m.group(2)}(rootfs)' + content[m.end():]
+# 调整 rootfs 之后所有分区的偏移
+def shift(mt):
+    off = int(mt.group(1), 16)
+    return f'@0x{off + delta:08x}' if off >= rootfs_end else mt.group(0)
+content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
+open(param_file, 'w').write(content)
+print(f"[param] 后续分区偏移 +{delta} sectors")
+PARAM_EXPAND
+    log "  ✓ rootfs 分区已扩展"
+  else
+    log "  ✓ rootfs raw ($RAW_SIZE_FINAL) ≤ 分区 ($PART_BYTES)"
+  fi
+else
+  warn "  parameter.txt 无 rootfs 分区定义"
+fi
+
+log "  ✓ rootfs.img 处理完成"
+
+# ============================================================
 # 5.5 扩容 kernel 分区
 # ============================================================
 log "[5.5/9] 扩容 kernel 分区"
@@ -371,8 +422,12 @@ def shift(mt):
     return f'@0x{off + delta:08x}' if off >= kernel_end else mt.group(0)
 content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
 open(param_file, 'w').write(content)
-print(f"[param] kernel: {old_size*512//1024//1024}→{new_size*512//1024//1024} MiB")
+print(f"[param] kernel: {old_size*512//1024//1024}→{new_size*512//1024//1024} MiB (delta={delta} sectors)")
 PARAM_PYEOF
+
+# 打印最终 parameter.txt 诊断
+log "  parameter.txt CMDLINE:"
+grep -E '^CMDLINE:' "$PARAM_FILE" | head -1 | sed 's/^/    /'
 
 # ============================================================
 # 6. dtb + uInitrd
@@ -397,7 +452,7 @@ if [ -n "$UINITRD" ]; then
 fi
 
 # ============================================================
-# ★★★ 6.9 重建 boot.img (KRNL + gzip) ★★★
+# 6.9 重建 boot.img (KRNL + gzip)
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
@@ -504,7 +559,6 @@ with open(boot_img_path, 'wb') as f:
     f.write(data)
     f.write(b'\x00\x00\x00\x00')
 print(f"    新 boot.img 总大小: {8 + len(data) + 4}")
-print(f"    size 字段: {size_field} (0x{size_field:08x})")
 BOOT_BUILD
 
     NEW_SIZE=$(stat -c%s "$BOOT_IMG" 2>/dev/null || echo 0)
@@ -535,14 +589,13 @@ log "═════════════════════════
 log ""
 
 # ============================================================
-# 7. 生成镜像（★★★ v41 新增完整诊断 ★★★）
+# 7. 生成镜像
 # ============================================================
 log "[7/9] 生成镜像"
 cd "$SDFUSE_DIR"
 chmod +x mk-sd-image.sh
 rm -f out/*.img /tmp/mk-sd.log
 
-# 打印 TARGET_DIR 内容
 log "  TARGET_DIR 内容（$DIST_NAME）:"
 ls -la "$DIST_NAME" | sed 's/^/    /'
 
@@ -553,7 +606,6 @@ MK_EXIT=$?
 set -o pipefail
 set -e
 
-# ★ 完整打印 mk-sd-image.sh 全部输出
 log "  ── mk-sd-image.sh 完整输出 ($(wc -l < /tmp/mk-sd.log) 行) ──"
 cat /tmp/mk-sd.log | sed 's/^/    /'
 log "  ── 输出结束 ──"
@@ -570,15 +622,10 @@ FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
 FOUND_SIZE=$(stat -c%s "$FOUND_IMG")
 log "  img 文件大小: $FOUND_SIZE bytes"
 
-# 稀疏文件检测
 APPARENT=$(du -B1 --apparent-size "$FOUND_IMG" 2>/dev/null | awk '{print $1}')
 PHYSICAL=$(du -B1 "$FOUND_IMG" 2>/dev/null | awk '{print $1}')
 log "  img 逻辑大小: $APPARENT bytes / 物理占用: $PHYSICAL bytes"
-if [ -n "$PHYSICAL" ] && [ -n "$APPARENT" ] && [ "$PHYSICAL" -lt $(( APPARENT / 4 )) ]; then
-  warn "  ⚠ img 是稀疏文件（物理占用 << 逻辑大小）→ 内容大部分是零"
-fi
 
-# ★★★ 校验 rootfs 分区是否有实际数据 ★★★
 ROOTFS_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(rootfs\)/\1/')
 if [ -n "$ROOTFS_OFFSET" ]; then
@@ -590,8 +637,7 @@ if [ -n "$ROOTFS_OFFSET" ]; then
   log "  rootfs 前 1KB 非零字节数: $NONZERO"
 
   if [ "$NONZERO" -lt 100 ]; then
-    err "  ✗ rootfs 分区前 1KB 几乎全零 —— mk-sd-image.sh 没有写入 rootfs！"
-    err "  这就是 .img.gz 只有 ~35MB 的原因（4GB img 里 90% 是零）"
+    err "  ✗ rootfs 分区前 1KB 几乎全零"
     exit 1
   fi
 
@@ -599,8 +645,6 @@ if [ -n "$ROOTFS_OFFSET" ]; then
   log "  rootfs 分区 @ +0x438 magic: $ROOTFS_MAGIC2"
   if [ "$ROOTFS_MAGIC2" = "53ef" ]; then
     log "  ✓ rootfs 分区含 ext4 magic"
-  else
-    warn "  ⚠ rootfs 分区未识别 ext4（magic=$ROOTFS_MAGIC2）"
   fi
 fi
 
@@ -614,7 +658,7 @@ log "[8/9] 最终验证"
 KERNEL_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(kernel\)/\1/')
 KERNEL_BYTE_OFF=$(( KERNEL_OFFSET * 512 ))
-MAGIC=$(dd if="$OUTPUT_IMG" bs=1 skip=$KERNEL_BYTE_OFF count=4 2>/dev/null)
+MAGIC=$(dd if="$OUTPUT_IMG" bs=1 skip="$KERNEL_BYTE_OFF" count=4 2>/dev/null)
 [ "$MAGIC" != "KRNL" ] && { err "  KNL magic 缺失"; exit 1; }
 log "  ✓ kernel KNL magic @ $KERNEL_BYTE_OFF"
 
@@ -622,7 +666,7 @@ BOOT_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(boot\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(boot\)/\1/')
 if [ -n "$BOOT_OFFSET" ]; then
   BOOT_BYTE_OFF=$(( BOOT_OFFSET * 512 ))
-  BOOT_MAGIC_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip=$BOOT_BYTE_OFF count=4 2>/dev/null | xxd -p)
+  BOOT_MAGIC_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip="$BOOT_BYTE_OFF" count=4 2>/dev/null | xxd -p)
   BOOT_DATA_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip=$(( BOOT_BYTE_OFF + 8 )) count=4 2>/dev/null | xxd -p)
   log "  boot 分区 @ $BOOT_BYTE_OFF: magic=$BOOT_MAGIC_HEX, payload=$BOOT_DATA_HEX"
   if [ "$BOOT_MAGIC_HEX" = "4b524e4c" ] && { [ "$BOOT_DATA_HEX" = "1f8b0800" ] || [ "$BOOT_DATA_HEX" = "1f8b0808" ]; }; then
