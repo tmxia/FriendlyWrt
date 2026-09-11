@@ -109,7 +109,6 @@ jobs:
         mkdir -p /tmp/official && cd /tmp/official
         if gh release download "$REF_TAG" --repo "$GITHUB_REPOSITORY" \
              --pattern "$REF_ASSET" --dir .; then
-          ls -la
           gunzip -k *.img.gz 2>/dev/null || true
           IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
           [ -n "$IMG" ] && echo "官方参考: $IMG"
@@ -169,7 +168,10 @@ jobs:
         tar xzf "$BOOT_TAR" -C boot_extract
         tar xzf "$DTB_TAR" -C dtb_extract
 
-    - name: 'Build KRNL with primary_entry detection'
+    # ============================================================
+    # 最终方案：payload = 完整 .text，code1 长跳转到 primary_entry
+    # ============================================================
+    - name: 'Build KRNL: full .text + long jump to primary_entry'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
@@ -183,7 +185,7 @@ jobs:
         raw = open(src, 'rb').read()
         ARM64_MAGIC = b'ARM\x64'
 
-        # PE 解析
+        # PE parse
         pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
         coff = pe_off + 4
         nsec = struct.unpack_from('<H', raw, coff + 2)[0]
@@ -191,96 +193,84 @@ jobs:
         sec_base = coff + 20 + opt_size
 
         text_off = text_size = None
+        data_off = data_size = 0
         for i in range(nsec):
             o = sec_base + i * 40
             name = raw[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
             rsize = struct.unpack_from('<I', raw, o + 16)[0]
             roff  = struct.unpack_from('<I', raw, o + 20)[0]
+            print("  section %s: off=0x%x size=%d" % (name, roff, rsize))
             if name == '.text':
                 text_off = roff; text_size = rsize
-                print("  .text: off=0x%x size=%d" % (roff, rsize))
+            elif name == '.data':
+                data_off = roff; data_size = rsize
 
-        text = raw[text_off:text_off + text_size]
-        print("Flippy .text: %d bytes" % len(text))
+        # payload = 完整 .text（我们只跳转 primary_entry，其他数据不影响）
+        payload = raw[text_off:text_off + text_size]
+        print("payload (完整 .text): %d bytes" % len(payload))
 
         # ============================================================
-        # 关键：搜 primary_entry
-        #   mrs x19, currentel  =  0xd5384253  →  内存字节 53 42 38 d5
+        # 搜 primary_entry = mrs x19, currentel (53 42 38 d5)
         # ============================================================
         print("")
         print("=" * 70)
-        print("搜 primary_entry (mrs x19, currentel = 53 42 38 d5)")
+        print("搜 primary_entry (53 42 38 d5)")
         print("=" * 70)
 
         PE_ENTRY = b'\x53\x42\x38\xd5'
-
-        hits = []
+        primary_entry_off = None
         pos = 0
-        while len(hits) < 20:
-            p = text.find(PE_ENTRY, pos)
+        while True:
+            p = payload.find(PE_ENTRY, pos)
             if p < 0: break
-            hits.append(p)
+            # 检查后面是不是 cmp x19, #8 (7f ?? 00/20 f1)
+            if p + 8 <= len(payload):
+                next4 = payload[p+4:p+8]
+                # 也可能是 mov w0, ... 之类
+                # 只打印候选
+                print("  候选 @ 0x%08x: %s" % (p, payload[p:p+16].hex()))
+                if primary_entry_off is None:
+                    primary_entry_off = p
             pos = p + 1
 
-        print("找到 %d 个 'mrs x19, currentel'：" % len(hits))
-        for p in hits:
-            # 打印附近上下文
-            ctx = text[max(0,p-8):p+24]
-            # 解读附近的指令
-            print("  偏移 0x%08x: 上下文 %s" % (p, ctx.hex()))
-
-        # 判据：
-        #   primary_entry 的特征 = paciasp; mrs x19, currentel; cmp x19,#...
-        #   即位置 p 之前 4 字节 是 paciasp (3f 23 03 d5)
-        paciasp = b'\x3f\x23\x03\xd5'
-        primary_entry_off = None
-        for p in hits:
-            if p >= 4 and text[p-4:p] == paciasp:
-                print("  ★ 位置 0x%x 前 4 字节 = PACIASP  → primary_entry 起点 = 0x%x" % (p, p-4))
-                primary_entry_off = p - 4
-                break
-
-        if primary_entry_off is None and hits:
-            # 退而求其次：取第一个命中位置
-            primary_entry_off = hits[0]
-            print("  ⚠ 没有 PACIASP 前缀，取第一个命中位置 = 0x%x" % primary_entry_off)
-
         if primary_entry_off is None:
-            # 完全搜不到 primary_entry，用 fallback: .text[0]
-            print("  ⚠ 未找到 primary_entry，使用 .text[0] 作为入口")
-            primary_entry_off = 0
+            print("未找到 primary_entry")
+            sys.exit(1)
 
-        # ============================================================
-        # 提取 payload = .text[primary_entry_off:]
-        #   跳过 EFI stub / PE 包装
-        # ============================================================
-        payload = text[primary_entry_off:]
         print("")
-        print("payload = .text[0x%x:] = %d bytes" % (primary_entry_off, len(payload)))
-        print("  payload[0:16]: %s" % payload[:16].hex())
+        print("★ primary_entry @ payload[0x%x] = 完整 .text 的偏移 0x%x" %
+              (primary_entry_off, primary_entry_off))
 
         # ============================================================
         # 构造 KRNL
         #   KRNL[0:4]   = "KRNL"
         #   KRNL[4:8]   = size
-        #   KRNL[8:0x48] = ARM64 header (code0=NOP, code1=B 跳 payload)
-        #   KRNL[0x48:]  = payload
+        #   KRNL[8:0x48] = ARM64 header (code0=NOP, code1=长跳转, ...)
+        #   KRNL[0x48:]  = payload（完整 .text）
+        #
+        # code1 位于 KRNL[0x0C]（对应 payload[0x04]）
+        # 目标 = KRNL[0x48 + primary_entry_off]
+        # 相对偏移 = (0x48 + primary_entry_off) - 0x0C
         # ============================================================
         PAYLOAD_OFF = 0x48
-        # code1 位于 KRNL[0x0C]，跳到 KRNL[0x48]
-        # 相对偏移 = 0x48 - 0x0C = 0x3C
-        # imm26 = 0x3C / 4 = 0xF
-        code1 = 0x14000000 | 0xF
-        print("code1 = 0x%08x (B +0x3C, 从 KRNL[0xC] 跳到 KRNL[0x48])" % code1)
+        target_in_knl = PAYLOAD_OFF + primary_entry_off
+        rel = target_in_knl - 0x0C
+        assert rel % 4 == 0, "code1 偏移未对齐: 0x%x" % rel
+        assert rel >= 0, "code1 偏移为负"
+        assert rel // 4 <= 0x01FFFFFF, "code1 偏移过大, 超出 B 指令范围"
+        imm26 = (rel // 4) & 0x03FFFFFF
+        code1 = 0x14000000 | imm26
+        print("code1 = 0x%08x  (B +0x%x, 从 KRNL[0xC] 跳到 KRNL[0x%x])" %
+              (code1, rel, target_in_knl))
 
-        hdr = bytearray(0x48)
-        struct.pack_into('<I', hdr, 0x00, 0x4c4e524b)       # "KRNL" (LE)
-        struct.pack_into('<I', hdr, 0x04, PAYLOAD_OFF + len(payload))
-        struct.pack_into('<I', hdr, 0x08, 0xd503201f)       # code0 = NOP
-        struct.pack_into('<I', hdr, 0x0C, code1)            # code1 = B +0x3C
-        struct.pack_into('<Q', hdr, 0x10, 0)                # text_offset
-        struct.pack_into('<Q', hdr, 0x18, len(payload))     # image_size
-        struct.pack_into('<Q', hdr, 0x20, 0x0a)             # flags
+        hdr = bytearray(PAYLOAD_OFF)
+        struct.pack_into('<I', hdr, 0x00, 0x4c4e524b)                # "KRNL"
+        struct.pack_into('<I', hdr, 0x04, PAYLOAD_OFF + len(payload))  # size
+        struct.pack_into('<I', hdr, 0x08, 0xd503201f)                # code0 = NOP
+        struct.pack_into('<I', hdr, 0x0C, code1)                     # code1 = B
+        struct.pack_into('<Q', hdr, 0x10, 0)                         # text_offset
+        struct.pack_into('<Q', hdr, 0x18, len(payload))              # image_size
+        struct.pack_into('<Q', hdr, 0x20, 0x0a)                      # flags
         hdr[0x40:0x44] = ARM64_MAGIC
 
         knl = bytes(hdr) + payload
@@ -290,10 +280,21 @@ jobs:
         # 校验
         # ============================================================
         out = open(dst, 'rb').read(0x80)
-        assert out[0:4] == b'KRNL', "KRNL magic 缺失"
-        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 不是 NOP"
-        assert out[0x40:0x44] == ARM64_MAGIC, "ARM64 magic 位置错误"
-        assert out[0x48:0x48+8] == payload[:8], "payload 位置错误"
+        assert out[0:4] == b'KRNL'
+        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5'
+        assert out[0x40:0x44] == ARM64_MAGIC
+        assert out[PAYLOAD_OFF:PAYLOAD_OFF+8] == payload[:8]
+
+        # 确认 code1 目标处的字节 = primary_entry
+        target_bytes = knl[target_in_knl:target_in_knl+8]
+        print("")
+        print("=" * 70)
+        print("code1 目标验证")
+        print("=" * 70)
+        print("  目标 KRNL[0x%x] = payload[0x%x]" % (target_in_knl, primary_entry_off))
+        print("  目标处 8 字节: %s" % target_bytes.hex())
+        print("  期望: %s" % PE_ENTRY.hex())
+        assert target_bytes[:4] == PE_ENTRY, "code1 没有跳到 primary_entry"
 
         print("")
         print("KRNL 结构验证")
@@ -301,9 +302,9 @@ jobs:
         print("  size 字段 [4:8]     = %d" % struct.unpack_from('<I', out, 4)[0])
         print("  code0 [0x08:0x0C]   = %s (NOP)" % out[0x08:0x0c].hex())
         print("  code1 [0x0C:0x10]   = %s" % out[0x0c:0x10].hex())
-        print("  image_size [0x18]   = 0x%x" % struct.unpack_from('<Q', out, 0x18)[0])
+        print("  image_size [0x18]   = 0x%x (%d)" % (struct.unpack_from('<Q', out, 0x18)[0], struct.unpack_from('<Q', out, 0x18)[0]))
         print("  magic  [0x40:0x44]  = %s" % out[0x40:0x44])
-        print("  payload [0x48:0x50] = %s" % out[0x48:0x50].hex())
+        print("  payload 大小        = %d" % len(payload))
         print("SUCCESS")
         PYEOF
         echo ""
