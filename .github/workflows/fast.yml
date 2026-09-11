@@ -168,9 +168,8 @@ jobs:
         mkdir -p boot_extract dtb_extract
         tar xzf "$BOOT_TAR" -C boot_extract
         tar xzf "$DTB_TAR" -C dtb_extract
-        ls -la boot_extract/
 
-    - name: 'Extract real kernel from EFI zboot'
+    - name: 'Build KRNL with primary_entry detection'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
@@ -178,185 +177,133 @@ jobs:
         echo "输入: $VMLINUZ ($(stat -c%s "$VMLINUZ") bytes)"
 
         python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
-        import sys, struct, gzip, bz2, lzma
+        import sys, struct
 
         src, dst = sys.argv[1], sys.argv[2]
         raw = open(src, 'rb').read()
         ARM64_MAGIC = b'ARM\x64'
 
-        # PE parse
+        # PE 解析
         pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
         coff = pe_off + 4
         nsec = struct.unpack_from('<H', raw, coff + 2)[0]
         opt_size = struct.unpack_from('<H', raw, coff + 16)[0]
         sec_base = coff + 20 + opt_size
 
-        sections = {}
+        text_off = text_size = None
         for i in range(nsec):
             o = sec_base + i * 40
             name = raw[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
             rsize = struct.unpack_from('<I', raw, o + 16)[0]
             roff  = struct.unpack_from('<I', raw, o + 20)[0]
-            sections[name] = (roff, rsize)
-            print("  section %s: off=0x%x size=%d" % (name, roff, rsize))
+            if name == '.text':
+                text_off = roff; text_size = rsize
+                print("  .text: off=0x%x size=%d" % (roff, rsize))
 
-        text_off, text_size = sections.get('.text', (0, 0))
-        data_off, data_size = sections.get('.data', (0, 0))
-        payload = raw[text_off:text_off + text_size] + raw[data_off:data_off + data_size]
-        print("payload total: %d bytes" % len(payload))
+        text = raw[text_off:text_off + text_size]
+        print("Flippy .text: %d bytes" % len(text))
 
-        # 搜 zboot magic
+        # ============================================================
+        # 关键：搜 primary_entry
+        #   mrs x19, currentel  =  0xd5384253  →  内存字节 53 42 38 d5
+        # ============================================================
         print("")
-        print("=" * 60)
-        print("搜 zboot magic (0x7a6f6f62 各种字节序)")
-        print("=" * 60)
-        ZB_VARIANTS = [
-            ("LE('booz')", b'\x62\x6f\x6f\x7a'),
-            ("BE('zoob')", b'\x7a\x6f\x6f\x62'),
-            ("str'zboot'", b'zboot'),
-        ]
+        print("=" * 70)
+        print("搜 primary_entry (mrs x19, currentel = 53 42 38 d5)")
+        print("=" * 70)
 
-        zboot_hits = []
-        for label, magic in ZB_VARIANTS:
-            p = 0
-            count = 0
-            while count < 10:
-                p = payload.find(magic, p)
-                if p < 0: break
-                # 验证 header 合理性
-                ok = False
-                if p + 0x60 <= len(payload):
-                    hv = struct.unpack_from('<I', payload, p + 4)[0]
-                    poff = struct.unpack_from('<I', payload, p + 12)[0]
-                    psz = struct.unpack_from('<I', payload, p + 16)[0]
-                    if 0 < hv < 16 and 0 < poff < 0x100000 and 0x10000 < psz < 0x10000000:
-                        ok = True
-                        print("  ★ %s @ 0x%x: hv=%d poff=0x%x psz=%d" % (label, p, hv, poff, psz))
-                        zboot_hits.append(p)
-                if not ok:
-                    print("    %s @ 0x%x (验证失败)" % (label, p))
-                p += 1
-                count += 1
+        PE_ENTRY = b'\x53\x42\x38\xd5'
 
-        # 逐个尝试 zboot 解压
-        best_img = None
-        for p in zboot_hits:
-            hv = struct.unpack_from('<I', payload, p + 4)[0]
-            kv = struct.unpack_from('<I', payload, p + 8)[0]
-            poff = struct.unpack_from('<I', payload, p + 12)[0]
-            psz = struct.unpack_from('<I', payload, p + 16)[0]
-            isz = struct.unpack_from('<I', payload, p + 20)[0]
-            ct_bytes = payload[p + 44:p + 76]
-            ct = ct_bytes.split(b'\x00')[0].decode('ascii', 'ignore')
-            kn_bytes = payload[p + 76:p + 92]
-            kn = kn_bytes.split(b'\x00')[0].decode('ascii', 'ignore')
+        hits = []
+        pos = 0
+        while len(hits) < 20:
+            p = text.find(PE_ENTRY, pos)
+            if p < 0: break
+            hits.append(p)
+            pos = p + 1
 
-            print("")
-            print("=" * 60)
-            print("zboot @ payload[0x%x]" % p)
-            print("  hdr_ver=%d kernel_ver=0x%08x" % (hv, kv))
-            print("  payload_offset=0x%x payload_size=%d image_size=%d" % (poff, psz, isz))
-            print("  compression='%s'" % ct)
-            print("  kernel_file_name='%s'" % kn)
+        print("找到 %d 个 'mrs x19, currentel'：" % len(hits))
+        for p in hits:
+            # 打印附近上下文
+            ctx = text[max(0,p-8):p+24]
+            # 解读附近的指令
+            print("  偏移 0x%08x: 上下文 %s" % (p, ctx.hex()))
 
-            comp_off = p + poff
-            if comp_off + psz > len(payload):
-                print("  压缩数据越界")
-                continue
-            comp_data = payload[comp_off:comp_off + psz]
-            print("  压缩数据 @ payload[0x%x], %d bytes" % (comp_off, len(comp_data)))
-            print("  前 16 字节: %s" % comp_data[:16].hex())
+        # 判据：
+        #   primary_entry 的特征 = paciasp; mrs x19, currentel; cmp x19,#...
+        #   即位置 p 之前 4 字节 是 paciasp (3f 23 03 d5)
+        paciasp = b'\x3f\x23\x03\xd5'
+        primary_entry_off = None
+        for p in hits:
+            if p >= 4 and text[p-4:p] == paciasp:
+                print("  ★ 位置 0x%x 前 4 字节 = PACIASP  → primary_entry 起点 = 0x%x" % (p, p-4))
+                primary_entry_off = p - 4
+                break
 
-            img = None
-            for c in [ct, 'gzip', 'zstd', 'lz4', 'lzma', 'xz', 'bzip2']:
-                if not c or img is not None: continue
-                try:
-                    if c in ('gzip', 'gz'):
-                        img = gzip.decompress(comp_data)
-                    elif c == 'zstd':
-                        import zstandard
-                        img = zstandard.ZstdDecompressor().decompress(
-                            comp_data, max_output_size=200*1024*1024)
-                    elif c in ('lz4', 'lz4legacy'):
-                        import lz4.frame
-                        img = lz4.frame.decompress(comp_data)
-                    elif c in ('lzma', 'xz'):
-                        img = lzma.decompress(comp_data)
-                    elif c == 'bzip2':
-                        img = bz2.decompress(comp_data)
-                    if img:
-                        print("  ✓ 解压(%s): %d bytes" % (c, len(img)))
-                except Exception as e:
-                    print("  %s: %s" % (c, str(e)[:50]))
+        if primary_entry_off is None and hits:
+            # 退而求其次：取第一个命中位置
+            primary_entry_off = hits[0]
+            print("  ⚠ 没有 PACIASP 前缀，取第一个命中位置 = 0x%x" % primary_entry_off)
 
-            if img is None:
-                continue
+        if primary_entry_off is None:
+            # 完全搜不到 primary_entry，用 fallback: .text[0]
+            print("  ⚠ 未找到 primary_entry，使用 .text[0] 作为入口")
+            primary_entry_off = 0
 
-            # 检查结果
-            if img[0x38:0x3c] != ARM64_MAGIC:
-                idx = img.find(ARM64_MAGIC, 0, 0x2000)
-                if idx >= 0x38:
-                    print("  对齐 magic @ 0x%x" % idx)
-                    img = img[idx-0x38:]
+        # ============================================================
+        # 提取 payload = .text[primary_entry_off:]
+        #   跳过 EFI stub / PE 包装
+        # ============================================================
+        payload = text[primary_entry_off:]
+        print("")
+        print("payload = .text[0x%x:] = %d bytes" % (primary_entry_off, len(payload)))
+        print("  payload[0:16]: %s" % payload[:16].hex())
 
-            if img[0x38:0x3c] == ARM64_MAGIC:
-                if best_img is None or len(img) > len(best_img):
-                    best_img = img
-                    print("  ★ 有效 ARM64 Image, 长度 %d" % len(img))
-
-        # Fallback: 直接尝试 gzip magic 位置
-        if best_img is None:
-            print("")
-            print("=" * 60)
-            print("Fallback: 直接尝试 gzip magic 位置")
-            print("=" * 60)
-            i = 0
-            while True:
-                p = payload.find(b'\x1f\x8b\x08', i)
-                if p < 0: break
-                print("  gzip @ 0x%x" % p)
-                try:
-                    img = gzip.decompress(payload[p:])
-                    print("    解压: %d bytes" % len(img))
-                    idx = img.find(ARM64_MAGIC, 0, 0x2000)
-                    if idx >= 0x38:
-                        img2 = img[idx-0x38:]
-                        if best_img is None or len(img2) > len(best_img):
-                            best_img = img2
-                            print("    ★ 有效 ARM64 Image @ 对齐 0x%x" % idx)
-                except Exception as e:
-                    print("    失败: %s" % str(e)[:50])
-                i = p + 1
-                if i >= len(payload): break
-
-        if best_img is None:
-            print("")
-            print("!!! 无法提取内核 !!!")
-            sys.exit(1)
-
+        # ============================================================
         # 构造 KRNL
-        print("")
-        print("=" * 60)
-        print("构造 KRNL")
-        print("=" * 60)
-        print("  内核大小: %d bytes" % len(best_img))
-        print("  code0 @ 0x00: %s" % best_img[0:4].hex())
-        print("  code1 @ 0x04: %s" % best_img[4:8].hex())
-        print("  magic @ 0x38: %s" % best_img[0x38:0x3c])
+        #   KRNL[0:4]   = "KRNL"
+        #   KRNL[4:8]   = size
+        #   KRNL[8:0x48] = ARM64 header (code0=NOP, code1=B 跳 payload)
+        #   KRNL[0x48:]  = payload
+        # ============================================================
+        PAYLOAD_OFF = 0x48
+        # code1 位于 KRNL[0x0C]，跳到 KRNL[0x48]
+        # 相对偏移 = 0x48 - 0x0C = 0x3C
+        # imm26 = 0x3C / 4 = 0xF
+        code1 = 0x14000000 | 0xF
+        print("code1 = 0x%08x (B +0x3C, 从 KRNL[0xC] 跳到 KRNL[0x48])" % code1)
 
-        knl = b'KRNL' + struct.pack('<I', len(best_img)) + best_img
+        hdr = bytearray(0x48)
+        struct.pack_into('<I', hdr, 0x00, 0x4c4e524b)       # "KRNL" (LE)
+        struct.pack_into('<I', hdr, 0x04, PAYLOAD_OFF + len(payload))
+        struct.pack_into('<I', hdr, 0x08, 0xd503201f)       # code0 = NOP
+        struct.pack_into('<I', hdr, 0x0C, code1)            # code1 = B +0x3C
+        struct.pack_into('<Q', hdr, 0x10, 0)                # text_offset
+        struct.pack_into('<Q', hdr, 0x18, len(payload))     # image_size
+        struct.pack_into('<Q', hdr, 0x20, 0x0a)             # flags
+        hdr[0x40:0x44] = ARM64_MAGIC
+
+        knl = bytes(hdr) + payload
         open(dst, 'wb').write(knl)
 
+        # ============================================================
+        # 校验
+        # ============================================================
         out = open(dst, 'rb').read(0x80)
-        assert out[0:4] == b'KRNL'
-        assert out[0x40:0x44] == ARM64_MAGIC
+        assert out[0:4] == b'KRNL', "KRNL magic 缺失"
+        assert out[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 不是 NOP"
+        assert out[0x40:0x44] == ARM64_MAGIC, "ARM64 magic 位置错误"
+        assert out[0x48:0x48+8] == payload[:8], "payload 位置错误"
 
         print("")
         print("KRNL 结构验证")
-        print("  size    = %d" % struct.unpack_from('<I', out, 4)[0])
-        print("  code0   = %s" % out[0x08:0x0c].hex())
-        print("  code1   = %s" % out[0x0c:0x10].hex())
-        print("  magic   @ 0x40 = %s" % out[0x40:0x44])
+        print("  KRNL total size     = %d (0x%x)" % (len(knl), len(knl)))
+        print("  size 字段 [4:8]     = %d" % struct.unpack_from('<I', out, 4)[0])
+        print("  code0 [0x08:0x0C]   = %s (NOP)" % out[0x08:0x0c].hex())
+        print("  code1 [0x0C:0x10]   = %s" % out[0x0c:0x10].hex())
+        print("  image_size [0x18]   = 0x%x" % struct.unpack_from('<Q', out, 0x18)[0])
+        print("  magic  [0x40:0x44]  = %s" % out[0x40:0x44])
+        print("  payload [0x48:0x50] = %s" % out[0x48:0x50].hex())
         print("SUCCESS")
         PYEOF
         echo ""
@@ -418,7 +365,6 @@ jobs:
         rm -f out/*.img
         set +e
         yes | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
-        MK_EXIT=$?
         set -e
         tail -20 /tmp/mk-sd.log
         FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
