@@ -100,7 +100,6 @@ jobs:
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
-
         TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
         FOUND=""
         for TAG in $TAGS; do
@@ -109,8 +108,6 @@ jobs:
           fi
         done
         [ -z "$FOUND" ] && { echo "ERROR: not found $PATTERN"; exit 1; }
-        echo "Using release: $FOUND"
-
         mkdir -p /tmp/inputs && cd /tmp/inputs
         gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
@@ -130,7 +127,6 @@ jobs:
           IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
           [ -n "$IMG" ] && echo "官方参考镜像: $IMG ($(stat -c%s "$IMG") bytes)"
         else
-          echo "官方参考固件下载失败，跳过对比验证"
           touch /tmp/official/.no_reference
         fi
 
@@ -148,7 +144,6 @@ jobs:
           auto|"")      PREFIX="" ;;
           *)            PREFIX="$KERNEL_VERSION" ;;
         esac
-        echo "Version prefix: ${PREFIX:-auto}"
 
         declare -A VER_TO_SOURCE
         SCAN_LIST=(
@@ -160,35 +155,24 @@ jobs:
 
         for target in "${SCAN_LIST[@]}"; do
           REPO="${target%%:*}"; RELEASE="${target##*:}"
-          echo "Scanning $REPO / $RELEASE ..."
           ASSETS=$(gh release view "$RELEASE" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || echo "")
-          [ -z "$ASSETS" ] && { echo "  (no assets)"; continue; }
-
+          [ -z "$ASSETS" ] && continue
           if [ -n "$PREFIX" ]; then
             VERS=$(echo "$ASSETS" | grep -E "^${PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V || echo "")
           else
             VERS=$(echo "$ASSETS" | grep -E '^6\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V || echo "")
           fi
-          [ -z "$VERS" ] && { echo "  (no match)"; continue; }
-
-          echo "  matched:"
-          echo "$VERS" | sed 's/^/    /'
+          [ -z "$VERS" ] && continue
           for v in $VERS; do
             [ -z "${VER_TO_SOURCE[$v]:-}" ] && VER_TO_SOURCE["$v"]="$REPO:$RELEASE"
           done
         done
 
-        if [ ${#VER_TO_SOURCE[@]} -eq 0 ]; then
-          echo "ERROR: no matching kernel for $KERNEL_VERSION"
-          exit 1
-        fi
-
+        [ ${#VER_TO_SOURCE[@]} -eq 0 ] && { echo "ERROR: no kernel"; exit 1; }
         SELECTED_VER=$(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V | tail -1)
         SELECTED_SOURCE="${VER_TO_SOURCE[$SELECTED_VER]}"
         SELECTED_REPO="${SELECTED_SOURCE%%:*}"
         SELECTED_RELEASE="${SELECTED_SOURCE##*:}"
-
-        echo ""
         echo "Selected: $SELECTED_VER from $SELECTED_REPO/$SELECTED_RELEASE"
         echo "version=$SELECTED_VER" >> $GITHUB_OUTPUT
         echo "repo=$SELECTED_REPO" >> $GITHUB_OUTPUT
@@ -198,7 +182,6 @@ jobs:
       run: |
         cd /tmp
         URL="https://github.com/${{ steps.kernel.outputs.repo }}/releases/download/${{ steps.kernel.outputs.release }}/${{ steps.kernel.outputs.version }}.tar.gz"
-        echo "URL: $URL"
         wget -q --timeout=120 "$URL" -O kernel.tar.gz || curl -L -f --max-time 300 "$URL" -o kernel.tar.gz
         tar xzf kernel.tar.gz
         KERNEL_VER="${{ steps.kernel.outputs.version }}"
@@ -212,36 +195,27 @@ jobs:
         ls -la boot_extract/
 
     # ============================================================
-    # 穷尽式诊断 + 自动提取 ARM64 Image
+    # 新方案：从 PE 里找到压缩的内核数据并解压
     # ============================================================
-    - name: 'Extract real ARM64 Image from PE (exhaustive scan)'
+    - name: 'Extract real kernel by decompressing zimage'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
         [ -z "$VMLINUZ" ] && { echo "vmlinuz not found"; exit 1; }
         echo "输入: $VMLINUZ ($(stat -c%s "$VMLINUZ") bytes)"
-        xxd -l 64 "$VMLINUZ"
 
         python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
-        import sys, struct, subprocess, os, gzip, bz2, lzma, io
+        import sys, struct, gzip, bz2, lzma, io
 
         src, dst = sys.argv[1], sys.argv[2]
         raw = open(src, 'rb').read()
         ARM64_MAGIC = b'ARM\x64'
+        ZIMAGE_MAGIC = b'\x1f\x8b\x08'   # gzip
+        XZ_MAGIC     = b'\xfd\x37\x7a\x58\x5a\x00'
 
-        print("=" * 70)
         print("输入大小: %d" % len(raw))
-        print("=" * 70)
 
-        if raw[:4] == b'KRNL':
-            print("已是 KRNL，直接使用")
-            open(dst, 'wb').write(raw); sys.exit(0)
-        if raw[:2] != b'MZ':
-            print("非 PE，直接当裸 Image")
-            open(dst, 'wb').write(b'KRNL' + struct.pack('<I', len(raw)) + raw)
-            sys.exit(0)
-
-        # ---------- PE 解析 ----------
+        # PE 解析
         pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
         coff = pe_off + 4
         nsec = struct.unpack_from('<H', raw, coff + 2)[0]
@@ -255,160 +229,175 @@ jobs:
             rsize = struct.unpack_from('<I', raw, o + 16)[0]
             roff  = struct.unpack_from('<I', raw, o + 20)[0]
             sections.append((name, roff, rsize))
-            print("PE section %-8s fileoff=0x%08x size=%d" % (name, roff, rsize))
 
-        # ---------- 拼接 payload = .text + .data ----------
+        # 拼接 payload
         payload = b''
-        text_off = text_size = None
         for name, roff, rsize in sections:
-            if name == '.text':
-                text_off = roff; text_size = rsize
             if name in ('.text', '.data') and rsize > 0:
                 payload += raw[roff:roff + rsize]
-                print("  + %s: %d bytes (payload offset 0x%x)"
-                      % (name, rsize, len(payload) - rsize))
-        print("payload 总大小: %d bytes" % len(payload))
+                print("  + %s: %d bytes" % (name, rsize))
+        print("payload 大小: %d bytes" % len(payload))
 
         # ============================================================
-        # 步骤 1: 反汇编 .text 前 512 字节
-        # ============================================================
-        with open('/tmp/_text_seg.bin', 'wb') as f:
-            f.write(raw[text_off:text_off + min(text_size, 0x2000)])
-
-        try:
-            res = subprocess.run(
-                ['aarch64-linux-gnu-objdump', '-D', '-b', 'binary', '-m', 'aarch64',
-                 '--adjust-vma=0x0', '/tmp/_text_seg.bin'],
-                capture_output=True, text=True, timeout=30)
-            disasm_lines = res.stdout.split('\n')
-            print("")
-            print("=" * 70)
-            print("DISASM .text[0x0:0x100] (前 64 条指令)")
-            print("=" * 70)
-            cnt = 0
-            for line in disasm_lines:
-                if ':\t' in line or ': ' in line:
-                    # 只打印含实际指令的行
-                    if any(hexbyte in line for hexbyte in [':']):
-                        print(line)
-                        cnt += 1
-                        if cnt >= 80:
-                            break
-        except Exception as e:
-            print("反汇编失败: %s" % e)
-
-        # ============================================================
-        # 步骤 2: 穷尽扫描 payload 里的 ARMd magic（只要 0x38 处是 ARMd）
+        # 扫描所有 gzip/xz/zstd magic 位置
         # ============================================================
         print("")
         print("=" * 70)
-        print("穷尽扫描 payload 里的 'ARMd' magic 位置")
+        print("扫描所有压缩 magic 位置")
         print("=" * 70)
-        candidates = []
-        for pos in range(0, len(payload) - 0x40, 4):
-            if payload[pos + 0x38:pos + 0x3c] == ARM64_MAGIC:
-                code0  = struct.unpack_from('<I', payload, pos)[0]
-                code1  = struct.unpack_from('<I', payload, pos + 4)[0]
-                txtoff = struct.unpack_from('<Q', payload, pos + 0x08)[0]
-                imgsz  = struct.unpack_from('<Q', payload, pos + 0x10)[0]
-                flags  = struct.unpack_from('<Q', payload, pos + 0x18)[0]
-                # 合法性检查
-                valid_code0 = (code0 == 0xd503201f or (code0 & 0xFC000000) == 0x14000000)
-                valid_code1 = ((code1 & 0xFC000000) == 0x14000000)
-                valid_size  = (0x100000 < imgsz < 0x10000000)
-                mark = ""
-                if valid_code0 and valid_code1 and valid_size:
-                    mark = "  ★ 候选"
-                    candidates.append((pos, code0, code1, txtoff, imgsz, flags))
-                print("  payload[0x%08x]: code0=0x%08x code1=0x%08x txtoff=0x%x imgsz=0x%x flags=0x%x%s"
-                      % (pos, code0, code1, txtoff, imgsz, flags, mark))
 
+        gzip_positions = []
+        xz_positions = []
+        zstd_positions = []
+
+        pos = 0
+        while True:
+            p = payload.find(ZIMAGE_MAGIC, pos)
+            if p < 0: break
+            gzip_positions.append(p)
+            pos = p + 1
+            if len(gzip_positions) > 20: break
+
+        pos = 0
+        while True:
+            p = payload.find(XZ_MAGIC, pos)
+            if p < 0: break
+            xz_positions.append(p)
+            pos = p + 1
+            if len(xz_positions) > 20: break
+
+        pos = 0
+        while True:
+            p = payload.find(b'\x28\xb5\x2f\xfd', pos)
+            if p < 0: break
+            zstd_positions.append(p)
+            pos = p + 1
+            if len(zstd_positions) > 20: break
+
+        print("gzip magic 位置 (%d 个):" % len(gzip_positions))
+        for p in gzip_positions: print("  0x%08x" % p)
+        print("xz magic 位置 (%d 个):" % len(xz_positions))
+        for p in xz_positions: print("  0x%08x" % p)
+        print("zstd magic 位置 (%d 个):" % len(zstd_positions))
+        for p in zstd_positions: print("  0x%08x" % p)
+
+        # ============================================================
+        # 尝试从每个 gzip 位置解压，找有 ARM64 Image header 的结果
+        # ============================================================
         print("")
-        print("找到 %d 个候选 ARM64 Image header" % len(candidates))
+        print("=" * 70)
+        print("尝试 gzip 解压")
+        print("=" * 70)
+
+        best_img = None
+        best_pos = -1
+
+        for p in gzip_positions:
+            try:
+                dec = gzip.decompress(payload[p:])
+                print("  gzip @ 0x%x: 解压成功, %d bytes" % (p, len(dec)))
+                # 检查是否是 ARM64 Image（header 前 4 字节是 code0，magic 在 0x38）
+                if len(dec) >= 0x40 and dec[0x38:0x3c] == ARM64_MAGIC:
+                    print("    ★ 解压结果是标准 ARM64 Image (magic @ 0x38)")
+                    if best_img is None or len(dec) > len(best_img):
+                        best_img = dec
+                        best_pos = p
+                else:
+                    # 尝试对齐到 magic
+                    idx = dec.find(ARM64_MAGIC, 0, 0x1000)
+                    if idx >= 0x38 and idx < 0x1000:
+                        candidate = dec[idx - 0x38:]
+                        if len(candidate) > 0x40 and candidate[0x38:0x3c] == ARM64_MAGIC:
+                            print("    ★ 找到 magic @ 0x%x，对齐后 %d bytes" % (idx, len(candidate)))
+                            if best_img is None or len(candidate) > len(best_img):
+                                best_img = candidate
+                                best_pos = p
+            except Exception as e:
+                print("  gzip @ 0x%x: 解压失败 (%s)" % (p, str(e)[:60]))
 
         # ============================================================
-        # 步骤 3: 选最佳候选（image_size 最大的）
+        # 尝试 xz
         # ============================================================
-        img = None
-        if candidates:
-            best = max(candidates, key=lambda c: c[4])
-            pos, code0, code1, txtoff, imgsz, flags = best
-            print("")
-            print("=" * 70)
-            print("★ 选择最佳候选: payload[0x%x]" % pos)
-            print("  code0=0x%08x code1=0x%08x imgsz=0x%x" % (code0, code1, imgsz))
-            print("=" * 70)
+        print("")
+        print("=" * 70)
+        print("尝试 xz 解压")
+        print("=" * 70)
 
-            # 内核 = payload[pos : pos + imgsz]
-            if pos + imgsz <= len(payload):
-                img = payload[pos:pos + imgsz]
-                print("  提取内核: %d bytes" % len(img))
-                # 校验提取结果
-                assert img[0x38:0x3c] == ARM64_MAGIC, "提取的内核 magic 不对"
-                assert img[0x00:0x04] == payload[pos:pos+4], "code0 不一致"
-            else:
-                # 内核可能跨越 payload 末尾，取剩下的部分
-                img = payload[pos:]
-                print("  内核越过 payload 末尾，取剩余 %d bytes" % len(img))
-
-        # ============================================================
-        # 步骤 4: 兜底 - 搜索压缩 magic
-        # ============================================================
-        if img is None:
-            print("")
-            print("=" * 70)
-            print("未找到 ARM64 Image header，扫描压缩 magic")
-            print("=" * 70)
-
-            SIGS = [
-                ('gzip',  b'\x1f\x8b\x08'),
-                ('zstd',  b'\x28\xb5\x2f\xfd'),
-                ('xz',    b'\xfd\x37\x7a\x58\x5a\x00'),
-                ('lz4',   b'\x04\x22\x4d\x18'),
-                ('bzip2', b'\x42\x5a\x68'),
-            ]
-            for signame, sig in SIGS:
-                p = payload.find(sig)
-                count = 0
-                while p >= 0 and count < 5:
-                    print("  %s magic @ payload[0x%x]" % (signame, p))
-                    p = payload.find(sig, p + 1)
-                    count += 1
+        for p in xz_positions:
+            try:
+                dec = lzma.decompress(payload[p:])
+                print("  xz @ 0x%x: 解压成功, %d bytes" % (p, len(dec)))
+                if len(dec) >= 0x40 and dec[0x38:0x3c] == ARM64_MAGIC:
+                    print("    ★ 解压结果是标准 ARM64 Image")
+                    if best_img is None or len(dec) > len(best_img):
+                        best_img = dec
+                        best_pos = p
+                else:
+                    idx = dec.find(ARM64_MAGIC, 0, 0x1000)
+                    if idx >= 0x38 and idx < 0x1000:
+                        candidate = dec[idx - 0x38:]
+                        if len(candidate) > 0x40 and candidate[0x38:0x3c] == ARM64_MAGIC:
+                            print("    ★ 找到 magic @ 0x%x，对齐后 %d bytes" % (idx, len(candidate)))
+                            if best_img is None or len(candidate) > len(best_img):
+                                best_img = candidate
+                                best_pos = p
+            except Exception as e:
+                print("  xz @ 0x%x: 解压失败 (%s)" % (p, str(e)[:60]))
 
         # ============================================================
-        # 步骤 5: 最终结果
+        # 尝试 zstd
         # ============================================================
-        if img is None:
-            print("")
-            print("!!! 无法提取内核 !!!")
-            print("诊断信息:")
-            print("  - payload 大小: %d bytes" % len(payload))
-            print("  - .text 段从 payload 偏移 0x0 开始，长 %d 字节" % text_size)
-            print("  - .text[0:16] = %s" % payload[:16].hex())
-            print("  - payload 中 ARMd magic 出现次数: %d" % payload.count(ARM64_MAGIC))
+        print("")
+        print("=" * 70)
+        print("尝试 zstd 解压")
+        print("=" * 70)
+
+        for p in zstd_positions:
+            try:
+                import zstandard
+                d = zstandard.ZstdDecompressor()
+                dec = d.decompress(payload[p:], max_output_size=256 * 1024 * 1024)
+                print("  zstd @ 0x%x: 解压成功, %d bytes" % (p, len(dec)))
+                if len(dec) >= 0x40 and dec[0x38:0x3c] == ARM64_MAGIC:
+                    if best_img is None or len(dec) > len(best_img):
+                        best_img = dec
+                        best_pos = p
+            except Exception as e:
+                print("  zstd @ 0x%x: 解压失败 (%s)" % (p, str(e)[:60]))
+
+        # ============================================================
+        # 最终判定
+        # ============================================================
+        print("")
+        print("=" * 70)
+
+        if best_img is None:
+            print("!!! 所有解压尝试都失败 !!!")
             sys.exit(1)
+
+        print("★ 使用 gzip/xz/zstd @ payload[0x%x]" % best_pos)
+        print("  解压后内核: %d bytes" % len(best_img))
+        print("  code0 @ 0x00 = 0x%08x" % struct.unpack_from('<I', best_img, 0)[0])
+        print("  code1 @ 0x04 = 0x%08x" % struct.unpack_from('<I', best_img, 4)[0])
+        print("  magic @ 0x38 = %s" % best_img[0x38:0x3c])
+        print("=" * 70)
 
         # ============================================================
         # 构造 KRNL
         # ============================================================
-        # img 是完整的 ARM64 Image（含 64 字节 header）
-        knl = b'KRNL' + struct.pack('<I', len(img)) + img
+        knl = b'KRNL' + struct.pack('<I', len(best_img)) + best_img
         open(dst, 'wb').write(knl)
 
-        # 最终校验
         out = open(dst, 'rb').read(0x80)
         assert out[0:4] == b'KRNL'
-        assert out[0x40:0x44] == ARM64_MAGIC, "magic 必须在 0x40"
+        assert out[0x40:0x44] == ARM64_MAGIC
 
         print("")
-        print("=" * 70)
         print("KRNL 结构验证")
         print("  size    = %d" % struct.unpack_from('<I', out, 4)[0])
         print("  code0   = %s" % out[0x08:0x0c].hex())
         print("  code1   = %s" % out[0x0c:0x10].hex())
         print("  magic   @ 0x40 = %s" % out[0x40:0x44])
-        print("  kernel[0:16] = %s" % out[0x48:0x58].hex())
-        print("=" * 70)
         print("SUCCESS")
         PYEOF
         echo "kernel.img: $(stat -c%s /tmp/kernel.img) bytes"
@@ -427,7 +416,6 @@ jobs:
 
         cp /tmp/kernel.img "$TARGET/kernel.img"
         NEW_KERNEL_SIZE=$(stat -c%s "$TARGET/kernel.img")
-        echo "新 kernel.img 大小: $NEW_KERNEL_SIZE bytes"
 
         PARAM_FILE="$TARGET/parameter.txt"
         [ -f "$PARAM_FILE" ] || { echo "缺少 parameter.txt"; exit 1; }
@@ -450,9 +438,8 @@ jobs:
         new_size = max(rounded, old_size)
 
         print(f"[param] old={old_size*512/1024/1024:.1f} MiB need={need*512/1024/1024:.1f} MiB new={new_size*512/1024/1024:.1f} MiB")
-
         if new_size == old_size:
-            print("[param] 无需扩容"); sys.exit(0)
+            sys.exit(0)
 
         delta = new_size - old_size
         content = content[:m.start()] + f'0x{new_size:08x}@{m.group(2)}(kernel)' + content[m.end():]
@@ -472,7 +459,6 @@ jobs:
         DTB_R5C=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5c.dtb" | head -1)
         [ -n "$DTB_R5S" ] && cp "$DTB_R5S" "$TARGET/dtb/rockchip/rk3568-nanopi-r5s.dtb"
         [ -n "$DTB_R5C" ] && cp "$DTB_R5C" "$TARGET/dtb/rockchip/rk3568-nanopi-r5c.dtb"
-        ls -la "$TARGET/dtb/rockchip/"
 
         UINITRD=$(find /tmp/boot_extract -name "uInitrd-*" | head -1)
         [ -n "$UINITRD" ] && cp "$UINITRD" "$TARGET/uInitrd"
@@ -488,7 +474,7 @@ jobs:
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit=$MK_EXIT"
-        tail -30 /tmp/mk-sd.log
+        tail -20 /tmp/mk-sd.log
 
         FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
         [ -z "$FOUND_IMG" ] && { echo "No image"; exit 1; }
@@ -509,13 +495,10 @@ jobs:
           "${{ steps.kernel.outputs.version }}"
         RC=$?
         set -e
-
         if [ $RC -eq 0 ]; then
           echo "passed=true" >> $GITHUB_OUTPUT
-          echo "验证通过"
         else
           echo "passed=false" >> $GITHUB_OUTPUT
-          echo "验证失败 (exit=$RC)"
           exit $RC
         fi
 
@@ -528,7 +511,7 @@ jobs:
           SIZE=$(stat -c%s "$f")
           echo "$f -> $SIZE bytes"
           if [ "$SIZE" -ge 2147483648 ]; then
-            echo "ERROR: 超过 2GiB 限制"; exit 1
+            echo "ERROR: 超过 2GiB"; exit 1
           fi
         done
 
@@ -546,17 +529,11 @@ jobs:
       github.event.repository.owner.id == github.event.sender.id &&
       needs.build.outputs.verified == 'true'
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
-
-    - name: Download artifact
-      uses: actions/download-artifact@v4
+    - uses: actions/checkout@v4
+    - uses: actions/download-artifact@v4
       with:
         name: firmware-${{ needs.build.outputs.img_name }}
         path: ./artifact
-
-    - name: List
-      run: ls -la ./artifact/
 
     - name: Generate tag
       id: release_tag
@@ -567,10 +544,7 @@ jobs:
         KV_SHORT="${KV%.y}"
         [ "$KV" = "auto" ] && KV_SHORT="auto"
         BASE_TAG="FriendlyWrt-kv${KV_SHORT}-$(date +%Y-%m-%d)"
-        FORCE_BASE=false
-        [ "${{ github.event.inputs.replace_existing }}" = "true" ] && FORCE_BASE=true
-
-        if [ "$FORCE_BASE" = "true" ]; then
+        if [ "${{ github.event.inputs.replace_existing }}" = "true" ]; then
           EXISTING=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
             | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
           for tag in $EXISTING; do
@@ -579,20 +553,7 @@ jobs:
           done
           TAG="$BASE_TAG"
         else
-          EXISTING=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' \
-            | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-          if [ -z "$EXISTING" ]; then
-            TAG="$BASE_TAG"
-          else
-            MAX=0
-            for t in $EXISTING; do
-              if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
-                N=${BASH_REMATCH[1]}
-                [ $N -gt $MAX ] && MAX=$N
-              fi
-            done
-            TAG="${BASE_TAG}-$((MAX+1))"
-          fi
+          TAG="$BASE_TAG"
         fi
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
