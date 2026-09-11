@@ -1,11 +1,11 @@
 #!/bin/bash
-# replace-kernel.sh - 支持6.18/6.12/6.6/6.1，PE→KRNL转换
+# replace-kernel.sh - 支持6.18/6.12/6.6/6.1，PE→KRNL转换 + kernel分区自动扩容
 set -euo pipefail
 
-VERSION="2026-09-11-v16-pe-convert"
-log() { echo -e "\033[0;32m[replace]\033[0m $*"; }
+VERSION="2026-09-11-v17-pe-convert-resize"
+log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
-err() { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
+err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
 log "replace-kernel.sh version: $VERSION"
 
 IMAGES_TGZ="$1"; SDFUSE_DIR="$2"; DIST_NAME="$3"; OUTPUT_IMG="$4"
@@ -41,14 +41,13 @@ SCAN_LIST=(
   "breakingbadboy/OpenWrt:kernel_stable"
 )
 
-# 解析用户选择的主/次版本前缀
 case "$KERNEL_VERSION" in
   6.18*|6.18.y) PREFIX="6.18" ;;
   6.12*|6.12.y) PREFIX="6.12" ;;
-  6.6*|6.6.y)    PREFIX="6.6" ;;
-  6.1*|6.1.y)    PREFIX="6.1" ;;
-  auto|"")       PREFIX="" ;;  # auto: 全扫描
-  *)             PREFIX="$KERNEL_VERSION" ;;
+  6.6*|6.6.y)   PREFIX="6.6" ;;
+  6.1*|6.1.y)   PREFIX="6.1" ;;
+  auto|"")      PREFIX="" ;;
+  *)            PREFIX="$KERNEL_VERSION" ;;
 esac
 log "  版本前缀: ${PREFIX:-auto}"
 
@@ -83,7 +82,6 @@ if [ ${#VER_TO_SOURCE[@]} -eq 0 ]; then
   exit 1
 fi
 
-# 选最高版本
 SELECTED_VER=$(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V | tail -1)
 SELECTED_SOURCE="${VER_TO_SOURCE[$SELECTED_VER]}"
 SELECTED_REPO="${SELECTED_SOURCE%%:*}"
@@ -165,7 +163,6 @@ elif [ "$MAGIC" = "d00dfeed" ]; then
   log "  >>> FIT 格式，直接使用"
   cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
 else
-  # PE 或裸机：调用 Python 转换
   log "  >>> 调用 PE 解析器..."
   python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" <<'PYEOF'
 import sys, struct, os
@@ -173,11 +170,9 @@ import sys, struct, os
 src, dst = sys.argv[1], sys.argv[2]
 data = open(src, 'rb').read()
 
-# ---- 检查是否为 PE 格式 ----
 is_pe = data[0:2] == b'MZ'
 if is_pe:
     print(f"    检测到 PE 格式 (MZ signature)")
-    # 读取 PE 头偏移 (offset 0x3C)
     pe_off = struct.unpack_from('<I', data, 0x3C)[0]
     print(f"    PE header offset: 0x{pe_off:x}")
 
@@ -185,7 +180,6 @@ if is_pe:
         print(f"    ✗ PE 签名不匹配，回退为裸机处理")
         is_pe = False
     else:
-        # 读取 COFF 头
         coff = pe_off + 4
         machine = struct.unpack_from('<H', data, coff)[0]
         num_sections = struct.unpack_from('<H', data, coff + 2)[0]
@@ -194,7 +188,6 @@ if is_pe:
         print(f"    Sections: {num_sections}")
         print(f"    Optional header size: {opt_size}")
 
-        # 遍历 section 表
         sec_start = coff + 20 + opt_size
         sections = []
         for i in range(num_sections):
@@ -205,7 +198,6 @@ if is_pe:
             sections.append((name, raw_off, raw_size))
             print(f"      Section {i}: {name:<8} RawOff=0x{raw_off:08x} RawSize=0x{raw_size:08x}")
 
-        # 优先找 .linux 节，否则用 .text
         linux_sec = next((s for s in sections if s[0] == '.linux'), None)
         text_sec = next((s for s in sections if s[0] == '.text'), None)
         target = linux_sec or text_sec
@@ -215,7 +207,6 @@ if is_pe:
             print(f"    >>> 提取节 '{name}': offset=0x{raw_off:x}, size={raw_size}")
             kernel_data = data[raw_off:raw_off + raw_size]
             print(f"    提取大小: {len(kernel_data)} bytes")
-            # 检查 ARM64 magic
             magic_pos = kernel_data.find(b'ARM\x64')
             print(f"    ARM64 magic 位置: 0x{magic_pos:x}")
             data = kernel_data
@@ -223,16 +214,13 @@ if is_pe:
             print(f"    ✗ 找不到 .linux 或 .text 节，回退为裸机处理")
             is_pe = False
 
-# ---- 裸机 ARM64 Image 处理 ----
 if not is_pe:
     print(f"    作为裸机 ARM64 Image 处理")
     magic_pos = data.find(b'ARM\x64')
     print(f"    ARM64 magic 位置: 0x{magic_pos:x}")
 
     if magic_pos == 0x38:
-        # 标准 Image 头，magic 在 0x38，前面就是 code0/code1
         print(f"    ✓ 标准 ARM64 Image 头")
-        # 检查 code0 是否为 NOP
         code0 = struct.unpack_from('<I', data, 0x00)[0]
         if code0 != 0xd503201f:
             print(f"    修复 code0: 0x{code0:08x} -> NOP")
@@ -242,7 +230,6 @@ if not is_pe:
     else:
         print(f"    ⚠ magic 位置异常 (0x{magic_pos:x})，不做修改")
 
-# ---- 构造 KRNL 头 ----
 knl_size = len(data)
 size_hex = struct.pack('<I', knl_size)
 with open(dst, 'wb') as f:
@@ -250,7 +237,6 @@ with open(dst, 'wb') as f:
     f.write(size_hex)
     f.write(data)
 
-# ---- 验证 ----
 out = open(dst, 'rb').read(128)
 assert out[0:4] == b'KRNL', 'KRNL missing'
 out_size = struct.unpack_from('<I', out, 4)[0]
@@ -267,6 +253,68 @@ PYEOF
 fi
 
 log "  新 kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
+
+# ============================================================
+# 5.5 动态扩容 kernel 分区（新增关键修复）
+# ============================================================
+log "========== [5.5/8] 扩容 kernel 分区 =========="
+
+PARAM_FILE="$TARGET_DIR/parameter.txt"
+[ -f "$PARAM_FILE" ] || { err "缺少 parameter.txt"; exit 1; }
+log "  修改前:"
+sed 's/^/    /' "$PARAM_FILE"
+
+python3 - "$PARAM_FILE" "$(stat -c%s "$TARGET_DIR/kernel.img")" <<'PARAM_PYEOF'
+import re, sys
+param_file, kernel_size = sys.argv[1], int(sys.argv[2])
+
+with open(param_file) as f:
+    content = f.read()
+
+# 匹配 0xSIZE@0xOFFSET(kernel)
+kernel_re = re.compile(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(kernel\)',
+                       re.IGNORECASE)
+m = kernel_re.search(content)
+if not m:
+    print("[param] 未找到 kernel 分区，跳过"); sys.exit(0)
+
+old_size   = int(m.group(1), 16)
+kernel_off = int(m.group(2), 16)
+kernel_end = kernel_off + old_size
+
+need_sectors = (kernel_size + 511) // 512
+rounded  = ((need_sectors + 0xFFF) // 0x1000) * 0x1000  # 2MiB 对齐
+new_size = max(rounded, old_size)
+
+print(f"[param] old  = 0x{old_size:x} ({old_size*512/1024/1024:.1f} MiB)")
+print(f"[param] need = 0x{need_sectors:x} sectors ({need_sectors*512/1024/1024:.1f} MiB)")
+print(f"[param] new  = 0x{new_size:x} ({new_size*512/1024/1024:.1f} MiB)")
+
+if new_size == old_size:
+    print("[param] 容量足够，无需扩容"); sys.exit(0)
+
+delta = new_size - old_size
+
+# 替换 kernel 分区大小（保留原 offset）
+new_kernel = f'0x{new_size:08x}@{m.group(2)}(kernel)'
+content = content[:m.start()] + new_kernel + content[m.end():]
+
+# kernel 之后的所有 @offset 整体平移
+def shift(match):
+    off = int(match.group(1), 16)
+    if off >= kernel_end:
+        return f'@0x{off + delta:08x}'
+    return match.group(0)
+
+content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
+
+with open(param_file, 'w') as f:
+    f.write(content)
+print(f"[param] parameter.txt 已更新 (delta = {delta} sectors = {delta*512/1024/1024:.1f} MiB)")
+PARAM_PYEOF
+
+log "  修改后:"
+sed 's/^/    /' "$PARAM_FILE"
 
 # ============================================================
 # 6. dtb + uInitrd
@@ -305,8 +353,6 @@ else
   log "  ⚠ 无 uInitrd，保留骨架"
 fi
 
-log "  parameter.txt 保留原版"
-
 # ============================================================
 # 7. 生成镜像
 # ============================================================
@@ -319,7 +365,7 @@ yes | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
 MK_EXIT=$?
 set -e
 echo "  mk-sd-image.sh exit=$MK_EXIT"
-tail -30 /tmp/mk-sd.log | sed 's/^/    /'
+tail -40 /tmp/mk-sd.log | sed 's/^/    /'
 
 FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
 [ -z "$FOUND_IMG" ] && { err "未生成镜像"; exit 1; }
@@ -337,7 +383,7 @@ with open(img, 'rb') as f:
     f.seek(off); data = f.read(128)
 assert data[0:4] == b'KRNL', 'KRNL missing'
 knl_size = int.from_bytes(data[4:8], 'little')
-code0 = int.from_bytes(data[8:12], 'little')
+code0    = int.from_bytes(data[8:12], 'little')
 idx = data.find(b'ARM\x64')
 print(f"    KRNL size: {knl_size}")
 print(f"    code0:     0x{code0:08x} ({'NOP' if code0 == 0xd503201f else '??'})")
