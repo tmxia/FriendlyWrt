@@ -14,14 +14,13 @@ on:
         default: 'R5S-R5C-Series-FriendlyWrt-24.10-docker.img.gz'
         type: string
       flippy_kernel_version:
-        description: 'Flippy 内核版本'
+        description: 'Flippy 内核系列（kernel_rk35xx 中实际存在的）'
         required: true
         default: '6.1.y'
         type: choice
         options:
           - '6.1.y'
           - '6.6.y'
-          - '6.18.y'
 
 jobs:
   diagnose:
@@ -37,6 +36,41 @@ jobs:
             wget curl git file xxd bc python3 \
             device-tree-compiler cpio gzip xz-utils lz4 zstd
 
+      # ============================================================
+      # 0. 枚举所有可能的 Flippy 内核源，确定真实可用版本
+      # ============================================================
+      - name: Enumerate Flippy kernel sources
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "########## 枚举所有 Flippy 内核源 ##########"
+          echo ""
+          SOURCES=(
+            "ophub/kernel:kernel_rk35xx"
+            "ophub/kernel:kernel_stable"
+            "ophub/kernel:kernel_flippy"
+            "breakingbadboy/OpenWrt:kernel_rk35xx"
+            "breakingbadboy/OpenWrt:kernel_stable"
+          )
+          for target in "${SOURCES[@]}"; do
+            REPO="${target%%:*}"
+            RELEASE="${target##*:}"
+            echo "=== $REPO / $RELEASE ==="
+            ASSETS=$(gh release view "$RELEASE" --repo "$REPO" \
+                     --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+            if [ -z "$ASSETS" ]; then
+              echo "  (无法访问或无资产)"
+            else
+              echo "$ASSETS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' | head -20 | sed 's/^/    /'
+              COUNT=$(echo "$ASSETS" | grep -cE '^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$' || true)
+              echo "  总数: $COUNT"
+            fi
+            echo ""
+          done
+
+      # ============================================================
+      # 1. 下载官方固件
+      # ============================================================
       - name: Download official firmware
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -60,7 +94,7 @@ jobs:
           fi
           echo "解压: $IMG_GZ"
           gunzip -k "$IMG_GZ"
-          IMG=$(find . -name "*.img" | head -1)
+          IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
           if [ -z "$IMG" ]; then
             echo "ERROR: 未找到 .img"
             exit 1
@@ -73,7 +107,7 @@ jobs:
           with open(img, 'rb') as f:
               f.seek(512)
               hdr = f.read(92)
-              assert hdr[0:8] == b'EFI PART', '镜像不是 GPT 格式'
+              assert hdr[0:8] == b'EFI PART', '不是 GPT'
               entries_lba = struct.unpack_from('<Q', hdr, 72)[0]
               num_entries = struct.unpack_from('<I', hdr, 80)[0]
               entry_size  = struct.unpack_from('<I', hdr, 84)[0]
@@ -91,7 +125,7 @@ jobs:
               first_lba = struct.unpack_from('<Q', entries, off+32)[0]
               last_lba  = struct.unpack_from('<Q', entries, off+40)[0]
               size_mb = (last_lba - first_lba + 1) * 512 / 1024 / 1024
-              print(f"  {name:12} LBA 0x{first_lba:x}-0x{last_lba:x}  {size_mb:.1f} MiB")
+              print(f"  {name:12} LBA 0x{first_lba:x}  {size_mb:.1f} MiB")
               parts.append((name, first_lba, last_lba))
 
           os.makedirs('/tmp/official/parts', exist_ok=True)
@@ -104,26 +138,24 @@ jobs:
                       data = f.read(min(size, 1024 * 1024))
                       with open('/tmp/official/parts/kernel_head.bin', 'wb') as w:
                           w.write(data)
-                      print(f"  提取 kernel 头部 {len(data)} 字节")
+                      print(f"  -> 提取 kernel 头部 {len(data)} 字节")
                   elif name == 'resource':
                       f.seek(offset)
                       data = f.read(size)
                       with open('/tmp/official/parts/resource.img', 'wb') as w:
                           w.write(data)
-                      print(f"  提取 resource.img ({size} bytes)")
+                      print(f"  -> 提取 resource.img {size} 字节")
                   elif name == 'boot':
                       f.seek(offset)
                       data = f.read(min(size, 1024 * 1024))
                       with open('/tmp/official/parts/boot_head.bin', 'wb') as w:
                           w.write(data)
-                      print(f"  提取 boot 头部 {len(data)} 字节")
+                      print(f"  -> 提取 boot 头部 {len(data)} 字节")
           PYEOF
 
-          echo ""
-          echo "=== parts 目录 ==="
           ls -la /tmp/official/parts/
 
-      - name: Parse resource.img and extract dtb
+      - name: Parse resource.img
         run: |
           cd /tmp/official/parts
           if [ ! -f resource.img ]; then
@@ -136,22 +168,16 @@ jobs:
           path = 'resource.img'
           with open(path, 'rb') as f:
               data = f.read()
-
           print(f"resource.img 大小: {len(data)}")
-          print(f"magic: {data[:8].hex()}")
+          print(f"前 32 字节: {data[:32].hex()}")
 
           magic = data[:4]
-          if magic == b'RKRS' or magic == b'RSCE':
+          if magic in (b'RKRS', b'RSCE'):
               ver = struct.unpack_from('<H', data, 4)[0]
-              hdr_size = struct.unpack_from('<H', data, 6)[0]
               idx_off = struct.unpack_from('<I', data, 8)[0]
               dat_off = struct.unpack_from('<I', data, 12)[0]
-              dat_sz = struct.unpack_from('<I', data, 16)[0]
               part_num = struct.unpack_from('<I', data, 20)[0]
-              print(f"ver={ver} hdr_size={hdr_size}")
-              print(f"idx_off=0x{idx_off:x} data_off=0x{dat_off:x}")
-              print(f"data_size={dat_sz} part_num={part_num}")
-
+              print(f"ver={ver} idx_off=0x{idx_off:x} part_num={part_num}")
               os.makedirs('/tmp/official/parts/dtb', exist_ok=True)
               for i in range(part_num):
                   eo = idx_off + i * 24
@@ -161,42 +187,36 @@ jobs:
                   eoff = struct.unpack_from('<I', data, eo+16)[0]
                   esz = struct.unpack_from('<I', data, eo+20)[0]
                   print(f"  entry[{i}]: '{name}' off=0x{eoff:x} size={esz}")
-
                   if eoff + esz <= len(data) and esz > 0:
                       blob = data[eoff:eoff+esz]
                       if blob[:4] == b'\xd0\x0d\xfe\xed':
                           out = f'/tmp/official/parts/dtb/{name}.dtb'
                           with open(out, 'wb') as w:
                               w.write(blob)
-                          print(f"    -> 提取 DTB ({esz} bytes)")
+                          print(f"    -> 提取 DTB")
           else:
-              print("未知 resource 格式，尝试扫描 dtb magic")
+              print("非标准 resource 格式，扫描 DTB magic")
               os.makedirs('/tmp/official/parts/dtb', exist_ok=True)
-              pos = 0
               cnt = 0
-              while pos < len(data) - 4:
+              pos = 0
+              while pos < len(data) - 4 and cnt < 5:
                   if data[pos:pos+4] == b'\xd0\x0d\xfe\xed':
-                      end = pos + 4 * 1024 * 1024
-                      if end > len(data):
-                          end = len(data)
-                      blob = data[pos:end]
-                      out = f'/tmp/official/parts/dtb/scan_{cnt}.dtb'
-                      with open(out, 'wb') as w:
+                      blob = data[pos:pos+1024*1024]
+                      with open(f'/tmp/official/parts/dtb/scan_{cnt}.dtb', 'wb') as w:
                           w.write(blob)
-                      print(f"  扫描到 dtb @ 0x{pos:x}")
+                      print(f"  dtb @ 0x{pos:x}")
                       cnt += 1
                       pos += 4
-                      if cnt >= 5:
-                          break
                   else:
                       pos += 1
           PYEOF
 
-          echo ""
-          echo "=== 提取的 DTB ==="
-          ls -la /tmp/official/parts/dtb/ 2>/dev/null || echo "无"
+          ls -la /tmp/official/parts/dtb/ 2>/dev/null || true
 
-      - name: Download and unpack Flippy kernel
+      # ============================================================
+      # 2. 下载 Flippy 内核 —— 健壮版，多源 fallback
+      # ============================================================
+      - name: Download Flippy kernel (robust)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KV: ${{ inputs.flippy_kernel_version }}
@@ -204,27 +224,63 @@ jobs:
           mkdir -p /tmp/flippy
           cd /tmp/flippy
 
-          ASSETS=$(gh release view kernel_rk35xx --repo breakingbadboy/OpenWrt \
-                   --json assets --jq '.assets[].name' 2>/dev/null || echo "")
-          if [ -z "$ASSETS" ]; then
-            echo "ERROR: 无法获取 kernel_rk35xx 资产列表"
+          SOURCES=(
+            "breakingbadboy/OpenWrt:kernel_rk35xx"
+            "ophub/kernel:kernel_rk35xx"
+            "ophub/kernel:kernel_stable"
+          )
+
+          SEL=""
+          SRC_REPO=""
+          SRC_REL=""
+
+          for target in "${SOURCES[@]}"; do
+            REPO="${target%%:*}"
+            REL="${target##*:}"
+            echo "尝试 $REPO / $REL ..."
+            ASSETS=$(gh release view "$REL" --repo "$REPO" \
+                     --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+            if [ -z "$ASSETS" ]; then
+              echo "  (无资产)"
+              continue
+            fi
+            PATTERN="^${KV}\\.[0-9]+\\.tar\\.gz\$"
+            VERS=$(echo "$ASSETS" | grep -E "$PATTERN" | sed 's/\.tar\.gz//' | sort -V || true)
+            if [ -z "$VERS" ]; then
+              echo "  (无 $KV 匹配)"
+              continue
+            fi
+            SEL=$(echo "$VERS" | tail -1)
+            SRC_REPO="$REPO"
+            SRC_REL="$REL"
+            echo "  ✓ 选中 $SEL (来自 $REPO/$REL)"
+            break
+          done
+
+          if [ -z "$SEL" ]; then
+            echo "ERROR: 所有源都无 $KV 匹配"
+            echo ""
+            echo "=== 请查看 'Enumerate Flippy kernel sources' 步骤输出，重新选择版本 ==="
             exit 1
           fi
 
-          PATTERN="^${KV}\\.[0-9]+\\.tar\\.gz\$"
-          VERS=$(echo "$ASSETS" | grep -E "$PATTERN" | sed 's/\.tar\.gz//' | sort -V || true)
-          if [ -z "$VERS" ]; then
-            echo "ERROR: 无匹配 $KV"
-            echo "$ASSETS" | head -20
-            exit 1
-          fi
-
-          SEL=$(echo "$VERS" | tail -1)
-          echo "选中: $SEL"
           echo "FLIPPY_VER=$SEL" >> $GITHUB_ENV
+          echo "SRC_REPO=$SRC_REPO" >> $GITHUB_ENV
+          echo "SRC_REL=$SRC_REL" >> $GITHUB_ENV
 
-          URL="https://github.com/breakingbadboy/OpenWrt/releases/download/kernel_rk35xx/${SEL}.tar.gz"
-          wget -q "$URL" -O kernel.tar.gz
+          URL="https://github.com/${SRC_REPO}/releases/download/${SRC_REL}/${SEL}.tar.gz"
+          echo "URL: $URL"
+          wget -q --timeout=120 "$URL" -O kernel.tar.gz
+
+          file kernel.tar.gz
+          SIZE=$(stat -c%s kernel.tar.gz)
+          echo "下载大小: $SIZE bytes"
+          if [ "$SIZE" -lt 10000 ]; then
+            echo "ERROR: 下载文件过小，可能是 404 页面"
+            head -c 500 kernel.tar.gz
+            exit 1
+          fi
+
           tar xzf kernel.tar.gz
 
           LDIR=$(find . -maxdepth 1 -type d -name "*${SEL}*" | head -1)
@@ -236,34 +292,48 @@ jobs:
 
           BOOT_TAR=$(find "$LDIR" -name "boot-*.tar.gz" | head -1)
           DTB_TAR=$(find "$LDIR" -name "dtb-rockchip-*.tar.gz" | head -1)
+          echo "BOOT_TAR: $BOOT_TAR"
+          echo "DTB_TAR: $DTB_TAR"
+
+          if [ -z "$BOOT_TAR" ]; then
+            echo "ERROR: boot tar 缺失"
+            find . -name "*.tar.gz" | head -20
+            exit 1
+          fi
+
           mkdir -p boot dtb
           tar xzf "$BOOT_TAR" -C boot
-          tar xzf "$DTB_TAR" -C dtb
+          if [ -n "$DTB_TAR" ]; then
+            tar xzf "$DTB_TAR" -C dtb
+          fi
 
           echo ""
           echo "=== Flippy boot/ ==="
           ls -la boot/
           echo ""
-          echo "=== Flippy dtb 中 R5S/R5C ==="
+          echo "=== Flippy dtb r5s/r5c ==="
           find dtb -name "*r5s*" -o -name "*r5c*" 2>/dev/null | head
 
+      # ============================================================
+      # 3. 对比 kernel 头
+      # ============================================================
       - name: Compare kernel heads
         run: |
           echo "==========================================="
-          echo "  对比 #1: kernel 头部 (最关键)"
+          echo "  对比 #1: kernel 头部"
           echo "==========================================="
           echo ""
-          echo "--- 官方 kernel 头 (来自镜像 LBA 0x12000) ---"
-          xxd -l 256 /tmp/official/parts/kernel_head.bin
+          echo "--- 官方 kernel 头（镜像 LBA 0x12000）---"
+          xxd -l 128 /tmp/official/parts/kernel_head.bin
 
           echo ""
-          echo "--- Flippy 原始 vmlinuz 头 ---"
+          echo "--- Flippy vmlinuz 头 ---"
           FLP_VMLINUZ=$(find /tmp/flippy/boot -name "vmlinuz-*" | head -1)
           echo "文件: $FLP_VMLINUZ ($(stat -c%s "$FLP_VMLINUZ") bytes)"
-          xxd -l 256 "$FLP_VMLINUZ"
+          xxd -l 128 "$FLP_VMLINUZ"
 
           echo ""
-          echo "--- 关键字段解析 ---"
+          echo "--- 字段解析 ---"
           OFF_HEAD=/tmp/official/parts/kernel_head.bin \
           FLP_VMLINUZ="$FLP_VMLINUZ" \
           python3 - <<'PYEOF'
@@ -276,77 +346,68 @@ jobs:
               except Exception as e:
                   print(f"  读取失败: {e}")
                   return
-              print(f"  bytes[0:4]      = {d[0:4]}")
-              print(f"  bytes[0:4].hex  = {d[0:4].hex()}")
+              print(f"  前 4 字节 = {d[0:4]}  (hex={d[0:4].hex()})")
               if d[0:4] == b'KRNL':
-                  print(f"  >> 是 KRNL 格式")
+                  print(f"  >> KRNL 格式")
                   print(f"  size[4:8]       = {int.from_bytes(d[4:8],'little')}")
                   print(f"  code0[8:12]     = 0x{int.from_bytes(d[8:12],'little'):08x}")
                   print(f"  image_size[16:24]= 0x{int.from_bytes(d[16:24],'little'):x}")
                   idx = d.find(b'ARM\x64')
                   print(f"  ARM\\x64 @       = 0x{idx:x}")
               elif d[0:2] == b'MZ':
-                  print(f"  >> 是 PE/EFI 格式")
+                  print(f"  >> PE/EFI 格式")
                   pe_off = int.from_bytes(d[0x3C:0x40], 'little')
-                  print(f"  PE header offset = 0x{pe_off:x}")
+                  print(f"  PE hdr @ 0x{pe_off:x}")
               elif d[0:4] == b'\xd0\x0d\xfe\xed':
-                  print(f"  >> 是 FIT/DTB 格式")
+                  print(f"  >> FIT/DTB")
               elif d[0:8] == b'ANDROID!':
-                  print(f"  >> 是 Android boot.img")
+                  print(f"  >> Android boot.img")
               else:
-                  print(f"  >> 未知格式")
-
+                  print(f"  >> 未知")
           inspect(os.environ.get("OFF_HEAD", ""), "OFFICIAL")
           inspect(os.environ.get("FLP_VMLINUZ", ""), "FLIPPY")
           PYEOF
 
+      # ============================================================
+      # 4. 对比 DTB
+      # ============================================================
       - name: Compare DTB
         run: |
           echo "==========================================="
           echo "  对比 #2: DTB"
           echo "==========================================="
-
-          OFF_DTB=$(find /tmp/official/parts/dtb -name "*r5s*" 2>/dev/null | head -1)
-          if [ -z "$OFF_DTB" ]; then
-            OFF_DTB=$(find /tmp/official/parts/dtb -name "*.dtb" 2>/dev/null | head -1)
-          fi
-
-          FLP_DTB=$(find /tmp/flippy/dtb -name "*r5s*" 2>/dev/null | head -1)
-          if [ -z "$FLP_DTB" ]; then
-            FLP_DTB=$(find /tmp/flippy/dtb -name "*.dtb" 2>/dev/null | head -1)
-          fi
-
+          OFF_DTB=$(find /tmp/official/parts/dtb -name "*.dtb" | head -1)
+          FLP_DTB=$(find /tmp/flippy/dtb -name "*r5s*" | head -1)
           echo "官方 DTB: $OFF_DTB"
           echo "Flippy DTB: $FLP_DTB"
-
           if [ -z "$OFF_DTB" ] || [ -z "$FLP_DTB" ]; then
-            echo "缺 DTB，跳过对比"
+            echo "缺一方 DTB，跳过"
             exit 0
           fi
-
-          stat -c "  官方大小: %s bytes" "$OFF_DTB"
-          stat -c "  Flippy大小: %s bytes" "$FLP_DTB"
+          stat -c "  官方大小: %s" "$OFF_DTB"
+          stat -c "  Flippy大小: %s" "$FLP_DTB"
 
           mkdir -p /tmp/dtbcmp
           dtc -I dtb -O dts -o /tmp/dtbcmp/official.dts "$OFF_DTB" 2>/dev/null || true
           dtc -I dtb -O dts -o /tmp/dtbcmp/flippy.dts "$FLP_DTB" 2>/dev/null || true
 
           echo ""
-          echo "--- 官方 chosen 节点 ---"
-          grep -A3 -B1 'chosen' /tmp/dtbcmp/official.dts 2>/dev/null | head -20 || echo "无"
+          echo "--- 官方 chosen/bootargs ---"
+          grep -A3 'chosen' /tmp/dtbcmp/official.dts 2>/dev/null | head -15 || echo "无"
+          echo ""
+          echo "--- Flippy chosen/bootargs ---"
+          grep -A3 'chosen' /tmp/dtbcmp/flippy.dts 2>/dev/null | head -15 || echo "无"
 
           echo ""
-          echo "--- Flippy chosen 节点 ---"
-          grep -A3 -B1 'chosen' /tmp/dtbcmp/flippy.dts 2>/dev/null | head -20 || echo "无"
-
+          echo "--- 差异前 50 行 ---"
+          diff /tmp/dtbcmp/official.dts /tmp/dtbcmp/flippy.dts | head -50 || true
+          DIFF=$(diff /tmp/dtbcmp/official.dts /tmp/dtbcmp/flippy.dts | grep -c '^[<>]' || true)
           echo ""
-          echo "--- 差异前 60 行 ---"
-          diff /tmp/dtbcmp/official.dts /tmp/dtbcmp/flippy.dts | head -60 || true
+          echo "差异总行数: $DIFF"
 
-          DIFF_LINES=$(diff /tmp/dtbcmp/official.dts /tmp/dtbcmp/flippy.dts | grep -c '^[<>]' || true)
-          echo ""
-          echo "差异总行数: $DIFF_LINES"
-
+      # ============================================================
+      # 5. 收集结果
+      # ============================================================
       - name: Collect results
         if: always()
         run: |
@@ -357,20 +418,17 @@ jobs:
           cp -rf /tmp/official/parts/dtb /tmp/results/official-dtb 2>/dev/null || true
 
           FLP_VMLINUZ=$(find /tmp/flippy/boot -name "vmlinuz-*" 2>/dev/null | head -1)
-          if [ -n "$FLP_VMLINUZ" ]; then
-            cp -f "$FLP_VMLINUZ" /tmp/results/flippy-vmlinuz 2>/dev/null || true
-          fi
+          [ -n "$FLP_VMLINUZ" ] && cp -f "$FLP_VMLINUZ" /tmp/results/flippy-vmlinuz
 
           FLP_DTB=$(find /tmp/flippy/dtb -name "*r5s*" 2>/dev/null | head -1)
-          if [ -n "$FLP_DTB" ]; then
-            cp -f "$FLP_DTB" /tmp/results/flippy-r5s.dtb 2>/dev/null || true
-          fi
+          [ -n "$FLP_DTB" ] && cp -f "$FLP_DTB" /tmp/results/flippy-r5s.dtb
 
           cp -f /tmp/dtbcmp/official.dts /tmp/results/ 2>/dev/null || true
           cp -f /tmp/dtbcmp/flippy.dts /tmp/results/ 2>/dev/null || true
 
           {
             echo "Flippy 内核版本: ${FLIPPY_VER:-unknown}"
+            echo "Flippy 来源: ${SRC_REPO:-unknown}/${SRC_REL:-unknown}"
             echo ""
             echo "官方 kernel 头部 (前 96 字节):"
             xxd -l 96 /tmp/official/parts/kernel_head.bin 2>/dev/null || echo "N/A"
