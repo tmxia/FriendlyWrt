@@ -378,12 +378,12 @@ jobs:
         kernel_end = kernel_off + old_size
 
         need_sectors = (kernel_size + 511) // 512
-        rounded = ((need_sectors + 0xFFF) // 0x1000) * 0x1000  # 2MiB 对齐
+        rounded  = ((need_sectors + 0xFFF) // 0x1000) * 0x1000  # 2MiB 对齐
         new_size = max(rounded, old_size)
 
-        print(f"[param] old = 0x{old_size:x} ({old_size*512/1024/1024:.1f} MiB)")
-        print(f"[param] need= 0x{need_sectors:x} sectors")
-        print(f"[param] new = 0x{new_size:x} ({new_size*512/1024/1024:.1f} MiB)")
+        print(f"[param] old  = 0x{old_size:x} ({old_size*512/1024/1024:.1f} MiB)")
+        print(f"[param] need = 0x{need_sectors:x} sectors ({need_sectors*512/1024/1024:.1f} MiB)")
+        print(f"[param] new  = 0x{new_size:x} ({new_size*512/1024/1024:.1f} MiB)")
 
         if new_size == old_size:
             print("[param] 容量足够，无需扩容"); sys.exit(0)
@@ -403,7 +403,7 @@ jobs:
 
         with open(param_file, 'w') as f:
             f.write(content)
-        print("[param] parameter.txt 已更新")
+        print(f"[param] parameter.txt 已更新 (delta = {delta} sectors = {delta*512/1024/1024:.1f} MiB)")
         PARAM_PYEOF
         echo "===== After ====="; cat "$PARAM_FILE"
 
@@ -445,7 +445,7 @@ jobs:
 
         # 验证最终镜像
         python3 - "$GITHUB_WORKSPACE/artifact/$IMG_FILE" <<'PYEOF'
-        import sys, re
+        import sys
         img = sys.argv[1]
         with open(img, 'rb') as f:
             f.seek(0x12000 * 512)
@@ -457,22 +457,23 @@ jobs:
         print("OK")
         PYEOF
 
-    - name: Compress and upload
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/${{ env.img_name }}
-        asset_name: ${{ env.img_name }}
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
-
-    - name: Compress img.gz
+    - name: Compress image to gz
       run: |
         cd $GITHUB_WORKSPACE/artifact
+        # 原始 img ~3.7GiB, 超过 GitHub Release 单 asset 2GiB 上限,
+        # 只上传 gzip 压缩后的镜像 (内部大量空洞, gz 后远小于 2GiB)
         gzip -f *.img
         ls -la
+        for f in *.img.gz; do
+          SIZE=$(stat -c%s "$f")
+          echo "$f -> $SIZE bytes"
+          if [ "$SIZE" -ge 2147483648 ]; then
+            echo "ERROR: $f 超过 GitHub Release 2GiB 单 asset 限制"
+            exit 1
+          fi
+        done
 
-    - name: Upload img.gz
+    - name: Upload img.gz only
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
