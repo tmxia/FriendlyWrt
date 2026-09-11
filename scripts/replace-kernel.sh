@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 + boot.img 重建 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v38-bootimg-args-fix"
+VERSION="2026-09-11-v39-direct-krnl-bootimg"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -397,63 +397,112 @@ if [ -n "$UINITRD" ]; then
 fi
 
 # ============================================================
-# ★★★ 6.9 重建 boot.img ★★★
-# 修复: build-boot-img.sh 需要 2 个参数
-#   用法: ./build-boot-img.sh <boot dir> <img filename>
-#   例:   ./build-boot-img.sh friendlywrt24-docker friendlywrt24-docker/boot.img
+# ★★★ 6.9 重建 boot.img (KRNL 格式直接构造) ★★★
+# 根因: build-boot-img.sh 是给 Debian/Ubuntu 生成 ext2 boot 的，不适用 FriendlyWrt
+# 正确: 官方 boot.img = KRNL头(8B: "KRNL"+size) + gzip数据 + 尾部 4B padding
+# 数据源: Flippy uInitrd
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
-log "  ★ [6.9/9] 重建 boot.img (调用官方 build-boot-img.sh)"
+log "  ★ [6.9/9] 重建 boot.img (KRNL 格式直接构造)"
 log "════════════════════════════════════════════════════════"
 
-BOOT_IMG_OLD_SIZE=$(stat -c%s "$TARGET_DIR/boot.img" 2>/dev/null || echo 0)
-BOOT_IMG_OLD_MD5=$(md5sum "$TARGET_DIR/boot.img" 2>/dev/null | awk '{print $1}' || echo "N/A")
-log "  旧 boot.img 大小: $BOOT_IMG_OLD_SIZE bytes"
-log "  旧 boot.img md5:  $BOOT_IMG_OLD_MD5"
-log "  旧 boot.img 前 16 字节:"
-xxd -l 16 "$TARGET_DIR/boot.img" 2>/dev/null | sed 's/^/    /' || echo "    (无)"
+BOOT_IMG="$TARGET_DIR/boot.img"
+UINITRD_FILE="$TARGET_DIR/uInitrd"
 
-cd "$SDFUSE_DIR"
-
-if [ -x ./build-boot-img.sh ]; then
-  # 删除旧的 boot.img（防止脚本因文件存在而跳过）
-  log "  ▶ 删除旧 boot.img"
-  rm -f "$DIST_NAME/boot.img"
-
-  log "  ▶ 调用 ./build-boot-img.sh $DIST_NAME $DIST_NAME/boot.img"
-  set +e
-  ./build-boot-img.sh "$DIST_NAME" "$DIST_NAME/boot.img" > "$WORK_DIR/build-boot.log" 2>&1
-  BOOT_RC=$?
-  set -e
-  log "  build-boot-img.sh exit=$BOOT_RC"
-  log "  ── 输出 ──"
-  cat "$WORK_DIR/build-boot.log" | sed 's/^/    /'
-  log "  ── 输出结束 ──"
-
-  if [ ! -f "$DIST_NAME/boot.img" ]; then
-    err "  ✗ build-boot-img.sh 执行后 boot.img 仍不存在"
-    exit 1
-  fi
+if [ ! -f "$UINITRD_FILE" ]; then
+  warn "  uInitrd 不存在，跳过 boot.img 重建"
 else
-  err "  ✗ build-boot-img.sh 不存在或不可执行"
-  exit 1
-fi
+  # 备份官方 boot.img（失败时回滚）
+  if [ -f "$BOOT_IMG" ]; then
+    cp "$BOOT_IMG" "$WORK_DIR/boot.img.orig" 2>/dev/null || true
+    log "  官方 boot.img: $(stat -c%s "$BOOT_IMG") bytes (已备份)"
+  fi
 
-if [ -f "$TARGET_DIR/boot.img" ]; then
-  NEW_BOOT_SIZE=$(stat -c%s "$TARGET_DIR/boot.img")
-  NEW_BOOT_MD5=$(md5sum "$TARGET_DIR/boot.img" | awk '{print $1}')
-  log "  新 boot.img 大小: $NEW_BOOT_SIZE bytes (旧: $BOOT_IMG_OLD_SIZE)"
-  log "  新 boot.img md5:  $NEW_BOOT_MD5"
-  log "  新 boot.img 前 32 字节:"
-  xxd -l 32 "$TARGET_DIR/boot.img" | sed 's/^/    /'
+  UINITRD_MAGIC=$(dd if="$UINITRD_FILE" bs=1 count=4 2>/dev/null | xxd -p)
+  UINITRD_SIZE=$(stat -c%s "$UINITRD_FILE")
+  log "  uInitrd: $UINITRD_SIZE bytes, magic=$UINITRD_MAGIC"
 
-  if [ "$NEW_BOOT_SIZE" != "$BOOT_IMG_OLD_SIZE" ]; then
-    log "  ✓ boot.img 已更新（大小变化）"
-  elif [ "$NEW_BOOT_MD5" != "$BOOT_IMG_OLD_MD5" ]; then
-    log "  ✓ boot.img 已更新（md5 变化，大小相同）"
+  # 检测 uInitrd 格式并提取载荷
+  RAMDISK=""
+  case "$UINITRD_MAGIC" in
+    27051956*)
+      log "  uInitrd 是 U-Boot legacy image，提取载荷"
+      mkdir -p "$WORK_DIR/boot_extract"
+      if command -v dumpimage >/dev/null 2>&1; then
+        set +e
+        dumpimage -i "$UINITRD_FILE" -o "$WORK_DIR/boot_extract/payload" -T ramdisk "$UINITRD_FILE" 2>/dev/null
+        DR=$?
+        set -e
+        if [ $DR -ne 0 ] || [ ! -s "$WORK_DIR/boot_extract/payload" ]; then
+          warn "    dumpimage 失败，手动剥离 64 字节头"
+          tail -c +65 "$UINITRD_FILE" > "$WORK_DIR/boot_extract/payload"
+        fi
+      else
+        warn "    dumpimage 不可用，剥离 64 字节头"
+        tail -c +65 "$UINITRD_FILE" > "$WORK_DIR/boot_extract/payload"
+      fi
+      RAMDISK="$WORK_DIR/boot_extract/payload"
+      log "  ✓ 提取到 payload: $(stat -c%s "$RAMDISK") bytes"
+      ;;
+    1f8b08*)
+      log "  uInitrd 是纯 gzip 数据"
+      RAMDISK="$UINITRD_FILE"
+      ;;
+    *)
+      warn "  uInitrd 未知格式 ($UINITRD_MAGIC)，保留官方 boot.img"
+      ;;
+  esac
+
+  if [ -n "$RAMDISK" ] && [ -f "$RAMDISK" ] && [ -s "$RAMDISK" ]; then
+    DATA_SIZE=$(stat -c%s "$RAMDISK")
+    log "  构造 KRNL boot.img (数据 $DATA_SIZE bytes)"
+
+    python3 - "$RAMDISK" "$BOOT_IMG" <<'BOOT_BUILD'
+import sys, struct
+
+ramdisk_path = sys.argv[1]
+boot_img_path = sys.argv[2]
+
+data = open(ramdisk_path, 'rb').read()
+print(f"    数据大小: {len(data)}")
+print(f"    数据前 4 字节: {data[:4].hex()}")
+
+# KRNL 格式: 头 8B (KRNL + size) + 数据 + 尾部 4B padding
+size_field = len(data)  # 官方验证: size = 数据大小
+hdr = b'KRNL' + struct.pack('<I', size_field)
+
+with open(boot_img_path, 'wb') as f:
+    f.write(hdr)
+    f.write(data)
+    f.write(b'\x00\x00\x00\x00')
+
+print(f"    新 boot.img 总大小: {8 + len(data) + 4}")
+print(f"    size 字段: {size_field} (0x{size_field:08x})")
+BOOT_BUILD
+
+    # 验证
+    NEW_SIZE=$(stat -c%s "$BOOT_IMG" 2>/dev/null || echo 0)
+    NEW_MAGIC=$(dd if="$BOOT_IMG" bs=1 count=4 2>/dev/null)
+    NEW_MD5=$(md5sum "$BOOT_IMG" 2>/dev/null | awk '{print $1}')
+    NEW_SIZE_FIELD=$(dd if="$BOOT_IMG" bs=1 skip=4 count=4 2>/dev/null | xxd -p)
+
+    log "  新 boot.img 大小: $NEW_SIZE bytes"
+    log "  新 boot.img magic: $NEW_MAGIC"
+    log "  新 boot.img md5:   $NEW_MD5"
+    log "  新 boot.img size 字段: $NEW_SIZE_FIELD"
+    log "  新 boot.img 前 16 字节:"
+    xxd -l 16 "$BOOT_IMG" | sed 's/^/    /'
+
+    if [ "$NEW_MAGIC" = "KRNL" ] && [ "$NEW_SIZE" -gt 100000 ]; then
+      log "  ✓ boot.img 重建成功"
+    else
+      err "  ✗ 重建失败 (size=$NEW_SIZE, magic=$NEW_MAGIC)，恢复官方 boot.img"
+      [ -f "$WORK_DIR/boot.img.orig" ] && cp "$WORK_DIR/boot.img.orig" "$BOOT_IMG"
+    fi
   else
-    warn "  ⚠ boot.img 未变化 —— 请检查 build-boot-img.sh 输出"
+    warn "  无有效数据源，保留官方 boot.img"
+    [ -f "$WORK_DIR/boot.img.orig" ] && cp "$WORK_DIR/boot.img.orig" "$BOOT_IMG"
   fi
 fi
 
@@ -496,15 +545,20 @@ KERNEL_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(kernel\)' "$PARAM_FILE"
 KERNEL_BYTE_OFF=$(( KERNEL_OFFSET * 512 ))
 MAGIC=$(dd if="$OUTPUT_IMG" bs=1 skip=$KERNEL_BYTE_OFF count=4 2>/dev/null)
 [ "$MAGIC" != "KRNL" ] && { err "  KNL magic 缺失"; exit 1; }
-log "  ✓ KNL magic @ $KERNEL_BYTE_OFF"
+log "  ✓ kernel KNL magic @ $KERNEL_BYTE_OFF"
 
 # 验证 boot 分区的 boot.img
 BOOT_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(boot\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(boot\)/\1/')
 if [ -n "$BOOT_OFFSET" ]; then
   BOOT_BYTE_OFF=$(( BOOT_OFFSET * 512 ))
-  BOOT_MAGIC=$(dd if="$OUTPUT_IMG" bs=1 skip=$BOOT_BYTE_OFF count=4 2>/dev/null)
-  log "  boot 分区 @ $BOOT_BYTE_OFF: magic=$(printf '%s' "$BOOT_MAGIC" | xxd -p)"
+  BOOT_MAGIC_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip=$BOOT_BYTE_OFF count=4 2>/dev/null | xxd -p)
+  log "  boot 分区 @ $BOOT_BYTE_OFF: magic=$BOOT_MAGIC_HEX"
+  if [ "$BOOT_MAGIC_HEX" = "4b524e4c" ]; then
+    log "  ✓ boot 分区 KRNL magic 正确"
+  else
+    warn "  ⚠ boot 分区 magic 不是 KRNL"
+  fi
 fi
 
 # ============================================================
