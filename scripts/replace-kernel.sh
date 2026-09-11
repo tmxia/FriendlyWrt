@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v33-img2simg-fix"
+VERSION="2026-09-11-v34-rootfs-2g"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -405,7 +405,14 @@ if echo "$RAW_FMT" | grep -qi "squashfs"; then
 elif echo "$RAW_FMT" | grep -qiE "ext[234]|Linux.*ext"; then
   log "  检测为 ext4"
   CURRENT_RAW=$(stat -c%s "$WORK_ROOTFS")
-  TARGET_RAW=$(( 3 * 1024 * 1024 * 1024 ))
+
+  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+  # 【关键修复】预扩展 2GB 而非 3GB
+  #   3GB rootfs → 分区表总和超过 4GB img 容量 → "Partitions layout exceds disk size"
+  #   2GB 足够容纳 3086 个模块（实测物理占用 ~170MB）+ ext4 元数据
+  #   分区总和: 3.17 GiB < 3.73 GiB img 容量 ✓
+  # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+  TARGET_RAW=$(( 2 * 1024 * 1024 * 1024 ))
   if [ "$CURRENT_RAW" -lt "$TARGET_RAW" ]; then
     log "  ★ 预扩展 raw: $(( CURRENT_RAW / 1024 / 1024 )) MiB → $(( TARGET_RAW / 1024 / 1024 )) MiB"
     truncate -s "$TARGET_RAW" "$WORK_ROOTFS"
@@ -466,8 +473,6 @@ else
   err "  不支持的 raw 格式: $RAW_FMT"; exit 1
 fi
 
-# ---------- raw → sparse ----------
-# ★★★ 关键修复：img2simg 的 block_size 是位置参数，不是 -b 选项 ★★★
 if [ "$IS_SPARSE" = "1" ]; then
   log "  转换 raw → Android sparse"
   ROOTFS_FINAL="$WORK_DIR/rootfs.final.img"
@@ -554,6 +559,40 @@ PARAM_PYEOF
 log "  parameter.txt CMDLINE:"
 grep -E '^CMDLINE:' "$PARAM_FILE" | head -1 | sed 's/^/    /'
 
+# ★ 分区总和检查
+python3 - "$PARAM_FILE" <<'CHECK_TOTAL' || true
+import re, sys
+param_file = sys.argv[1]
+content = open(param_file).read()
+m = re.search(r'CMDLINE:\s*mtdparts=[^:]+:(.+?)(?:\s|$)', content)
+if not m: sys.exit(0)
+layout = m.group(1)
+items = layout.split(',')
+total_end = 0
+for it in items:
+    mm = re.match(r'0x([0-9a-fA-F]+)@0x([0-9a-fA-F]+)\(([^)]+)\)', it)
+    if not mm: continue
+    size = int(mm.group(1), 16)
+    off  = int(mm.group(2), 16)
+    name = mm.group(3)
+    end = off + size
+    if end > total_end: total_end = end
+img_capacity_sectors = 4000000000 // 512
+total_bytes = total_end * 512
+pct = 100.0 * total_end / img_capacity_sectors if img_capacity_sectors else 0
+print("  [分区检查] 最后固定分区结束 @ sector 0x%x = %d bytes (%.1f MiB)" %
+      (total_end, total_bytes, total_bytes/1024/1024))
+print("  [分区检查] img 容量 sector = 0x%x = %d bytes (%.1f MiB)" %
+      (img_capacity_sectors, img_capacity_sectors*512, img_capacity_sectors*512/1024/1024))
+print("  [分区检查] 占用 = %.1f%%" % pct)
+if total_end >= img_capacity_sectors:
+    print("  [分区检查] ✗ 分区总和超出 img 容量！需缩减 rootfs")
+    sys.exit(2)
+else:
+    print("  [分区检查] ✓ 分区总和 < img 容量，余量 %.1f MiB" %
+          ((img_capacity_sectors - total_end) * 512 / 1024 / 1024))
+CHECK_TOTAL
+
 # ============================================================
 # 6. dtb + uInitrd
 # ============================================================
@@ -579,9 +618,6 @@ else
   warn "  ✗ uInitrd 未找到"
 fi
 
-log "  TARGET_DIR 内容:"
-ls -la "$TARGET_DIR" | sed 's/^/    /'
-
 # ============================================================
 # 7. 生成镜像（严格判定成功）
 # ============================================================
@@ -597,13 +633,15 @@ MK_EXIT=$?
 set -o pipefail
 set -e
 
-log "  ── mk-sd-image.sh 输出 ($(wc -l < /tmp/mk-sd.log) 行) ──"
-cat /tmp/mk-sd.log | sed 's/^/    /'
+log "  ── mk-sd-image.sh 输出 ($(wc -l < /tmp/mk-sd.log) 行，仅关键行) ──"
+grep -E 'Creating RAW|RAW image successfully|Partitions layout|capacity|error|Error|fail' /tmp/mk-sd.log | sed 's/^/    /'
 log "  ── 输出结束 ──"
 log "  mk-sd-image.sh exit=$MK_EXIT"
 
 if ! grep -q "RAW image successfully created" /tmp/mk-sd.log; then
   err "  mk-sd-image.sh 未报告成功"
+  err "  完整日志已保存到 /tmp/mk-sd.log，尾部 30 行："
+  tail -30 /tmp/mk-sd.log | sed 's/^/    /'
   exit 1
 fi
 
