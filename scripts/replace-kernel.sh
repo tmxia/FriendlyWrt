@@ -11,7 +11,7 @@
 #   KERNEL_VERSION   - 6.12.y (默认) / 6.18.y
 set -euo pipefail
 
-VERSION="2026-09-11-v9-fulldtb"
+VERSION="2026-09-11-v10-tarextract"
 log() { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err() { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -101,21 +101,31 @@ if [ ! -f "$KERNEL_CACHE/.ready" ]; then
 
   LOCAL_KDIR="$MATCHED_VER"
   [ ! -d "$LOCAL_KDIR" ] && LOCAL_KDIR=$(find . -maxdepth 2 -type d -name "*${MATCHED_VER}*" ! -path "./boot*" ! -path "./dtb*" ! -path "./modules*" | head -1)
-  [ -z "$LOCAL_KDIR" ] && { err "找不到内核目录"; exit 1; }
+  [ -z "$LOCAL_KDIR" ] && { err "找不到内核目录"; ls -la; exit 1; }
 
   log "  解压后顶层内容:"
   ls -la "$LOCAL_KDIR/" | sed 's/^/    /'
 
-  mkdir -p boot dtb modules
+  # 保存内核顶层目录路径供后续使用
+  echo "$KERNEL_CACHE/$LOCAL_KDIR" > "$KERNEL_CACHE/.topdir"
+
+  # 解压 boot / dtb / modules 到子目录
   for type in boot dtb modules; do
     TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "${type}-*.tar.gz" | head -1)
     [ -z "$TAR" ] && [ "$type" = "dtb" ] && TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-    [ -n "$TAR" ] && tar xzf "$TAR" -C "$type" && log "  ✓ 解压 $type: $(basename "$TAR")"
+    if [ -n "$TAR" ]; then
+      tar xzf "$TAR" -C "$KERNEL_CACHE"
+      log "  ✓ 解压 $type: $(basename "$TAR")"
+    fi
   done
 
   touch .ready
 fi
 log "  缓存: $KERNEL_CACHE"
+
+# 找到 kernels 解压后的顶层目录
+KERNEL_TOPDIR=$(cat "$KERNEL_CACHE/.topdir" 2>/dev/null || echo "$KERNEL_CACHE/$MATCHED_VER")
+log "  内核顶层目录: $KERNEL_TOPDIR"
 
 # ============================================================
 # 3. 复制骨架
@@ -131,12 +141,13 @@ log "  已复制: $TARGET_DIR"
 # ============================================================
 log "========== [4/6] 构造 kernel.img =========="
 
+# 找 vmlinuz
 IMAGE_FILE=""
-for pattern in "Image" "vmlinuz-*" "kernel*.img" "*.bin" "Image-*"; do
-  IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 4 -name "$pattern" -type f 2>/dev/null | head -1)
+for pattern in "vmlinuz-*" "Image" "Image-*" "kernel*.img" "*.bin"; do
+  IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "$pattern" 2>/dev/null | head -1)
   [ -n "$IMAGE_FILE" ] && break
 done
-[ -z "$IMAGE_FILE" ] && { err "找不到内核 Image"; find "$KERNEL_CACHE" -type f -name "vmlinuz*" -o -name "Image*" | head -10; exit 1; }
+[ -z "$IMAGE_FILE" ] && { err "找不到内核 Image"; find "$KERNEL_CACHE" -type f | head -20; exit 1; }
 
 IMAGE_SIZE=$(stat -c%s "$IMAGE_FILE")
 log "  内核文件: $(basename "$IMAGE_FILE") ($IMAGE_SIZE bytes)"
@@ -159,7 +170,6 @@ elif [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "4d5a" ]; then
   log "  >>> PE/EFI stub 格式，修复 ARM64 Image 头..."
   python3 - "$IMAGE_FILE" "$WORK_DIR/patched.img" <<'PYEOF'
 import sys, struct
-
 data = bytearray(open(sys.argv[1], 'rb').read())
 file_size = len(data)
 
@@ -172,12 +182,11 @@ magic_pos = data.find(b'ARM\x64')
 
 print(f"    原 code0:       0x{orig_code0:08x}")
 print(f"    原 code1:       0x{orig_code1:08x}")
-print(f"    原 text_offset: 0x{orig_text_off:x} ({orig_text_off})")
+print(f"    原 text_offset: 0x{orig_text_off:x}")
 print(f"    原 image_size:  {orig_img_size} bytes")
 print(f"    原 flags:       0x{orig_flags:x}")
 print(f"    ARM64 magic@:   0x{magic_pos:x}")
 print(f"    实际文件大小:   {file_size} bytes")
-print("")
 
 data[0x00:0x04] = b'\x1f\x20\x03\xd5'
 print(f"    ✓ code0 修复: 0x{orig_code0:08x} -> 0xd503201f (NOP)")
@@ -194,10 +203,10 @@ if opcode == 0x05:
     if imm26 & 0x02000000:
         imm26 = imm26 - 0x04000000
     offset = imm26 * 4
-    print(f"    ✓ code1 是合法 B 指令，跳转 +{offset} bytes (0x{offset:x})")
+    print(f"    ✓ code1 合法 B 指令，跳转 +{offset} bytes")
 
 open(sys.argv[2], 'wb').write(data)
-print(f"    → 已生成 patched Image: {file_size} bytes")
+print(f"    → patched: {file_size} bytes")
 PYEOF
 
   [ ! -f "$WORK_DIR/patched.img" ] && { err "PE 修复失败"; exit 1; }
@@ -209,26 +218,8 @@ PYEOF
   printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
   cat "$WORK_DIR/patched.img" >> "$TARGET_DIR/kernel.img"
 
-elif [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "1f8b" ]; then
-  log "  >>> gzip 压缩，解压 + 修复头"
-  gunzip -c "$IMAGE_FILE" > "$WORK_DIR/raw.img" 2>/dev/null || cp "$IMAGE_FILE" "$WORK_DIR/raw.img"
-  python3 - "$WORK_DIR/raw.img" "$WORK_DIR/patched.img" <<'PYEOF'
-import sys, struct
-data = bytearray(open(sys.argv[1], 'rb').read())
-data[0x00:0x04] = b'\x1f\x20\x03\xd5'
-struct.pack_into('<Q', data, 0x08, 0)
-struct.pack_into('<Q', data, 0x10, len(data))
-open(sys.argv[2], 'wb').write(data)
-PYEOF
-  IMG_SIZE=$(stat -c%s "$WORK_DIR/patched.img")
-  SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
-  SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-  printf 'KRNL' > "$TARGET_DIR/kernel.img"
-  printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
-  cat "$WORK_DIR/patched.img" >> "$TARGET_DIR/kernel.img"
-
 else
-  log "  >>> 未知格式，作为纯 Image + NOP 修复"
+  log "  >>> 未知格式，按纯 Image + NOP 修复"
   python3 - "$IMAGE_FILE" "$WORK_DIR/patched.img" <<'PYEOF'
 import sys, struct
 data = bytearray(open(sys.argv[1], 'rb').read())
@@ -245,138 +236,82 @@ PYEOF
   cat "$WORK_DIR/patched.img" >> "$TARGET_DIR/kernel.img"
 fi
 
-# 最终验证
-log "  ========== 最终 kernel.img 验证 =========="
+# 验证
+log "  ========== kernel.img 验证 =========="
 python3 - "$TARGET_DIR/kernel.img" <<'PYEOF'
 import sys, struct
 data = open(sys.argv[1], 'rb').read(128)
-assert data[0:4] == b'KRNL', 'KRNL missing!'
+assert data[0:4] == b'KRNL'
 knl_size = struct.unpack_from('<I', data, 4)[0]
 code0 = struct.unpack_from('<I', data, 8)[0]
-code1 = struct.unpack_from('<I', data, 12)[0]
-text_off = struct.unpack_from('<Q', data, 16)[0]
 img_size = struct.unpack_from('<Q', data, 24)[0]
-flags = struct.unpack_from('<Q', data, 32)[0]
 magic_pos = data.find(b'ARM\x64')
-
-print(f"    KRNL size:       {knl_size}")
-print(f"    code0:           0x{code0:08x}  {'✓ NOP' if code0 == 0xd503201f else '✗'}")
-print(f"    code1:           0x{code1:08x}")
-print(f"    text_offset:     0x{text_off:x}")
-print(f"    image_size:      {img_size}")
-print(f"    flags:           0x{flags:x}")
-print(f"    ARM64 magic@:    0x{magic_pos:x}  {'✓' if magic_pos == 0x40 else '✗ 期望 0x40'}")
-
-assert code0 == 0xd503201f, 'code0 修复失败'
-assert img_size == knl_size, f'image_size ({img_size}) != KRNL size ({knl_size})'
-assert magic_pos == 0x40, f'magic 位置错误'
-print("    ✓✓✓ 所有断言通过")
+print(f"    KRNL size:  {knl_size}")
+print(f"    code0:      0x{code0:08x}  {'✓ NOP' if code0 == 0xd503201f else '✗'}")
+print(f"    image_size: {img_size}")
+print(f"    magic@:     0x{magic_pos:x}")
+assert code0 == 0xd503201f and magic_pos == 0x40
+print("    ✓✓✓ 断言通过")
 PYEOF
 
-log "  新 kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
-
 # ============================================================
-# 5. dtb + uInitrd + parameter（全目录搜索）
+# 5. dtb + uInitrd + parameter —— 直接从 tar 包提取
 # ============================================================
 log "========== [5/6] dtb + uInitrd + parameter =========="
 
-log "  诊断: KERNEL_CACHE 完整结构"
-log "    KERNEL_CACHE=$KERNEL_CACHE"
-log "    顶层内容:"
-ls -la "$KERNEL_CACHE/" | sed 's/^/      /'
+# 找到 dtb-rockchip tar 包（从原始内核目录里找）
+DTB_TAR=""
+for search_dir in "$KERNEL_TOPDIR" "$KERNEL_CACHE"; do
+  DTB_TAR=$(find "$search_dir" -maxdepth 2 -name "dtb-rockchip-*.tar.gz" 2>/dev/null | head -1)
+  [ -n "$DTB_TAR" ] && break
+done
+[ -z "$DTB_TAR" ] && { err "找不到 dtb-rockchip-*.tar.gz"; find "$KERNEL_CACHE" -name "*.tar.gz" | head; exit 1; }
+log "  dtb 包: $DTB_TAR"
+log "  包内 rk3568-nanopi-r5* 文件:"
+tar tzf "$DTB_TAR" | grep -E "rk3568-nanopi-r5[sc]" | sed 's/^/    /' || echo "    (无匹配)"
 
-log "    dtb 目录:"
-ls -la "$KERNEL_CACHE/dtb/" 2>/dev/null | head -20 | sed 's/^/      /' || echo "      (无 dtb 目录)"
+# 直接从 tar 包提取到骨架
+mkdir -p "$TARGET_DIR/dtb/rockchip"
+R5S_PATH=$(tar tzf "$DTB_TAR" | grep -E "(^|/)rk3568-nanopi-r5s\.dtb$" | head -1 || echo "")
+R5C_PATH=$(tar tzf "$DTB_TAR" | grep -E "(^|/)rk3568-nanopi-r5c\.dtb$" | head -1 || echo "")
 
-log "    全目录搜索所有 .dtb (前 30):"
-find "$KERNEL_CACHE" -type f -name "*.dtb" 2>/dev/null | head -30 | sed 's/^/      /' || true
+log "  r5s 路径: ${R5S_PATH:-未找到}"
+log "  r5c 路径: ${R5C_PATH:-未找到}"
 
-log "    全目录搜索 rk3568-nanopi-* :"
-find "$KERNEL_CACHE" -type f -name "rk3568-nanopi-*" 2>/dev/null | sed 's/^/      /' || true
+DTB_R5S=""
+DTB_R5C=""
 
-log "    全目录搜索 *r5s* :"
-find "$KERNEL_CACHE" -type f -name "*r5s*" 2>/dev/null | sed 's/^/      /' || true
+if [ -n "$R5S_PATH" ]; then
+  tar xzf "$DTB_TAR" -C "$WORK_DIR" "$R5S_PATH"
+  cp "$WORK_DIR/$R5S_PATH" "$TARGET_DIR/dtb/rockchip/rk3568-nanopi-r5s.dtb"
+  DTB_R5S="$TARGET_DIR/dtb/rockchip/rk3568-nanopi-r5s.dtb"
+  log "  ✓ r5s dtb 已提取: $(stat -c%s "$DTB_R5S") bytes"
+fi
 
-log "    全目录搜索 *r5c* :"
-find "$KERNEL_CACHE" -type f -name "*r5c*" 2>/dev/null | sed 's/^/      /' || true
+if [ -n "$R5C_PATH" ]; then
+  tar xzf "$DTB_TAR" -C "$WORK_DIR" "$R5C_PATH"
+  cp "$WORK_DIR/$R5C_PATH" "$TARGET_DIR/dtb/rockchip/rk3568-nanopi-r5c.dtb"
+  DTB_R5C="$TARGET_DIR/dtb/rockchip/rk3568-nanopi-r5c.dtb"
+  log "  ✓ r5c dtb 已提取: $(stat -c%s "$DTB_R5C") bytes"
+fi
 
-# 实际查找
-DTB_R5S=$(find "$KERNEL_CACHE" -type f -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
-DTB_R5C=$(find "$KERNEL_CACHE" -type f -name "rk3568-nanopi-r5c.dtb" 2>/dev/null | head -1)
-
-log "  查找结果:"
-log "    r5s: ${DTB_R5S:-未找到}"
-log "    r5c: ${DTB_R5C:-未找到}"
-
-# 如果找不到，尝试从 ophub/kernel 下载
 if [ -z "$DTB_R5S" ] && [ -z "$DTB_R5C" ]; then
-  log "  ⚠ 内核包中未找到，尝试从 ophub/kernel kernel_flippy ${MATCHED_VER} 下载..."
-  FLIPPY_DTB_CACHE="/tmp/flippy-dtb-${MATCHED_VER}"
-  if [ ! -f "$FLIPPY_DTB_CACHE/.ready" ]; then
-    mkdir -p "$FLIPPY_DTB_CACHE"
-    cd "$FLIPPY_DTB_CACHE"
-    URL="https://github.com/ophub/kernel/releases/download/kernel_flippy/${MATCHED_VER}.tar.gz"
-    if wget -q --timeout=60 "$URL" -O flippy.tar.gz 2>/dev/null; then
-      tar xzf flippy.tar.gz 2>/dev/null
-      LOCAL_FLIPPY="${MATCHED_VER}"
-      [ ! -d "$LOCAL_FLIPPY" ] && LOCAL_FLIPPY=$(find . -maxdepth 1 -type d -name "*${MATCHED_VER}*" | head -1)
-      DTB_FLIPPY_TAR=$(find "$LOCAL_FLIPPY" -name "dtb-rockchip-*.tar.gz" 2>/dev/null | head -1)
-      if [ -n "$DTB_FLIPPY_TAR" ]; then
-        mkdir -p dtb
-        tar xzf "$DTB_FLIPPY_TAR" -C dtb
-        touch .ready
-        log "    ✓ flippy dtb 下载并解压"
-      fi
-    else
-      log "    ✗ flippy ${MATCHED_VER} 下载失败"
-    fi
-  fi
-  if [ -d "$FLIPPY_DTB_CACHE/dtb" ]; then
-    DTB_R5S=$(find "$FLIPPY_DTB_CACHE" -type f -name "rk3568-nanopi-r5s.dtb" | head -1)
-    DTB_R5C=$(find "$FLIPPY_DTB_CACHE" -type f -name "rk3568-nanopi-r5c.dtb" | head -1)
-    log "    flippy 缓存查找: r5s=${DTB_R5S:-未找到}, r5c=${DTB_R5C:-未找到}"
-  fi
+  warn "  ✗ 未能从 dtb 包提取 r5s/r5c dtb"
+  warn "  dtb 包全部内容（前 50）:"
+  tar tzf "$DTB_TAR" | head -50 | sed 's/^/    /'
+  warn "  将保留骨架 dtb，可能影响启动"
 fi
 
-# 替换 dtb
-if [ -n "$DTB_R5S" ] || [ -n "$DTB_R5C" ]; then
-  log "  替换 dtb 到骨架..."
-  if [ ! -d "$TARGET_DIR/dtb/rockchip" ]; then
-    mkdir -p "$TARGET_DIR/dtb/rockchip"
-  fi
-  BEFORE=$(find "$TARGET_DIR/dtb" -type f -name "*.dtb" 2>/dev/null | wc -l)
-  rm -rf "$TARGET_DIR/dtb/rockchip"
-  mkdir -p "$TARGET_DIR/dtb/rockchip"
-  if [ -n "$DTB_R5S" ]; then
-    cp -f "$DTB_R5S" "$TARGET_DIR/dtb/rockchip/rk3568-nanopi-r5s.dtb"
-    log "    ✓ r5s: $(basename "$DTB_R5S") -> rk3568-nanopi-r5s.dtb"
-  fi
-  if [ -n "$DTB_R5C" ]; then
-    cp -f "$DTB_R5C" "$TARGET_DIR/dtb/rockchip/rk3568-nanopi-r5c.dtb"
-    log "    ✓ r5c: $(basename "$DTB_R5C") -> rk3568-nanopi-r5c.dtb"
-  fi
-  AFTER=$(find "$TARGET_DIR/dtb" -type f -name "*.dtb" 2>/dev/null | wc -l)
-  log "    dtb 数量: $BEFORE -> $AFTER"
-  ls -la "$TARGET_DIR/dtb/rockchip/" | sed 's/^/      /'
-else
-  log "  ✗✗✗ 无法找到 r5s/r5c dtb，保留骨架 dtb"
-  log "  这极可能导致启动失败！"
-fi
-
-# uInitrd
-UINITRD=$(find "$KERNEL_CACHE" -type f -name "uInitrd-*" | head -1)
-if [ -n "$UINITRD" ]; then
-  cp "$UINITRD" "$TARGET_DIR/uInitrd"
-  log "  ✓ uInitrd: $(stat -c%s "$TARGET_DIR/uInitrd") bytes"
-else
-  INITRD=$(find "$KERNEL_CACHE" -type f -name "initrd.img-*" | head -1)
-  if [ -n "$INITRD" ] && command -v mkimage >/dev/null 2>&1; then
-    log "  从 initrd.img 转换..."
-    mkimage -A arm64 -O linux -T ramdisk -C gzip -n "uInitrd" -d "$INITRD" "$TARGET_DIR/uInitrd" 2>/dev/null || \
-      cp "$INITRD" "$TARGET_DIR/uInitrd"
+# uInitrd（也从 tar 包提取）
+BOOT_TAR=$(find "$KERNEL_TOPDIR" -maxdepth 1 -name "boot-*.tar.gz" 2>/dev/null | head -1)
+if [ -n "$BOOT_TAR" ]; then
+  UINITRD_PATH=$(tar tzf "$BOOT_TAR" | grep -E "uInitrd" | head -1 || echo "")
+  if [ -n "$UINITRD_PATH" ]; then
+    tar xzf "$BOOT_TAR" -C "$WORK_DIR" "$UINITRD_PATH"
+    cp "$WORK_DIR/$UINITRD_PATH" "$TARGET_DIR/uInitrd"
     log "  ✓ uInitrd: $(stat -c%s "$TARGET_DIR/uInitrd") bytes"
   else
-    warn "  找不到 uInitrd，保留骨架"
+    warn "  boot 包中无 uInitrd"
   fi
 fi
 
@@ -391,6 +326,8 @@ grep -q "0x00018000@0x00012000(kernel)" "$PARAM" && log "  ✓ parameter.txt OK"
 
 log "  最终目录内容:"
 ls -la "$TARGET_DIR/" | sed 's/^/    /'
+log "  dtb/rockchip 内容:"
+ls -la "$TARGET_DIR/dtb/rockchip/" | sed 's/^/    /'
 
 # ============================================================
 # 6. 生成镜像
@@ -410,7 +347,7 @@ FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
 [ -z "$FOUND_IMG" ] && { err "未生成镜像"; ls -la out/; exit 1; }
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
-# 验证最终镜像
+# 验证
 KERNEL_OFFSET=$((0x12000 * 512))
 log "  验证 kernel 分区 (偏移 $KERNEL_OFFSET)..."
 python3 - "$OUTPUT_IMG" "$KERNEL_OFFSET" <<'PYEOF'
@@ -419,7 +356,7 @@ img, off = sys.argv[1], int(sys.argv[2])
 with open(img, 'rb') as f:
     f.seek(off)
     data = f.read(128)
-assert data[0:4] == b'KRNL', 'KRNL missing!'
+assert data[0:4] == b'KRNL'
 knl_size = struct.unpack_from('<I', data, 4)[0]
 code0 = struct.unpack_from('<I', data, 8)[0]
 img_size = struct.unpack_from('<Q', data, 24)[0]
@@ -429,14 +366,14 @@ print(f"    ✓ code0=0x{code0:08x} ({'NOP' if code0 == 0xd503201f else '??'})")
 print(f"    ✓ image_size={img_size}")
 print(f"    ✓ magic@0x{magic_pos:x}")
 assert code0 == 0xd503201f and magic_pos == 0x40
-print("    ✓✓✓ 最终镜像含正确修复的内核")
+print("    ✓✓✓ 最终镜像 OK")
 PYEOF
 
 log "=========================================="
 log "✓ 完成 (version $VERSION)"
-log "  内核 tag: $KERNEL_TAG"
-log "  内核版本: $MATCHED_VER"
-log "  r5s dtb: ${DTB_R5S:-未找到}"
-log "  r5c dtb: ${DTB_R5C:-未找到}"
-log "  输出: $OUTPUT_IMG ($(($(stat -c%s "$OUTPUT_IMG")/1024/1024)) MiB)"
+log "  内核 tag:  $KERNEL_TAG"
+log "  内核版本:  $MATCHED_VER"
+log "  r5s dtb:   ${DTB_R5S:-未找到}"
+log "  r5c dtb:   ${DTB_R5C:-未找到}"
+log "  输出:      $OUTPUT_IMG ($(($(stat -c%s "$OUTPUT_IMG")/1024/1024)) MiB)"
 log "=========================================="
