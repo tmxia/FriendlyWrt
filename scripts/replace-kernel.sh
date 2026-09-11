@@ -1,29 +1,27 @@
 #!/bin/bash
-# replace-kernel.sh - 从 ophub/kernel 和 breakingbadboy/OpenWrt 扫描最新 6.1.x 内核
+# replace-kernel.sh - 支持6.18/6.12/6.6/6.1，PE→KRNL转换
 set -euo pipefail
 
-VERSION="2026-09-11-v15-6.1-latest"
+VERSION="2026-09-11-v16-pe-convert"
 log() { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err() { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
 log "replace-kernel.sh version: $VERSION"
 
-IMAGES_TGZ="$1"
-SDFUSE_DIR="$2"
-DIST_NAME="$3"
-OUTPUT_IMG="$4"
+IMAGES_TGZ="$1"; SDFUSE_DIR="$2"; DIST_NAME="$3"; OUTPUT_IMG="$4"
 TARGET_MODEL="${TARGET_MODEL:-r5s}"
+KERNEL_VERSION="${KERNEL_VERSION:-6.18.y}"
 
-log "参数: images=$(basename "$IMAGES_TGZ"), model=$TARGET_MODEL"
+log "参数: images=$(basename "$IMAGES_TGZ"), model=$TARGET_MODEL, version=$KERNEL_VERSION"
 
 WORK_DIR=$(mktemp -d /tmp/replace-kernel.XXXXXX)
 trap "rm -rf $WORK_DIR" EXIT
 log "工作目录: $WORK_DIR"
 
 # ============================================================
-# 1. 解压官方 images tgz
+# 1. 解压 images.tgz
 # ============================================================
-log "========== [1/7] 解压 images.tgz =========="
+log "========== [1/8] 解压 images.tgz =========="
 mkdir -p "$WORK_DIR/base"
 tar xzf "$IMAGES_TGZ" -C "$WORK_DIR/base"
 BASE_DIR=$(find "$WORK_DIR/base" -maxdepth 2 -type d -name "friendlywrt*" | head -1)
@@ -31,12 +29,11 @@ BASE_DIR=$(find "$WORK_DIR/base" -maxdepth 2 -type d -name "friendlywrt*" | head
 log "  顶层: $BASE_DIR"
 
 # ============================================================
-# 2. 扫描两个仓库的 6.1.x 版本
+# 2. 扫描内核版本 (6.18/6.12/6.6/6.1)
 # ============================================================
-log "========== [2/7] 扫描 6.1.x 内核版本 =========="
+log "========== [2/8] 扫描 $KERNEL_VERSION 内核 =========="
 
 declare -A VER_TO_SOURCE
-
 SCAN_LIST=(
   "ophub/kernel:kernel_rk35xx"
   "ophub/kernel:kernel_flippy"
@@ -44,44 +41,49 @@ SCAN_LIST=(
   "breakingbadboy/OpenWrt:kernel_stable"
 )
 
+# 解析用户选择的主/次版本前缀
+case "$KERNEL_VERSION" in
+  6.18*|6.18.y) PREFIX="6.18" ;;
+  6.12*|6.12.y) PREFIX="6.12" ;;
+  6.6*|6.6.y)    PREFIX="6.6" ;;
+  6.1*|6.1.y)    PREFIX="6.1" ;;
+  auto|"")       PREFIX="" ;;  # auto: 全扫描
+  *)             PREFIX="$KERNEL_VERSION" ;;
+esac
+log "  版本前缀: ${PREFIX:-auto}"
+
 for target in "${SCAN_LIST[@]}"; do
-  REPO="${target%%:*}"
-  RELEASE="${target##*:}"
+  REPO="${target%%:*}"; RELEASE="${target##*:}"
   log "  扫描 $REPO / $RELEASE ..."
 
   ASSETS=$(gh release view "$RELEASE" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || echo "")
-  if [ -z "$ASSETS" ]; then
-    log "    (无资产或不存在)"
+  [ -z "$ASSETS" ] && { log "    (无资产)"; continue; }
+
+  if [ -n "$PREFIX" ]; then
+    VERS=$(echo "$ASSETS" | grep -E "^${PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V || echo "")
+  else
+    VERS=$(echo "$ASSETS" | grep -E '^6\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V || echo "")
+  fi
+
+  if [ -z "$VERS" ]; then
+    log "    (无匹配)"
     continue
   fi
 
-  V61=$(echo "$ASSETS" | grep -E '^6\.1\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V || echo "")
-  if [ -z "$V61" ]; then
-    log "    (无 6.1.x)"
-    continue
-  fi
+  log "    匹配版本:"
+  echo "$VERS" | sed 's/^/      /'
 
-  log "    6.1.x 版本:"
-  echo "$V61" | sed 's/^/      /'
-
-  for v in $V61; do
-    if [ -z "${VER_TO_SOURCE[$v]:-}" ]; then
-      VER_TO_SOURCE["$v"]="$REPO:$RELEASE"
-    fi
+  for v in $VERS; do
+    [ -z "${VER_TO_SOURCE[$v]:-}" ] && VER_TO_SOURCE["$v"]="$REPO:$RELEASE"
   done
 done
 
 if [ ${#VER_TO_SOURCE[@]} -eq 0 ]; then
-  err "  两个仓库都没有 6.1.x 内核"
+  err "  无匹配 $KERNEL_VERSION 的内核"
   exit 1
 fi
 
-log ""
-log "  所有可用 6.1.x 版本（去重后）:"
-for v in $(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V); do
-  log "    $v  ← ${VER_TO_SOURCE[$v]}"
-done
-
+# 选最高版本
 SELECTED_VER=$(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V | tail -1)
 SELECTED_SOURCE="${VER_TO_SOURCE[$SELECTED_VER]}"
 SELECTED_REPO="${SELECTED_SOURCE%%:*}"
@@ -89,20 +91,17 @@ SELECTED_RELEASE="${SELECTED_SOURCE##*:}"
 
 log ""
 log "  ============ 决策 ============"
-log "  最新 6.1.x: $SELECTED_VER"
+log "  选中版本: $SELECTED_VER"
 log "  来源: $SELECTED_REPO / $SELECTED_RELEASE"
 
 # ============================================================
-# 3. 下载选定版本
+# 3. 下载并解压
 # ============================================================
-log "========== [3/7] 下载 $SELECTED_VER =========="
+log "========== [3/8] 下载 $SELECTED_VER =========="
 
 KERNEL_CACHE="/tmp/kernel-cache-${SELECTED_RELEASE}/${SELECTED_VER}"
 if [ ! -f "$KERNEL_CACHE/.ready" ]; then
-  log "  下载 $SELECTED_VER from $SELECTED_REPO/$SELECTED_RELEASE..."
-  rm -rf "$KERNEL_CACHE"
-  mkdir -p "$KERNEL_CACHE"
-  cd "$KERNEL_CACHE"
+  rm -rf "$KERNEL_CACHE"; mkdir -p "$KERNEL_CACHE"; cd "$KERNEL_CACHE"
   URL="https://github.com/${SELECTED_REPO}/releases/download/${SELECTED_RELEASE}/${SELECTED_VER}.tar.gz"
   log "  URL: $URL"
 
@@ -111,21 +110,18 @@ if [ ! -f "$KERNEL_CACHE/.ready" ]; then
   [ "$DOWNLOAD_OK" != "true" ] && curl -L -f --connect-timeout 60 --max-time 300 "$URL" -o kernel.tar.gz 2>/dev/null && DOWNLOAD_OK=true
   [ "$DOWNLOAD_OK" != "true" ] && { err "下载失败"; exit 1; }
 
-  tar xzf kernel.tar.gz || { err "解压失败"; exit 1; }
+  tar xzf kernel.tar.gz
 
   LOCAL_KDIR="$SELECTED_VER"
   [ ! -d "$LOCAL_KDIR" ] && LOCAL_KDIR=$(find . -maxdepth 2 -type d -name "*${SELECTED_VER}*" ! -path "./boot*" ! -path "./dtb*" ! -path "./modules*" | head -1)
-  [ -z "$LOCAL_KDIR" ] && { err "找不到内核目录"; ls -la; exit 1; }
-
-  log "  顶层内容:"
-  ls -la "$LOCAL_KDIR/" | sed 's/^/    /'
+  [ -z "$LOCAL_KDIR" ] && { err "找不到内核目录"; exit 1; }
 
   echo "$KERNEL_CACHE/$LOCAL_KDIR" > "$KERNEL_CACHE/.topdir"
 
   for type in boot dtb modules; do
     TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "${type}-*.tar.gz" | head -1)
     [ -z "$TAR" ] && [ "$type" = "dtb" ] && TAR=$(find "$LOCAL_KDIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
-    [ -n "$TAR" ] && tar xzf "$TAR" -C "$KERNEL_CACHE" && log "  ✓ 解压 $type: $(basename "$TAR")"
+    [ -n "$TAR" ] && tar xzf "$TAR" -C "$KERNEL_CACHE" && log "  ✓ 解压 $type"
   done
 
   touch .ready
@@ -136,19 +132,18 @@ log "  缓存: $KERNEL_CACHE"
 # ============================================================
 # 4. 复制骨架
 # ============================================================
-log "========== [4/7] 复制骨架 =========="
+log "========== [4/8] 复制骨架 =========="
 TARGET_DIR="$SDFUSE_DIR/$DIST_NAME"
 rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
-log "  已复制"
 
 # ============================================================
-# 5. 构造 kernel.img
+# 5. 构造 kernel.img —— PE→KRNL 转换
 # ============================================================
-log "========== [5/7] 构造 kernel.img =========="
+log "========== [5/8] 构造 kernel.img =========="
 
 IMAGE_FILE=""
-for pattern in "Image" "vmlinuz-*" "kernel*.img" "*.bin" "Image-*"; do
+for pattern in "vmlinuz-*" "Image" "Image-*" "kernel*.img" "*.bin"; do
   IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "$pattern" 2>/dev/null | head -1)
   [ -n "$IMAGE_FILE" ] && break
 done
@@ -164,54 +159,119 @@ MAGIC=$(xxd -l 4 -p "$IMAGE_FILE")
 log "  magic: $MAGIC"
 
 if [ "$MAGIC" = "4b524e4c" ]; then
-  log "  >>> KRNL 格式"
+  log "  >>> KRNL 格式，直接使用"
   cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
-
 elif [ "$MAGIC" = "d00dfeed" ]; then
-  log "  >>> FIT 格式"
+  log "  >>> FIT 格式，直接使用"
   cp "$IMAGE_FILE" "$TARGET_DIR/kernel.img"
-
-elif [ "$(xxd -l 2 -p "$IMAGE_FILE")" = "4d5a" ]; then
-  log "  ⚠ PE 格式，仅修复 code0"
-  python3 - "$IMAGE_FILE" "$WORK_DIR/patched.img" <<'PYEOF'
-import sys, struct
-data = bytearray(open(sys.argv[1], 'rb').read())
-code0 = struct.unpack_from('<I', data, 0x00)[0]
-data[0x00:0x04] = b'\x1f\x20\x03\xd5'
-print(f"    ✓ code0: 0x{code0:08x} -> NOP")
-open(sys.argv[2], 'wb').write(data)
-PYEOF
-  IMG_SIZE=$(stat -c%s "$WORK_DIR/patched.img")
-  SIZE_HEX=$(printf '%08x' "$IMG_SIZE")
-  SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-  printf 'KRNL' > "$TARGET_DIR/kernel.img"
-  printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
-  cat "$WORK_DIR/patched.img" >> "$TARGET_DIR/kernel.img"
 else
-  log "  >>> 裸机 ARM64 Image"
-  SIZE_HEX=$(printf '%08x' "$IMAGE_SIZE")
-  SIZE_LE=$(echo "$SIZE_HEX" | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/')
-  printf 'KRNL' > "$TARGET_DIR/kernel.img"
-  printf "$SIZE_LE" | xxd -r -p >> "$TARGET_DIR/kernel.img"
-  cat "$IMAGE_FILE" >> "$TARGET_DIR/kernel.img"
+  # PE 或裸机：调用 Python 转换
+  log "  >>> 调用 PE 解析器..."
+  python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" <<'PYEOF'
+import sys, struct, os
+
+src, dst = sys.argv[1], sys.argv[2]
+data = open(src, 'rb').read()
+
+# ---- 检查是否为 PE 格式 ----
+is_pe = data[0:2] == b'MZ'
+if is_pe:
+    print(f"    检测到 PE 格式 (MZ signature)")
+    # 读取 PE 头偏移 (offset 0x3C)
+    pe_off = struct.unpack_from('<I', data, 0x3C)[0]
+    print(f"    PE header offset: 0x{pe_off:x}")
+
+    if data[pe_off:pe_off+4] != b'PE\x00\x00':
+        print(f"    ✗ PE 签名不匹配，回退为裸机处理")
+        is_pe = False
+    else:
+        # 读取 COFF 头
+        coff = pe_off + 4
+        machine = struct.unpack_from('<H', data, coff)[0]
+        num_sections = struct.unpack_from('<H', data, coff + 2)[0]
+        opt_size = struct.unpack_from('<H', data, coff + 16)[0]
+        print(f"    Machine: 0x{machine:04x} (0xaa64 = ARM64)")
+        print(f"    Sections: {num_sections}")
+        print(f"    Optional header size: {opt_size}")
+
+        # 遍历 section 表
+        sec_start = coff + 20 + opt_size
+        sections = []
+        for i in range(num_sections):
+            sec_off = sec_start + i * 40
+            name = data[sec_off:sec_off+8].rstrip(b'\x00').decode('ascii', 'ignore')
+            raw_size = struct.unpack_from('<I', data, sec_off + 16)[0]
+            raw_off = struct.unpack_from('<I', data, sec_off + 20)[0]
+            sections.append((name, raw_off, raw_size))
+            print(f"      Section {i}: {name:<8} RawOff=0x{raw_off:08x} RawSize=0x{raw_size:08x}")
+
+        # 优先找 .linux 节，否则用 .text
+        linux_sec = next((s for s in sections if s[0] == '.linux'), None)
+        text_sec = next((s for s in sections if s[0] == '.text'), None)
+        target = linux_sec or text_sec
+
+        if target:
+            name, raw_off, raw_size = target
+            print(f"    >>> 提取节 '{name}': offset=0x{raw_off:x}, size={raw_size}")
+            kernel_data = data[raw_off:raw_off + raw_size]
+            print(f"    提取大小: {len(kernel_data)} bytes")
+            # 检查 ARM64 magic
+            magic_pos = kernel_data.find(b'ARM\x64')
+            print(f"    ARM64 magic 位置: 0x{magic_pos:x}")
+            data = kernel_data
+        else:
+            print(f"    ✗ 找不到 .linux 或 .text 节，回退为裸机处理")
+            is_pe = False
+
+# ---- 裸机 ARM64 Image 处理 ----
+if not is_pe:
+    print(f"    作为裸机 ARM64 Image 处理")
+    magic_pos = data.find(b'ARM\x64')
+    print(f"    ARM64 magic 位置: 0x{magic_pos:x}")
+
+    if magic_pos == 0x38:
+        # 标准 Image 头，magic 在 0x38，前面就是 code0/code1
+        print(f"    ✓ 标准 ARM64 Image 头")
+        # 检查 code0 是否为 NOP
+        code0 = struct.unpack_from('<I', data, 0x00)[0]
+        if code0 != 0xd503201f:
+            print(f"    修复 code0: 0x{code0:08x} -> NOP")
+            data = bytearray(data)
+            data[0x00:0x04] = b'\x1f\x20\x03\xd5'
+            data = bytes(data)
+    else:
+        print(f"    ⚠ magic 位置异常 (0x{magic_pos:x})，不做修改")
+
+# ---- 构造 KRNL 头 ----
+knl_size = len(data)
+size_hex = struct.pack('<I', knl_size)
+with open(dst, 'wb') as f:
+    f.write(b'KRNL')
+    f.write(size_hex)
+    f.write(data)
+
+# ---- 验证 ----
+out = open(dst, 'rb').read(128)
+assert out[0:4] == b'KRNL', 'KRNL missing'
+out_size = struct.unpack_from('<I', out, 4)[0]
+magic_pos2 = out.find(b'ARM\x64')
+print(f"    KRNL size: {out_size}")
+print(f"    magic@:    0x{magic_pos2:x}")
+if magic_pos2 == 0x40:
+    print(f"    ✓✓✓ KRNL 转换成功")
+elif magic_pos2 > 0:
+    print(f"    ✓ KRNL 转换完成 (magic@0x{magic_pos2:x})")
+else:
+    print(f"    ⚠ KRNL 转换完成但未找到 ARM64 magic")
+PYEOF
 fi
 
-python3 - "$TARGET_DIR/kernel.img" <<'PYEOF'
-import sys
-data = open(sys.argv[1], 'rb').read(128)
-assert data[0:4] == b'KRNL'
-idx = data.find(b'ARM\x64')
-print(f"    KRNL size: {int.from_bytes(data[4:8],'little')}")
-print(f"    code0:     0x{int.from_bytes(data[8:12],'little'):08x}")
-print(f"    magic@:    0x{idx:x}")
-assert idx == 0x40
-print("    ✓✓✓ KRNL OK")
-PYEOF
+log "  新 kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
 
 # ============================================================
 # 6. dtb + uInitrd
 # ============================================================
-log "========== [6/7] dtb + uInitrd =========="
+log "========== [6/8] dtb + uInitrd =========="
 
 DTB_TAR=""
 for search_dir in "$KERNEL_TOPDIR" "$KERNEL_CACHE"; do
@@ -250,7 +310,7 @@ log "  parameter.txt 保留原版"
 # ============================================================
 # 7. 生成镜像
 # ============================================================
-log "========== [7/7] 生成镜像 =========="
+log "========== [7/8] 生成镜像 =========="
 cd "$SDFUSE_DIR"
 chmod +x mk-sd-image.sh
 rm -f out/*.img
@@ -265,21 +325,30 @@ FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
 [ -z "$FOUND_IMG" ] && { err "未生成镜像"; exit 1; }
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
+# ============================================================
+# 8. 最终验证
+# ============================================================
+log "========== [8/8] 验证 =========="
 KERNEL_OFFSET=$((0x12000 * 512))
 python3 - "$OUTPUT_IMG" "$KERNEL_OFFSET" <<'PYEOF'
 import sys
 img, off = sys.argv[1], int(sys.argv[2])
 with open(img, 'rb') as f:
     f.seek(off); data = f.read(128)
-assert data[0:4] == b'KRNL'
+assert data[0:4] == b'KRNL', 'KRNL missing'
+knl_size = int.from_bytes(data[4:8], 'little')
+code0 = int.from_bytes(data[8:12], 'little')
 idx = data.find(b'ARM\x64')
-assert idx == 0x40
-print(f"    ✓ 最终镜像 magic@0x{idx:x}")
+print(f"    KRNL size: {knl_size}")
+print(f"    code0:     0x{code0:08x} ({'NOP' if code0 == 0xd503201f else '??'})")
+print(f"    magic@:    0x{idx:x}")
+assert idx == 0x40, f'ARM64 magic 位置错误: 0x{idx:x}'
+print("    ✓✓✓ 最终镜像含有效内核")
 PYEOF
 
 log "=========================================="
-log "✓ 完成"
+log "✓ 完成 (version $VERSION)"
 log "  内核: $SELECTED_VER"
 log "  来源: $SELECTED_REPO / $SELECTED_RELEASE"
-log "  输出: $OUTPUT_IMG"
+log "  输出: $OUTPUT_IMG ($(($(stat -c%s "$OUTPUT_IMG")/1024/1024)) MiB)"
 log "=========================================="
