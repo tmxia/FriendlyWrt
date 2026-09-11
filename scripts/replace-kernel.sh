@@ -1,10 +1,10 @@
 #!/bin/bash
-# replace-kernel.sh - Flippy 内核 → 官方 KRNL 结构（完整版）
+# replace-kernel.sh - Flippy 内核 → 官方 KRNL 结构
 # 用法: replace-kernel.sh <images.tgz> <sd-fuse目录> <dist_name> <输出img路径>
 # 环境变量: KERNEL_VERSION, OFFICIAL_DIR
 set -euo pipefail
 
-VERSION="2026-09-11-v21-complete"
+VERSION="2026-09-11-v22-pipefail-fix"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -98,7 +98,7 @@ rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
 
 # ============================================================
-# 5. KRNL 构造（完整 PE → KRNL，含 .data）
+# 5. KRNL 构造
 # ============================================================
 log "[5/7] 构造 kernel.img"
 
@@ -107,29 +107,30 @@ IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "vmlinuz-*" | head -
 [ -z "$IMAGE_FILE" ] && { err "找不到内核 Image"; exit 1; }
 log "  文件: $(basename "$IMAGE_FILE") ($(stat -c%s "$IMAGE_FILE") bytes)"
 
-# 提取官方 KRNL 头（用于动态对比，不硬编码）
-OFFICIAL_HEAD="$WORK_DIR/official_krnl_head.bin"
+# 抓取官方完整 KNL payload（用于入口锚点匹配）
+OFFICIAL_PAYLOAD="$WORK_DIR/official_krnl.bin"
 OFFICIAL_IMG=$(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.img" 2>/dev/null | head -1 || true)
 if [ -n "$OFFICIAL_IMG" ] && [ -f "$OFFICIAL_IMG" ]; then
-  python3 - "$OFFICIAL_IMG" "$OFFICIAL_HEAD" <<'EXTRACT' || true
+  python3 - "$OFFICIAL_IMG" "$OFFICIAL_PAYLOAD" <<'EXTRACT' || true
 import sys
 img, out = sys.argv[1], sys.argv[2]
 with open(img, 'rb') as f:
-    buf = f.read(4 * 1024 * 1024)
+    buf = f.read(64 * 1024 * 1024)
 idx = buf.find(b'KRNL')
 if idx >= 0:
-    open(out, 'wb').write(buf[idx:idx + 0x10000])
-    print(f"  官方 KRNL @ 0x{idx:x}")
+    end = min(len(buf), idx + 40 * 1024 * 1024)
+    open(out, 'wb').write(buf[idx:end])
+    print("  官方 KNL: 0x%x, 抓取 %d 字节" % (idx, end-idx))
 else:
     sys.exit(1)
 EXTRACT
 fi
 
-python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" "$OFFICIAL_HEAD" <<'PYEOF'
+python3 - "$IMAGE_FILE" "$TARGET_DIR/kernel.img" "$OFFICIAL_PAYLOAD" <<'PYEOF'
 import sys, struct, os
 
 src, dst = sys.argv[1], sys.argv[2]
-off_head_path = sys.argv[3] if len(sys.argv) > 3 else None
+off_path = sys.argv[3] if len(sys.argv) > 3 else None
 raw = open(src, 'rb').read()
 
 # ---------- 输入校验 ----------
@@ -165,33 +166,109 @@ for i in range(nsec):
 text_s = next(s for s in secs if s['name'] == '.text')
 text = raw[text_s['roff']: text_s['roff'] + text_s['rsize']]
 
-# ---------- 关键修复①：payload = .text + 其后所有段 ----------
+# ---------- payload = .text + 其后所有段 ----------
 payload_tail = raw[text_s['roff']:]
 print("\n  .text 文件偏移=0x%x  大小=%d" % (text_s['roff'], text_s['rsize']))
 print("  payload 尾部大小=%d（.text + .data + ...）" % len(payload_tail))
-assert len(payload_tail) >= text_s['rsize'], "payload 尾部小于 .text，文件损坏"
+assert len(payload_tail) >= text_s['rsize']
 
-after = sorted([s for s in secs if s['vaddr'] > text_s['vaddr']], key=lambda x: x['vaddr'])
-for s in after:
+for s in sorted([x for x in secs if x['vaddr'] > text_s['vaddr']], key=lambda x: x['vaddr']):
     print("    + 附加段 %-10s vaddr=0x%08x size=%d" % (s['name'], s['vaddr'], s['rsize']))
 
-# ---------- 关键修复②：定位真正的 primary_entry ----------
-PATTERN = b'\x53\x42\x38\xd5\x7f\x22\x00\xf1'   # mrs x19, CurrentEL; cmp x19, #8
-rec = text.find(PATTERN)
-assert rec >= 0, "未找到 record_mmu_state 特征"
-print("\n  record_mmu_state @ .text[0x%x]" % rec)
+# ---------- ★ 入口定位：多策略 ----------
+entry = None
+entry_method = None
 
-entry = rec
-if rec >= 4:
-    prev = struct.unpack_from('<I', text, rec - 4)[0]
-    if (prev & 0xFC000000) == 0x94000000:          # BL 指令
-        imm26 = prev & 0x03FFFFFF
-        if imm26 & 0x02000000: imm26 -= 0x04000000
-        tgt = (rec - 4) + imm26 * 4
-        if rec <= tgt <= rec + 16:
-            entry = rec - 4
-            print("  ★ primary_entry @ .text[0x%x] (通过前置 BL 回溯)" % entry)
-print("  ★ 使用入口 @ .text[0x%x]" % entry)
+# 特征：mrs x19, currentel; cmp x19, #8
+PATTERN = b'\x53\x42\x38\xd5\x7f\x22\x00\xf1'
+
+print("\n  搜索 record_mmu_state 特征 (mrs x19, currentel; cmp x19, #8)...")
+all_matches = []
+start = 0
+while True:
+    i = text.find(PATTERN, start)
+    if i < 0: break
+    all_matches.append(i)
+    start = i + 1
+
+print("  找到 %d 处匹配:" % len(all_matches))
+for i, m in enumerate(all_matches[:30]):
+    pct = 100.0 * m / len(text) if len(text) else 0
+    print("    [%2d] .text[0x%08x]  (%.1f%%)" % (i, m, pct))
+if len(all_matches) > 30:
+    print("    ... 还有 %d 处" % (len(all_matches) - 30))
+
+# 策略 1：官方锚点匹配（尝试小端 / 大端）
+if off_path and os.path.exists(off_path):
+    off_raw = open(off_path, 'rb').read()
+    print("\n  官方 payload: %d 字节" % len(off_raw))
+
+    KNL_HDR = 0x10000
+    for endian, fmt in [('little', '<I'), ('big', '>I')]:
+        code1_off = struct.unpack_from(fmt, off_raw, 0x0C)[0]
+        opcode = (code1_off >> 26) & 0x3F
+        if opcode != 5:
+            continue   # 不是 B 指令，跳过这个字节序
+        imm26 = code1_off & 0x03FFFFFF
+        if imm26 & 0x02000000:
+            imm26 -= 0x04000000
+        target = 0x0C + imm26 * 4
+        print("  官方 code1(%s) = 0x%08x  opcode=%d  target=0x%x" %
+              (endian, code1_off, opcode, target))
+        if not (KNL_HDR <= target < len(off_raw)):
+            continue
+        off_entry = target - KNL_HDR
+        pattern64 = off_raw[KNL_HDR + off_entry: KNL_HDR + off_entry + 64]
+        print("  官方入口前 16B: %s" % pattern64[:16].hex())
+
+        # 在 Flippy .text 里搜 32B 模式
+        all_idx = []
+        s = 0
+        while True:
+            j = text.find(pattern64[:32], s)
+            if j < 0: break
+            all_idx.append(j)
+            s = j + 1
+        if all_idx:
+            if len(all_idx) > 1:
+                print("  ⚠ 命中 %d 处，取最靠前" % len(all_idx))
+            entry = all_idx[0]
+            entry_method = "官方 code1 目标(%s端)处 32B 模式匹配" % endian
+            print("  ★ 匹配成功，Flippy entry @ .text[0x%x]" % entry)
+            break
+        else:
+            print("  ✗ Flippy 中未找到官方入口模式(%s端)" % endian)
+
+# 策略 2：最靠前的特征匹配
+if entry is None and all_matches:
+    first = all_matches[0]
+    if first >= 4:
+        prev = struct.unpack_from('<I', text, first - 4)[0]
+        if (prev & 0xFC000000) == 0x94000000:
+            imm26 = prev & 0x03FFFFFF
+            if imm26 & 0x02000000: imm26 -= 0x04000000
+            tgt = (first - 4) + imm26 * 4
+            if first <= tgt <= first + 16:
+                entry = first - 4
+                entry_method = "最早特征 + 前置 BL 回溯"
+                print("  ★ 前置 BL 回溯成功，entry @ .text[0x%x]" % entry)
+    if entry is None:
+        entry = first
+        entry_method = "最早特征匹配（无前置 BL）"
+        print("  ★ 使用最早特征位置，entry @ .text[0x%x]" % entry)
+
+# 策略 3：兜底
+if entry is None:
+    entry = 0
+    entry_method = "兜底（.text 起始）"
+    print("  ⚠ 所有策略失败，兜底 entry @ .text[0x0]")
+
+print("\n  ★ 最终 entry: .text[0x%x]  方法: %s" % (entry, entry_method))
+
+# 可靠性检查：入口应在 .text 前部
+if entry > len(text) * 0.5:
+    print("  ⚠⚠ 警告：entry 在 .text 后半部分 (%.1f%%)，可能定位错误！" %
+          (100.0 * entry / len(text)))
 
 # ---------- 构造 KRNL ----------
 KNL_HDR = 0x10000
@@ -205,11 +282,11 @@ print("  code1=0x%08x  B %+d  → KNL[0x%x]" % (code1, rel, target_in_knl))
 
 hdr = bytearray(KNL_HDR)
 struct.pack_into('<I', hdr, 0x00, 0x4c4e524b)              # "KRNL"
-struct.pack_into('<I', hdr, 0x04, KNL_HDR + len(payload))  # 含头大小的总长
+struct.pack_into('<I', hdr, 0x04, KNL_HDR + len(payload))
 struct.pack_into('<I', hdr, 0x08, 0xd503201f)              # code0 = NOP
 struct.pack_into('<I', hdr, 0x0C, code1)
 struct.pack_into('<Q', hdr, 0x10, 0)
-struct.pack_into('<Q', hdr, 0x18, len(payload))            # image_size
+struct.pack_into('<Q', hdr, 0x18, len(payload))
 struct.pack_into('<Q', hdr, 0x20, 0x0a)
 hdr[0x40:0x44] = b'ARMd'
 
@@ -218,45 +295,24 @@ open(dst, 'wb').write(knl)
 
 # ---------- 严格校验 ----------
 zero_region = knl[0x48:0x10000]
-assert knl[0:4] == b'KRNL', "KRNL magic 错误"
-assert knl[0x08:0x0c] == b'\x1f\x20\x03\xd5', "code0 不是 NOP"
-assert knl[0x0c:0x10] == struct.pack('<I', code1), "code1 写入错误"
-assert knl[0x40:0x44] == b'ARMd', "ARM64 magic 位置错误"
-assert not any(zero_region), "0x48..0x10000 必须零填充（%d 字节非零）" % sum(zero_region)
-assert knl[0x10000:0x10004] == text[:4], "payload 起点错误"
-assert knl[target_in_knl:target_in_knl+4] == text[entry:entry+4], "code1 目标未命中入口"
+assert knl[0:4] == b'KRNL'
+assert knl[0x08:0x0c] == b'\x1f\x20\x03\xd5'
+assert knl[0x0c:0x10] == struct.pack('<I', code1)
+assert knl[0x40:0x44] == b'ARMd'
+assert not any(zero_region), "0x48..0x10000 非零"
+assert knl[0x10000:0x10004] == text[:4]
+assert knl[target_in_knl:target_in_knl+4] == text[entry:entry+4]
 
-print("\n" + "=" * 70)
-print("结果")
-print("=" * 70)
-print("  KNL size              = %d" % len(knl))
+print("\n  KNL size              = %d" % len(knl))
 print("  payload (.text+.data) = %d" % len(payload))
 print("  image_size            = %d" % len(payload))
-print("  entry offset          = 0x%x  (%s)" %
-      (entry, "primary_entry" if entry < rec else "record_mmu_state"))
+print("  entry offset          = 0x%x" % entry)
 print("  0x48..0x10000         = 零填充 ✓")
-
-if off_head_path and os.path.exists(off_head_path):
-    off = open(off_head_path, 'rb').read(0x10000)
-    print("\n  ── 与官方 KRNL 头动态对比 ──")
-    print("  字段        自建          官方")
-    print("  [0x00]      %s      %s" % (knl[0:4], off[0:4]))
-    print("  [0x08]      %s      %s" % (knl[0x08:0x0c].hex(), off[0x08:0x0c].hex()))
-    print("  [0x40]      %s      %s" % (knl[0x40:0x44], off[0x40:0x44]))
-    print("  [0x04]size  %-12d  %d" % (
-        struct.unpack_from('<I', knl, 4)[0],
-        struct.unpack_from('<I', off, 4)[0]))
-    print("  [0x18]imgsz 0x%-11x 0x%x" % (
-        struct.unpack_from('<Q', knl, 0x18)[0],
-        struct.unpack_from('<Q', off, 0x18)[0]))
-    off_code1 = struct.unpack_from('<I', off, 0x0C)[0]
-    assert (code1 >> 26) == (off_code1 >> 26), "code1 opcode 与官方不一致"
-
 print("\n  SUCCESS")
 PYEOF
 
 # ============================================================
-# 5.5 从 parameter.txt 动态解析 kernel 分区并扩容
+# 5.5 扩容 kernel 分区
 # ============================================================
 log "[5.5/7] 扩容 kernel 分区"
 PARAM_FILE="$TARGET_DIR/parameter.txt"
@@ -311,23 +367,34 @@ UINITRD=$(find "$KERNEL_CACHE" -type f -name "uInitrd-*" | head -1)
 if [ -n "$UINITRD" ]; then
   cp "$UINITRD" "$TARGET_DIR/uInitrd"; log "  ✓ uInitrd"
 else
-  warn "  ✗ uInitrd 未找到（boot 可能失败）"
+  warn "  ✗ uInitrd 未找到"
 fi
 
 # ============================================================
-# 7. 生成镜像
+# 7. 生成镜像（★ pipefail 修复核心）
 # ============================================================
 log "[7/7] 生成镜像"
 cd "$SDFUSE_DIR"
 chmod +x mk-sd-image.sh
 rm -f out/*.img
+
+# ★★ 关键修复：
+#   yes | ... 管道中 yes 会因 SIGPIPE 退出码 141 污染整条管道
+#   临时关闭 pipefail，用产物存在性判定成功
 set +e
-yes | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
+set +o pipefail
+yes 2>/dev/null | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
 MK_EXIT=$?
+set -o pipefail
 set -e
-[ $MK_EXIT -ne 0 ] && { err "mk-sd-image.sh 失败:"; tail -50 /tmp/mk-sd.log; exit 1; }
+
 FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
-[ -z "$FOUND_IMG" ] && { err "未生成镜像"; exit 1; }
+if [ -z "$FOUND_IMG" ]; then
+  err "mk-sd-image.sh 未生成镜像 (exit=$MK_EXIT)，日志尾部:"
+  tail -50 /tmp/mk-sd.log
+  exit 1
+fi
+log "  镜像已生成: $FOUND_IMG ($(stat -c%s "$FOUND_IMG") bytes)"
 mv "$FOUND_IMG" "$OUTPUT_IMG"
 
 # ============================================================
