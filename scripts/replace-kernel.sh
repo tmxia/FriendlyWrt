@@ -4,7 +4,7 @@
 # 环境变量: KERNEL_VERSION, OFFICIAL_DIR
 set -euo pipefail
 
-VERSION="2026-09-11-v23-system-map"
+VERSION="2026-09-11-v24-bl-backtrace"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -98,7 +98,7 @@ rm -rf "$TARGET_DIR"
 cp -a "$BASE_DIR" "$TARGET_DIR"
 
 # ============================================================
-# 5. KRNL 构造（System.map 精确定位入口）
+# 5. KRNL 构造
 # ============================================================
 log "[5/7] 构造 kernel.img"
 
@@ -107,12 +107,9 @@ IMAGE_FILE=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "vmlinuz-*" | head -
 [ -z "$IMAGE_FILE" ] && { err "找不到内核 Image"; exit 1; }
 log "  文件: $(basename "$IMAGE_FILE") ($(stat -c%s "$IMAGE_FILE") bytes)"
 
-# 找 System.map（在 boot 目录里）
 SYSTEM_MAP=$(find "$KERNEL_CACHE" -maxdepth 3 -type f -name "System.map-*" | head -1)
 if [ -n "$SYSTEM_MAP" ]; then
-  log "  System.map: $(basename "$SYSTEM_MAP") ($(stat -c%s "$SYSTEM_MAP") bytes)"
-else
-  warn "  未找到 System.map，将回退到模式匹配（不推荐）"
+  log "  System.map: $(basename "$SYSTEM_MAP")"
 fi
 
 # 抓取官方 KNL（用于对比验证）
@@ -139,7 +136,7 @@ import sys, struct, os
 
 src, dst = sys.argv[1], sys.argv[2]
 off_path = sys.argv[3] if len(sys.argv) > 3 else None
-sysmap_path = sys.argv[4] if len(sys.argv) > 4 else None
+sysmap_path = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
 raw = open(src, 'rb').read()
 
 # ---------- 输入校验 ----------
@@ -174,10 +171,11 @@ for i in range(nsec):
 
 text_s = next(s for s in secs if s['name'] == '.text')
 text = raw[text_s['roff']: text_s['roff'] + text_s['rsize']]
+text_roff = text_s['roff']
 
 # ---------- payload = .text + 其后所有段 ----------
 payload_tail = raw[text_s['roff']:]
-print("\n  .text 文件偏移=0x%x  大小=%d" % (text_s['roff'], text_s['rsize']))
+print("\n  .text 文件偏移=0x%x  大小=%d" % (text_roff, text_s['rsize']))
 print("  payload 尾部大小=%d（.text + .data + ...）" % len(payload_tail))
 assert len(payload_tail) >= text_s['rsize']
 
@@ -185,109 +183,163 @@ for s in sorted([x for x in secs if x['vaddr'] > text_s['vaddr']], key=lambda x:
     print("    + 附加段 %-10s vaddr=0x%08x size=%d" % (s['name'], s['vaddr'], s['rsize']))
 
 # ============================================================
-# ★ 入口定位：System.map 优先
+# System.map 读符号（仅用于交叉验证）
 # ============================================================
-entry = None
-entry_method = None
+text_vaddr = None
+rec_mmu_vaddr = None
+primary_entry_vaddr = None
 
 if sysmap_path and os.path.exists(sysmap_path):
-    print("\n  ── System.map 精确解析 ──")
-    symbols = {}
+    print("\n  ── 读 System.map（交叉验证用） ──")
     with open(sysmap_path, 'r', errors='ignore') as f:
         for line in f:
             parts = line.split()
-            if len(parts) >= 3:
-                try:
-                    addr = int(parts[0], 16)
-                    name = parts[2]
-                    # 若重名保留第一个（通常是最外层的）
-                    if name not in symbols:
-                        symbols[name] = addr
-                except (ValueError, IndexError):
-                    pass
-    print("  符号总数: %d" % len(symbols))
+            if len(parts) < 3: continue
+            try:
+                addr = int(parts[0], 16)
+            except ValueError:
+                continue
+            name = parts[2]
+            if name in ('_text', 'stext', '_stext') and text_vaddr is None:
+                text_vaddr = addr
+            elif name == 'record_mmu_state' and rec_mmu_vaddr is None:
+                rec_mmu_vaddr = addr
+            elif name == 'primary_entry' and primary_entry_vaddr is None:
+                primary_entry_vaddr = addr
 
-    # 关键符号
-    _text       = symbols.get('_text') or symbols.get('stext') or symbols.get('_stext')
-    primary     = symbols.get('primary_entry') or symbols.get('_primary_entry')
-    # 备用锚点
-    rec_mmu     = symbols.get('record_mmu_state')
-    preserve    = symbols.get('preserve_boot_args')
-    create_idm  = symbols.get('create_idmap')
-    el2_setup   = symbols.get('el2_setup')
+    if text_vaddr: print("  _text              = %s" % hex(text_vaddr))
+    if rec_mmu_vaddr: print("  record_mmu_state   = %s" % hex(rec_mmu_vaddr))
+    if primary_entry_vaddr:
+        print("  primary_entry      = %s" % hex(primary_entry_vaddr))
+        if rec_mmu_vaddr:
+            gap = rec_mmu_vaddr - primary_entry_vaddr
+            print("  primary_entry ↔ record_mmu_state 距离 = %d (0x%x)" % (gap, gap))
 
-    print("  _text             = %s" % (hex(_text) if _text else "N/A"))
-    print("  primary_entry     = %s" % (hex(primary) if primary else "N/A"))
-    print("  record_mmu_state  = %s" % (hex(rec_mmu) if rec_mmu else "N/A"))
-    print("  preserve_boot_args= %s" % (hex(preserve) if preserve else "N/A"))
-    print("  create_idmap      = %s" % (hex(create_idm) if create_idm else "N/A"))
-    print("  el2_setup         = %s" % (hex(el2_setup) if el2_setup else "N/A"))
+# ============================================================
+# 入口定位：特征匹配 record_mmu_state + BL 反查
+# ============================================================
+print("\n  ── 入口定位 ──")
 
-    if _text and primary:
-        entry = primary - _text
-        entry_method = "System.map: primary_entry - _text"
-        print("\n  ★ entry = primary_entry - _text = 0x%x (%d 字节, .text 的 %.2f%%)"
-              % (entry, entry, 100.0 * entry / len(text)))
+# mrs x19, currentel; cmp x19, #8
+REC_PATTERN = b'\x53\x42\x38\xd5\x7f\x22\x00\xf1'
+rec_matches = []
+s = 0
+while True:
+    i = text.find(REC_PATTERN, s)
+    if i < 0: break
+    rec_matches.append(i)
+    s = i + 1
+
+print("  record_mmu_state 特征匹配 %d 处:" % len(rec_matches))
+for i, m in enumerate(rec_matches[:20]):
+    pct = 100.0 * m / len(text) if len(text) else 0
+    print("    [%2d] .text[0x%08x]  (%.2f%%)" % (i, m, pct))
+
+# 如果 System.map 可用，用它筛出正确的 record_mmu_state
+sysmap_rec_payload_off = None
+if text_vaddr and rec_mmu_vaddr:
+    # payload[X] 对应虚拟地址 (text_vaddr + text_roff + X)
+    # 即 payload 偏移 = (vaddr - text_vaddr) - text_roff
+    sysmap_rec_payload_off = (rec_mmu_vaddr - text_vaddr) - text_roff
+    print("\n  System.map 推算: record_mmu_state → payload[0x%x]" % sysmap_rec_payload_off)
+    if sysmap_rec_payload_off in rec_matches:
+        print("  ✓ 与特征匹配一致")
     else:
-        print("\n  ⚠ System.map 缺少 _text 或 primary_entry，尝试备用符号")
-        # 有些内核叫 stext，或者 _head
-        if _text and el2_setup:
-            entry = el2_setup - _text
-            entry_method = "System.map: el2_setup - _text"
-            print("  ★ 备用 entry = 0x%x" % entry)
+        print("  ⚠ 与特征匹配不一致，可能 System.map 与 Image 不匹配")
 
-# ============================================================
-# 回退：模式匹配
-# ============================================================
-if entry is None:
-    print("\n  ⚠ System.map 定位失败，回退到模式匹配（风险较高）")
-    PATTERN = b'\x53\x42\x38\xd5\x7f\x22\x00\xf1'
-    all_matches = []
-    start = 0
-    while True:
-        i = text.find(PATTERN, start)
-        if i < 0: break
-        all_matches.append(i)
-        start = i + 1
-    print("  特征匹配 %d 处:" % len(all_matches))
-    for i, m in enumerate(all_matches[:20]):
-        print("    [%2d] .text[0x%08x]  (%.1f%%)" % (i, m, 100.0*m/len(text)))
-    if all_matches:
-        entry = all_matches[0]
-        entry_method = "特征匹配（回退）"
-        print("  ★ 使用最早匹配 @ 0x%x" % entry)
+# 对每个 record_mmu_state 候选，往前搜 BL 目标指向该位置
+def find_bl_to(target_off, max_search=0x2000):
+    """在 [target_off-max_search, target_off) 内搜 BL，目标是 target_off。返回最早的偏移"""
+    start = max(0, target_off - max_search)
+    start = (start // 4) * 4
+    for i in range(start, target_off, 4):
+        if i + 4 > len(text): break
+        insn = struct.unpack_from('<I', text, i)[0]
+        if ((insn >> 26) & 0x3F) != 0x25:  # 不是 BL
+            continue
+        imm26 = insn & 0x03FFFFFF
+        if imm26 & 0x02000000:
+            imm26 -= 0x04000000
+        if i + imm26 * 4 == target_off:
+            return i
+    return None
+
+entry = None
+entry_method = None
+
+# 优先用 System.map 匹配到的 record_mmu_state
+candidates = []
+if sysmap_rec_payload_off is not None and sysmap_rec_payload_off in rec_matches:
+    candidates = [sysmap_rec_payload_off]
+else:
+    candidates = rec_matches[:]
+
+for rec_off in candidates:
+    bl_off = find_bl_to(rec_off)
+    if bl_off is None:
+        print("  record_mmu @ 0x%x: 未找到 BL 反查" % rec_off)
+        continue
+    # 验证 bl_off 前 4 条指令符合 primary_entry 特征
+    # 期望：bl, bl, (mov), bl, ...
+    ok = True
+    seq = []
+    for k in range(4):
+        off = bl_off + k*4
+        if off + 4 > len(text): break
+        insn = struct.unpack_from('<I', text, off)[0]
+        op = (insn >> 26) & 0x3F
+        seq.append((off, insn, op))
+    # 首指令必须是 BL (opcode 0x25)
+    if not seq or seq[0][2] != 0x25:
+        ok = False
+    # 至少前 2 条是 BL
+    bl_count = sum(1 for _, _, op in seq[:4] if op == 0x25)
+    if bl_count < 2:
+        ok = False
+
+    print("  record_mmu @ 0x%x → BL 反查 @ 0x%x  前 4 条 opcode: %s  %s" %
+          (rec_off, bl_off, [hex(op) for _,_,op in seq[:4]], "✓" if ok else "✗"))
+    if ok:
+        entry = bl_off
+        entry_method = "特征匹配 + BL 反查 (record_mmu @ 0x%x)" % rec_off
+        print("  ★ 采纳 entry @ .text[0x%x]" % entry)
+        break
 
 if entry is None:
-    err_exit("无法定位入口，请检查内核包完整性")
+    print("\n  ✗ 入口定位失败")
     sys.exit(1)
 
 # ============================================================
-# 交叉验证：用 System.map 确认入口指令
+# 交叉验证
 # ============================================================
 print("\n  ── 入口交叉验证 ──")
+if entry + 16 > len(text):
+    print("  ✗ entry 越界"); sys.exit(1)
 
-# 读取入口处 16 字节
 entry_bytes = text[entry:entry+16]
 print("  entry 处 16 字节: %s" % entry_bytes.hex())
 
-# 逐条解码前 4 条指令的 opcode
 for i in range(4):
-    if entry + i*4 + 4 > len(text): break
-    insn = struct.unpack_from('<I', text, entry + i*4)[0]
+    off = entry + i*4
+    insn = struct.unpack_from('<I', text, off)[0]
     op = (insn >> 26) & 0x3F
-    opname = {0x25: 'BL', 0x05: 'B', 0x24: 'BLR', 0x0b: 'ADD', 0x2a: 'MOV',
-              0x29: 'MOV', 0x28: 'MOV', 0x34: 'MOV'}.get(op, "op_0x%02x" % op)
+    opname = {0x25: 'BL', 0x05: 'B', 0x24: 'BLR'}.get(op, "op_0x%02x" % op)
     print("    [%d] 0x%08x  opcode=0x%02x (%s)" % (i, insn, op, opname))
 
-# 期望：primary_entry 前几条应是 BL 或 mov
-first_insn = struct.unpack_from('<I', text, entry)[0]
-first_op = (first_insn >> 26) & 0x3F
-if first_op in (0x25, 0x24):  # BL or BLR
-    print("  ✓ 入口首指令是 BL/BLR（符合 primary_entry 特征）")
-elif first_op in (0x28, 0x29, 0x2a, 0x2b):  # MOV variants
-    print("  ⚠ 入口首指令是 MOV（可能是中间指令，谨慎）")
+first_op = (struct.unpack_from('<I', text, entry)[0] >> 26) & 0x3F
+if first_op == 0x25:
+    print("  ✓ 入口首指令是 BL")
 else:
     print("  ⚠ 入口首指令 opcode=0x%02x，请人工确认" % first_op)
+
+# 与 System.map 的 record_mmu_state 关系检查
+if sysmap_rec_payload_off is not None:
+    gap = sysmap_rec_payload_off - entry
+    print("  entry → record_mmu_state 距离 = %d 字节" % gap)
+    if 0 < gap < 0x1000:
+        print("  ✓ 距离合理（<4KB）")
+    else:
+        print("  ⚠ 距离异常，可能入口定位错误")
 
 # ---------- 构造 KRNL ----------
 KNL_HDR = 0x10000
@@ -321,6 +373,22 @@ assert knl[0x40:0x44] == b'ARMd'
 assert not any(zero_region), "0x48..0x10000 非零"
 assert knl[0x10000:0x10004] == text[:4]
 assert knl[target_in_knl:target_in_knl+4] == text[entry:entry+4]
+
+# 与官方对比（信息性）
+if off_path and os.path.exists(off_path):
+    off = open(off_path, 'rb').read()
+    off_code1 = struct.unpack_from('<I', off, 0x0C)[0]
+    print("\n  ── 与官方对比 ──")
+    print("  官方 KNL header: magic=%s code0=%s code1=0x%08x" %
+          (off[0:4], off[0x08:0x0c].hex(), off_code1))
+    print("  自建 KNL header: magic=%s code0=%s code1=0x%08x" %
+          (knl[0:4], knl[0x08:0x0c].hex(), code1))
+    # 官方 code1 目标
+    off_imm26 = off_code1 & 0x03FFFFFF
+    if off_imm26 & 0x02000000: off_imm26 -= 0x04000000
+    off_target = 0x0C + off_imm26 * 4
+    print("  官方 code1 目标 = KNL[0x%x]" % off_target)
+    print("  自建 code1 目标 = KNL[0x%x]" % target_in_knl)
 
 print("\n  KNL size              = %d" % len(knl))
 print("  payload (.text+.data) = %d" % len(payload))
