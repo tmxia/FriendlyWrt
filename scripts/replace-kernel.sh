@@ -2,7 +2,7 @@
 # replace-kernel.sh - Flippy 内核 + 模块注入 + boot.img 重建 → 官方 KRNL 结构
 set -euo pipefail
 
-VERSION="2026-09-11-v39-direct-krnl-bootimg"
+VERSION="2026-09-11-v40-xz-to-gzip"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -397,14 +397,13 @@ if [ -n "$UINITRD" ]; then
 fi
 
 # ============================================================
-# ★★★ 6.9 重建 boot.img (KRNL 格式直接构造) ★★★
-# 根因: build-boot-img.sh 是给 Debian/Ubuntu 生成 ext2 boot 的，不适用 FriendlyWrt
-# 正确: 官方 boot.img = KRNL头(8B: "KRNL"+size) + gzip数据 + 尾部 4B padding
-# 数据源: Flippy uInitrd
+# ★★★ 6.9 重建 boot.img (KRNL + gzip，与官方格式完全一致) ★★★
+# 官方 boot.img 结构: KRNL头(8B) + gzip数据 + 4B padding
+# 关键: U-Boot 只认 gzip，所以 XZ 数据必须先转 gzip
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
-log "  ★ [6.9/9] 重建 boot.img (KRNL 格式直接构造)"
+log "  ★ [6.9/9] 重建 boot.img (KRNL + gzip)"
 log "════════════════════════════════════════════════════════"
 
 BOOT_IMG="$TARGET_DIR/boot.img"
@@ -413,7 +412,6 @@ UINITRD_FILE="$TARGET_DIR/uInitrd"
 if [ ! -f "$UINITRD_FILE" ]; then
   warn "  uInitrd 不存在，跳过 boot.img 重建"
 else
-  # 备份官方 boot.img（失败时回滚）
   if [ -f "$BOOT_IMG" ]; then
     cp "$BOOT_IMG" "$WORK_DIR/boot.img.orig" 2>/dev/null || true
     log "  官方 boot.img: $(stat -c%s "$BOOT_IMG") bytes (已备份)"
@@ -423,37 +421,77 @@ else
   UINITRD_SIZE=$(stat -c%s "$UINITRD_FILE")
   log "  uInitrd: $UINITRD_SIZE bytes, magic=$UINITRD_MAGIC"
 
-  # 检测 uInitrd 格式并提取载荷
-  RAMDISK=""
+  # ---------- 提取 U-Boot legacy image 内的载荷 ----------
+  RAW_PAYLOAD=""
   case "$UINITRD_MAGIC" in
     27051956*)
-      log "  uInitrd 是 U-Boot legacy image，提取载荷"
+      log "  uInitrd 是 U-Boot legacy image，剥离 64 字节头"
       mkdir -p "$WORK_DIR/boot_extract"
-      if command -v dumpimage >/dev/null 2>&1; then
-        set +e
-        dumpimage -i "$UINITRD_FILE" -o "$WORK_DIR/boot_extract/payload" -T ramdisk "$UINITRD_FILE" 2>/dev/null
-        DR=$?
-        set -e
-        if [ $DR -ne 0 ] || [ ! -s "$WORK_DIR/boot_extract/payload" ]; then
-          warn "    dumpimage 失败，手动剥离 64 字节头"
-          tail -c +65 "$UINITRD_FILE" > "$WORK_DIR/boot_extract/payload"
-        fi
-      else
-        warn "    dumpimage 不可用，剥离 64 字节头"
-        tail -c +65 "$UINITRD_FILE" > "$WORK_DIR/boot_extract/payload"
-      fi
-      RAMDISK="$WORK_DIR/boot_extract/payload"
-      log "  ✓ 提取到 payload: $(stat -c%s "$RAMDISK") bytes"
+      RAW_PAYLOAD="$WORK_DIR/boot_extract/raw_payload"
+      tail -c +65 "$UINITRD_FILE" > "$RAW_PAYLOAD"
+      log "  ✓ 提取到 raw payload: $(stat -c%s "$RAW_PAYLOAD") bytes"
       ;;
     1f8b08*)
       log "  uInitrd 是纯 gzip 数据"
-      RAMDISK="$UINITRD_FILE"
+      RAW_PAYLOAD="$UINITRD_FILE"
       ;;
     *)
       warn "  uInitrd 未知格式 ($UINITRD_MAGIC)，保留官方 boot.img"
       ;;
   esac
 
+  # ---------- 转码为 gzip（U-Boot RK 只支持 gzip） ----------
+  RAMDISK=""
+  if [ -n "$RAW_PAYLOAD" ] && [ -f "$RAW_PAYLOAD" ] && [ -s "$RAW_PAYLOAD" ]; then
+    PAYLOAD_MAGIC=$(dd if="$RAW_PAYLOAD" bs=1 count=4 2>/dev/null | xxd -p)
+    log "  payload magic: $PAYLOAD_MAGIC"
+
+    case "$PAYLOAD_MAGIC" in
+      1f8b08*)
+        log "  ✓ payload 已是 gzip，保持"
+        RAMDISK="$RAW_PAYLOAD"
+        ;;
+      fd377a58*)
+        log "  ★ payload 是 XZ，转码为 gzip（U-Boot 兼容）..."
+        set +e
+        unxz -c "$RAW_PAYLOAD" > "$WORK_DIR/boot_extract/raw" 2>/dev/null
+        RC1=$?
+        set -e
+        if [ $RC1 -eq 0 ] && [ -s "$WORK_DIR/boot_extract/raw" ]; then
+          RAW_SIZE=$(stat -c%s "$WORK_DIR/boot_extract/raw")
+          log "    XZ 解压成功: $RAW_SIZE bytes"
+          gzip -9 -c "$WORK_DIR/boot_extract/raw" > "$WORK_DIR/boot_extract/raw.gz"
+          GZ_SIZE=$(stat -c%s "$WORK_DIR/boot_extract/raw.gz")
+          log "    gzip 压缩完成: $GZ_SIZE bytes"
+          RAMDISK="$WORK_DIR/boot_extract/raw.gz"
+        else
+          warn "    XZ 解压失败，保留原样（U-Boot 可能无法加载）"
+          RAMDISK="$RAW_PAYLOAD"
+        fi
+        ;;
+      04224d18*)
+        log "  ★ payload 是 LZ4，转码为 gzip..."
+        set +e
+        lz4 -d -c "$RAW_PAYLOAD" > "$WORK_DIR/boot_extract/raw" 2>/dev/null
+        RC1=$?
+        set -e
+        if [ $RC1 -eq 0 ] && [ -s "$WORK_DIR/boot_extract/raw" ]; then
+          gzip -9 -c "$WORK_DIR/boot_extract/raw" > "$WORK_DIR/boot_extract/raw.gz"
+          RAMDISK="$WORK_DIR/boot_extract/raw.gz"
+          log "    LZ4 → gzip 完成"
+        else
+          warn "    LZ4 解压失败，保留原样"
+          RAMDISK="$RAW_PAYLOAD"
+        fi
+        ;;
+      *)
+        warn "  ⚠ 未知压缩格式 ($PAYLOAD_MAGIC)，保留原样"
+        RAMDISK="$RAW_PAYLOAD"
+        ;;
+    esac
+  fi
+
+  # ---------- 构造 KRNL boot.img ----------
   if [ -n "$RAMDISK" ] && [ -f "$RAMDISK" ] && [ -s "$RAMDISK" ]; then
     DATA_SIZE=$(stat -c%s "$RAMDISK")
     log "  构造 KRNL boot.img (数据 $DATA_SIZE bytes)"
@@ -469,7 +507,7 @@ print(f"    数据大小: {len(data)}")
 print(f"    数据前 4 字节: {data[:4].hex()}")
 
 # KRNL 格式: 头 8B (KRNL + size) + 数据 + 尾部 4B padding
-size_field = len(data)  # 官方验证: size = 数据大小
+size_field = len(data)
 hdr = b'KRNL' + struct.pack('<I', size_field)
 
 with open(boot_img_path, 'wb') as f:
@@ -481,23 +519,22 @@ print(f"    新 boot.img 总大小: {8 + len(data) + 4}")
 print(f"    size 字段: {size_field} (0x{size_field:08x})")
 BOOT_BUILD
 
-    # 验证
     NEW_SIZE=$(stat -c%s "$BOOT_IMG" 2>/dev/null || echo 0)
     NEW_MAGIC=$(dd if="$BOOT_IMG" bs=1 count=4 2>/dev/null)
-    NEW_MD5=$(md5sum "$BOOT_IMG" 2>/dev/null | awk '{print $1}')
-    NEW_SIZE_FIELD=$(dd if="$BOOT_IMG" bs=1 skip=4 count=4 2>/dev/null | xxd -p)
+    NEW_DATA_MAGIC=$(dd if="$BOOT_IMG" bs=1 skip=8 count=4 2>/dev/null | xxd -p)
 
     log "  新 boot.img 大小: $NEW_SIZE bytes"
     log "  新 boot.img magic: $NEW_MAGIC"
-    log "  新 boot.img md5:   $NEW_MD5"
-    log "  新 boot.img size 字段: $NEW_SIZE_FIELD"
+    log "  新 boot.img payload magic: $NEW_DATA_MAGIC"
     log "  新 boot.img 前 16 字节:"
     xxd -l 16 "$BOOT_IMG" | sed 's/^/    /'
 
-    if [ "$NEW_MAGIC" = "KRNL" ] && [ "$NEW_SIZE" -gt 100000 ]; then
-      log "  ✓ boot.img 重建成功"
+    if [ "$NEW_MAGIC" = "KRNL" ] && [ "$NEW_DATA_MAGIC" = "1f8b0800" ] || [ "$NEW_DATA_MAGIC" = "1f8b0808" ]; then
+      log "  ✓ boot.img 重建成功 (payload = gzip)"
+    elif [ "$NEW_MAGIC" = "KRNL" ] && [ "$NEW_SIZE" -gt 100000 ]; then
+      warn "  ⚠ boot.img 已重建但 payload 非 gzip (magic=$NEW_DATA_MAGIC)"
     else
-      err "  ✗ 重建失败 (size=$NEW_SIZE, magic=$NEW_MAGIC)，恢复官方 boot.img"
+      err "  ✗ 重建失败，恢复官方 boot.img"
       [ -f "$WORK_DIR/boot.img.orig" ] && cp "$WORK_DIR/boot.img.orig" "$BOOT_IMG"
     fi
   else
@@ -547,17 +584,15 @@ MAGIC=$(dd if="$OUTPUT_IMG" bs=1 skip=$KERNEL_BYTE_OFF count=4 2>/dev/null)
 [ "$MAGIC" != "KRNL" ] && { err "  KNL magic 缺失"; exit 1; }
 log "  ✓ kernel KNL magic @ $KERNEL_BYTE_OFF"
 
-# 验证 boot 分区的 boot.img
 BOOT_OFFSET=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(boot\)' "$PARAM_FILE" \
   | head -1 | sed -E 's/.*@(0x[0-9a-fA-F]+)\(boot\)/\1/')
 if [ -n "$BOOT_OFFSET" ]; then
   BOOT_BYTE_OFF=$(( BOOT_OFFSET * 512 ))
   BOOT_MAGIC_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip=$BOOT_BYTE_OFF count=4 2>/dev/null | xxd -p)
-  log "  boot 分区 @ $BOOT_BYTE_OFF: magic=$BOOT_MAGIC_HEX"
-  if [ "$BOOT_MAGIC_HEX" = "4b524e4c" ]; then
-    log "  ✓ boot 分区 KRNL magic 正确"
-  else
-    warn "  ⚠ boot 分区 magic 不是 KRNL"
+  BOOT_DATA_HEX=$(dd if="$OUTPUT_IMG" bs=1 skip=$(( BOOT_BYTE_OFF + 8 )) count=4 2>/dev/null | xxd -p)
+  log "  boot 分区 @ $BOOT_BYTE_OFF: magic=$BOOT_MAGIC_HEX, payload=$BOOT_DATA_HEX"
+  if [ "$BOOT_MAGIC_HEX" = "4b524e4c" ] && [ "$BOOT_DATA_HEX" = "1f8b0800" -o "$BOOT_DATA_HEX" = "1f8b0808" ]; then
+    log "  ✓ boot 分区 KRNL + gzip 正确"
   fi
 fi
 
