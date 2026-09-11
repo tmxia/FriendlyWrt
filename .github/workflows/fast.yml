@@ -212,7 +212,7 @@ jobs:
         ls -la boot_extract/
         ls dtb_extract/ | grep -E "rk3568-nanopi-r5[sc]" || echo "no r5s/r5c dtb"
 
-    - name: 'Convert kernel to KRNL (decompress EFI zboot)'
+    - name: 'Convert kernel to KRNL (multi-fallback decompress)'
       run: |
         cd /tmp
         VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
@@ -221,7 +221,7 @@ jobs:
         xxd -l 64 "$VMLINUZ"
 
         python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
-        import sys, struct, gzip, bz2, lzma
+        import sys, struct, gzip, bz2, lzma, io
 
         src, dst = sys.argv[1], sys.argv[2]
         raw = open(src, 'rb').read()
@@ -233,12 +233,7 @@ jobs:
             print("已是 KRNL"); open(dst, 'wb').write(raw); sys.exit(0)
 
         if raw[:2] != b'MZ':
-            print("非 PE，尝试裸 Image")
-            idx = raw.find(ARM64_MAGIC)
-            if idx == 0x38 and raw[:4] == b'\x1f\x20\x03\xd5':
-                open(dst, 'wb').write(b'KRNL' + struct.pack('<I', len(raw)) + raw)
-                print("裸 Image 封装"); sys.exit(0)
-            print("未知格式"); sys.exit(1)
+            print("非 PE"); sys.exit(1)
 
         pe_off = struct.unpack_from('<I', raw, 0x3C)[0]
         assert raw[pe_off:pe_off+4] == b'PE\x00\x00'
@@ -264,21 +259,40 @@ jobs:
                 text_off = roff; text_size = rsize; break
         assert text_off is not None, "无 .text"
 
-        # 找 zboot magic
-        zboot_pos = -1
-        for align in (8, 4, 2, 1):
-            pos = text_off; end = text_off + text_size
-            while pos < end - 64:
-                p = raw.find(b'zboot', pos, end)
-                if p < 0: break
-                if p % align == 0:
-                    zboot_pos = p; break
-                pos = p + 1
-            if zboot_pos >= 0:
-                print("zboot magic @ 0x%x (align=%d)" % (zboot_pos, align))
-                break
+        print("Dump .text[0:128]:")
+        for i in range(0, 128, 16):
+            ch = raw[text_off+i:text_off+i+16]
+            print("  %04x: %s" % (i, ' '.join('%02x' % b for b in ch)))
 
         img = None
+        errs = []
+
+        # ===== 尝试 1: zboot magic =====
+        ZBOOT_MAGICS = [
+            ('LE', struct.pack('<I', 0x7a6f6f62)),
+            ('BE', struct.pack('>I', 0x7a6f6f62)),
+            ('str', b'zboot'),
+        ]
+        zboot_pos = -1
+        for label, magic in ZBOOT_MAGICS:
+            p = text_off
+            end = text_off + text_size
+            while p < end - 64:
+                p = raw.find(magic, p, end)
+                if p < 0: break
+                try:
+                    hv = struct.unpack_from('<I', raw, p + 4)[0]
+                    poff = struct.unpack_from('<I', raw, p + 12)[0]
+                    psz = struct.unpack_from('<I', raw, p + 16)[0]
+                    if 0 < hv <= 16 and 0 < poff < 0x4000000 and 0x100 < psz < 0x4000000:
+                        zboot_pos = p
+                        print("zboot magic (%s) @ 0x%x" % (label, p))
+                        break
+                except Exception:
+                    pass
+                p += 1
+            if zboot_pos >= 0:
+                break
 
         if zboot_pos >= 0:
             hv  = struct.unpack_from('<I', raw, zboot_pos + 4)[0]
@@ -286,33 +300,28 @@ jobs:
             poff= struct.unpack_from('<I', raw, zboot_pos + 12)[0]
             psz = struct.unpack_from('<I', raw, zboot_pos + 16)[0]
             isz = struct.unpack_from('<I', raw, zboot_pos + 20)[0]
-            comp_raw = raw[zboot_pos + 28 : zboot_pos + 28 + 32]
-            comp = comp_raw.split(b'\x00')[0].decode('ascii', 'ignore')
+            ctype_raw = raw[zboot_pos + 28 : zboot_pos + 60]
+            ctype = ctype_raw.split(b'\x00')[0].decode('ascii', 'ignore')
 
-            print("  header_version  = %d" % hv)
-            print("  kernel_version  = 0x%08x" % kv)
-            print("  payload_offset  = 0x%x" % poff)
-            print("  payload_size    = %d" % psz)
-            print("  image_size      = %d" % isz)
-            print("  compression     = '%s'" % comp)
+            print("  hdr_ver=%d kernel_ver=0x%08x" % (hv, kv))
+            print("  payload_off=0x%x payload_size=%d image_size=%d" % (poff, psz, isz))
+            print("  compression='%s'" % ctype)
 
             payload_abs = zboot_pos + poff
-            print("  payload 绝对偏移: 0x%x" % payload_abs)
-
-            if payload_abs + psz <= len(raw):
+            if 0 < payload_abs and payload_abs + psz <= len(raw):
                 payload = raw[payload_abs:payload_abs + psz]
                 print("  payload 提取: %d bytes" % len(payload))
 
-                errs = []
-                for c in (comp, 'gzip', 'zstd', 'lz4', 'lzma', 'xz', 'bzip2'):
-                    if not c or img is not None: continue
+                for c in (ctype, 'gzip', 'zstd', 'lz4', 'lzma', 'xz', 'bzip2'):
+                    if not c or img is not None:
+                        continue
                     try:
                         if c in ('gzip', 'gz'):
                             img = gzip.decompress(payload)
                         elif c == 'zstd':
                             import zstandard
                             img = zstandard.ZstdDecompressor().decompress(
-                                payload, max_output_size=max(isz * 2, 128*1024*1024))
+                                payload, max_output_size=max(isz * 2, 256 * 1024 * 1024))
                         elif c in ('lz4', 'lz4legacy'):
                             import lz4.frame
                             img = lz4.frame.decompress(payload)
@@ -320,46 +329,101 @@ jobs:
                             img = lzma.decompress(payload)
                         elif c == 'bzip2':
                             img = bz2.decompress(payload)
-                        if img is not None:
+                        if img:
                             print("  解压成功 (%s): %d bytes" % (c, len(img)))
                     except Exception as e:
-                        errs.append("%s:%s" % (c, str(e)[:60]))
-
+                        errs.append("%s: %s" % (c, str(e)[:60]))
                 if img is None:
                     print("  解压失败: %s" % errs)
 
+        # ===== 尝试 2: 扫描压缩签名 =====
         if img is None:
-            # Fallback：直接把 .text + .data 拼起来
-            print("未找到可用 zboot，直接拼 .text + .data")
-            payload = b''
+            print("扫描 .text 中的压缩签名...")
+            SIGS = [
+                ('gzip',  b'\x1f\x8b\x08'),
+                ('zstd',  b'\x28\xb5\x2f\xfd'),
+                ('xz',    b'\xfd\x37\x7a\x58\x5a\x00'),
+                ('lz4',   b'\x04\x22\x4d\x18'),
+                ('bzip2', b'\x42\x5a\x68'),
+            ]
+            for signame, sig in SIGS:
+                p = text_off
+                end = text_off + text_size
+                while p < end - 16 and img is None:
+                    p = raw.find(sig, p, end)
+                    if p < 0: break
+                    try:
+                        payload = raw[p:]
+                        if signame == 'gzip':
+                            img = gzip.decompress(payload)
+                        elif signame == 'zstd':
+                            import zstandard
+                            img = zstandard.ZstdDecompressor().decompress(
+                                payload, max_output_size=256 * 1024 * 1024)
+                        elif signame == 'xz':
+                            img = lzma.decompress(payload)
+                        elif signame == 'lz4':
+                            import lz4.frame
+                            img = lz4.frame.decompress(payload)
+                        elif signame == 'bzip2':
+                            img = bz2.decompress(payload)
+                        if img:
+                            print("  %s @ 0x%x 解压成功: %d bytes" % (signame, p, len(img)))
+                    except Exception:
+                        p += 1
+            if img is None:
+                print("  未找到压缩签名")
+
+        # ===== 尝试 3: 在 .text 里直接找 ARM64 Image 头 =====
+        if img is None:
+            print("在 .text 里扫描 ARM64 Image 头...")
+            pos = text_off
+            end = text_off + text_size - 0x40
+            while pos < end:
+                if raw[pos:pos+4] == b'\x1f\x20\x03\xd5' and raw[pos+0x38:pos+0x3c] == ARM64_MAGIC:
+                    code1 = struct.unpack_from('<I', raw, pos + 4)[0]
+                    if (code1 & 0xFC000000) == 0x14000000:
+                        isize_off = pos + 0x10
+                        if isize_off + 8 <= len(raw):
+                            isize = struct.unpack_from('<Q', raw, isize_off)[0]
+                            if 0x100000 < isize < 0x4000000:
+                                img = raw[pos:pos+isize]
+                                print("  Image @ 0x%x, size=%d" % (pos, len(img)))
+                                break
+                pos += 4
+            if img is None:
+                print("  未找到")
+
+        # ===== 尝试 4: 直接拼 .text + .data =====
+        if img is None:
+            print("Fallback: 直接拼 .text + .data")
+            img = b''
             for wanted in ('.text', '.data'):
                 for name, roff, rsize in sections:
                     if name == wanted and rsize > 0:
-                        payload += raw[roff:roff+rsize]
+                        img += raw[roff:roff + rsize]
                         print("  + %s: %d bytes" % (name, rsize))
                         break
-            img = payload
 
-        # 定位 ARM64 Image header
-        if len(img) < 0x40 or img[0x38:0x3c] != ARM64_MAGIC:
-            found = False
-            for skip in (0x40, 0x100, 0x200, 0x1000, 0x10000):
-                if len(img) > skip + 0x40 and img[skip+0x38:skip+0x3c] == ARM64_MAGIC:
-                    print("  跳过 header 0x%x" % skip)
-                    img = img[skip:]; found = True; break
-            if not found:
-                idx = img.find(ARM64_MAGIC)
-                if 0x30 <= idx <= 0x1000:
-                    img = img[idx-0x38:]
-                    print("  对齐到 magic @ 0x%x" % idx)
+        assert len(img) >= 0x40, "结果太小"
 
-        assert len(img) >= 0x40 and img[0x38:0x3c] == ARM64_MAGIC, "结果不是 ARM64 Image"
+        if img[0x38:0x3c] != ARM64_MAGIC:
+            idx = img.find(ARM64_MAGIC, 0, 0x200000)
+            if 0x30 <= idx <= 0x100000:
+                img = img[idx - 0x38:]
+                print("  已对齐到 ARM64 Image header（原 magic @ 0x%x）" % idx)
+
+        if img[0x38:0x3c] != ARM64_MAGIC:
+            print("!!! 结果不含 ARM64 Image header")
+            print("    magic 位置实际内容: %s" % img[0x38:0x3c].hex())
+            print("    Dump 前 128 字节:")
+            for i in range(0, 128, 16):
+                print("      %04x: %s" % (i, ' '.join('%02x' % b for b in img[i:i+16])))
+            sys.exit(1)
 
         code0 = struct.unpack_from('<I', img, 0x00)[0]
         code1 = struct.unpack_from('<I', img, 0x04)[0]
-        print("  Image code0 = 0x%08x" % code0)
-        print("  Image code1 = 0x%08x" % code1)
-        print("  Image size  = %d" % len(img))
+        print("Image: code0=0x%08x code1=0x%08x size=%d" % (code0, code1, len(img)))
 
         knl = b'KRNL' + struct.pack('<I', len(img)) + img
         open(dst, 'wb').write(knl)
