@@ -293,13 +293,11 @@ jobs:
             assert text_off is not None, "no .text"
             print("_stext offset: 0x%x" % text_off)
 
-            # 计算 code0 = b +text_off
             imm26 = text_off // 4
             assert imm26 <= 0x03FFFFFF, "offset too large"
             code0 = 0x14000000 | imm26
             print("code0 = 0x%08x (b +0x%x)" % (code0, text_off))
 
-            # 构造新头，保留其余字节
             file_size = len(data)
             new_header = bytearray(64)
             struct.pack_into('<I', new_header, 0x00, code0)
@@ -316,7 +314,6 @@ jobs:
             check = open(dst, 'rb').read(0x10010)
             assert check[0:4] == b'KRNL'
             magic_idx = check.find(ARM64_MAGIC)
-            # Image 0x10000 = KRNL 0x10008
             at_stext = check[0x10008:0x1000C].hex()
             print("KRNL magic@: 0x%x" % magic_idx)
             print("PACIASP check: %s" % at_stext)
@@ -331,7 +328,6 @@ jobs:
         if magic_idx == 0x38:
             print("Clean ARM64 Image")
             file_size = len(data)
-            # 修正 image_size
             struct.pack_into('<Q', data, 0x10, file_size)
             knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
             open(dst, 'wb').write(knl)
@@ -344,7 +340,7 @@ jobs:
         echo "kernel.img: $(stat -c%s /tmp/kernel.img) bytes"
         xxd -l 96 /tmp/kernel.img
 
-    - name: Prepare sd-fuse directory
+    - name: Prepare sd-fuse directory (with kernel partition resize)
       run: |
         cd /tmp
         mkdir -p /tmp/work
@@ -357,6 +353,59 @@ jobs:
 
         # 替换 kernel.img
         cp /tmp/kernel.img "$TARGET/kernel.img"
+        NEW_KERNEL_SIZE=$(stat -c%s "$TARGET/kernel.img")
+        echo "新 kernel.img 大小: $NEW_KERNEL_SIZE bytes"
+
+        # ---- 动态扩容 kernel 分区 ----
+        PARAM_FILE="$TARGET/parameter.txt"
+        [ -f "$PARAM_FILE" ] || { echo "缺少 parameter.txt"; exit 1; }
+        echo "===== Before ====="; cat "$PARAM_FILE"
+        python3 - "$PARAM_FILE" "$NEW_KERNEL_SIZE" <<'PARAM_PYEOF'
+        import re, sys
+        param_file, kernel_size = sys.argv[1], int(sys.argv[2])
+
+        with open(param_file) as f:
+            content = f.read()
+
+        kernel_re = re.compile(r'0x([0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(kernel\)',
+                               re.IGNORECASE)
+        m = kernel_re.search(content)
+        if not m:
+            print("[param] 未找到 kernel 分区，跳过"); sys.exit(0)
+
+        old_size   = int(m.group(1), 16)
+        kernel_off = int(m.group(2), 16)
+        kernel_end = kernel_off + old_size
+
+        need_sectors = (kernel_size + 511) // 512
+        rounded = ((need_sectors + 0xFFF) // 0x1000) * 0x1000  # 2MiB 对齐
+        new_size = max(rounded, old_size)
+
+        print(f"[param] old = 0x{old_size:x} ({old_size*512/1024/1024:.1f} MiB)")
+        print(f"[param] need= 0x{need_sectors:x} sectors")
+        print(f"[param] new = 0x{new_size:x} ({new_size*512/1024/1024:.1f} MiB)")
+
+        if new_size == old_size:
+            print("[param] 容量足够，无需扩容"); sys.exit(0)
+
+        delta = new_size - old_size
+
+        new_kernel = f'0x{new_size:08x}@{m.group(2)}(kernel)'
+        content = content[:m.start()] + new_kernel + content[m.end():]
+
+        def shift(match):
+            off = int(match.group(1), 16)
+            if off >= kernel_end:
+                return f'@0x{off + delta:08x}'
+            return match.group(0)
+
+        content = re.sub(r'@0x([0-9a-fA-F]+)', shift, content)
+
+        with open(param_file, 'w') as f:
+            f.write(content)
+        print("[param] parameter.txt 已更新")
+        PARAM_PYEOF
+        echo "===== After ====="; cat "$PARAM_FILE"
 
         # 替换 dtb
         mkdir -p "$TARGET/dtb/rockchip"
@@ -383,7 +432,7 @@ jobs:
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit=$MK_EXIT"
-        tail -40 /tmp/mk-sd.log
+        tail -60 /tmp/mk-sd.log
 
         FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
         [ -z "$FOUND_IMG" ] && { echo "No image"; exit 1; }
@@ -396,7 +445,7 @@ jobs:
 
         # 验证最终镜像
         python3 - "$GITHUB_WORKSPACE/artifact/$IMG_FILE" <<'PYEOF'
-        import sys
+        import sys, re
         img = sys.argv[1]
         with open(img, 'rb') as f:
             f.seek(0x12000 * 512)
