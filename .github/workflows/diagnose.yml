@@ -1,0 +1,186 @@
+name: Diagnose sd-fuse
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Init env
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d
+        sudo apt-get update -qq
+        sudo apt-get install -qq --no-install-recommends \
+          wget curl git file xxd binutils python3 \
+          device-tree-compiler android-sdk-libsparse-utils u-boot-tools
+        git clone https://github.com/friendlyarm/repo /tmp/repo
+        sudo -E cp /tmp/repo/repo /usr/bin/
+
+    - name: Fetch sd-fuse
+      run: |
+        cd /tmp
+        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests \
+          -b master-v24.10 -m rk3568.xml \
+          --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
+        repo sync -c scripts/sd-fuse --no-clone-bundle
+
+    - name: Download images.tgz
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        PATTERN="images-R5S-R5C-Series-FriendlyWrt-24.10-docker.tgz"
+        TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
+        FOUND=""
+        for TAG in $TAGS; do
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' 2>/dev/null | grep -qF "$PATTERN"; then
+            FOUND="$TAG"; break
+          fi
+        done
+        [ -z "$FOUND" ] && { echo "ERROR: not found"; exit 1; }
+        mkdir -p /tmp/inputs && cd /tmp/inputs
+        gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
+        mkdir -p /tmp/work
+        tar xzf /tmp/inputs/$PATTERN -C /tmp/work
+        echo "BASE=$(find /tmp/work -maxdepth 1 -type d -name 'friendlywrt*' | head -1)"
+
+    - name: Diagnose
+      run: |
+        BASE=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        SDFUSE="/tmp/scripts/sd-fuse"
+
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 1. sd-fuse 目录结构                                    ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        ls -la "$SDFUSE"
+        echo ""
+        echo "─── tools/ ───"
+        ls -laR "$SDFUSE/tools/" 2>&1 | head -100
+        echo ""
+        echo "─── files/ ───"
+        ls -laR "$SDFUSE/files/" 2>&1 | head -80
+        echo ""
+        echo "─── prebuilt/ ───"
+        ls -laR "$SDFUSE/prebuilt/" 2>&1 | head -80
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 2. build-kernel.sh（完整）                             ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        cat "$SDFUSE/build-kernel.sh" 2>/dev/null || echo "NOT FOUND"
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 3. build-boot-img.sh（完整）                           ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        cat "$SDFUSE/build-boot-img.sh" 2>/dev/null || echo "NOT FOUND"
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 4. mk-sd-image.sh（完整）                              ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        cat "$SDFUSE/mk-sd-image.sh" 2>/dev/null || echo "NOT FOUND"
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 5. build-rootfs-img.sh（完整）                         ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        cat "$SDFUSE/build-rootfs-img.sh" 2>/dev/null || echo "NOT FOUND"
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 6. images.tgz 顶层文件                                 ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        ls -la "$BASE"
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 7. resource.img 头部 + 内部 FDT 扫描                   ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        if [ -f "$BASE/resource.img" ]; then
+          echo "═══ 文件信息 ═══"
+          stat -c "%n: %s bytes" "$BASE/resource.img"
+          file -b "$BASE/resource.img"
+          echo ""
+          echo "═══ 前 256 字节 ═══"
+          xxd -l 256 "$BASE/resource.img"
+          echo ""
+          echo "═══ 搜索 DTB magic (d00dfeed) ═══"
+          python3 - "$BASE/resource.img" <<'PYEOF'
+import sys
+raw = open(sys.argv[1], 'rb').read()
+magic = b'\xd0\x0d\xfe\xed'
+idxs = []
+i = 0
+while True:
+    j = raw.find(magic, i)
+    if j < 0: break
+    idxs.append(j)
+    i = j + 1
+    if len(idxs) > 30: break
+print(f"  找到 {len(idxs)} 个 FDT magic：")
+for off in idxs[:30]:
+    print(f"    @ 0x{off:x}")
+PYEOF
+        else
+          echo "resource.img 不存在"
+        fi
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 8. boot.img 类型识别                                   ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        if [ -f "$BASE/boot.img" ]; then
+          stat -c "%n: %s bytes" "$BASE/boot.img"
+          file -b "$BASE/boot.img"
+          echo "前 64 字节:"
+          xxd -l 64 "$BASE/boot.img"
+        else
+          echo "boot.img 不存在"
+        fi
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 9. kernel.img / dtbo.img / uboot.img                   ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        for f in kernel.img dtbo.img uboot.img idbloader.img; do
+          if [ -f "$BASE/$f" ]; then
+            echo "═══ $f ═══"
+            stat -c "  size: %s bytes" "$BASE/$f"
+            file -b "$BASE/$f"
+            xxd -l 32 "$BASE/$f" | head -2
+            echo ""
+          fi
+        done
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 10. dtb/rockchip 目录内容                              ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        ls -la "$BASE/dtb/" 2>/dev/null
+        echo ""
+        ls -la "$BASE/dtb/rockchip/" 2>/dev/null | head -30
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 11. parameter.txt（原始）                              ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        cat "$BASE/parameter.txt" 2>/dev/null
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 12. tools 里所有可执行文件                             ║"
+        echo "╚════════════════════════════════════════════════════════╝"
+        find "$SDFUSE" -maxdepth 4 -type f \( -name "*resource*" -o -name "*dtb*" -o -name "*img*tool*" -o -name "mkimage" -o -name "dtc" \) 2>/dev/null
+        echo ""
+        echo "─── 所有 executable ───"
+        find "$SDFUSE" -maxdepth 4 -type f -executable 2>/dev/null | head -50
+
+        echo ""
+        echo "╔════════════════════════════════════════════════════════╗"
+        echo "║ 诊断完成                                                ║"
+        echo "╚════════════════════════════════════════════════════════╝"
