@@ -52,7 +52,7 @@ jobs:
     - uses: actions/checkout@v4
 
     # ============================================================
-    # 1. 环境初始化
+    # 1. 环境初始化（无 heredoc）
     # ============================================================
     - name: Init env
       env:
@@ -95,7 +95,7 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         SUFFIX=""
-        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
+        [ "${{ inputs.set }}" = "docker" ] && SUFFIX="-docker"
         PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
         TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
         FOUND=""
@@ -110,7 +110,7 @@ jobs:
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
     # ============================================================
-    # 4. 下载官方参考
+    # 4. 下载官方参考（无 heredoc）
     # ============================================================
     - name: Download official
       env:
@@ -129,7 +129,7 @@ jobs:
         fi
 
     # ============================================================
-    # 5. 扫描 + 下载内核
+    # 5. 扫描内核版本
     # ============================================================
     - name: Scan kernel
       id: kernel
@@ -168,6 +168,9 @@ jobs:
         echo "repo=$SELECTED_REPO" >> $GITHUB_OUTPUT
         echo "release=$SELECTED_RELEASE" >> $GITHUB_OUTPUT
 
+    # ============================================================
+    # 6. 下载内核（★ 移除全部 heredoc）
+    # ============================================================
     - name: Download kernel
       run: |
         cd /tmp
@@ -182,25 +185,11 @@ jobs:
         mkdir -p boot_extract dtb_extract
         tar xzf "$BOOT_TAR" -C boot_extract
         tar xzf "$DTB_TAR" -C dtb_extract
-        # 顺便提取官方 KRNL 头用于对比
-        OFF_IMG=$(find /tmp/official -maxdepth 1 -name "*.img" 2>/dev/null | head -1 || true)
-        if [ -n "$OFF_IMG" ]; then
-          python3 - "$OFF_IMG" /tmp/official_krnl_head.bin <<'PYEOF'
-import sys
-img, out = sys.argv[1], sys.argv[2]
-with open(img, 'rb') as f:
-    buf = f.read(4 * 1024 * 1024)
-idx = buf.find(b'KRNL')
-if idx >= 0:
-    open(out, 'wb').write(buf[idx:idx + 0x10000])
-    print(f"官方 KRNL @ 0x{idx:x}")
-else:
-    sys.exit(1)
-PYEOF
-        fi
+        echo "boot_extract:"; ls -la boot_extract/ | head
+        echo "dtb_extract:";  ls -la dtb_extract/ | head
 
     # ============================================================
-    # 6. 替换内核 + 生成镜像（单一实现，调用 replace-kernel.sh）
+    # 7. 替换内核 + 生成镜像（只调脚本，无 heredoc）
     # ============================================================
     - name: Replace kernel & build image
       env:
@@ -220,7 +209,7 @@ PYEOF
         echo "img_name=$IMG_FILE" >> $GITHUB_ENV
 
     # ============================================================
-    # 7. 验证
+    # 8. 验证
     # ============================================================
     - name: Verify
       id: verify
@@ -239,7 +228,7 @@ PYEOF
         fi
 
     # ============================================================
-    # 8. 压缩 + 上传
+    # 9. 压缩 + 上传
     # ============================================================
     - name: Compress
       run: |
@@ -265,7 +254,7 @@ PYEOF
         retention-days: 7
 
   # ============================================================
-  # 发布 + 清理
+  # 发布
   # ============================================================
   publish:
     needs: build
@@ -308,6 +297,9 @@ PYEOF
         generate_release_notes: true
         files: ./artifact/*.img.gz
 
+  # ============================================================
+  # 清理
+  # ============================================================
   cleanup_self:
     name: Cleanup Self Workflow History
     runs-on: ubuntu-latest
