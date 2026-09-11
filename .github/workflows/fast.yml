@@ -140,8 +140,6 @@ jobs:
           --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
         repo sync -c scripts/sd-fuse --no-clone-bundle
         ls -la /tmp/scripts/sd-fuse/
-        # 查找 gpt2env 工具
-        find /tmp/scripts/sd-fuse -name "gpt2env" -o -name "*gpt*env*" 2>/dev/null || echo "gpt2env not found in sd-fuse"
 
     - name: Download official images tgz
       id: images
@@ -350,12 +348,10 @@ jobs:
         rm -rf "$TARGET"
         cp -a "$BASE_DIR" "$TARGET"
 
-        # 替换 kernel.img
         cp /tmp/kernel.img "$TARGET/kernel.img"
         NEW_KERNEL_SIZE=$(stat -c%s "$TARGET/kernel.img")
         echo "新 kernel.img 大小: $NEW_KERNEL_SIZE bytes"
 
-        # ---- 动态扩容 kernel 分区 ----
         PARAM_FILE="$TARGET/parameter.txt"
         [ -f "$PARAM_FILE" ] || { echo "缺少 parameter.txt"; exit 1; }
         echo "===== Before ====="; cat "$PARAM_FILE"
@@ -377,7 +373,8 @@ jobs:
         kernel_end = kernel_off + old_size
 
         need_sectors = (kernel_size + 511) // 512
-        rounded  = ((need_sectors + 0xFFF) // 0x1000) * 0x1000  # 2MiB 对齐
+        # 8MiB 对齐，避免频繁扩容
+        rounded  = ((need_sectors + 0x3FFF) // 0x4000) * 0x4000
         new_size = max(rounded, old_size)
 
         print(f"[param] old  = 0x{old_size:x} ({old_size*512/1024/1024:.1f} MiB)")
@@ -406,7 +403,6 @@ jobs:
         PARAM_PYEOF
         echo "===== After ====="; cat "$PARAM_FILE"
 
-        # 替换 dtb
         mkdir -p "$TARGET/dtb/rockchip"
         DTB_R5S=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5s.dtb" | head -1)
         DTB_R5C=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5c.dtb" | head -1)
@@ -415,52 +411,9 @@ jobs:
         echo "dtb/rockchip:"
         ls -la "$TARGET/dtb/rockchip/"
 
-        # 替换 uInitrd
         UINITRD=$(find /tmp/boot_extract -name "uInitrd-*" | head -1)
         [ -n "$UINITRD" ] && cp "$UINITRD" "$TARGET/uInitrd"
         echo "kernel.img: $(stat -c%s "$TARGET/kernel.img") bytes"
-
-    - name: Generate GPT from parameter.txt (fix partition table sync)
-      run: |
-        set -e
-        cd /tmp/scripts/sd-fuse
-        DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')$([ "${{ inputs.set }}" = "docker" ] && echo "-docker")"
-        TARGET_DIR="$DIST_NAME"
-        PARAM_FILE="$TARGET_DIR/parameter.txt"
-
-        echo "=== 当前 parameter.txt 中的分区定义 ==="
-        grep -o 'mtdparts=[^ ]*' "$PARAM_FILE"
-
-        # 方法1: 使用 sd-fuse 自带的 gpt2env 工具（如果存在）
-        if [ -x "tools/gpt2env" ]; then
-          echo ">>> 使用 tools/gpt2env 生成 GPT 环境变量"
-          ./tools/gpt2env -i "$PARAM_FILE" -o "$TARGET_DIR/gpt_env.txt"
-          if [ -f "$TARGET_DIR/gpt_env.txt" ]; then
-            echo "gpt_env.txt 生成成功:"
-            cat "$TARGET_DIR/gpt_env.txt"
-          fi
-        else
-          echo ">>> tools/gpt2env 不存在，尝试从 RK SDK 获取或使用替代方案"
-        fi
-
-        # 方法2: 直接替换 prebuilt 中的 GPT 相关文件
-        # mk-sd-image.sh 通常从 prebuilt/ 目录读取 GPT 模板
-        # 我们根据 parameter.txt 生成一个兼容的 GPT 定义文件
-        echo ">>> 检查 prebuilt 目录中的 GPT 相关文件:"
-        ls -la prebuilt/ | grep -i gpt || echo "prebuilt 中无 GPT 文件"
-
-        # 如果存在 parameter.template 或 gpt 模板，用修改后的 parameter.txt 替换
-        for f in prebuilt/parameter.template prebuilt/parameter_gpt.txt prebuilt/gpt.txt; do
-          if [ -f "$f" ]; then
-            echo ">>> 用修改后的 parameter.txt 替换 $f"
-            cp "$PARAM_FILE" "$f"
-          fi
-        done
-
-        # 额外: 在 target 目录中也放置 parameter.txt 的副本，确保 mk-sd-image.sh 能找到
-        cp "$PARAM_FILE" "$TARGET_DIR/parameter.txt"
-
-        echo "=== GPT 同步准备完成 ==="
 
     - name: Build final image
       run: |
@@ -473,7 +426,7 @@ jobs:
         MK_EXIT=$?
         set -e
         echo "mk-sd-image.sh exit=$MK_EXIT"
-        tail -80 /tmp/mk-sd.log
+        tail -60 /tmp/mk-sd.log
 
         FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
         [ -z "$FOUND_IMG" ] && { echo "No image"; exit 1; }
@@ -486,7 +439,7 @@ jobs:
 
         # 验证最终镜像
         python3 - "$GITHUB_WORKSPACE/artifact/$IMG_FILE" <<'PYEOF'
-        import sys
+        import sys, struct
         img = sys.argv[1]
         with open(img, 'rb') as f:
             f.seek(0x12000 * 512)
@@ -496,44 +449,29 @@ jobs:
         print("Final image: KRNL magic at 0x%x" % idx)
         assert idx == 0x40
         print("OK")
-        PYEOF
 
-        # 额外验证: 检查镜像中 GPT 分区表是否与 parameter.txt 一致
-        echo "=== 验证镜像中的分区布局 ==="
-        # 使用 Python 解析镜像中的 GPT（简化检查：搜索 kernel 分区的 GPT 条目）
-        python3 - "$GITHUB_WORKSPACE/artifact/$IMG_FILE" <<'GPTCHECK'
-        import struct, sys
-
-        img = sys.argv[1]
+        # 打印 GPT 分区表，确认 kernel 分区已扩容
+        print("=== GPT 分区表（来自镜像 LBA1） ===")
         with open(img, 'rb') as f:
-            f.seek(512)  # GPT header at LBA 1
-            header = f.read(512)
-        
-        if header[0:8] != b'EFI PART':
-            print("WARNING: GPT signature not found at LBA 1")
-        else:
-            print("GPT signature: EFI PART ✓")
-            # GPT header: partition entries start at offset 72, entries count at offset 80
-            entries_lba = struct.unpack_from('<Q', header, 72)[0]
-            num_entries = struct.unpack_from('<I', header, 80)[0]
-            entry_size = struct.unpack_from('<I', header, 84)[0]
-            print(f"Partition entries LBA: {entries_lba}, count: {num_entries}, entry_size: {entry_size}")
-            
-            # 读取分区条目，查找 kernel
-            with open(img, 'rb') as f:
-                f.seek(entries_lba * 512)
-                entries = f.read(entry_size * num_entries)
-            
-            for i in range(num_entries):
-                off = i * entry_size
-                name_bytes = entries[off+56:off+56+72]
-                name = name_bytes.split(b'\x00')[0].decode('utf-16-le', errors='ignore').strip()
-                if name:
-                    first_lba = struct.unpack_from('<Q', entries, off+32)[0]
-                    last_lba = struct.unpack_from('<Q', entries, off+40)[0]
-                    size_mb = (last_lba - first_lba + 1) * 512 / 1024 / 1024
-                    print(f"  Partition {i}: {name} @ 0x{first_lba:x} (0x{last_lba-first_lba+1:x} sectors, {size_mb:.1f} MiB)")
-        GPTCHECK
+            f.seek(512)
+            header = f.read(92)
+        assert header[0:8] == b'EFI PART', 'GPT signature missing'
+        entries_lba = struct.unpack_from('<Q', header, 72)[0]
+        num_entries = struct.unpack_from('<I', header, 80)[0]
+        entry_size  = struct.unpack_from('<I', header, 84)[0]
+        with open(img, 'rb') as f:
+            f.seek(entries_lba * 512)
+            entries = f.read(entry_size * num_entries)
+        for i in range(num_entries):
+            off = i * entry_size
+            nb = entries[off+56:off+56+72]
+            name = nb.split(b'\x00')[0].decode('utf-16-le', errors='ignore').strip()
+            if not name: continue
+            first = struct.unpack_from('<Q', entries, off+32)[0]
+            last  = struct.unpack_from('<Q', entries, off+40)[0]
+            size_mb = (last - first + 1) * 512 / 1024 / 1024
+            print(f"  {name:<12} @ LBA 0x{first:x} size={size_mb:>6.1f} MiB")
+        PYEOF
 
     - name: Compress image to gz
       run: |
