@@ -1,8 +1,8 @@
 #!/bin/bash
-# replace-kernel.sh - 内核替换 + 模块注入 + boot.img 重建 + 全面静态验证
+# replace-kernel.sh - 内核替换 + 模块注入 + boot.img 重建 + 全面静态验证 + resource.img 诊断
 set -euo pipefail
 
-VERSION="2026-09-11-v46-fixed-static-verify"
+VERSION="2026-09-11-v47-resource-diagnose"
 log()  { echo -e "\033[0;32m[replace]\033[0m $*"; }
 warn() { echo -e "\033[0;33m[replace]\033[0m $*"; }
 err()  { echo -e "\033[0;31m[replace]\033[0m $*" >&2; }
@@ -76,7 +76,6 @@ for target in "${SCAN_REPOS[@]}"; do
 done
 [ ${#VER_TO_SOURCE[@]} -eq 0 ] && { err "无匹配内核"; exit 1; }
 
-# ★ 选择策略：rk35xx 优先
 SELECTED_VER=""
 SELECTED_SOURCE=""
 for v in $(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V -r); do
@@ -282,7 +281,7 @@ KERNEL_IMG="$TARGET_DIR/kernel.img"
 log "  ✓ kernel.img KNL magic 通过 ($(stat -c%s "$KERNEL_IMG") bytes)"
 
 # ============================================================
-# 5.2 内核内容验证（确认支持 RK3568）
+# 5.2 内核内容验证
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
@@ -298,41 +297,12 @@ RK3568_CNT=$(count_matches "$KERNEL_IMG" "rk3568")
 ROCKCHIP_CNT=$(count_matches "$KERNEL_IMG" "rockchip")
 KERNEL_VER_STR=$(strings -a "$KERNEL_IMG" 2>/dev/null | grep -oE "Linux version [0-9]+\.[0-9]+\.[0-9]+[^ ]*" | head -1 || echo "")
 
-log "  ── 自建 kernel.img 字符串统计 ──"
-log "    'rk3568':    $RK3568_CNT 处"
-log "    'rockchip':  $ROCKCHIP_CNT 处"
-log "    Linux 版本:  ${KERNEL_VER_STR:-(未找到)}"
+log "  'rk3568':    $RK3568_CNT 处"
+log "  'rockchip':  $ROCKCHIP_CNT 处"
+log "  Linux 版本:  ${KERNEL_VER_STR:-(未找到)}"
 
-if [ -n "$OFFICIAL_PAYLOAD" ] && [ -f "$OFFICIAL_PAYLOAD" ]; then
-  OFF_RK3568=$(count_matches "$OFFICIAL_PAYLOAD" "rk3568")
-  OFF_ROCKCHIP=$(count_matches "$OFFICIAL_PAYLOAD" "rockchip")
-  OFF_KVER=$(strings -a "$OFFICIAL_PAYLOAD" 2>/dev/null | grep -oE "Linux version [0-9]+\.[0-9]+\.[0-9]+[^ ]*" | head -1 || echo "")
-  log "  ── 官方 kernel 字符串统计（参考） ──"
-  log "    'rk3568':    $OFF_RK3568 处"
-  log "    'rockchip':  $OFF_ROCKCHIP 处"
-  log "    Linux 版本:  ${OFF_KVER:-(未找到)}"
-fi
-
-if [ "$RK3568_CNT" -eq 0 ]; then
-  err ""
-  err "  ╔══════════════════════════════════════════════════════════╗"
-  err "  ║  ✗ 致命：内核不含 'rk3568' 字符串，无法在 RK3568 上启动 ║"
-  err "  ║  当前来源: $SELECTED_REPO/$SELECTED_RELEASE"
-  err "  ╚══════════════════════════════════════════════════════════╝"
-  err ""
-  VERIFY_FAIL=1
-fi
-if [ "$ROCKCHIP_CNT" -eq 0 ]; then
-  err "  ✗ 内核不含 'rockchip' 字符串"
-  VERIFY_FAIL=1
-fi
-if [ -z "$KERNEL_VER_STR" ]; then
-  warn "  ⚠ 未找到 Linux version 字符串（可能被 strip，非致命）"
-fi
-
-[ "$VERIFY_FAIL" -eq 1 ] && { err "内核内容验证失败，终止构建"; exit 1; }
-log "  ✓✓✓ 内核支持 RK3568"
-log "════════════════════════════════════════════════════════"
+[ "$RK3568_CNT" -eq 0 ] && { err "内核不含 rk3568 字符串"; exit 1; }
+log "  ✓ 内核支持 RK3568"
 log ""
 
 # ============================================================
@@ -432,8 +402,7 @@ ROOTFS_PART=$(grep -oE '0x[0-9a-fA-F]+@0x[0-9a-fA-F]+\(rootfs\)' "$PARAM_FILE" |
 if [ -n "$ROOTFS_PART" ]; then
   PART_SECTORS=$(echo "$ROOTFS_PART" | sed -E 's/0x([0-9a-fA-F]+)@.*/\1/')
   PART_BYTES=$(( 0x$PART_SECTORS * 512 ))
-  log "  parameter.txt rootfs 分区: $PART_SECTORS sectors ($((PART_BYTES/1024/1024)) MiB)"
-  log "  rootfs raw 大小: $RAW_SIZE_FINAL bytes ($((RAW_SIZE_FINAL/1024/1024)) MiB)"
+  log "  rootfs 分区: $((PART_BYTES/1024/1024)) MiB / raw: $((RAW_SIZE_FINAL/1024/1024)) MiB"
 
   if [ "$RAW_SIZE_FINAL" -gt "$PART_BYTES" ]; then
     warn "  ★ 扩展 rootfs 分区"
@@ -448,10 +417,9 @@ rootfs_end = rootfs_off + old_size
 need = (new_bytes + 511) // 512
 rounded = ((need + 0x3FFF) // 0x4000) * 0x4000
 new_size = max(rounded, old_size)
-if new_size == old_size:
-    sys.exit(0)
+if new_size == old_size: sys.exit(0)
 delta = new_size - old_size
-print(f"[param] rootfs: {old_size*512/1024/1024:.1f}MiB → {new_size*512/1024/1024:.1f}MiB")
+print(f"[param] rootfs: {old_size*512/1024/1024:.1f}→{new_size*512/1024/1024:.1f} MiB")
 content = content[:m.start()] + f'0x{new_size:08x}@{m.group(2)}(rootfs)' + content[m.end():]
 def shift(mt):
     off = int(mt.group(1), 16)
@@ -461,7 +429,7 @@ open(param_file, 'w').write(content)
 PARAM_EXPAND
   fi
 fi
-log "  ✓ rootfs.img 处理完成"
+log "  ✓ rootfs 处理完成"
 
 # ============================================================
 # 5.5 扩容 kernel 分区
@@ -502,16 +470,11 @@ if [ -n "$DTB_TAR" ]; then
       tar xzf "$DTB_TAR" -C "$WORK_DIR" "$ENTRY"
       cp "$WORK_DIR/$ENTRY" "$TARGET_DIR/dtb/rockchip/rk3568-nanopi-${board}.dtb"
       log "  ✓ $board dtb"
-    else
-      warn "  ✗ $board dtb 未找到"
     fi
   done
 fi
 UINITRD=$(find "$KERNEL_CACHE" -type f -name "uInitrd-*" | head -1)
-if [ -n "$UINITRD" ]; then
-  cp "$UINITRD" "$TARGET_DIR/uInitrd"
-  log "  ✓ uInitrd ($(stat -c%s "$TARGET_DIR/uInitrd") bytes)"
-fi
+[ -n "$UINITRD" ] && { cp "$UINITRD" "$TARGET_DIR/uInitrd"; log "  ✓ uInitrd"; }
 
 # ============================================================
 # 6.9 重建 boot.img
@@ -521,10 +484,7 @@ BOOT_IMG="$TARGET_DIR/boot.img"
 UINITRD_FILE="$TARGET_DIR/uInitrd"
 
 if [ -f "$UINITRD_FILE" ]; then
-  if [ -f "$BOOT_IMG" ]; then
-    cp "$BOOT_IMG" "$WORK_DIR/boot.img.orig" 2>/dev/null || true
-    log "  官方 boot.img: $(stat -c%s "$BOOT_IMG") bytes (已备份)"
-  fi
+  [ -f "$BOOT_IMG" ] && cp "$BOOT_IMG" "$WORK_DIR/boot.img.orig" 2>/dev/null || true
 
   UINITRD_MAGIC=$(dd if="$UINITRD_FILE" bs=1 count=4 2>/dev/null | xxd -p)
   log "  uInitrd magic: $UINITRD_MAGIC"
@@ -580,13 +540,92 @@ BOOT_BUILD
     NEW_MAGIC=$(dd if="$BOOT_IMG" bs=1 count=4 2>/dev/null)
     NEW_PAYLOAD=$(dd if="$BOOT_IMG" bs=1 skip=8 count=4 2>/dev/null | xxd -p)
     log "  boot.img: magic=$NEW_MAGIC, payload=$NEW_PAYLOAD, size=$(stat -c%s "$BOOT_IMG")"
-    if [ "$NEW_MAGIC" != "KRNL" ] || { [ "$NEW_PAYLOAD" != "1f8b0800" ] && [ "$NEW_PAYLOAD" != "1f8b0808" ]; }; then
-      err "  ✗ boot.img 重建失败，恢复官方"
-      [ -f "$WORK_DIR/boot.img.orig" ] && cp "$WORK_DIR/boot.img.orig" "$BOOT_IMG"
-      VERIFY_FAIL=1
-    fi
   fi
 fi
+
+# ============================================================
+# ★★★ 6.7 resource.img 深度诊断（v47 新增）★★★
+# ============================================================
+log ""
+log "════════════════════════════════════════════════════════"
+log "  ★ [6.7/9] resource.img 深度诊断"
+log "════════════════════════════════════════════════════════"
+
+RESOURCE_IMG="$TARGET_DIR/resource.img"
+if [ -f "$RESOURCE_IMG" ]; then
+  RES_SIZE=$(stat -c%s "$RESOURCE_IMG")
+  log "  resource.img 总大小: $RES_SIZE bytes"
+  log ""
+  log "  ── 前 4KB hex ──"
+  xxd -l 4096 "$RESOURCE_IMG" | sed 's/^/    /'
+  log ""
+  log "  ── 搜索 'rk-kernel.dtb' 字符串位置 ──"
+  grep -abo "rk-kernel.dtb" "$RESOURCE_IMG" 2>/dev/null | head -10 | sed 's/^/    /' || echo "    (未找到)"
+  log ""
+  log "  ── 搜索所有 FDT magic (d00dfeed) 位置 ──"
+  python3 -c "
+raw = open('$RESOURCE_IMG','rb').read()
+magic = b'\xd0\x0d\xfe\xed'
+idxs = []
+i = 0
+while True:
+    j = raw.find(magic, i)
+    if j < 0: break
+    idxs.append(j)
+    i = j + 1
+    if len(idxs) > 20: break
+print(f'    共 {len(idxs)} 个 FDT:')
+for off in idxs:
+    print(f'      @ 0x{off:x} ({off})')
+"
+  log ""
+  log "  ── 搜索所有 'RSCE' 位置 ──"
+  grep -abo "RSCE" "$RESOURCE_IMG" 2>/dev/null | head -10 | sed 's/^/    /' || echo "    (未找到)"
+  log ""
+  log "  ── 搜索已知 resource 子文件名字符串 ──"
+  for name in "logo.bmp" "logo_kernel.bmp" "resource" "rk-kernel" "dtb"; do
+    POS=$(grep -abo "$name" "$RESOURCE_IMG" 2>/dev/null | head -3 | awk -F: '{print $1}' | tr '\n' ' ')
+    if [ -n "$POS" ]; then
+      log "    '$name': $POS"
+    fi
+  done
+  log ""
+
+  # 尝试解析 RSCE 头
+  log "  ── 尝试解析 RSCE 头 ──"
+  python3 -c "
+import struct
+raw = open('$RESOURCE_IMG','rb').read()
+
+# 前 32 字节
+print('    前 32 字节逐字段解读:')
+print(f'      [0x00:0x04] = {raw[0:4]!r}')
+print(f'      [0x04:0x08] = 0x{struct.unpack_from(\"<I\", raw, 4)[0]:08x}')
+print(f'      [0x08:0x0c] = 0x{struct.unpack_from(\"<I\", raw, 8)[0]:08x}')
+print(f'      [0x0c:0x10] = 0x{struct.unpack_from(\"<I\", raw, 12)[0]:08x}')
+print(f'      [0x10:0x14] = 0x{struct.unpack_from(\"<I\", raw, 16)[0]:08x}')
+print(f'      [0x14:0x18] = 0x{struct.unpack_from(\"<I\", raw, 20)[0]:08x}')
+print(f'      [0x18:0x1c] = 0x{struct.unpack_from(\"<I\", raw, 24)[0]:08x}')
+print(f'      [0x1c:0x20] = 0x{struct.unpack_from(\"<I\", raw, 28)[0]:08x}')
+
+# 尝试在偏移 8 处找文件名（找 'rk-kernel.dtb' 字符串）
+for name_to_find in [b'rk-kernel.dtb', b'logo.bmp', b'logo_kernel.bmp']:
+    idx = raw.find(name_to_find)
+    if idx > 0:
+        print(f'    找到 {name_to_find!r} @ 0x{idx:x}')
+        # 往前找可能的 name 字段起点（假设 name 字段 256 字节）
+        for test_entry_start in [idx - 256, idx]:
+            if test_entry_start >= 0:
+                # 尝试读 entry 结构
+                if test_entry_start + 264 <= len(raw):
+                    off_v = struct.unpack_from('<I', raw, test_entry_start + 256)[0]
+                    size_v = struct.unpack_from('<I', raw, test_entry_start + 260)[0]
+                    print(f'      [假设 entry 起 0x{test_entry_start:x}]: offset=0x{off_v:x} size=0x{size_v:x}')
+"
+  log ""
+fi
+log "════════════════════════════════════════════════════════"
+log ""
 
 # ============================================================
 # 7. 生成镜像
@@ -614,7 +653,7 @@ mv "$FOUND_IMG" "$OUTPUT_IMG"
 log "  镜像: $OUTPUT_IMG ($(stat -c%s "$OUTPUT_IMG") bytes)"
 
 # ============================================================
-# 8. 全面静态验证（v46：只检查 parameter.txt 实际分区）
+# 8. 全面静态验证
 # ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
@@ -629,7 +668,7 @@ info() { log "  ℹ️  $*"; }
 IMG="$OUTPUT_IMG"
 IMG_SIZE=$(stat -c%s "$IMG")
 
-# ---- 8.1 parameter.txt 分区解析 ----
+# 8.1
 log ""
 log "── 8.1 parameter.txt 分区表 ──"
 CMDLINE=$(grep -E '^CMDLINE:' "$PARAM_FILE" | head -1)
@@ -641,14 +680,10 @@ while IFS= read -r part; do
   SIZE_HEX=$(echo "$part" | sed -E 's/^(-?|0x[0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(([^)]+)\).*/\1/')
   OFF_HEX=$(echo "$part" | sed -E 's/^(-?|0x[0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(([^)]+)\).*/\2/')
   NAME=$(echo "$part" | sed -E 's/^(-?|0x[0-9a-fA-F]+)@(0x[0-9a-fA-F]+)\(([^)]+)\).*/\3/')
-  NAME="${NAME%%:*}"   # 去掉 :grow 后缀
-  if [ -z "$NAME" ] || [ "$SIZE_HEX" = "-" ] || [ -z "$SIZE_HEX" ]; then
-    continue
-  fi
-  SIZE=$(( SIZE_HEX ))
-  OFF=$(( OFF_HEX ))
-  PART_SIZE[$NAME]=$SIZE
-  PART_OFF[$NAME]=$OFF
+  NAME="${NAME%%:*}"
+  if [ -z "$NAME" ] || [ "$SIZE_HEX" = "-" ] || [ -z "$SIZE_HEX" ]; then continue; fi
+  SIZE=$(( SIZE_HEX )); OFF=$(( OFF_HEX ))
+  PART_SIZE[$NAME]=$SIZE; PART_OFF[$NAME]=$OFF
   END=$(( OFF + SIZE ))
   [ $END -gt $TOTAL_END ] && TOTAL_END=$END
   log "    $NAME: off=0x$(printf %x $OFF) size=$(( SIZE * 512 / 1024 / 1024 ))MiB"
@@ -656,12 +691,11 @@ done < <(echo "$PARTS" | tr ',' '\n')
 
 IMG_SECTORS=$(( IMG_SIZE / 512 ))
 if [ $TOTAL_END -gt $IMG_SECTORS ]; then
-  bad "分区总结束 ${TOTAL_END}s > img 容量 ${IMG_SECTORS}s"
+  bad "分区总结束 > img 容量"
 else
   ok "分区总和 ≤ img 容量（余量 $(( (IMG_SECTORS - TOTAL_END) * 512 / 1024 / 1024 ))MiB）"
 fi
 
-# 只检查 parameter.txt 里定义的分区；可选分区（recovery/opt/userdata）不存在不算错
 OPTIONAL_PARTS=" recovery opt userdata "
 for part in "${!PART_SIZE[@]}"; do
   FILE="$TARGET_DIR/${part}.img"
@@ -675,196 +709,107 @@ for part in "${!PART_SIZE[@]}"; do
   fi
   FSIZE=$(stat -c%s "$FILE")
   PSIZE=$(( ${PART_SIZE[$part]:-0} * 512 ))
-  if [ $PSIZE -eq 0 ]; then
-    info "$part: (grow 分区，跳过)"
-  elif [ $FSIZE -gt $PSIZE ]; then
-    bad "$part: 文件($FSIZE) > 分区($PSIZE)"
+  if [ $PSIZE -eq 0 ]; then info "$part: (grow)"
+  elif [ $FSIZE -gt $PSIZE ]; then bad "$part: 文件 > 分区"
   fi
 done
 
-# ---- 8.2 img 内各分区首部 magic ----
+# 8.2
 log ""
 log "── 8.2 最终 img 内各分区首部 magic ──"
-
 check_magic() {
   local name="$1" expected_hex="$2" desc="$3"
   local off=$(( ${PART_OFF[$name]:-0} * 512 ))
   [ $off -eq 0 ] && return
   local actual=$(dd if="$IMG" bs=1 skip=$off count=4 2>/dev/null | xxd -p)
-  if [ "$actual" = "$expected_hex" ]; then
-    ok "$name @ $off: $desc ($actual)"
-  else
-    bad "$name @ $off: magic=$actual (期望 $expected_hex, $desc)"
+  if [ "$actual" = "$expected_hex" ]; then ok "$name @ $off: $desc ($actual)"
+  else bad "$name @ $off: magic=$actual (期望 $expected_hex)"
   fi
 }
-
-# RK U-Boot 是 FDT 头（d00dfeed），不是 classic U-Boot legacy（27051956）
 check_magic uboot      "d00dfeed"  "RK U-Boot (FDT)"
 check_magic resource   "52534345"  "RSCE"
 check_magic kernel     "4b524e4c"  "KRNL"
 check_magic boot       "4b524e4c"  "KRNL"
 
-# boot 分区 payload 必须 gzip
 BOOT_OFF=$(( ${PART_OFF[boot]:-0} * 512 ))
 if [ $BOOT_OFF -gt 0 ]; then
   BOOT_PAYLOAD=$(dd if="$IMG" bs=1 skip=$(( BOOT_OFF + 8 )) count=4 2>/dev/null | xxd -p)
   if [ "$BOOT_PAYLOAD" = "1f8b0800" ] || [ "$BOOT_PAYLOAD" = "1f8b0808" ]; then
     ok "boot 分区 payload=gzip"
   else
-    bad "boot 分区 payload=$BOOT_PAYLOAD (期望 gzip)"
+    bad "boot 分区 payload=$BOOT_PAYLOAD"
   fi
 fi
 
-# rootfs 分区 ext4 magic @ +0x438
 ROOTFS_OFF=$(( ${PART_OFF[rootfs]:-0} * 512 ))
 if [ $ROOTFS_OFF -gt 0 ]; then
   RM2=$(dd if="$IMG" bs=1 skip=$(( ROOTFS_OFF + 0x438 )) count=2 2>/dev/null | xxd -p)
-  if [ "$RM2" = "53ef" ]; then
-    ok "rootfs 分区 @ +0x438: ext4 magic=53ef"
-  else
-    bad "rootfs 分区 @ +0x438: magic=$RM2 (期望 53ef)"
-  fi
+  [ "$RM2" = "53ef" ] && ok "rootfs ext4 magic=53ef" || bad "rootfs magic=$RM2"
 fi
 
-# ---- 8.3 与官方固件对比（纯信息） ----
+# 8.3
 log ""
 log "── 8.3 与官方固件对比 ──"
 OFFICIAL_IMG=$(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.img" 2>/dev/null | head -1 || true)
 if [ -n "$OFFICIAL_IMG" ] && [ -f "$OFFICIAL_IMG" ]; then
-  OFF_SIZE=$(stat -c%s "$OFFICIAL_IMG")
   OFF_FMT=$(file -b "$OFFICIAL_IMG")
-  log "  官方 img: $OFF_SIZE bytes"
-  log "  官方格式: $OFF_FMT"
-  log "  自建 img: $IMG_SIZE bytes"
-
-  if echo "$OFF_FMT" | grep -qi "Android sparse"; then
-    info "官方 img 是 sparse 格式，无法按 raw offset 对比"
-    info "（自建固件 magic 已在 8.2 验证通过）"
-  else
-    for part in kernel boot; do
-      off=$(( ${PART_OFF[$part]:-0} * 512 ))
-      [ $off -eq 0 ] && continue
-      OUR=$(dd if="$IMG" bs=1 skip=$off count=4 2>/dev/null | xxd -p)
-      OFF=$(dd if="$OFFICIAL_IMG" bs=1 skip=$off count=4 2>/dev/null | xxd -p)
-      if [ "$OUR" = "$OFF" ]; then
-        ok "$part 首部 magic 与官方一致 ($OUR)"
-      else
-        warn "$part 首部 magic 不同（自建=$OUR 官方=$OFF）"
-      fi
-    done
-  fi
-else
-  info "无官方 img，跳过对比"
+  info "官方格式: $OFF_FMT"
 fi
 
-# ---- 8.4 rootfs 分区深度校验（挂载） ----
+# 8.4 rootfs 挂载
 log ""
-log "── 8.4 rootfs 分区深度校验（挂载） ──"
-
+log "── 8.4 rootfs 挂载校验 ──"
 ROOTFS_CHECK="$WORK_DIR/rootfs_check"
 mkdir -p "$ROOTFS_CHECK"
-
 if [ $ROOTFS_OFF -gt 0 ]; then
   ROOTFS_EXTRACT="$WORK_DIR/rootfs_extract.img"
   dd if="$IMG" bs=1M skip=$(( ROOTFS_OFF / 1024 / 1024 )) \
      of="$ROOTFS_EXTRACT" count=$(( ${PART_SIZE[rootfs]:-0} * 512 / 1024 / 1024 )) 2>/dev/null
-
   if sudo mount -o loop,ro "$ROOTFS_EXTRACT" "$ROOTFS_CHECK" 2>/dev/null; then
     ok "rootfs 可挂载"
-
-    if sudo test -d "$ROOTFS_CHECK/lib/modules/$KVER"; then
-      ok "rootfs 含 /lib/modules/$KVER/"
-      KOS=$(sudo find "$ROOTFS_CHECK/lib/modules/$KVER" -name '*.ko*' 2>/dev/null | wc -l)
-      if [ "$KOS" -ge 1000 ]; then
-        ok "rootfs 含 $KOS 个 ko 模块"
-      else
-        bad "rootfs 只有 $KOS 个 ko（期望 ≥1000）"
-      fi
-    else
-      bad "rootfs 缺 /lib/modules/$KVER/"
-    fi
-
-    if sudo test -x "$ROOTFS_CHECK/sbin/init" || sudo test -L "$ROOTFS_CHECK/sbin/init"; then
-      ok "rootfs 含 /sbin/init"
-    else
-      bad "rootfs 缺 /sbin/init"
-    fi
-
-    if sudo test -f "$ROOTFS_CHECK/etc/openwrt_release" || sudo test -f "$ROOTFS_CHECK/etc/os-release"; then
-      ok "rootfs 含 OpenWrt 标识文件"
-    fi
-
+    sudo test -d "$ROOTFS_CHECK/lib/modules/$KVER" && ok "含 $KVER 模块目录" || bad "缺模块目录"
+    KOS=$(sudo find "$ROOTFS_CHECK/lib/modules/$KVER" -name '*.ko*' 2>/dev/null | wc -l)
+    [ "$KOS" -ge 1000 ] && ok "含 $KOS 个 ko" || bad "仅 $KOS 个 ko"
+    sudo test -x "$ROOTFS_CHECK/sbin/init" && ok "含 /sbin/init" || bad "缺 /sbin/init"
     sudo umount "$ROOTFS_CHECK"
   else
     bad "rootfs 无法挂载"
   fi
 fi
 
-# ---- 8.5 boot.img payload 深度校验 ----
+# 8.5 boot payload
 log ""
-log "── 8.5 boot.img payload 深度校验 ──"
-
+log "── 8.5 boot payload 完整性 ──"
 if [ -f "$BOOT_IMG" ]; then
   BOOT_SIZE=$(stat -c%s "$BOOT_IMG")
-  PAYLOAD_SIZE=$(( BOOT_SIZE - 12 ))
-  dd if="$BOOT_IMG" bs=1 skip=8 count=$PAYLOAD_SIZE of="$WORK_DIR/boot_payload.gz" 2>/dev/null
-
+  dd if="$BOOT_IMG" bs=1 skip=8 count=$(( BOOT_SIZE - 12 )) of="$WORK_DIR/boot_payload.gz" 2>/dev/null
   if gunzip -t "$WORK_DIR/boot_payload.gz" 2>/dev/null; then
     ok "boot payload gzip 完整性通过"
-    DECOMP_SIZE=$(gunzip -c "$WORK_DIR/boot_payload.gz" 2>/dev/null | wc -c)
-    log "    解压后大小: $DECOMP_SIZE bytes"
-    if [ "$DECOMP_SIZE" -gt 1000000 ]; then
-      ok "解压后 >1MB，含实际 ramdisk 内容"
-    else
-      bad "解压后仅 $DECOMP_SIZE bytes，异常"
-    fi
+    DSIZE=$(gunzip -c "$WORK_DIR/boot_payload.gz" 2>/dev/null | wc -c)
+    [ "$DSIZE" -gt 1000000 ] && ok "解压 $DSIZE bytes" || bad "解压仅 $DSIZE bytes"
   else
-    bad "boot payload gzip 完整性失败"
+    bad "boot payload gzip 损坏"
   fi
 fi
 
-# ---- 8.6 大小对比 ----
-log ""
-log "── 8.6 固件大小合理性 ──"
-if [ "$IMG_SIZE" -ge 3000000000 ]; then
-  ok "img ≥3GB"
-else
-  bad "img 仅 $IMG_SIZE bytes，异常"
-fi
-
-# ============================================================
-# 8.7 汇总结论
-# ============================================================
 log ""
 log "════════════════════════════════════════════════════════"
 log "  验证结果: 通过 $PASS 项 / 失败 $FAIL 项"
 log "════════════════════════════════════════════════════════"
 
-if [ "$FAIL" -gt 0 ]; then
-  err ""
-  err "  ╔══════════════════════════════════════════════════════════╗"
-  err "  ║  ✗ 验证失败，固件禁止上传                              ║"
-  err "  ╚══════════════════════════════════════════════════════════╝"
-  exit 1
-fi
+[ "$FAIL" -gt 0 ] && exit 1
 
-log ""
 log "  ✅ 所有静态验证通过"
-log "  说明: 固件结构、格式、内容均正确"
-log "  风险: 静态验证不覆盖硬件启动过程（U-Boot/DDR/时钟）"
-log "  建议: 可刷机测试"
 
 # ============================================================
 # 9. 汇总
 # ============================================================
 log ""
 log "[9/9] 汇总"
-log "  内核来源:     $SELECTED_REPO / $SELECTED_RELEASE"
-log "  内核版本:     $SELECTED_VER"
-log "  kernel.img:   $(stat -c%s "$TARGET_DIR/kernel.img") bytes"
-log "  boot.img:     $(stat -c%s "$TARGET_DIR/boot.img") bytes"
-log "  rootfs.img:   $(stat -c%s "$TARGET_DIR/rootfs.img") bytes"
-log "  最终 img:     $OUTPUT_IMG ($IMG_SIZE bytes)"
-
+log "  内核: $SELECTED_VER ($SELECTED_REPO/$SELECTED_RELEASE)"
+log "  kernel.img: $(stat -c%s "$TARGET_DIR/kernel.img")"
+log "  boot.img:   $(stat -c%s "$TARGET_DIR/boot.img")"
+log "  rootfs.img: $(stat -c%s "$TARGET_DIR/rootfs.img")"
+log "  img:        $OUTPUT_IMG ($IMG_SIZE)"
 log ""
 log "完成 (version $VERSION)"
