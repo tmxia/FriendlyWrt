@@ -24,14 +24,9 @@ on:
         default: 'images-R5S-R5C-Series-FriendlyWrt-24.10-docker.tgz'
         type: string
       flippy_kernel_repo:
-        description: '内核来源仓库 (owner/repo)'
+        description: '内核来源仓库'
         required: true
         default: 'ophub/kernel'
-        type: string
-      flippy_kernel_release:
-        description: '内核 Release tag'
-        required: true
-        default: 'kernel_flippy'
         type: string
       package_soc:
         description: '打包目标 SoC'
@@ -52,14 +47,21 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    - name: Install dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -qq --no-install-recommends \
+          wget curl git rsync time file unzip bc bzip2 xxd \
+          python3 dosfstools e2fsprogs parted \
+          android-sdk-libsparse-utils u-boot-tools \
+          gzip xz-utils zstd lz4 squashfs-tools
+
     - name: Prepare workspace
       run: |
         sudo mkdir -p $WORKSPACE
         sudo chown -R runner:runner $WORKSPACE
-        mkdir -p $WORKSPACE/input
-        mkdir -p $WORKSPACE/output
+        mkdir -p $WORKSPACE/input $WORKSPACE/output $WORKSPACE/extract
         echo "WORKSPACE: $WORKSPACE"
-        ls -la $WORKSPACE
 
     # ============================================================
     # 1. 下载 rootfs tgz
@@ -69,55 +71,111 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         cd $WORKSPACE/input
-        echo "下载 ${{ inputs.rootfs_asset }} from ${{ inputs.rootfs_release_tag }}"
         gh release download "${{ inputs.rootfs_release_tag }}" \
           --repo "$GITHUB_REPOSITORY" \
           --pattern "${{ inputs.rootfs_asset }}" \
           --dir .
         ls -la
-        echo "下载完成"
 
     # ============================================================
-    # 2. 解压 tgz，重新打包为 flippy 期望的 rootfs.tar.gz
+    # 2. 解压 tgz，取出 rootfs.img
+    # ============================================================
+    - name: Extract images tgz
+      run: |
+        cd $WORKSPACE/input
+        TGZ=$(find . -maxdepth 1 -name "*.tgz" | head -1)
+        echo "输入: $TGZ"
+        tar xzf "$TGZ" -C $WORKSPACE/extract
+
+        echo "=== 解压后结构 ==="
+        find $WORKSPACE/extract -maxdepth 2 -type f | head -30
+
+        # 定位 rootfs.img
+        ROOTFS_IMG=$(find $WORKSPACE/extract -maxdepth 3 -name "rootfs.img" | head -1)
+        [ -z "$ROOTFS_IMG" ] && { echo "ERROR: 找不到 rootfs.img"; exit 1; }
+        echo "rootfs.img: $ROOTFS_IMG"
+        ls -la "$ROOTFS_IMG"
+        file "$ROOTFS_IMG"
+
+    # ============================================================
+    # 3. 挂载 rootfs.img 提取文件系统内容
+    # ============================================================
+    - name: Mount rootfs.img and extract filesystem
+      run: |
+        ROOTFS_IMG=$(find $WORKSPACE/extract -maxdepth 3 -name "rootfs.img" | head -1)
+        MNT=$WORKSPACE/mnt
+        sudo mkdir -p "$MNT"
+
+        # 检测文件系统类型
+        FS_TYPE=$(sudo file -b "$ROOTFS_IMG" 2>/dev/null)
+        echo "文件系统类型: $FS_TYPE"
+
+        MOUNTED=false
+
+        # 尝试 mount ext4
+        if sudo mount -o loop,ro "$ROOTFS_IMG" "$MNT" 2>/dev/null; then
+          echo "✓ 已挂载 (ext4/其他)"
+          MOUNTED=true
+        fi
+
+        # 若失败, 尝试用 offset 探测 (有些 rootfs.img 带分区表)
+        if [ "$MOUNTED" != "true" ]; then
+          echo "直接 mount 失败, 尝试探测分区偏移..."
+          # 尝试 512 字节对齐的常见偏移
+          for OFFSET in 1048576 2097152 4194304 8388608; do
+            if sudo mount -o loop,ro,offset=$OFFSET "$ROOTFS_IMG" "$MNT" 2>/dev/null; then
+              echo "✓ 已挂载 @ offset=$OFFSET"
+              MOUNTED=true
+              break
+            fi
+          done
+        fi
+
+        if [ "$MOUNTED" != "true" ]; then
+          # 尝试用 unsquashfs (若是 squashfs)
+          if unsquashfs -l "$ROOTFS_IMG" >/dev/null 2>&1; then
+            echo "✓ 检测到 squashfs, 使用 unsquashfs 解压"
+            sudo unsquashfs -d "$MNT" "$ROOTFS_IMG"
+            MOUNTED=true
+            # 注意: unsquashfs 后不需要 umount
+            echo "MOUNT_TYPE=squashfs" >> $GITHUB_ENV
+          fi
+        else
+          echo "MOUNT_TYPE=loop" >> $GITHUB_ENV
+        fi
+
+        if [ "$MOUNTED" != "true" ]; then
+          echo "ERROR: 无法挂载或解压 rootfs.img"
+          echo "尝试 file 命令:"
+          file "$ROOTFS_IMG"
+          echo ""
+          echo "尝试 hexdump 前 512 字节:"
+          xxd -l 512 "$ROOTFS_IMG"
+          exit 1
+        fi
+
+        echo ""
+        echo "=== rootfs 内容检查 ==="
+        sudo ls -la "$MNT/" | head -30
+        sudo ls "$MNT/bin/" 2>/dev/null | head -10
+        sudo ls "$MNT/etc/" 2>/dev/null | head -10
+
+        # 检查是否是有效 rootfs
+        if [ ! -d "$MNT/bin" ] || [ ! -d "$MNT/etc" ]; then
+          echo "ERROR: 挂载的内容看起来不是有效 rootfs"
+          exit 1
+        fi
+
+        echo "✓ 有效 rootfs"
+
+    # ============================================================
+    # 4. 打包为 rootfs.tar.gz
     # ============================================================
     - name: Repack rootfs as tar.gz
       run: |
-        cd $WORKSPACE/input
-        TGZ=$(find . -maxdepth 1 -name "*.tgz" -o -name "*.tar.gz" | head -1)
-        echo "输入: $TGZ"
-        mkdir -p extracted
-        tar xzf "$TGZ" -C extracted
-
-        echo "=== 解压后结构 ==="
-        ls -la extracted/
-
-        # 找到根目录顶层
-        TOP=$(find extracted -maxdepth 1 -mindepth 1 -type d | head -1)
-        if [ -z "$TOP" ]; then
-          echo "找不到顶层目录，假设 extracted 本身就是 rootfs"
-          TOP=extracted
-        fi
-        echo "顶层: $TOP"
-        ls -la "$TOP/" | head -30
-
-        # 检查是否真的是 rootfs（有 bin/ etc/ lib/ 等目录）
-        if [ ! -d "$TOP/bin" ] && [ ! -d "$TOP/etc" ]; then
-          echo "⚠ 顶层没有 bin/etc，可能在更深一层"
-          # 尝试更深一层
-          DEEP=$(find extracted -maxdepth 3 -type d -name "etc" | head -1)
-          if [ -n "$DEEP" ]; then
-            TOP=$(dirname "$DEEP")
-            echo "修正顶层: $TOP"
-          fi
-        fi
-
-        ls -la "$TOP/" | head -20
-
-        # 打包为 flippy 期望的 rootfs.tar.gz
-        # flippy 工具期望：tarball 内容是 rootfs 内容本身（bin/ etc/ 位于顶层）
-        cd "$TOP"
+        MNT=$WORKSPACE/mnt
+        cd "$MNT"
         sudo tar czf $WORKSPACE/input/rootfs.tar.gz --numeric-owner --owner=0 --group=0 .
-        cd $WORKSPACE/input
 
         echo ""
         echo "=== rootfs.tar.gz 信息 ==="
@@ -125,85 +183,54 @@ jobs:
         SIZE=$(stat -c%s $WORKSPACE/input/rootfs.tar.gz)
         echo "大小: $SIZE bytes ($((SIZE/1024/1024)) MiB)"
 
-        # 快速验证 tarball 内容
         echo ""
         echo "=== tarball 前 20 项 ==="
         tar tzf $WORKSPACE/input/rootfs.tar.gz | head -20
 
+        # 卸载
+        if [ "$MOUNT_TYPE" = "loop" ]; then
+          sudo umount "$MNT" || true
+        fi
+
     # ============================================================
-    # 3. 使用 flippy 官方 action 打包
+    # 5. 使用 flippy 官方 action 打包（修复分支名）
     # ============================================================
     - name: Build Flippy image (official action)
       id: pack
       uses: ophub/flippy-openwrt-actions@main
       env:
-        # 必填：rootfs tar.gz 路径
         OPENWRT_ARMSR: ${{ env.WORKSPACE }}/input/rootfs.tar.gz
-        # 打包目标 SoC
         PACKAGE_SOC: ${{ inputs.package_soc }}
-        # 内核版本
         KERNEL_VERSION_NAME: ${{ inputs.kernel_version }}
         KERNEL_AUTO_LATEST: 'true'
-        # 内核来源
         KERNEL_REPO_URL: ${{ inputs.flippy_kernel_repo }}
-        # 打包脚本来源（unifreq/openwrt_packit）
         SCRIPT_REPO_URL: unifreq/openwrt_packit
-        SCRIPT_REPO_BRANCH: main
-        # 输出到 workspace 便于上传
+        SCRIPT_REPO_BRANCH: master         # ← 修复: main → master
         OUTPUT_DIR: ${{ env.WORKSPACE }}/output
 
     # ============================================================
-    # 4. 查找并复制输出到 workspace
+    # 6. 收集输出
     # ============================================================
     - name: Locate output images
       if: always()
       run: |
-        echo "=== 工作区输出 ==="
+        echo "=== workspace 输出 ==="
         ls -la $WORKSPACE/output/ 2>/dev/null || true
 
         echo ""
-        echo "=== 搜索所有 .img / .img.gz ==="
-        find $WORKSPACE -type f \( -name "*.img" -o -name "*.img.gz" \) 2>/dev/null
-
-        echo ""
-        echo "=== 搜索 action 可能的输出位置 ==="
-        for d in \
-          openwrt_packit/tmp \
-          openwrt_packit/out \
-          /tmp/openwrt_packit/tmp \
-          $GITHUB_WORKSPACE/openwrt_packit/tmp \
-          $WORKSPACE/input/openwrt_packit/tmp \
-          ; do
-          if [ -d "$d" ]; then
-            echo "找到: $d"
-            ls -la "$d"
-          fi
-        done
-
-        # 把找到的输出都拷到 output 目录
-        FOUND=$(find / -maxdepth 7 -type f -name "*.img.gz" -newer $WORKSPACE/input/rootfs.tar.gz 2>/dev/null | head -20)
-        echo ""
         echo "=== 全局搜索 .img.gz ==="
+        FOUND=$(find / -maxdepth 8 -type f -name "*.img.gz" -newer $WORKSPACE/input/rootfs.tar.gz 2>/dev/null | head -20)
         echo "$FOUND"
         for f in $FOUND; do
           cp "$f" $WORKSPACE/output/ 2>/dev/null || true
         done
 
         echo ""
-        echo "=== 最终 output 目录 ==="
+        echo "=== 最终 output ==="
         ls -la $WORKSPACE/output/
 
-    - name: Verify output
-      if: always()
-      run: |
-        COUNT=$(find $WORKSPACE/output -type f -name "*.img.gz" | wc -l)
-        echo "找到 $COUNT 个 .img.gz"
-        if [ "$COUNT" -eq 0 ]; then
-          echo "⚠ 未找到 .img.gz 输出，将只上传日志"
-        fi
-
     # ============================================================
-    # 5. 上传 artifact
+    # 7. 上传 artifact
     # ============================================================
     - name: Upload artifact
       if: always()
@@ -215,39 +242,3 @@ jobs:
           ${{ env.WORKSPACE }}/output/*.img
         retention-days: 7
         if-no-files-found: warn
-
-    # ============================================================
-    # 6. 附带日志收集（用于诊断）
-    # ============================================================
-    - name: Collect logs
-      if: always()
-      run: |
-        mkdir -p $WORKSPACE/logs
-        # 收集可能的构建日志
-        for f in \
-          openwrt_packit/make.log \
-          /tmp/openwrt_packit.log \
-          $WORKSPACE/input/openwrt_packit.log \
-          ; do
-          [ -f "$f" ] && cp "$f" $WORKSPACE/logs/ 2>/dev/null || true
-        done
-        # 汇总环境信息
-        {
-          echo "=== 构建信息 ==="
-          echo "内核版本: ${{ inputs.kernel_version }}"
-          echo "内核来源: ${{ inputs.flippy_kernel_repo }}:${{ inputs.flippy_kernel_release }}"
-          echo "SoC: ${{ inputs.package_soc }}"
-          echo ""
-          echo "=== output 目录 ==="
-          ls -la $WORKSPACE/output/ 2>/dev/null || echo "(空)"
-        } > $WORKSPACE/logs/BUILD_INFO.txt
-        cat $WORKSPACE/logs/BUILD_INFO.txt
-
-    - name: Upload logs
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-logs
-        path: ${{ env.WORKSPACE }}/logs/
-        retention-days: 7
-        if-no-files-found: ignore
