@@ -11,7 +11,7 @@ on:
         options:
           - '24.10'
           - '25.12'
-      build_set:
+      set:
         description: 'Build type'
         required: true
         default: 'docker'
@@ -27,22 +27,6 @@ on:
         options:
           - r5s
           - r5c
-      slim:
-        description: 'Slim mode'
-        required: true
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
-      kernel_version:
-        description: 'Kernel version'
-        required: true
-        default: '6.18.y'
-        type: choice
-        options:
-          - '6.18.y'
-          - '6.12.y'
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
@@ -67,8 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          KERNEL_SHORT="${{ inputs.kernel_version }}"
-          BASE_TAG="FriendlyWrt-bbb-${KERNEL_SHORT}-$(date +%Y-%m-%d)"
+          BASE_TAG="FriendlyWrt-rk35xx-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -117,8 +100,6 @@ jobs:
     needs: prepare_release
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
-    env:
-      KERNEL_REPO: 'breakingbadboy/OpenWrt'
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -150,6 +131,7 @@ jobs:
           -b master-v${{ inputs.version }} -m rk3568.xml \
           --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
         repo sync -c scripts/sd-fuse --no-clone-bundle
+        echo "=== sd-fuse 目录 ==="
         ls -la /tmp/scripts/sd-fuse/
 
     - name: Find and download images tgz
@@ -158,7 +140,7 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         SUFFIX=""
-        [ "${{ inputs.build_set }}" == "docker" ] && SUFFIX="-docker"
+        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
         echo "查找: $PATTERN"
 
@@ -182,15 +164,11 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         TARGET_MODEL: ${{ inputs.model }}
-        SLIM_MODE: ${{ inputs.slim }}
-        KERNEL_VERSION: ${{ inputs.kernel_version }}
       run: |
         SUFFIX=""
-        [ "${{ inputs.build_set }}" == "docker" ] && SUFFIX="-docker"
+        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
-
-        KERNEL_SHORT="${{ inputs.kernel_version }}"
-        IMG_NAME="R5S-R5C-Series-FriendlyWrt-bbb-${KERNEL_SHORT}-${{ inputs.version }}${SUFFIX}.img"
+        IMG_NAME="R5S-R5C-Series-FriendlyWrt-rk35xx-${{ inputs.version }}${SUFFIX}.img"
 
         bash $GITHUB_WORKSPACE/scripts/replace-kernel.sh \
           "${{ steps.images.outputs.images_tgz }}" \
@@ -221,6 +199,6 @@ jobs:
     - name: Upload img.gz as workflow artifact (backup)
       uses: actions/upload-artifact@v4
       with:
-        name: img-bbb-${{ inputs.kernel_version }}-${{ inputs.version }}-${{ inputs.build_set }}-${{ inputs.model }}
+        name: img-rk35xx-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
         path: ${{ github.workspace }}/artifact/*.img.gz
         retention-days: 7
