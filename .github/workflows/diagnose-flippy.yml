@@ -76,7 +76,6 @@ jobs:
             exit 1
           fi
 
-          # 用 KV 前缀构造正则，避免 ${} 与 $ 冲突
           PATTERN="^${KV}\\.[0-9]+\\.tar\\.gz\$"
           VERS=$(echo "$ASSETS" | grep -E "$PATTERN" | sed 's/\.tar\.gz//' | sort -V || true)
 
@@ -94,7 +93,6 @@ jobs:
           tar xzf kernel.tar.gz
           echo "FLIPPY_VER=$SEL" >> $GITHUB_ENV
 
-          # 解包 boot / dtb
           LDIR=$(find . -maxdepth 1 -type d -name "*${SEL}*" | head -1)
           if [ -z "$LDIR" ]; then
             LDIR="$SEL"
@@ -122,45 +120,51 @@ jobs:
           xxd -l 64 "$VMLINUZ"
 
           python3 - "$VMLINUZ" /tmp/flippy/kernel.img <<'PY'
-import sys, struct
-src, dst = sys.argv[1], sys.argv[2]
-data = bytearray(open(src, 'rb').read())
-MAGIC = b'ARM\x64'
-if data[:4] == b'KRNL':
-    open(dst, 'wb').write(data); print("已是 KRNL"); sys.exit(0)
-if data[:2] == b'MZ':
-    pe_off = struct.unpack_from('<I', data, 0x3C)[0]
-    assert data[pe_off:pe_off+4] == b'PE\x00\x00'
-    coff = pe_off + 4
-    nsec = struct.unpack_from('<H', data, coff + 2)[0]
-    opt = struct.unpack_from('<H', data, coff + 16)[0]
-    sec0 = coff + 20 + opt
-    text_off = None
-    for i in range(nsec):
-        o = sec0 + i*40
-        name = data[o:o+8].rstrip(b'\x00').decode('ascii','ignore')
-        roff = struct.unpack_from('<I', data, o+20)[0]
-        print(f"  Section {name} @ 0x{roff:x}")
-        if name == '.text': text_off = roff
-    imm26 = text_off // 4
-    code0 = 0x14000000 | imm26
-    file_size = len(data)
-    hdr = bytearray(64)
-    struct.pack_into('<I', hdr, 0x00, code0)
-    struct.pack_into('<Q', hdr, 0x10, file_size)
-    struct.pack_into('<Q', hdr, 0x18, 0x0a)
-    hdr[0x38:0x3c] = MAGIC
-    data[0:0x40] = hdr
-    knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
-    open(dst, 'wb').write(knl)
-    print(f"生成 KRNL: code0=0x{code0:08x} size={file_size}")
-PY
+          import sys, struct
+          src, dst = sys.argv[1], sys.argv[2]
+          data = bytearray(open(src, 'rb').read())
+          MAGIC = b'ARM\x64'
+          if data[:4] == b'KRNL':
+              open(dst, 'wb').write(data)
+              print("已是 KRNL")
+              sys.exit(0)
+          if data[:2] == b'MZ':
+              pe_off = struct.unpack_from('<I', data, 0x3C)[0]
+              assert data[pe_off:pe_off+4] == b'PE\x00\x00'
+              coff = pe_off + 4
+              nsec = struct.unpack_from('<H', data, coff + 2)[0]
+              opt = struct.unpack_from('<H', data, coff + 16)[0]
+              sec0 = coff + 20 + opt
+              text_off = None
+              for i in range(nsec):
+                  o = sec0 + i * 40
+                  name = data[o:o+8].rstrip(b'\x00').decode('ascii', 'ignore')
+                  roff = struct.unpack_from('<I', data, o + 20)[0]
+                  print("  Section %s @ 0x%x" % (name, roff))
+                  if name == '.text':
+                      text_off = roff
+              imm26 = text_off // 4
+              code0 = 0x14000000 | imm26
+              file_size = len(data)
+              hdr = bytearray(64)
+              struct.pack_into('<I', hdr, 0x00, code0)
+              struct.pack_into('<Q', hdr, 0x10, file_size)
+              struct.pack_into('<Q', hdr, 0x18, 0x0a)
+              hdr[0x38:0x3c] = MAGIC
+              data[0:0x40] = hdr
+              knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
+              open(dst, 'wb').write(knl)
+              print("生成 KRNL: code0=0x%08x size=%d" % (code0, file_size))
+          PY
           echo "Flippy kernel.img: $(stat -c%s /tmp/flippy/kernel.img) bytes"
 
       # ==================================================
-      # 3. 提取官方固件组件
+      # 3. 提取官方组件
       # ==================================================
       - name: Extract official components
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OFFICIAL_TAG: ${{ inputs.official_release_tag }}
         run: |
           cd /tmp/official
           BASE=$(find . -maxdepth 2 -type d -name "friendlywrt*" | head -1)
@@ -170,7 +174,7 @@ PY
 
           echo ""
           echo "=== Release 中是否含完整 img.gz ==="
-          gh release view "${{ inputs.official_release_tag }}" \
+          gh release view "$OFFICIAL_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets --jq '.assets[].name' | grep -iE '\.img\.gz$' || \
             echo "（无 img.gz，仅对比 images 包内组件）"
@@ -180,9 +184,9 @@ PY
       # ==================================================
       - name: Compare kernel.img headers
         run: |
-          echo "════════════════════════════════════════════"
+          echo "========================================"
           echo "  对比 #1: kernel.img 头部"
-          echo "════════════════════════════════════════════"
+          echo "========================================"
           OFF=$(find /tmp/official -maxdepth 4 -type f -name "kernel.img" | head -1)
           FLP="/tmp/flippy/kernel.img"
 
@@ -203,34 +207,37 @@ PY
           echo ""
           echo "--- 关键字段解析 ---"
           OFF_ENV="$OFF" FLP_ENV="$FLP" python3 - <<'PY'
-import os, struct
-def inspect(path, label):
-    print(f"\n[{label}] {path}")
-    try:
-        with open(path,'rb') as f: d = f.read(0x200)
-    except Exception as e:
-        print(f"  (无法读取: {e})"); return
-    print(f"  magic[0:4]       = {d[:4]}")
-    print(f"  size_field[4:8]  = {int.from_bytes(d[4:8],'little')}")
-    print(f"  code0[8:12]      = 0x{int.from_bytes(d[8:12],'little'):08x}")
-    print(f"  code1[12:16]     = 0x{int.from_bytes(d[12:16],'little'):08x}")
-    print(f"  text_off[16:24]  = 0x{int.from_bytes(d[16:24],'little'):x}")
-    print(f"  image_size[24:32]= 0x{int.from_bytes(d[24:32],'little'):x}")
-    print(f"  flags[32:40]     = 0x{int.from_bytes(d[32:40],'little'):x}")
-    idx = d.find(b'ARM\x64')
-    print(f"  'ARM\\x64' @      = 0x{idx:x}")
-inspect(os.environ.get("OFF_ENV",""), "OFFICIAL")
-inspect(os.environ.get("FLP_ENV",""), "FLIPPY")
-PY
+          import os
+          def inspect(path, label):
+              print("")
+              print("[%s] %s" % (label, path))
+              try:
+                  with open(path, 'rb') as f:
+                      d = f.read(0x200)
+              except Exception as e:
+                  print("  (无法读取: %s)" % e)
+                  return
+              print("  magic[0:4]       = %s" % d[:4])
+              print("  size_field[4:8]  = %d" % int.from_bytes(d[4:8], 'little'))
+              print("  code0[8:12]      = 0x%08x" % int.from_bytes(d[8:12], 'little'))
+              print("  code1[12:16]     = 0x%08x" % int.from_bytes(d[12:16], 'little'))
+              print("  text_off[16:24]  = 0x%x" % int.from_bytes(d[16:24], 'little'))
+              print("  image_size[24:32]= 0x%x" % int.from_bytes(d[24:32], 'little'))
+              print("  flags[32:40]     = 0x%x" % int.from_bytes(d[32:40], 'little'))
+              idx = d.find(b'ARM\x64')
+              print("  'ARM64' @        = 0x%x" % idx)
+          inspect(os.environ.get("OFF_ENV", ""), "OFFICIAL")
+          inspect(os.environ.get("FLP_ENV", ""), "FLIPPY")
+          PY
 
       # ==================================================
       # 5. 对比 DTB
       # ==================================================
       - name: Compare DTB
         run: |
-          echo "════════════════════════════════════════════"
+          echo "========================================"
           echo "  对比 #2: rk3568-nanopi-r5s.dtb"
-          echo "════════════════════════════════════════════"
+          echo "========================================"
           OFF=$(find /tmp/official -name "rk3568-nanopi-r5s.dtb" | head -1)
           FLP=$(find /tmp/flippy/dtb -name "rk3568-nanopi-r5s.dtb" | head -1)
           echo "官方: $OFF"
@@ -270,9 +277,9 @@ PY
       # ==================================================
       - name: Compare boot.img and uInitrd
         run: |
-          echo "════════════════════════════════════════════"
+          echo "========================================"
           echo "  对比 #3: boot.img / uInitrd"
-          echo "════════════════════════════════════════════"
+          echo "========================================"
           OFF_BOOT=$(find /tmp/official -name "boot.img" | head -1)
           FLP_UI=$(find /tmp/flippy -name "uInitrd-*" | head -1)
 
