@@ -1,4 +1,4 @@
-name: Quick Verify Kernel Replacement
+name: Build FriendlyWrt With Custom Kernel
 
 on:
   workflow_dispatch:
@@ -94,7 +94,6 @@ jobs:
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Generated release tag: $TAG"
 
       - name: Create or update release
         uses: softprops/action-gh-release@v1
@@ -107,7 +106,7 @@ jobs:
           allow_updates: true
           overwrite: true
 
-  quick_verify:
+  build:
     needs: prepare_release
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
@@ -124,15 +123,13 @@ jobs:
         sudo apt-get install -qq --no-install-recommends \
           wget curl git rsync time file unzip bc bzip2 xxd \
           python3 dosfstools e2fsprogs parted \
-          android-sdk-libsparse-utils u-boot-tools
+          android-sdk-libsparse-utils u-boot-tools \
+          gzip xz-utils zstd lz4
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git clone https://github.com/friendlyarm/repo /tmp/repo
         sudo -E cp /tmp/repo/repo /usr/bin/
         mkdir -p $GITHUB_WORKSPACE/artifact
-        chmod +x scripts/*.sh
-        echo "=== 工具检查 ==="
-        which xxd simg2img img2simg mkfs.ext4 mkimage curl
         echo "cores: $(nproc)"
 
     - name: Fetch sd-fuse scripts
@@ -142,10 +139,9 @@ jobs:
           -b master-v${{ inputs.version }} -m rk3568.xml \
           --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
         repo sync -c scripts/sd-fuse --no-clone-bundle
-        echo "=== sd-fuse 目录 ==="
         ls -la /tmp/scripts/sd-fuse/
 
-    - name: Find and download images tgz
+    - name: Download official images tgz
       id: images
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -153,7 +149,6 @@ jobs:
         SUFFIX=""
         [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
         PATTERN="images-R5S-R5C-Series-FriendlyWrt-${{ inputs.version }}${SUFFIX}.tgz"
-        echo "查找: $PATTERN"
 
         TAGS=$(gh release list --limit 50 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName')
         FOUND=""
@@ -162,46 +157,273 @@ jobs:
             FOUND="$TAG"; break
           fi
         done
-        [ -z "$FOUND" ] && { echo "ERROR: 找不到 $PATTERN"; exit 1; }
-        echo "使用 release: $FOUND"
+        [ -z "$FOUND" ] && { echo "ERROR: not found $PATTERN"; exit 1; }
+        echo "Using release: $FOUND"
 
-        mkdir -p /tmp/inputs
-        cd /tmp/inputs
+        mkdir -p /tmp/inputs && cd /tmp/inputs
         gh release download "$FOUND" --repo "$GITHUB_REPOSITORY" --pattern "$PATTERN" --dir .
-        ls -la
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
-    - name: Replace kernel and build image
+    - name: Scan and select kernel
+      id: kernel
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        TARGET_MODEL: ${{ inputs.model }}
-        KERNEL_VERSION: ${{ inputs.kernel_version }}
       run: |
-        SUFFIX=""
-        [ "${{ inputs.set }}" == "docker" ] && SUFFIX="-docker"
-        DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')${SUFFIX}"
-        KV_SHORT="${KERNEL_VERSION%.y}"
-        [ "$KERNEL_VERSION" = "auto" ] && KV_SHORT="auto"
-        IMG_NAME="R5S-R5C-Series-FriendlyWrt-kv${KV_SHORT}-${{ inputs.version }}${SUFFIX}.img"
+        KERNEL_VERSION="${{ inputs.kernel_version }}"
+        case "$KERNEL_VERSION" in
+          6.18*|6.18.y) PREFIX="6.18" ;;
+          6.12*|6.12.y) PREFIX="6.12" ;;
+          6.6*|6.6.y)   PREFIX="6.6" ;;
+          6.1*|6.1.y)   PREFIX="6.1" ;;
+          auto|"")      PREFIX="" ;;
+          *)            PREFIX="$KERNEL_VERSION" ;;
+        esac
+        echo "Version prefix: ${PREFIX:-auto}"
 
-        bash $GITHUB_WORKSPACE/scripts/replace-kernel.sh \
-          "${{ steps.images.outputs.images_tgz }}" \
-          "/tmp/scripts/sd-fuse" \
-          "$DIST_NAME" \
-          "$GITHUB_WORKSPACE/artifact/$IMG_NAME"
+        declare -A VER_TO_SOURCE
+        SCAN_LIST=(
+          "ophub/kernel:kernel_rk35xx"
+          "ophub/kernel:kernel_flippy"
+          "breakingbadboy/OpenWrt:kernel_rk35xx"
+          "breakingbadboy/OpenWrt:kernel_stable"
+        )
 
-        echo "img_name=$IMG_NAME" >> $GITHUB_ENV
+        for target in "${SCAN_LIST[@]}"; do
+          REPO="${target%%:*}"; RELEASE="${target##*:}"
+          echo "Scanning $REPO / $RELEASE ..."
+          ASSETS=$(gh release view "$RELEASE" --repo "$REPO" --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+          [ -z "$ASSETS" ] && { echo "  (no assets)"; continue; }
 
-    - name: Compress image
+          if [ -n "$PREFIX" ]; then
+            VERS=$(echo "$ASSETS" | grep -E "^${PREFIX}\.[0-9]+\.tar\.gz$" | sed 's/\.tar\.gz//' | sort -V || echo "")
+          else
+            VERS=$(echo "$ASSETS" | grep -E '^6\.[0-9]+\.[0-9]+\.tar\.gz$' | sed 's/\.tar\.gz//' | sort -V || echo "")
+          fi
+          [ -z "$VERS" ] && { echo "  (no match)"; continue; }
+
+          echo "  matched:"
+          echo "$VERS" | sed 's/^/    /'
+          for v in $VERS; do
+            [ -z "${VER_TO_SOURCE[$v]:-}" ] && VER_TO_SOURCE["$v"]="$REPO:$RELEASE"
+          done
+        done
+
+        if [ ${#VER_TO_SOURCE[@]} -eq 0 ]; then
+          echo "ERROR: no matching kernel for $KERNEL_VERSION"
+          exit 1
+        fi
+
+        echo ""
+        echo "Available versions:"
+        for v in $(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V); do
+          echo "  $v <- ${VER_TO_SOURCE[$v]}"
+        done
+
+        SELECTED_VER=$(printf '%s\n' "${!VER_TO_SOURCE[@]}" | sort -V | tail -1)
+        SELECTED_SOURCE="${VER_TO_SOURCE[$SELECTED_VER]}"
+        SELECTED_REPO="${SELECTED_SOURCE%%:*}"
+        SELECTED_RELEASE="${SELECTED_SOURCE##*:}"
+
+        echo ""
+        echo "Selected: $SELECTED_VER from $SELECTED_REPO/$SELECTED_RELEASE"
+        echo "version=$SELECTED_VER" >> $GITHUB_OUTPUT
+        echo "repo=$SELECTED_REPO" >> $GITHUB_OUTPUT
+        echo "release=$SELECTED_RELEASE" >> $GITHUB_OUTPUT
+
+    - name: Download kernel
+      run: |
+        cd /tmp
+        URL="https://github.com/${{ steps.kernel.outputs.repo }}/releases/download/${{ steps.kernel.outputs.release }}/${{ steps.kernel.outputs.version }}.tar.gz"
+        echo "URL: $URL"
+        wget -q --timeout=120 "$URL" -O kernel.tar.gz || curl -L -f --max-time 300 "$URL" -o kernel.tar.gz
+        tar xzf kernel.tar.gz
+        KERNEL_VER="${{ steps.kernel.outputs.version }}"
+        LOCAL_DIR=$(find . -maxdepth 1 -type d -name "*${KERNEL_VER}*" | head -1)
+        [ -z "$LOCAL_DIR" ] && LOCAL_DIR="$KERNEL_VER"
+        BOOT_TAR=$(find "$LOCAL_DIR" -maxdepth 1 -name "boot-*.tar.gz" | head -1)
+        DTB_TAR=$(find "$LOCAL_DIR" -maxdepth 1 -name "dtb-rockchip-*.tar.gz" | head -1)
+        mkdir -p boot_extract dtb_extract
+        tar xzf "$BOOT_TAR" -C boot_extract
+        tar xzf "$DTB_TAR" -C dtb_extract
+        ls -la boot_extract/
+        ls dtb_extract/ | grep -E "rk3568-nanopi-r5[sc]" || echo "no r5s/r5c dtb"
+
+    - name: Convert kernel to KRNL
+      run: |
+        cd /tmp
+        VMLINUZ=$(find boot_extract -name "vmlinuz-*" | head -1)
+        [ -z "$VMLINUZ" ] && { echo "vmlinuz not found"; exit 1; }
+        python3 - "$VMLINUZ" /tmp/kernel.img <<'PYEOF'
+        import sys, struct
+
+        src, dst = sys.argv[1], sys.argv[2]
+        data = bytearray(open(src, 'rb').read())
+        ARM64_MAGIC = bytes([0x41, 0x52, 0x4d, 0x64])
+
+        print("Input size: %d" % len(data))
+        print("First 16 bytes: %s" % data[:16].hex())
+
+        # 情况 1: 已是 KRNL
+        if data[:4] == b'KRNL':
+            print("Already KRNL")
+            open(dst, 'wb').write(data)
+            sys.exit(0)
+
+        # 情况 2: PE/EFI zboot
+        if data[:2] == b'MZ':
+            pe_off = struct.unpack_from('<I', data, 0x3C)[0]
+            assert data[pe_off:pe_off+4] == b'PE\x00\x00', "Bad PE"
+            print("PE header at 0x%x" % pe_off)
+
+            coff = pe_off + 4
+            num_sections = struct.unpack_from('<H', data, coff + 2)[0]
+            opt_hdr_size = struct.unpack_from('<H', data, coff + 16)[0]
+            sec_start = coff + 20 + opt_hdr_size
+
+            text_off = None
+            for i in range(num_sections):
+                off = sec_start + i * 40
+                name = data[off:off+8].rstrip(b'\x00').decode('ascii', 'ignore')
+                raw_off = struct.unpack_from('<I', data, off + 20)[0]
+                raw_size = struct.unpack_from('<I', data, off + 16)[0]
+                print("Section %s: off=0x%x size=%d" % (name, raw_off, raw_size))
+                if name == '.text':
+                    text_off = raw_off
+
+            assert text_off is not None, "no .text"
+            print("_stext offset: 0x%x" % text_off)
+
+            # 计算 code0 = b +text_off
+            imm26 = text_off // 4
+            assert imm26 <= 0x03FFFFFF, "offset too large"
+            code0 = 0x14000000 | imm26
+            print("code0 = 0x%08x (b +0x%x)" % (code0, text_off))
+
+            # 构造新头，保留其余字节
+            file_size = len(data)
+            new_header = bytearray(64)
+            struct.pack_into('<I', new_header, 0x00, code0)
+            struct.pack_into('<I', new_header, 0x04, 0)
+            struct.pack_into('<Q', new_header, 0x08, 0)
+            struct.pack_into('<Q', new_header, 0x10, file_size)
+            struct.pack_into('<Q', new_header, 0x18, 0x0a)
+            new_header[0x38:0x3c] = ARM64_MAGIC
+            data[0:0x40] = new_header
+
+            knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
+            open(dst, 'wb').write(knl)
+
+            check = open(dst, 'rb').read(0x10010)
+            assert check[0:4] == b'KRNL'
+            magic_idx = check.find(ARM64_MAGIC)
+            # Image 0x10000 = KRNL 0x10008
+            at_stext = check[0x10008:0x1000C].hex()
+            print("KRNL magic@: 0x%x" % magic_idx)
+            print("PACIASP check: %s" % at_stext)
+            assert magic_idx == 0x40
+            assert at_stext == "3f2303d5", "PACIASP mismatch"
+            print("SUCCESS")
+            sys.exit(0)
+
+        # 情况 3: 裸机 ARM64 Image (magic at 0x38)
+        magic_idx = data.find(ARM64_MAGIC)
+        print("Not PE. magic@0x%x" % magic_idx)
+        if magic_idx == 0x38:
+            print("Clean ARM64 Image")
+            file_size = len(data)
+            # 修正 image_size
+            struct.pack_into('<Q', data, 0x10, file_size)
+            knl = b'KRNL' + struct.pack('<I', file_size) + bytes(data)
+            open(dst, 'wb').write(knl)
+            print("SUCCESS")
+            sys.exit(0)
+
+        print("Unknown format")
+        sys.exit(1)
+        PYEOF
+        echo "kernel.img: $(stat -c%s /tmp/kernel.img) bytes"
+        xxd -l 96 /tmp/kernel.img
+
+    - name: Prepare sd-fuse directory
+      run: |
+        cd /tmp
+        mkdir -p /tmp/work
+        tar xzf "${{ steps.images.outputs.images_tgz }}" -C /tmp/work
+        BASE_DIR=$(find /tmp/work -maxdepth 1 -type d -name "friendlywrt*" | head -1)
+        DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')$([ "${{ inputs.set }}" = "docker" ] && echo "-docker")"
+        TARGET="/tmp/scripts/sd-fuse/$DIST_NAME"
+        rm -rf "$TARGET"
+        cp -a "$BASE_DIR" "$TARGET"
+
+        # 替换 kernel.img
+        cp /tmp/kernel.img "$TARGET/kernel.img"
+
+        # 替换 dtb
+        mkdir -p "$TARGET/dtb/rockchip"
+        DTB_R5S=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5s.dtb" | head -1)
+        DTB_R5C=$(find /tmp/dtb_extract -name "rk3568-nanopi-r5c.dtb" | head -1)
+        [ -n "$DTB_R5S" ] && cp "$DTB_R5S" "$TARGET/dtb/rockchip/rk3568-nanopi-r5s.dtb"
+        [ -n "$DTB_R5C" ] && cp "$DTB_R5C" "$TARGET/dtb/rockchip/rk3568-nanopi-r5c.dtb"
+        echo "dtb/rockchip:"
+        ls -la "$TARGET/dtb/rockchip/"
+
+        # 替换 uInitrd
+        UINITRD=$(find /tmp/boot_extract -name "uInitrd-*" | head -1)
+        [ -n "$UINITRD" ] && cp "$UINITRD" "$TARGET/uInitrd"
+        echo "kernel.img: $(stat -c%s "$TARGET/kernel.img") bytes"
+
+    - name: Build final image
+      run: |
+        cd /tmp/scripts/sd-fuse
+        DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')$([ "${{ inputs.set }}" = "docker" ] && echo "-docker")"
+        chmod +x mk-sd-image.sh
+        rm -f out/*.img
+        set +e
+        yes | ./mk-sd-image.sh "$DIST_NAME" > /tmp/mk-sd.log 2>&1
+        MK_EXIT=$?
+        set -e
+        echo "mk-sd-image.sh exit=$MK_EXIT"
+        tail -40 /tmp/mk-sd.log
+
+        FOUND_IMG=$(find out -maxdepth 1 -name "*.img" -print -quit)
+        [ -z "$FOUND_IMG" ] && { echo "No image"; exit 1; }
+
+        KV_SHORT="${{ inputs.kernel_version }}"
+        [ "$KV_SHORT" = "auto" ] || KV_SHORT="${KV_SHORT%.y}"
+        IMG_FILE="R5S-R5C-Series-FriendlyWrt-kv${KV_SHORT}-${{ inputs.version }}$([ "${{ inputs.set }}" = "docker" ] && echo "-docker").img"
+        mv "$FOUND_IMG" "$GITHUB_WORKSPACE/artifact/$IMG_FILE"
+        echo "img_name=$IMG_FILE" >> $GITHUB_ENV
+
+        # 验证最终镜像
+        python3 - "$GITHUB_WORKSPACE/artifact/$IMG_FILE" <<'PYEOF'
+        import sys
+        img = sys.argv[1]
+        with open(img, 'rb') as f:
+            f.seek(0x12000 * 512)
+            data = f.read(256)
+        assert data[0:4] == b'KRNL', 'KRNL missing'
+        idx = data.find(b'ARM\x64')
+        print("Final image: KRNL magic at 0x%x" % idx)
+        assert idx == 0x40
+        print("OK")
+        PYEOF
+
+    - name: Compress and upload
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/${{ env.img_name }}
+        asset_name: ${{ env.img_name }}
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
+    - name: Compress img.gz
       run: |
         cd $GITHUB_WORKSPACE/artifact
-        echo "=== 压缩前 ==="
-        ls -la
         gzip -f *.img
-        echo "=== 压缩后 ==="
         ls -la
 
-    - name: Upload img.gz to release
+    - name: Upload img.gz
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
@@ -209,10 +431,3 @@ jobs:
         asset_name: ${{ env.img_name }}.gz
         tag: ${{ needs.prepare_release.outputs.release_tag }}
         overwrite: true
-
-    - name: Upload img.gz as workflow artifact (backup)
-      uses: actions/upload-artifact@v4
-      with:
-        name: img-kv-${{ inputs.kernel_version }}-${{ inputs.version }}-${{ inputs.set }}-${{ inputs.model }}
-        path: ${{ github.workspace }}/artifact/*.img.gz
-        retention-days: 7
