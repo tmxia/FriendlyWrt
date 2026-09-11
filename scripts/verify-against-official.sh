@@ -26,7 +26,6 @@ SELF_SIZE=$(stat -c%s "$SELF_IMG")
 echo "自建镜像大小: $SELF_SIZE bytes"
 echo ""
 
-# 从 parameter.txt 解析偏移（不再硬编码）
 PARAM=$(dirname "$SELF_IMG")/parameter.txt
 if [ ! -f "$PARAM" ]; then
   PARAM=$(find /tmp -name "parameter.txt" -path "*sd-fuse*" 2>/dev/null | head -1)
@@ -42,7 +41,6 @@ fi
 echo "kernel 分区偏移: $KERNEL_OFFSET bytes (0x$(printf %x $KERNEL_OFFSET))"
 echo ""
 
-# ---------- 读取自建 KRNL 头 ----------
 read -r MAGIC CODE0 CODE1 KRNL_SIZE MAGIC_OFFSET KNL_ZERO_OK CODE1_TARGET < <(
   python3 - "$SELF_IMG" "$KERNEL_OFFSET" <<'PYEOF'
 import sys, struct
@@ -55,16 +53,11 @@ code0 = d[8:12].hex()
 code1 = int.from_bytes(d[12:16], 'little')
 knl_size = int.from_bytes(d[4:8], 'little')
 magic_off = d.find(b'ARM\x64')
-
-# 零填充检查
 zero_ok = "1" if d[0x48:0x10000] == b'\x00' * (0x10000 - 0x48) else "0"
-
-# B 指令目标解码（有符号 26 位）
 imm26 = code1 & 0x03FFFFFF
 if imm26 & 0x02000000:
     imm26 -= 0x04000000
 target = 0x0C + imm26 * 4
-
 print(magic, code0, f"{code1:08x}", knl_size, magic_off, zero_ok, target)
 PYEOF
 )
@@ -81,17 +74,16 @@ echo "  零填充: $([ "$KNL_ZERO_OK" = "1" ] && echo '✅ 是' || echo '❌ 否
 [ "$CODE0" = "1f2003d5" ]      && ok "code0 = NOP (1f2003d5)"     || bad "code0 不是 NOP: $CODE0"
 
 CODE1_OP=$(( (0x$CODE1 >> 26) & 0x3F ))
-[ "$CODE1_OP" -eq 5 ] && ok "code1 opcode=5 (B 指令)" || bad "code1 opcode=$CODE1_OP (期望 5=B)"
+[ "$CODE1_OP" -eq 5 ] && ok "code1 opcode=5 (B 指令)" || bad "code1 opcode=$CODE1_OP (期望 5)"
 
 [ "$MAGIC_OFFSET" = "64" ]     && ok "ARM64 magic 位于 0x40"       || bad "ARM64 magic 位置错误: $(printf '0x%x' "$MAGIC_OFFSET")"
 
 [ "$KNL_ZERO_OK" = "1" ]       && ok "0x48..0x10000 零填充"        || bad "0x48..0x10000 非零填充"
 
-# code1 目标必须在 payload 区（>=0x10000）
 if [ "$CODE1_TARGET" -ge $((0x10000)) ]; then
   ok "code1 目标 0x$(printf %x "$CODE1_TARGET") 在 payload 区"
 else
-  bad "code1 目标 0x$(printf %x "$CODE1_TARGET") 落在 header 区（期望 >=0x10000）"
+  bad "code1 目标 0x$(printf %x "$CODE1_TARGET") 落在 header 区"
 fi
 
 echo ""
@@ -106,7 +98,7 @@ echo ""
 echo "── [3] 与官方固件对比 ──"
 
 if [ -f "$OFFICIAL_DIR/.no_reference" ] || [ -z "$(find "$OFFICIAL_DIR" -maxdepth 1 -name '*.img' 2>/dev/null)" ]; then
-  warn "无官方参考镜像，跳过对比（仅做结构验证）"
+  warn "无官方参考镜像，跳过对比"
 else
   OFF_IMG=$(find "$OFFICIAL_DIR" -maxdepth 1 -name "*.img" | head -1)
   echo "  官方镜像: $OFF_IMG"
@@ -147,10 +139,9 @@ PYEOF
   echo "    自建 code1 = 0x$CODE1   → 目标 0x$(printf %x "$CODE1_TARGET")"
   echo "    官方 code1 = 0x$OFF_CODE1 → 目标 0x$(printf %x "$OFF_CODE1_TARGET")"
   if [ "$CODE1" = "$OFF_CODE1" ]; then
-    ok "code1 与官方完全一致（B 指令目标位置相同）"
+    ok "code1 与官方完全一致"
   else
-    warn "code1 精确值不同（内核版本不同 → primary_entry 偏移不同，属预期差异）"
-    # 关键：两者目标都必须在各自的 payload 区
+    warn "code1 精确值不同（内核版本不同，属预期）"
     if [ "$CODE1_TARGET" -ge $((0x10000)) ] && [ "$OFF_CODE1_TARGET" -ge $((0x10000)) ]; then
       ok "两者 code1 目标均落在 payload 区（>=0x10000）"
     else
