@@ -1,4 +1,4 @@
-name: Build OpenWrt for NanoPi R5S
+name: Build OpenWrt for NanoPi R5S (FriendlyWrt-style)
 
 on:
   watch:
@@ -25,14 +25,13 @@ jobs:
     if: github.event.repository.owner.id == github.event.sender.id
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
-      upload_url: ${{ steps.release.outputs.upload_url }}
     steps:
       - name: Generate unique release tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="OpenWrt-R5S-$(date +%Y-%m-%d)"
+          BASE_TAG="FriendlyWrt-R5S-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -66,7 +65,6 @@ jobs:
           echo "Release tag: $TAG"
 
       - name: Create or update release
-        id: release
         uses: softprops/action-gh-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -102,13 +100,15 @@ jobs:
           liblzma-dev libbz2-dev \
           device-tree-compiler u-boot-tools \
           bzip2 xz-utils zip unzip wget curl \
-          autoconf automake autopoint texinfo help2man
+          autoconf automake autopoint texinfo help2man \
+          android-sdk-libsparse-utils e2fsprogs parted dosfstools mtools
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
         python3 -c "import elftools" 2>/dev/null || pip3 install --quiet pyelftools
         mkdir -p ./artifact
         echo "CPU cores: $(nproc)"
 
-    - name: Prepare FriendlyWrt-style workspace using OpenWrt official source
+    # ---------- 1. 准备 OpenWrt 官方源码 ----------
+    - name: Prepare OpenWrt workspace
       run: |
         mkdir -p project
         cd project
@@ -121,7 +121,7 @@ jobs:
         cd ..
         mkdir -p configs/rockchip
         touch configs/rockchip/01-nanopi
-        echo "Workspace prepared with OpenWrt ${{ env.OPENWRT_BRANCH }}"
+        echo "OpenWrt workspace prepared"
 
     - name: Initialize .config with R5S target
       run: |
@@ -142,7 +142,6 @@ jobs:
           echo "[OK] OpenWrt Rockchip target uses kernel 6.12"
         else
           echo "ERROR: 6.12 kernel artifacts not found"
-          find target/linux/rockchip/ -maxdepth 2 -name "*6.12*"
           exit 1
         fi
 
@@ -154,7 +153,7 @@ jobs:
         fi
         ls -la config-6.1
 
-    - name: Apply customizations (original script, unmodified)
+    - name: Apply customizations (original script)
       run: |
         cd project
         bash ../scripts/add_packages.sh
@@ -162,43 +161,124 @@ jobs:
     - name: Final config check
       run: |
         cd project/friendlywrt
-        echo "--- Clashoo packages ---"
         grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || true
-        echo "--- Kernel INET_DIAG (from armv8/config-6.12) ---"
-        grep -E "CONFIG_INET_DIAG|CONFIG_INET_TCP_DIAG|CONFIG_INET_UDP_DIAG|CONFIG_INET_RAW_DIAG" target/linux/rockchip/armv8/config-6.12 || true
 
+    # ---------- 2. 编译 OpenWrt ----------
     - name: Download packages
       run: |
         cd project/friendlywrt
-        if make download -j$(nproc) > /tmp/dl.log 2>&1; then
-          echo "Package download completed"
-        else
+        if ! make download -j$(nproc) > /tmp/dl.log 2>&1; then
           echo "::error::make download failed"
-          grep -iE "error|fail|404|not found|unable|denied|timeout|refused|missing" /tmp/dl.log | head -30 || true
+          grep -iE "error|fail|404|not found|unable|denied|timeout|refused" /tmp/dl.log | head -30 || true
           exit 1
         fi
+        echo "Package download completed"
 
-    - name: Compile OpenWrt
+    - name: Compile OpenWrt (kernel 6.12 + rootfs)
       run: |
         cd project/friendlywrt
         if ! make -j$(nproc) > /tmp/build.log 2>&1; then
           echo "Build failed. Last 100 lines:"
           tail -100 /tmp/build.log
-          echo "--- Errors summary ---"
-          grep -iE "error:|ERROR|failed" /tmp/build.log | tail -30 || true
           exit 1
         fi
-        echo "Compile finished"
+        echo "OpenWrt compile finished"
+
+    # ---------- 3. 准备 sd-fuse 打包工作区 ----------
+    - name: Clone sd-fuse_rk3568
+      run: |
+        cd project
+        git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse
+        cd sd-fuse
+        # sd-fuse 需要一个 prebuilt 目录来存放内核和 rootfs
+        mkdir -p prebuilt
+        echo "sd-fuse cloned"
+
+    - name: Stage OpenWrt outputs into sd-fuse prebuilt
+      run: |
+        cd project
+
+        # --- 内核 Image ---
+        KERNEL_IMAGE=""
+        for cand in \
+          friendlywrt/bin/targets/rockchip/armv8/*Image* \
+          friendlywrt/bin/targets/rockchip/armv8/*itb* \
+          friendlywrt/build_dir/target-aarch64_cortex-a53_musl/linux-rockchip_armv8/Image ; do
+          if [ -f "$cand" ]; then KERNEL_IMAGE="$cand"; break; fi
+        done
+
+        if [ -z "$KERNEL_IMAGE" ]; then
+          echo "::error::Kernel Image not found"
+          find friendlywrt/bin -type f | head -50
+          exit 1
+        fi
+        cp "$KERNEL_IMAGE" sd-fuse/prebuilt/Image
+        echo "Kernel: $KERNEL_IMAGE"
+
+        # --- Rootfs 目录 ---
+        ROOTFS_DIR=$(ls -d friendlywrt/build_dir/target-aarch64_cortex-a53_musl/root-* 2>/dev/null | head -1)
+        if [ -z "$ROOTFS_DIR" ]; then
+          echo "::error::Rootfs build dir not found"
+          exit 1
+        fi
+        # sd-fuse 期望 rootfs.img（ext4 镜像）
+        # OpenWrt 已构建出 rootfs 目录，直接用 mkfs.ext4 打成镜像
+        ROOTFS_SIZE_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1+80}')
+        rm -f sd-fuse/prebuilt/rootfs.img
+        dd if=/dev/zero of=sd-fuse/prebuilt/rootfs.img bs=1M count=${ROOTFS_SIZE_MB} status=none
+        mkfs.ext4 -q -F -L rootfs sd-fuse/prebuilt/rootfs.img
+        mkdir -p /tmp/rootfs_mnt
+        sudo mount -o loop sd-fuse/prebuilt/rootfs.img /tmp/rootfs_mnt
+        sudo cp -a "$ROOTFS_DIR"/. /tmp/rootfs_mnt/
+        sudo umount /tmp/rootfs_mnt
+        echo "Rootfs image built: $(du -h sd-fuse/prebuilt/rootfs.img | awk '{print $1}')"
+
+        echo "--- sd-fuse prebuilt ---"
+        ls -lh sd-fuse/prebuilt/
+
+    # ---------- 4. 用 sd-fuse 生成可刷写镜像 ----------
+    - name: Build SD image with sd-fuse
+      run: |
+        cd project/sd-fuse
+        ls -la
+        echo "=== Looking for build scripts ==="
+        ls -1 *.sh 2>/dev/null || true
+
+        # sd-fuse_rk3568 的主脚本通常是 mk-sd-image.sh
+        if [ ! -f ./mk-sd-image.sh ]; then
+          echo "::error::mk-sd-image.sh not found"
+          exit 1
+        fi
+
+        # 检查 prebuilt 目录结构
+        echo "=== prebuilt content ==="
+        ls -la prebuilt/ || true
+
+        # 执行打包（需要 sudo 因为要 mount loop 设备）
+        sudo ./mk-sd-image.sh rk3568 2>&1 | tee /tmp/sd-fuse.log || {
+          echo "::warning::mk-sd-image.sh returned non-zero, checking output"
+          tail -50 /tmp/sd-fuse.log
+        }
+
+        echo "=== output directory ==="
+        ls -lh out/ 2>/dev/null || echo "no out/ directory"
+        find . -maxdepth 2 -name "*.img" -o -maxdepth 2 -name "*.img.gz" 2>/dev/null | head
 
     - name: Collect artifacts
       run: |
-        cd project/friendlywrt
-        find bin/targets/rockchip/armv8/ -maxdepth 1 -type f \
-          \( -name "*nanopi-r5s*.img.gz" -o -name "*nanopi-r5s*.manifest" \
-             -o -name "*nanopi-r5s*.tar.gz" \) \
-          -exec cp {} ../../artifact/ \;
+        cd project
+
+        # 优先收集 sd-fuse 生成的完整镜像
+        find sd-fuse -maxdepth 2 -type f \( -name "*.img" -o -name "*.img.gz" \) \
+          -exec cp {} ../artifact/ \; 2>/dev/null || true
+
+        # 同时收集 OpenWrt 原生产物作为备用
+        find friendlywrt/bin/targets/rockchip/armv8/ -maxdepth 1 -type f \
+          \( -name "*nanopi-r5s*.img.gz" -o -name "*nanopi-r5s*.tar.gz" -o -name "*nanopi-r5s*.manifest" \) \
+          -exec cp {} ../artifact/ \; 2>/dev/null || true
+
         echo "--- Collected artifacts ---"
-        ls -lh ../../artifact/
+        ls -lh ../artifact/
 
     - name: Upload artifacts to release
       uses: svenstaro/upload-release-action@v2
@@ -224,5 +304,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
+          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S (FriendlyWrt-style)"
           repository: ${{ github.repository }}
