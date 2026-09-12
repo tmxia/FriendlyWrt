@@ -3,6 +3,15 @@ name: Build FriendlyWrt New
 on:
   workflow_dispatch:
     inputs:
+      kernel:
+        description: 'Kernel version'
+        required: true
+        default: '6.12'
+        type: choice
+        options:
+          - '6.12'
+          - '6.18'
+          - 'both'
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
@@ -77,7 +86,14 @@ jobs:
     if: |
       github.event.repository.owner.id == github.event.sender.id &&
       github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        KERNEL: ${{ fromJSON(github.event.inputs.kernel == 'both' && '["6.12","6.18"]' || format('["{0}"]', github.event.inputs.kernel)) }}
     steps:
+    - name: Show build configuration
+      run: |
+        echo "Building kernel: ${{ matrix.KERNEL }}"
+
     - name: Checkout
       uses: actions/checkout@v4
 
@@ -98,7 +114,7 @@ jobs:
         sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
         echo "cores: $(nproc)"
 
-    - name: Clone OpenWrt official source (6.12) into project/friendlywrt
+    - name: Clone OpenWrt official source into project/friendlywrt
       run: |
         mkdir -p project
         cd project
@@ -108,19 +124,42 @@ jobs:
         echo "--- 确认内核版本 ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
 
-        # 修正 Makefile 格式：KERNEL_PATCHVER:=6.12 -> KERNEL_PATCHVER := 6.12
-        # 这样 custome_config.sh 里的 awk '{print $3}' 才能取到 6.12
+        # 修正 Makefile 格式，让脚本里的 awk '{print $3}' 能取到值
         sed -i 's/^KERNEL_PATCHVER:=/KERNEL_PATCHVER := /' target/linux/rockchip/Makefile
-        echo "--- 修正后 ---"
-        grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile
 
-        # 准备初始 .config（目标平台 + 设备）
-        cat > .config <<'EOF'
+        # 根据选择的内核版本，动态添加 KERNEL_TESTING_PATCHVER
+        if [ "${{ matrix.KERNEL }}" == "6.18" ]; then
+          echo "===== 配置 6.18 测试内核 ====="
+          # 添加或更新 TESTING_PATCHVER
+          if grep -q '^KERNEL_TESTING_PATCHVER' target/linux/rockchip/Makefile; then
+            sed -i 's/^KERNEL_TESTING_PATCHVER.*/KERNEL_TESTING_PATCHVER:=6.18/' target/linux/rockchip/Makefile
+          else
+            sed -i '/^KERNEL_PATCHVER/a KERNEL_TESTING_PATCHVER:=6.18' target/linux/rockchip/Makefile
+          fi
+        else
+          echo "===== 配置 6.12 默认内核 ====="
+          # 移除 TESTING_PATCHVER 以确保使用默认内核
+          sed -i '/^KERNEL_TESTING_PATCHVER/d' target/linux/rockchip/Makefile
+        fi
+
+        echo "--- 修正后 ---"
+        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile
+
+        # 准备初始 .config
+        if [ "${{ matrix.KERNEL }}" == "6.18" ]; then
+          cat > .config <<'EOF'
         CONFIG_TARGET_rockchip=y
         CONFIG_TARGET_rockchip_armv8=y
         CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
-        CONFIG_TARGET_KERNEL_VERSION_6_12=y
+        CONFIG_TESTING_KERNEL=y
         EOF
+        else
+          cat > .config <<'EOF'
+        CONFIG_TARGET_rockchip=y
+        CONFIG_TARGET_rockchip_armv8=y
+        CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
+        EOF
+        fi
 
         # 让脚本里的 configs/rockchip/01-nanopi 实际写入 .config
         cd ..
@@ -154,8 +193,8 @@ jobs:
         cd project/friendlywrt
         echo "=== 内核版本 ==="
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
-        echo "=== config-6.12 文件 ==="
-        ls -la target/linux/rockchip/config-6.12* 2>/dev/null || echo "(no config-6.12 file)"
+        echo "=== TESTING_KERNEL 状态 ==="
+        grep -E 'CONFIG_TESTING_KERNEL' .config || echo "(none)"
         echo "=== Clashoo 相关 ==="
         grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || echo "WARNING"
         echo "=== 屏蔽包 ==="
@@ -164,6 +203,25 @@ jobs:
         done
         echo "=== UCI defaults ==="
         ls -la files/etc/uci-defaults/ || true
+
+    # 修复：禁用编译失败的 file 包
+    - name: Fix conflicting file package
+      run: |
+        cd project/friendlywrt
+        echo "=== 检查 file 包来源 ==="
+        ls -la feeds/packages/libs/file/ 2>/dev/null && echo "[found in feeds]" || echo "[not in feeds]"
+
+        # file 命令在 6.12 内核 + musl 下编译失败，禁用
+        sed -i '/^CONFIG_PACKAGE_file=y$/d' .config
+        sed -i '/^CONFIG_PACKAGE_libmagic=y$/d' .config
+        grep -q "^# CONFIG_PACKAGE_file is not set" .config || echo "# CONFIG_PACKAGE_file is not set" >> .config
+        grep -q "^# CONFIG_PACKAGE_libmagic is not set" .config || echo "# CONFIG_PACKAGE_libmagic is not set" >> .config
+
+        # 从源码树中移除 file 包，避免 make 重新拉入
+        rm -rf feeds/packages/libs/file 2>/dev/null || true
+
+        echo "=== 确认 file 已禁用 ==="
+        grep -E "CONFIG_PACKAGE_(file|libmagic)" .config || echo "(no file config)"
 
     - name: Download package
       run: |
@@ -192,7 +250,7 @@ jobs:
         cp ${BIN_DIR}/kernel                ../../artifact/ 2>/dev/null || true
         cp ${BIN_DIR}/sha256sums           ../../artifact/ 2>/dev/null || true
 
-        tar czf ../../artifact/openwrt-rockchip-armv8-${{ github.run_number }}.tar.gz -C bin/targets/rockchip armv8/
+        tar czf ../../artifact/openwrt-rockchip-armv8-k${{ matrix.KERNEL }}-${{ github.run_number }}.tar.gz -C bin/targets/rockchip armv8/
 
         echo "=== artifact ==="
         ls -la ../../artifact/
