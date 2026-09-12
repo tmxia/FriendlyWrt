@@ -1,0 +1,209 @@
+name: Build FriendlyWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      replace_existing:
+        description: 'Replace existing release tag (overwrite)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+env:
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  OPENWRT_BRANCH: 'openwrt-25.12'
+
+jobs:
+  prepare_release:
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.tag }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
+    steps:
+      - name: Generate unique release tag with auto-increment or overwrite
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_TAG="OpenWrt-R5S-$(date +%Y-%m-%d)"
+          FORCE_BASE=false
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
+            FORCE_BASE=true
+          fi
+          if [ "$FORCE_BASE" = "true" ]; then
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            for tag in $EXISTING_TAGS; do
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+              git push origin --delete "refs/tags/$tag" || true
+            done
+            TAG="$BASE_TAG"
+          else
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            if [ -z "$EXISTING_TAGS" ]; then
+              TAG="$BASE_TAG"
+            else
+              MAX_NUM=0
+              for t in $EXISTING_TAGS; do
+                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                  NUM=${BASH_REMATCH[1]}
+                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+                fi
+              done
+              TAG="${BASE_TAG}-$((MAX_NUM + 1))"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Generated release tag: $TAG"
+
+      - name: Create or update release
+        id: release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          allow_updates: true
+          overwrite: true
+
+  build:
+    needs: prepare_release
+    runs-on: ubuntu-22.04
+    if: |
+      github.event.repository.owner.id == github.event.sender.id &&
+      github.event_name == 'workflow_dispatch'
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d
+        sudo apt-get update
+        sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev zlib1g-dev gawk git gettext \
+            libssl-dev xsltproc rsync wget unzip python3 python3-distutils file time ccache
+        git config --global user.name 'GitHub Actions'
+        git config --global user.email 'noreply@github.com'
+        git config --global color.ui false
+        mkdir -p ./artifact
+        sudo swapoff -a || true
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk /usr/local/share/boost /opt/ghc 2>/dev/null || true
+        echo "cores: $(nproc)"
+
+    # ----- 关键：源码仍叫 friendlywrt，让原脚本路径全部命中 -----
+    - name: Clone OpenWrt official source (6.12) into project/friendlywrt
+      run: |
+        mkdir -p project
+        cd project
+        git clone --depth=1 -b ${OPENWRT_BRANCH} ${OPENWRT_REPO} friendlywrt
+        cd friendlywrt
+        git log -1 --oneline
+        echo "--- 确认内核版本 ---"
+        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
+
+        # 准备初始 .config（目标平台 + 设备）
+        cat > .config <<'EOF'
+        CONFIG_TARGET_rockchip=y
+        CONFIG_TARGET_rockchip_armv8=y
+        CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
+        CONFIG_TARGET_KERNEL_VERSION_6_12=y
+        EOF
+
+        # 让脚本里的 configs/rockchip/01-nanopi 实际写入 .config
+        mkdir -p configs/rockchip
+        ln -sf "$(pwd)/.config" configs/rockchip/01-nanopi
+
+    - name: Apply customizations (scripts/custome_config.sh)
+      run: |
+        cd project
+        # 原脚本，OpenWrt 官方源码下若有不兼容语句请在脚本里加判断
+        source ../scripts/custome_config.sh
+
+    - name: Add customize packages (scripts/add_packages.sh)
+      run: |
+        cd project
+        bash ../scripts/add_packages.sh
+
+    # ----- 脚本已经做过 make defconfig，这里再复核 -----
+    - name: Verify config
+      run: |
+        cd project/friendlywrt
+        echo "=== 内核版本 ==="
+        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
+        echo "=== Clashoo 相关 ==="
+        grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || echo "WARNING"
+        echo "=== 屏蔽包 ==="
+        for pkg in luci-app-cpufreq luci-app-hd-idle luci-app-nlbwmon luci-app-smartdns; do
+          grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "[OK] $pkg disabled" || echo "[WARN] $pkg"
+        done
+        echo "=== UCI defaults ==="
+        ls -la files/etc/uci-defaults/ || true
+
+    - name: Download package
+      run: |
+        cd project/friendlywrt
+        make download -j8 || true
+        find dl -size -1024c -exec ls -l {} \; 2>/dev/null || true
+        find dl -size -1024c -exec rm -f {} \; 2>/dev/null || true
+
+    - name: Compile firmware
+      id: compile
+      run: |
+        cd project/friendlywrt
+        make -j$(nproc)
+
+    - name: Collect artifacts
+      id: collect
+      run: |
+        cd project/friendlywrt
+        BIN_DIR="bin/targets/rockchip/armv8"
+        echo "=== 编译产物 ==="
+        ls -la ${BIN_DIR}/ || { echo "产物目录不存在，编译失败"; exit 1; }
+
+        mkdir -p ../../artifact
+        # sysupgrade 镜像
+        cp ${BIN_DIR}/*sysupgrade*.img.gz ../../artifact/ 2>/dev/null || true
+        cp ${BIN_DIR}/*ext4*.img.gz        ../../artifact/ 2>/dev/null || true
+        # 内核（可选，便于你比对）
+        cp ${BIN_DIR}/kernel                ../../artifact/ 2>/dev/null || true
+        # 校验文件
+        cp ${BIN_DIR}/sha256sums           ../../artifact/ 2>/dev/null || true
+
+        # 打包一份完整的 target 目录
+        tar czf ../../artifact/openwrt-rockchip-armv8-${{ github.run_number }}.tar.gz -C bin/targets/rockchip armv8/
+
+        echo "=== artifact ==="
+        ls -la ../../artifact/
+
+    - name: Upload to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/*
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+
+  cleanup_self:
+    name: Cleanup Self Workflow History
+    runs-on: ubuntu-latest
+    needs: [prepare_release, build]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 0
+          retain_days: 0
+          delete_workflow_pattern: "Build FriendlyWrt New"
+          repository: ${{ github.repository }}
