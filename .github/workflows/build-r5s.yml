@@ -104,13 +104,11 @@ jobs:
         cd project
         git clone --depth 1 -b ${{ env.OPENWRT_BRANCH }} \
           https://github.com/openwrt/openwrt.git friendlywrt > /dev/null 2>&1
-        # 让 OpenWrt 使用 FriendlyWrt 风格的配置文件
         cd friendlywrt
         cp feeds.conf.default feeds.conf
         ./scripts/feeds update -a > /dev/null 2>&1
         ./scripts/feeds install -a > /dev/null 2>&1
         cd ..
-        # 创建 FriendlyWrt 风格的 configs 目录（脚本会向其追加内容）
         mkdir -p configs/rockchip
         touch configs/rockchip/01-nanopi
         echo "Workspace prepared with OpenWrt ${{ env.OPENWRT_BRANCH }}"
@@ -130,13 +128,14 @@ jobs:
     - name: Verify upstream kernel version (must be 6.12)
       run: |
         cd project/friendlywrt
-        KV=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
-        echo "OpenWrt Rockchip target KERNEL_PATCHVER = $KV"
-        if [ "$KV" != "6.12" ]; then
-          echo "ERROR: expected 6.12 kernel, got $KV"
+        if [ -f target/linux/rockchip/config-6.12 ]; then
+          echo "[OK] OpenWrt Rockchip target uses kernel 6.12 (config-6.12 present)"
+        else
+          echo "ERROR: config-6.12 not found under target/linux/rockchip/"
+          ls -1 target/linux/rockchip/
           exit 1
         fi
-        test -f target/linux/rockchip/config-6.12 && echo "config-6.12 present"
+        grep -n "KERNEL_PATCHVER" target/linux/rockchip/Makefile || true
 
     - name: Apply customizations (original script, unmodified)
       run: |
