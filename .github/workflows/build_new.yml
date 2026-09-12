@@ -1,4 +1,4 @@
-name: Build FriendlyWrt
+name: Build FriendlyWrt New
 
 on:
   workflow_dispatch:
