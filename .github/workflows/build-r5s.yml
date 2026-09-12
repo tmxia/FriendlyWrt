@@ -105,9 +105,12 @@ jobs:
         git clone --depth 1 -b ${{ env.OPENWRT_BRANCH }} \
           https://github.com/openwrt/openwrt.git friendlywrt > /dev/null 2>&1
         cd friendlywrt
-        cp feeds.conf.default feeds.conf
+        # 用 feeds.conf.default 更新/安装 feeds（feeds 元数据随后保留在 feeds/ 目录中）
         ./scripts/feeds update -a > /dev/null 2>&1
         ./scripts/feeds install -a > /dev/null 2>&1
+        # 关键：删除 feeds.conf，让 add_packages.sh 依其原逻辑自行创建
+        # （否则 [ ! -f feeds.conf ] 为 false，配合 set -e 会导致脚本立即退出）
+        rm -f feeds.conf
         cd ..
         mkdir -p configs/rockchip
         touch configs/rockchip/01-nanopi
@@ -130,8 +133,6 @@ jobs:
         cd project/friendlywrt
         if [ -d target/linux/rockchip/patches-6.12 ] && [ -f target/linux/rockchip/armv8/config-6.12 ]; then
           echo "[OK] OpenWrt Rockchip target uses kernel 6.12"
-          echo "  - patches-6.12 present"
-          echo "  - armv8/config-6.12 present"
         else
           echo "ERROR: 6.12 kernel artifacts not found"
           find target/linux/rockchip/ -maxdepth 2 -name "*6.12*"
@@ -141,8 +142,7 @@ jobs:
     - name: Bridge add_packages.sh kernel config path
       run: |
         cd project/friendlywrt/target/linux/rockchip
-        # add_packages.sh 期望 config-6.1 路径（其内部 fallback），
-        # 通过符号链接把写入内容桥接到实际生效的 armv8/config-6.12
+        # add_packages.sh 内部 fallback 到 config-6.1，通过符号链接桥接到实际生效的 armv8/config-6.12
         if [ ! -e config-6.1 ]; then
           ln -s armv8/config-6.12 config-6.1
         fi
