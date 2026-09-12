@@ -128,14 +128,25 @@ jobs:
     - name: Verify upstream kernel version (must be 6.12)
       run: |
         cd project/friendlywrt
-        if [ -f target/linux/rockchip/config-6.12 ]; then
-          echo "[OK] OpenWrt Rockchip target uses kernel 6.12 (config-6.12 present)"
+        if [ -d target/linux/rockchip/patches-6.12 ] && [ -f target/linux/rockchip/armv8/config-6.12 ]; then
+          echo "[OK] OpenWrt Rockchip target uses kernel 6.12"
+          echo "  - patches-6.12 present"
+          echo "  - armv8/config-6.12 present"
         else
-          echo "ERROR: config-6.12 not found under target/linux/rockchip/"
-          ls -1 target/linux/rockchip/
+          echo "ERROR: 6.12 kernel artifacts not found"
+          find target/linux/rockchip/ -maxdepth 2 -name "*6.12*"
           exit 1
         fi
-        grep -n "KERNEL_PATCHVER" target/linux/rockchip/Makefile || true
+
+    - name: Bridge add_packages.sh kernel config path
+      run: |
+        cd project/friendlywrt/target/linux/rockchip
+        # add_packages.sh 期望 config-6.1 路径（其内部 fallback），
+        # 通过符号链接把写入内容桥接到实际生效的 armv8/config-6.12
+        if [ ! -e config-6.1 ]; then
+          ln -s armv8/config-6.12 config-6.1
+        fi
+        ls -la config-6.1
 
     - name: Apply customizations (original script, unmodified)
       run: |
@@ -147,8 +158,8 @@ jobs:
         cd project/friendlywrt
         echo "--- Clashoo packages ---"
         grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || true
-        echo "--- Kernel INET_DIAG ---"
-        grep -E "CONFIG_INET_DIAG|CONFIG_INET_TCP_DIAG|CONFIG_INET_UDP_DIAG|CONFIG_INET_RAW_DIAG" target/linux/rockchip/config-6.12 || true
+        echo "--- Kernel INET_DIAG (from armv8/config-6.12) ---"
+        grep -E "CONFIG_INET_DIAG|CONFIG_INET_TCP_DIAG|CONFIG_INET_UDP_DIAG|CONFIG_INET_RAW_DIAG" target/linux/rockchip/armv8/config-6.12 || true
 
     - name: Download packages
       run: |
@@ -165,7 +176,6 @@ jobs:
     - name: Collect artifacts
       run: |
         cd project/friendlywrt
-        ls -lh bin/targets/rockchip/armv8/ | head -30
         find bin/targets/rockchip/armv8/ -maxdepth 1 -type f \
           \( -name "*nanopi-r5s*.img.gz" -o -name "*nanopi-r5s*.manifest" \
              -o -name "*nanopi-r5s*.tar.gz" \) \
