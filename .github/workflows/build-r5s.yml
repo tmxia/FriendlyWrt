@@ -165,6 +165,12 @@ jobs:
         sed -i '/^# CONFIG_TESTING_KERNEL is not set/d' .config
         echo "# CONFIG_TESTING_KERNEL is not set" >> .config
 
+        echo "===== 3b. [方案A] 加大 rootfs / kernel 分区 (defconfig 前) ====="
+        sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+        sed -i '/^CONFIG_TARGET_KERNEL_PARTSIZE=/d' .config
+        echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1024" >> .config
+        echo "CONFIG_TARGET_KERNEL_PARTSIZE=64"   >> .config
+
         echo "===== 4. make defconfig ====="
         make defconfig
 
@@ -178,6 +184,12 @@ jobs:
         sed -i '/^# CONFIG_TESTING_KERNEL is not set/d' .config
         echo "# CONFIG_TESTING_KERNEL is not set" >> .config
 
+        echo "===== 5b. [方案A] 加大 rootfs / kernel 分区 (defconfig 后) ====="
+        sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+        sed -i '/^CONFIG_TARGET_KERNEL_PARTSIZE=/d' .config
+        echo "CONFIG_TARGET_ROOTFS_PARTSIZE=1024" >> .config
+        echo "CONFIG_TARGET_KERNEL_PARTSIZE=64"   >> .config
+
         echo "===== 6. 从源码树移除问题包 ====="
         rm -rf feeds/packages/libs/file       2>/dev/null || true
         rm -rf feeds/packages/utils/logrotate 2>/dev/null || true
@@ -187,6 +199,7 @@ jobs:
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
         grep -E "CONFIG_TESTING_KERNEL" .config || echo "(TESTING_KERNEL none)"
         grep -E "CONFIG_PACKAGE_(file|libmagic|logrotate|vsftpd) " .config || echo "(no problem pkgs config)"
+        grep -E "CONFIG_TARGET_(ROOTFS|KERNEL)_PARTSIZE" .config || echo "(PART SIZE none) <-- 异常!"
 
     - name: Verify config
       run: |
@@ -195,10 +208,12 @@ jobs:
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
         echo "=== TESTING_KERNEL 状态 ==="
         grep -E "CONFIG_TESTING_KERNEL" .config || echo "(none)"
+        echo "=== [方案A] 分区大小 ==="
+        grep -E "CONFIG_TARGET_(ROOTFS|KERNEL)_PARTSIZE" .config || echo "WARNING: 分区配置缺失"
         echo "=== Clashoo 相关 ==="
         grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || echo "WARNING"
         echo "=== 屏蔽包 ==="
-        for pkg in luci-app-cpufreq luci-app-hd-idle luci-app-nlbwmon luci-app-smartdns; do
+        for pkg in luci-app-hd-idle luci-app-nlbwmon luci-app-smartdns; do
           grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "[OK] $pkg disabled" || echo "[WARN] $pkg"
         done
         echo "=== 问题包状态 ==="
@@ -224,25 +239,18 @@ jobs:
       run: |
         cd project/friendlywrt
 
-        # 第一次：正常并行编译
         set +e
         make -j$(nproc) > /tmp/build.log 2>&1
         BUILD_EXIT=$?
         set -e
 
         echo "===== 首次编译退出码: $BUILD_EXIT ====="
-        tail -50 /tmp/build.log
+        tail -60 /tmp/build.log
 
         if [ $BUILD_EXIT -ne 0 ]; then
           echo ""
-          echo "===== 编译失败，用 V=s -j1 重跑 target/linux/install 抓详细错误 ====="
-          set +e
-          make target/linux/install V=s -j1 > /tmp/install.log 2>&1
-          INSTALL_EXIT=$?
-          set -e
-          echo "install 退出码: $INSTALL_EXIT"
-          echo "===== install.log 最后 300 行 ====="
-          tail -300 /tmp/install.log
+          echo "===== 编译失败，输出 build.log 最后 300 行 ====="
+          tail -300 /tmp/build.log
         fi
 
         exit $BUILD_EXIT
