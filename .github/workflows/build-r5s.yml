@@ -87,6 +87,7 @@ jobs:
       github.event.repository.owner.id == github.event.sender.id &&
       github.event_name == 'workflow_dispatch'
     strategy:
+      fail-fast: false
       matrix:
         KERNEL: ${{ fromJSON(github.event.inputs.kernel == 'both' && '["6.12","6.18"]' || format('["{0}"]', github.event.inputs.kernel)) }}
     steps:
@@ -121,45 +122,30 @@ jobs:
         git clone --depth=1 -b ${OPENWRT_BRANCH} ${OPENWRT_REPO} friendlywrt
         cd friendlywrt
         git log -1 --oneline
-        echo "--- 确认内核版本 ---"
+
+        echo "--- 原始 Makefile 内核配置 ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
 
-        # 修正 Makefile 格式，让脚本里的 awk '{print $3}' 能取到值
+        # 让 KERNEL_PATCHVER 格式统一为 "KERNEL_PATCHVER := x.x"，方便后续脚本 grep
         sed -i 's/^KERNEL_PATCHVER:=/KERNEL_PATCHVER := /' target/linux/rockchip/Makefile
 
-        # 根据选择的内核版本，动态添加 KERNEL_TESTING_PATCHVER
+        # 若选了 6.18，写入 KERNEL_TESTING_PATCHVER
         if [ "${{ matrix.KERNEL }}" == "6.18" ]; then
-          echo "===== 配置 6.18 测试内核 ====="
-          # 添加或更新 TESTING_PATCHVER
-          if grep -q '^KERNEL_TESTING_PATCHVER' target/linux/rockchip/Makefile; then
-            sed -i 's/^KERNEL_TESTING_PATCHVER.*/KERNEL_TESTING_PATCHVER:=6.18/' target/linux/rockchip/Makefile
-          else
-            sed -i '/^KERNEL_PATCHVER/a KERNEL_TESTING_PATCHVER:=6.18' target/linux/rockchip/Makefile
-          fi
+          sed -i '/^KERNEL_TESTING_PATCHVER/d' target/linux/rockchip/Makefile
+          sed -i '/^KERNEL_PATCHVER/a KERNEL_TESTING_PATCHVER:=6.18' target/linux/rockchip/Makefile
         else
-          echo "===== 配置 6.12 默认内核 ====="
-          # 移除 TESTING_PATCHVER 以确保使用默认内核
           sed -i '/^KERNEL_TESTING_PATCHVER/d' target/linux/rockchip/Makefile
         fi
 
-        echo "--- 修正后 ---"
+        echo "--- 修正后 Makefile ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile
 
         # 准备初始 .config
-        if [ "${{ matrix.KERNEL }}" == "6.18" ]; then
-          cat > .config <<'EOF'
-        CONFIG_TARGET_rockchip=y
-        CONFIG_TARGET_rockchip_armv8=y
-        CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
-        CONFIG_TESTING_KERNEL=y
-        EOF
-        else
-          cat > .config <<'EOF'
+        cat > .config <<'EOF'
         CONFIG_TARGET_rockchip=y
         CONFIG_TARGET_rockchip_armv8=y
         CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
         EOF
-        fi
 
         # 让脚本里的 configs/rockchip/01-nanopi 实际写入 .config
         cd ..
@@ -188,40 +174,71 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
+    # 关键步骤：用 OpenWrt 官方 scripts/config 命令修正 .config
+    - name: Fix packages and force testing kernel
+      env:
+        KERNEL_CHOICE: ${{ matrix.KERNEL }}
+      run: |
+        cd project/friendlywrt
+
+        # 确保 scripts/config 已经编译（defconfig 已跑过，应该已存在）
+        ls scripts/config/conf >/dev/null 2>&1 || make defconfig
+
+        echo "===== 禁用会在 6.18 内核下编译失败的包 ====="
+        for pkg in PACKAGE_file PACKAGE_libmagic PACKAGE_logrotate PACKAGE_vsftpd; do
+          echo "  disable $pkg"
+          ./scripts/config --disable "$pkg" 2>/dev/null || true
+        done
+
+        if [ "$KERNEL_CHOICE" == "6.18" ]; then
+          echo "===== 启用 6.18 测试内核 ====="
+          ./scripts/config --enable TESTING_KERNEL
+        else
+          echo "===== 使用 6.12 默认内核 ====="
+          ./scripts/config --disable TESTING_KERNEL 2>/dev/null || true
+        fi
+
+        echo "===== 同步依赖 ====="
+        make defconfig
+
+        echo "===== 二次强制（防止 defconfig 回滚） ====="
+        for pkg in PACKAGE_file PACKAGE_libmagic PACKAGE_logrotate PACKAGE_vsftpd; do
+          ./scripts/config --disable "$pkg" 2>/dev/null || true
+        done
+        if [ "$KERNEL_CHOICE" == "6.18" ]; then
+          ./scripts/config --enable TESTING_KERNEL
+        else
+          ./scripts/config --disable TESTING_KERNEL 2>/dev/null || true
+        fi
+        make defconfig
+
+        echo "===== 从源码树移除问题包 ====="
+        rm -rf feeds/packages/libs/file       2>/dev/null || true
+        rm -rf feeds/packages/utils/logrotate 2>/dev/null || true
+        rm -rf feeds/packages/net/vsftpd      2>/dev/null || true
+
+        echo "===== 最终状态 ====="
+        grep -E "CONFIG_TESTING_KERNEL|CONFIG_PACKAGE_(file|libmagic|logrotate|vsftpd)" .config || echo "(none)"
+
     - name: Verify config
       run: |
         cd project/friendlywrt
         echo "=== 内核版本 ==="
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
         echo "=== TESTING_KERNEL 状态 ==="
-        grep -E 'CONFIG_TESTING_KERNEL' .config || echo "(none)"
+        grep -E "CONFIG_TESTING_KERNEL" .config || echo "(none)"
         echo "=== Clashoo 相关 ==="
         grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || echo "WARNING"
         echo "=== 屏蔽包 ==="
         for pkg in luci-app-cpufreq luci-app-hd-idle luci-app-nlbwmon luci-app-smartdns; do
           grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "[OK] $pkg disabled" || echo "[WARN] $pkg"
         done
+        echo "=== 问题包状态 ==="
+        for pkg in file libmagic logrotate vsftpd; do
+          grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "[OK] $pkg disabled" || echo "[WARN] $pkg"
+        done
         echo "=== UCI defaults ==="
         ls -la files/etc/uci-defaults/ || true
-
-    # 修复：禁用编译失败的 file 包
-    - name: Fix conflicting file package
-      run: |
-        cd project/friendlywrt
-        echo "=== 检查 file 包来源 ==="
-        ls -la feeds/packages/libs/file/ 2>/dev/null && echo "[found in feeds]" || echo "[not in feeds]"
-
-        # file 命令在 6.12 内核 + musl 下编译失败，禁用
-        sed -i '/^CONFIG_PACKAGE_file=y$/d' .config
-        sed -i '/^CONFIG_PACKAGE_libmagic=y$/d' .config
-        grep -q "^# CONFIG_PACKAGE_file is not set" .config || echo "# CONFIG_PACKAGE_file is not set" >> .config
-        grep -q "^# CONFIG_PACKAGE_libmagic is not set" .config || echo "# CONFIG_PACKAGE_libmagic is not set" >> .config
-
-        # 从源码树中移除 file 包，避免 make 重新拉入
-        rm -rf feeds/packages/libs/file 2>/dev/null || true
-
-        echo "=== 确认 file 已禁用 ==="
-        grep -E "CONFIG_PACKAGE_(file|libmagic)" .config || echo "(no file config)"
 
     - name: Download package
       run: |
