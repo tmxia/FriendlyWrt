@@ -126,10 +126,10 @@ jobs:
         echo "--- 原始 Makefile 内核配置 ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
 
-        # 让 KERNEL_PATCHVER 格式统一为 "KERNEL_PATCHVER := x.x"，方便后续脚本 grep
+        # 统一格式，方便后续 grep
         sed -i 's/^KERNEL_PATCHVER:=/KERNEL_PATCHVER := /' target/linux/rockchip/Makefile
 
-        # 若选了 6.18，写入 KERNEL_TESTING_PATCHVER
+        # 按选择写入 KERNEL_TESTING_PATCHVER
         if [ "${{ matrix.KERNEL }}" == "6.18" ]; then
           sed -i '/^KERNEL_TESTING_PATCHVER/d' target/linux/rockchip/Makefile
           sed -i '/^KERNEL_PATCHVER/a KERNEL_TESTING_PATCHVER:=6.18' target/linux/rockchip/Makefile
@@ -140,7 +140,7 @@ jobs:
         echo "--- 修正后 Makefile ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile
 
-        # 准备初始 .config
+        # 初始 .config（仅目标平台）
         cat > .config <<'EOF'
         CONFIG_TARGET_rockchip=y
         CONFIG_TARGET_rockchip_armv8=y
@@ -174,51 +174,55 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 关键步骤：用 OpenWrt 官方 scripts/config 命令修正 .config
+    # 关键步骤：用 sed 直接改 .config，禁用问题包 + 强制 testing kernel
     - name: Fix packages and force testing kernel
       env:
         KERNEL_CHOICE: ${{ matrix.KERNEL }}
       run: |
         cd project/friendlywrt
 
-        # 确保 scripts/config 已经编译（defconfig 已跑过，应该已存在）
-        ls scripts/config/conf >/dev/null 2>&1 || make defconfig
-
-        echo "===== 禁用会在 6.18 内核下编译失败的包 ====="
-        for pkg in PACKAGE_file PACKAGE_libmagic PACKAGE_logrotate PACKAGE_vsftpd; do
-          echo "  disable $pkg"
-          ./scripts/config --disable "$pkg" 2>/dev/null || true
+        echo "===== 1. 禁用会在 6.12/6.18 下编译失败的非核心包 ====="
+        for pkg in file libmagic logrotate vsftpd; do
+          sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+          sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+          echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
         done
 
+        echo "===== 2. 设置内核选择 ====="
+        sed -i '/^CONFIG_TESTING_KERNEL=/d' .config
+        sed -i '/^# CONFIG_TESTING_KERNEL is not set/d' .config
         if [ "$KERNEL_CHOICE" == "6.18" ]; then
-          echo "===== 启用 6.18 测试内核 ====="
-          ./scripts/config --enable TESTING_KERNEL
+          echo "CONFIG_TESTING_KERNEL=y" >> .config
         else
-          echo "===== 使用 6.12 默认内核 ====="
-          ./scripts/config --disable TESTING_KERNEL 2>/dev/null || true
+          echo "# CONFIG_TESTING_KERNEL is not set" >> .config
         fi
 
-        echo "===== 同步依赖 ====="
+        echo "===== 3. make defconfig 同步依赖 ====="
         make defconfig
 
-        echo "===== 二次强制（防止 defconfig 回滚） ====="
-        for pkg in PACKAGE_file PACKAGE_libmagic PACKAGE_logrotate PACKAGE_vsftpd; do
-          ./scripts/config --disable "$pkg" 2>/dev/null || true
+        echo "===== 4. defconfig 后二次强制（防回滚） ====="
+        for pkg in file libmagic logrotate vsftpd; do
+          sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+          sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+          echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
         done
+        sed -i '/^CONFIG_TESTING_KERNEL=/d' .config
+        sed -i '/^# CONFIG_TESTING_KERNEL is not set/d' .config
         if [ "$KERNEL_CHOICE" == "6.18" ]; then
-          ./scripts/config --enable TESTING_KERNEL
+          echo "CONFIG_TESTING_KERNEL=y" >> .config
         else
-          ./scripts/config --disable TESTING_KERNEL 2>/dev/null || true
+          echo "# CONFIG_TESTING_KERNEL is not set" >> .config
         fi
-        make defconfig
 
-        echo "===== 从源码树移除问题包 ====="
+        echo "===== 5. 从源码树移除问题包 ====="
         rm -rf feeds/packages/libs/file       2>/dev/null || true
         rm -rf feeds/packages/utils/logrotate 2>/dev/null || true
         rm -rf feeds/packages/net/vsftpd      2>/dev/null || true
 
-        echo "===== 最终状态 ====="
-        grep -E "CONFIG_TESTING_KERNEL|CONFIG_PACKAGE_(file|libmagic|logrotate|vsftpd)" .config || echo "(none)"
+        echo "===== 6. 最终状态 ====="
+        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile
+        grep -E "CONFIG_TESTING_KERNEL" .config || echo "(TESTING_KERNEL none)"
+        grep -E "CONFIG_PACKAGE_(file|libmagic|logrotate|vsftpd) " .config || echo "(no problem pkgs config)"
 
     - name: Verify config
       run: |
