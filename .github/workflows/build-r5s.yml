@@ -3,15 +3,6 @@ name: Build OpenWrt for NanoPi R5S
 on:
   workflow_dispatch:
     inputs:
-      kernel:
-        description: 'Kernel version'
-        required: true
-        default: '6.12'
-        type: choice
-        options:
-          - '6.12'
-          - '6.18'
-          - 'both'
       replace_existing:
         description: 'Replace existing release tag (overwrite)'
         required: false
@@ -86,15 +77,7 @@ jobs:
     if: |
       github.event.repository.owner.id == github.event.sender.id &&
       github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        KERNEL: ${{ fromJSON(github.event.inputs.kernel == 'both' && '["6.12","6.18"]' || format('["{0}"]', github.event.inputs.kernel)) }}
     steps:
-    - name: Show build configuration
-      run: |
-        echo "Building kernel: ${{ matrix.KERNEL }}"
-
     - name: Checkout
       uses: actions/checkout@v4
 
@@ -126,21 +109,13 @@ jobs:
         echo "--- 原始 Makefile 内核配置 ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
 
-        # 统一格式，方便后续 grep
+        # 为了让 add_packages.sh 里的 awk '{print $3}' 读到 6.12，
+        # 临时把 KERNEL_PATCHVER:=6.12 改成 "KERNEL_PATCHVER := 6.12"（多两个空格）
         sed -i 's/^KERNEL_PATCHVER:=/KERNEL_PATCHVER := /' target/linux/rockchip/Makefile
+        echo "--- 临时调整后 ---"
+        grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile
 
-        # 按选择写入 KERNEL_TESTING_PATCHVER
-        if [ "${{ matrix.KERNEL }}" == "6.18" ]; then
-          sed -i '/^KERNEL_TESTING_PATCHVER/d' target/linux/rockchip/Makefile
-          sed -i '/^KERNEL_PATCHVER/a KERNEL_TESTING_PATCHVER:=6.18' target/linux/rockchip/Makefile
-        else
-          sed -i '/^KERNEL_TESTING_PATCHVER/d' target/linux/rockchip/Makefile
-        fi
-
-        echo "--- 修正后 Makefile ---"
-        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile
-
-        # 初始 .config（仅目标平台）
+        # 初始 .config（仅目标平台，不启用 TESTING_KERNEL）
         cat > .config <<'EOF'
         CONFIG_TARGET_rockchip=y
         CONFIG_TARGET_rockchip_armv8=y
@@ -174,33 +149,31 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 关键步骤：用 sed 直接改 .config，禁用问题包 + 强制 testing kernel
-    - name: Fix packages and force testing kernel
-      env:
-        KERNEL_CHOICE: ${{ matrix.KERNEL }}
+    # 脚本跑完后，把 Makefile 恢复成 OpenWrt 官方格式，避免 kernel-version.mk 解析失败
+    - name: Restore Makefile format and disable problem packages
       run: |
         cd project/friendlywrt
 
-        echo "===== 1. 禁用会在 6.12/6.18 下编译失败的非核心包 ====="
+        echo "===== 1. 恢复 KERNEL_PATCHVER 官方格式 ====="
+        sed -i 's/^KERNEL_PATCHVER := /KERNEL_PATCHVER:=/' target/linux/rockchip/Makefile
+        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
+
+        echo "===== 2. 禁用会编译失败的非核心包 ====="
         for pkg in file libmagic logrotate vsftpd; do
           sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
           sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
         done
 
-        echo "===== 2. 设置内核选择 ====="
+        echo "===== 3. 确保 TESTING_KERNEL 未启用（25.12 只支持 6.12） ====="
         sed -i '/^CONFIG_TESTING_KERNEL=/d' .config
         sed -i '/^# CONFIG_TESTING_KERNEL is not set/d' .config
-        if [ "$KERNEL_CHOICE" == "6.18" ]; then
-          echo "CONFIG_TESTING_KERNEL=y" >> .config
-        else
-          echo "# CONFIG_TESTING_KERNEL is not set" >> .config
-        fi
+        echo "# CONFIG_TESTING_KERNEL is not set" >> .config
 
-        echo "===== 3. make defconfig 同步依赖 ====="
+        echo "===== 4. make defconfig 同步依赖 ====="
         make defconfig
 
-        echo "===== 4. defconfig 后二次强制（防回滚） ====="
+        echo "===== 5. defconfig 后二次强制 ====="
         for pkg in file libmagic logrotate vsftpd; do
           sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
           sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -208,19 +181,15 @@ jobs:
         done
         sed -i '/^CONFIG_TESTING_KERNEL=/d' .config
         sed -i '/^# CONFIG_TESTING_KERNEL is not set/d' .config
-        if [ "$KERNEL_CHOICE" == "6.18" ]; then
-          echo "CONFIG_TESTING_KERNEL=y" >> .config
-        else
-          echo "# CONFIG_TESTING_KERNEL is not set" >> .config
-        fi
+        echo "# CONFIG_TESTING_KERNEL is not set" >> .config
 
-        echo "===== 5. 从源码树移除问题包 ====="
+        echo "===== 6. 从源码树移除问题包 ====="
         rm -rf feeds/packages/libs/file       2>/dev/null || true
         rm -rf feeds/packages/utils/logrotate 2>/dev/null || true
         rm -rf feeds/packages/net/vsftpd      2>/dev/null || true
 
-        echo "===== 6. 最终状态 ====="
-        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile
+        echo "===== 7. 最终状态 ====="
+        grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
         grep -E "CONFIG_TESTING_KERNEL" .config || echo "(TESTING_KERNEL none)"
         grep -E "CONFIG_PACKAGE_(file|libmagic|logrotate|vsftpd) " .config || echo "(no problem pkgs config)"
 
@@ -241,6 +210,8 @@ jobs:
         for pkg in file libmagic logrotate vsftpd; do
           grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "[OK] $pkg disabled" || echo "[WARN] $pkg"
         done
+        echo "=== config-6.12 文件 ==="
+        ls -la target/linux/rockchip/config-6.12* 2>/dev/null || echo "(no config-6.12 file)"
         echo "=== UCI defaults ==="
         ls -la files/etc/uci-defaults/ || true
 
@@ -271,7 +242,7 @@ jobs:
         cp ${BIN_DIR}/kernel                ../../artifact/ 2>/dev/null || true
         cp ${BIN_DIR}/sha256sums           ../../artifact/ 2>/dev/null || true
 
-        tar czf ../../artifact/openwrt-rockchip-armv8-k${{ matrix.KERNEL }}-${{ github.run_number }}.tar.gz -C bin/targets/rockchip armv8/
+        tar czf ../../artifact/openwrt-rockchip-armv8-k6.12-${{ github.run_number }}.tar.gz -C bin/targets/rockchip armv8/
 
         echo "=== artifact ==="
         ls -la ../../artifact/
