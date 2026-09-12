@@ -109,20 +109,16 @@ jobs:
         echo "--- 原始 Makefile 内核配置 ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
 
-        # 为了让 add_packages.sh 里的 awk '{print $3}' 读到 6.12，
-        # 临时把 KERNEL_PATCHVER:=6.12 改成 "KERNEL_PATCHVER := 6.12"（多两个空格）
         sed -i 's/^KERNEL_PATCHVER:=/KERNEL_PATCHVER := /' target/linux/rockchip/Makefile
         echo "--- 临时调整后 ---"
         grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile
 
-        # 初始 .config（仅目标平台，不启用 TESTING_KERNEL）
         cat > .config <<'EOF'
         CONFIG_TARGET_rockchip=y
         CONFIG_TARGET_rockchip_armv8=y
         CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
         EOF
 
-        # 让脚本里的 configs/rockchip/01-nanopi 实际写入 .config
         cd ..
         mkdir -p configs/rockchip
         ln -sf "$(pwd)/friendlywrt/.config" configs/rockchip/01-nanopi
@@ -149,8 +145,7 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # 脚本跑完后，把 Makefile 恢复成 OpenWrt 官方格式，避免 kernel-version.mk 解析失败
-    - name: Restore Makefile format and disable problem packages
+    - name: Fix packages and restore Makefile format
       run: |
         cd project/friendlywrt
 
@@ -165,12 +160,12 @@ jobs:
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
         done
 
-        echo "===== 3. 确保 TESTING_KERNEL 未启用（25.12 只支持 6.12） ====="
+        echo "===== 3. 确保 TESTING_KERNEL 未启用 ====="
         sed -i '/^CONFIG_TESTING_KERNEL=/d' .config
         sed -i '/^# CONFIG_TESTING_KERNEL is not set/d' .config
         echo "# CONFIG_TESTING_KERNEL is not set" >> .config
 
-        echo "===== 4. make defconfig 同步依赖 ====="
+        echo "===== 4. make defconfig ====="
         make defconfig
 
         echo "===== 5. defconfig 后二次强制 ====="
@@ -212,6 +207,8 @@ jobs:
         done
         echo "=== config-6.12 文件 ==="
         ls -la target/linux/rockchip/config-6.12* 2>/dev/null || echo "(no config-6.12 file)"
+        echo "=== config-6.12 内容 ==="
+        cat target/linux/rockchip/config-6.12 2>/dev/null || true
         echo "=== UCI defaults ==="
         ls -la files/etc/uci-defaults/ || true
 
@@ -226,10 +223,33 @@ jobs:
       id: compile
       run: |
         cd project/friendlywrt
-        make -j$(nproc)
+
+        # 第一次：正常并行编译
+        set +e
+        make -j$(nproc) > /tmp/build.log 2>&1
+        BUILD_EXIT=$?
+        set -e
+
+        echo "===== 首次编译退出码: $BUILD_EXIT ====="
+        tail -50 /tmp/build.log
+
+        if [ $BUILD_EXIT -ne 0 ]; then
+          echo ""
+          echo "===== 编译失败，用 V=s -j1 重跑 target/linux/install 抓详细错误 ====="
+          set +e
+          make target/linux/install V=s -j1 > /tmp/install.log 2>&1
+          INSTALL_EXIT=$?
+          set -e
+          echo "install 退出码: $INSTALL_EXIT"
+          echo "===== install.log 最后 300 行 ====="
+          tail -300 /tmp/install.log
+        fi
+
+        exit $BUILD_EXIT
 
     - name: Collect artifacts
       id: collect
+      if: success()
       run: |
         cd project/friendlywrt
         BIN_DIR="bin/targets/rockchip/armv8"
@@ -248,6 +268,7 @@ jobs:
         ls -la ../../artifact/
 
     - name: Upload to release
+      if: success()
       uses: svenstaro/upload-release-action@v2
       with:
         repo_token: ${{ secrets.GITHUB_TOKEN }}
