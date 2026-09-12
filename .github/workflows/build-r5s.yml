@@ -34,7 +34,7 @@ on:
 
 env:
   AUTO_REPLACE_TAG: 'false'
-  # === 内核版本（改这里即可切换内核）===
+  # === 内核版本：仅在此处定义，其他位置统一通过 ${{ env.KERNEL_VERSION }} 引用 ===
   KERNEL_VERSION: '6.12'
   # === 发行名称（用于 tag 和产物命名）===
   DISTRO_NAME: 'OpenWrt'
@@ -104,7 +104,7 @@ jobs:
           overwrite: true
 
   # ============================================================
-  # 手动构建（含内核强制 6.12）
+  # 手动构建
   # ============================================================
   build_manual:
     needs: prepare_release
@@ -166,9 +166,9 @@ jobs:
         source ../scripts/custome_config.sh
 
     # ============================================================
-    # 强制内核版本为 6.12（在 build.sh 生成 .config 之前）
+    # 强制内核版本（在 build.sh 生成 .config 之前）
     # ============================================================
-    - name: Force kernel to ${{ env.KERNEL_VERSION }}
+    - name: Force kernel version
       run: |
         cd project/friendlywrt
         MAKEFILE="target/linux/rockchip/Makefile"
@@ -176,6 +176,7 @@ jobs:
           echo "ERROR: $MAKEFILE not found"
           exit 1
         fi
+        echo "Target kernel version: ${{ env.KERNEL_VERSION }}"
         echo "===== 修改前 ====="
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' "$MAKEFILE" || true
 
@@ -207,7 +208,6 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
-    # Force enable Clashoo
     - name: Update config after custom packages
       run: |
         cd project
@@ -221,9 +221,9 @@ jobs:
         make oldconfig
 
     # ============================================================
-    # make oldconfig 后再次强制 6.12
+    # 二次强制内核版本（防止被 make oldconfig 重置）
     # ============================================================
-    - name: Re-assert kernel ${{ env.KERNEL_VERSION }}
+    - name: Re-assert kernel version
       run: |
         cd project/friendlywrt
         MAKEFILE="target/linux/rockchip/Makefile"
@@ -396,9 +396,9 @@ jobs:
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
     # ============================================================
-    # 编译 uboot / kernel 前，第三次强制 6.12
+    # 编译 uboot / kernel 前，第三次强制内核版本
     # ============================================================
-    - name: Re-assert kernel ${{ env.KERNEL_VERSION }} before kernel build
+    - name: Re-assert kernel version before kernel build
       run: |
         cd project/friendlywrt
         sed -i 's/^KERNEL_PATCHVER[[:space:]]*:=.*/KERNEL_PATCHVER := ${{ env.KERNEL_VERSION }}/' target/linux/rockchip/Makefile
@@ -512,9 +512,9 @@ jobs:
         source ../scripts/custome_config.sh
 
     # ============================================================
-    # 强制内核版本为 6.12（build.sh 之前）
+    # 强制内核版本
     # ============================================================
-    - name: Force kernel to ${{ env.KERNEL_VERSION }}
+    - name: Force kernel version
       run: |
         cd project/friendlywrt
         MAKEFILE="target/linux/rockchip/Makefile"
@@ -522,6 +522,7 @@ jobs:
           echo "ERROR: $MAKEFILE not found"
           exit 1
         fi
+        echo "Target kernel version: ${{ env.KERNEL_VERSION }}"
         echo "===== 修改前 ====="
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' "$MAKEFILE" || true
 
@@ -566,9 +567,9 @@ jobs:
         make oldconfig
 
     # ============================================================
-    # 二次强制 6.12
+    # 二次强制内核版本
     # ============================================================
-    - name: Re-assert kernel ${{ env.KERNEL_VERSION }}
+    - name: Re-assert kernel version
       run: |
         cd project/friendlywrt
         MAKEFILE="target/linux/rockchip/Makefile"
@@ -737,9 +738,9 @@ jobs:
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
     # ============================================================
-    # 编译 uboot / kernel 前，第三次强制 6.12
+    # 编译 uboot / kernel 前，第三次强制内核版本
     # ============================================================
-    - name: Re-assert kernel ${{ env.KERNEL_VERSION }} before kernel build
+    - name: Re-assert kernel version before kernel build
       run: |
         cd project/friendlywrt
         sed -i 's/^KERNEL_PATCHVER[[:space:]]*:=.*/KERNEL_PATCHVER := ${{ env.KERNEL_VERSION }}/' target/linux/rockchip/Makefile
