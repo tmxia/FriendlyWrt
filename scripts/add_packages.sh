@@ -100,6 +100,10 @@ minidlna luci-app-minidlna
 luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
 luci-app-diskman collectd luci-app-statistics
 luci-app-watchcat luci-theme-openwrt-2020
+luci-app-cpufreq luci-i18n-cpufreq-zh-cn
+luci-app-hd-idle hd-idle luci-i18n-hd-idle-zh-cn
+luci-app-nlbwmon nlbwmon luci-i18n-nlbwmon-zh-cn
+luci-app-smartdns smartdns luci-i18n-smartdns-zh-cn
 "
 
 for pkg in $DISABLE_PKGS; do
