@@ -1,4 +1,4 @@
-name: Build FriendlyWrt New
+name: Build OpenWrt for NanoPi R5S
 
 on:
   workflow_dispatch:
@@ -278,5 +278,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt New"
+          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
           repository: ${{ github.repository }}
