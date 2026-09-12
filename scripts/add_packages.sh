@@ -1,162 +1,202 @@
-#!/bin/bash
-set -e
+name: Build OpenWrt for NanoPi R5S
 
-# Ensure feeds.conf exists
-(cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
+on:
+  watch:
+    types: started
+  workflow_dispatch:
+    inputs:
+      replace_existing:
+        description: 'Replace existing release tag (overwrite)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
-# Add Clashoo feed if missing
-FEED_CONF="friendlywrt/feeds.conf"
-grep -q "src-git clashoo" "$FEED_CONF" || echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> "$FEED_CONF"
+env:
+  AUTO_REPLACE_TAG: 'false'
+  OPENWRT_BRANCH: 'openwrt-25.12'
+  FLAVOR: 'r5s'
 
-# Add Clashoo packages to target config
-CONFIG_FILE="configs/rockchip/01-nanopi"
-grep -q "CONFIG_PACKAGE_luci-app-clashoo" "$CONFIG_FILE" || cat >> "$CONFIG_FILE" << EOF
+jobs:
+  prepare_release:
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.tag }}
+      upload_url: ${{ steps.release.outputs.upload_url }}
+    steps:
+      - name: Generate unique release tag
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_TAG="OpenWrt-R5S-$(date +%Y-%m-%d)"
+          FORCE_BASE=false
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
+            FORCE_BASE=true
+          elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
+            FORCE_BASE=true
+          fi
 
-# Clashoo packages
-CONFIG_PACKAGE_clashoo=y
-CONFIG_PACKAGE_luci-app-clashoo=y
-CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
-CONFIG_PACKAGE_kmod-inet-diag=y
-EOF
+          if [ "$FORCE_BASE" = "true" ]; then
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            for tag in $EXISTING_TAGS; do
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+              git push origin --delete "refs/tags/$tag" || true
+            done
+            TAG="$BASE_TAG"
+          else
+            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+            if [ -z "$EXISTING_TAGS" ]; then
+              TAG="$BASE_TAG"
+            else
+              MAX_NUM=0
+              for t in $EXISTING_TAGS; do
+                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                  NUM=${BASH_REMATCH[1]}
+                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+                fi
+              done
+              TAG="${BASE_TAG}-$((MAX_NUM + 1))"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
 
-# Required system packages
-ENSURE_PKGS="
-bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
-"
+      - name: Create or update release
+        id: release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          allow_updates: true
+          overwrite: true
 
-for pkg in $ENSURE_PKGS; do
-    grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
-done
+  build:
+    needs: prepare_release
+    runs-on: ubuntu-22.04
+    if: github.event.repository.owner.id == github.event.sender.id
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
 
-# Update and install Clashoo feed
-(cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
+    - name: Initialization environment
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq build-essential clang flex bison g++ gawk \
+          gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+          python3 python3-distutils python3-setuptools rsync unzip zlib1g-dev \
+          file wget subversion libelf-dev ecj fastjar swig time xsltproc zip
+        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
+        mkdir -p ./artifact
+        echo "CPU cores: $(nproc)"
 
-# Enable kernel INET_DIAG dependencies for Clashoo
-cd friendlywrt
-KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
-[ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
-KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
-touch "$KERNEL_CONFIG_FILE"
+    - name: Prepare FriendlyWrt-style workspace using OpenWrt official source
+      run: |
+        mkdir -p project
+        cd project
+        git clone --depth 1 -b ${{ env.OPENWRT_BRANCH }} \
+          https://github.com/openwrt/openwrt.git friendlywrt > /dev/null 2>&1
+        # 让 OpenWrt 使用 FriendlyWrt 风格的配置文件
+        cd friendlywrt
+        cp feeds.conf.default feeds.conf
+        ./scripts/feeds update -a > /dev/null 2>&1
+        ./scripts/feeds install -a > /dev/null 2>&1
+        cd ..
+        # 创建 FriendlyWrt 风格的 configs 目录（脚本会向其追加内容）
+        mkdir -p configs/rockchip
+        touch configs/rockchip/01-nanopi
+        echo "Workspace prepared with OpenWrt ${{ env.OPENWRT_BRANCH }}"
 
-sed -i '/^# CONFIG_INET_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-sed -i '/^# CONFIG_INET_TCP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-sed -i '/^# CONFIG_INET_UDP_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-sed -i '/^# CONFIG_INET_RAW_DIAG is not set/d' "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_TCP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_UDP_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-echo "CONFIG_INET_RAW_DIAG=y" >> "$KERNEL_CONFIG_FILE"
-echo "Kernel config updated: $KERNEL_CONFIG_FILE"
-cd ..
+    - name: Initialize .config with R5S target
+      run: |
+        cd project/friendlywrt
+        cat > .config <<'EOF'
+        CONFIG_TARGET_rockchip=y
+        CONFIG_TARGET_rockchip_armv8=y
+        CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
+        CONFIG_LUCI_LANG_zh_Hans=y
+        EOF
+        make defconfig > /dev/null 2>&1
+        echo "Initial .config created"
 
-# UCI default settings for side-router
-mkdir -p friendlywrt/files/etc/uci-defaults
-cat > friendlywrt/files/etc/uci-defaults/99-custom << 'EOF'
-#!/bin/sh
-uci set network.lan.ipaddr='192.168.3.3/24'
-uci set network.lan.gateway='192.168.3.1'
-uci set network.lan.dns='192.168.3.1'
-uci delete network.lan.netmask 2>/dev/null
-uci commit network
-uci set dhcp.lan.ignore='1'
-uci commit dhcp
-uci set firewall.@zone[0].network='lan'
-uci commit firewall
-uci set network.wan.clientid=''
-uci commit network
+    - name: Verify upstream kernel version (must be 6.12)
+      run: |
+        cd project/friendlywrt
+        KV=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
+        echo "OpenWrt Rockchip target KERNEL_PATCHVER = $KV"
+        if [ "$KV" != "6.12" ]; then
+          echo "ERROR: expected 6.12 kernel, got $KV"
+          exit 1
+        fi
+        test -f target/linux/rockchip/config-6.12 && echo "config-6.12 present"
 
-printf "tony\ntony\n" | passwd root
+    - name: Apply customizations (original script, unmodified)
+      run: |
+        cd project
+        bash ../scripts/add_packages.sh
 
-uci set luci.main.mediaurlbase='/luci-static/bootstrap'
-uci delete luci.themes.Argon 2>/dev/null || true
-uci commit luci
-rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null
-/etc/init.d/uhttpd restart
+    - name: Final config check
+      run: |
+        cd project/friendlywrt
+        echo "--- Clashoo packages ---"
+        grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || true
+        echo "--- Kernel INET_DIAG ---"
+        grep -E "CONFIG_INET_DIAG|CONFIG_INET_TCP_DIAG|CONFIG_INET_UDP_DIAG|CONFIG_INET_RAW_DIAG" target/linux/rockchip/config-6.12 || true
 
-/etc/init.d/network restart
-/etc/init.d/firewall restart
-exit 0
-EOF
-chmod +x friendlywrt/files/etc/uci-defaults/99-custom
+    - name: Download packages
+      run: |
+        cd project/friendlywrt
+        make download -j$(nproc) > /dev/null 2>&1
+        echo "Package download completed"
 
-cd friendlywrt
+    - name: Compile OpenWrt
+      run: |
+        cd project/friendlywrt
+        make -j$(nproc) > /dev/null 2>&1
+        echo "Compile finished"
 
-# Disable global build options that may cause conflicts
-for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
-    sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || echo "# ${opt} is not set" >> .config
-done
+    - name: Collect artifacts
+      run: |
+        cd project/friendlywrt
+        ls -lh bin/targets/rockchip/armv8/ | head -30
+        find bin/targets/rockchip/armv8/ -maxdepth 1 -type f \
+          \( -name "*nanopi-r5s*.img.gz" -o -name "*nanopi-r5s*.manifest" \
+             -o -name "*nanopi-r5s*.tar.gz" \) \
+          -exec cp {} ../../artifact/ \;
+        echo "--- Collected artifacts ---"
+        ls -lh ../../artifact/
 
-make defconfig
+    - name: Upload artifacts to release
+      uses: svenstaro/upload-release-action@v2
+      with:
+        repo_token: ${{ secrets.GITHUB_TOKEN }}
+        file: ./artifact/*
+        tag: ${{ needs.prepare_release.outputs.release_tag }}
+        overwrite: true
+        file_glob: true
 
-# Packages to explicitly remove
-DISABLE_PKGS="
-adblock luci-app-adblock
-aria2 luci-app-aria2
-sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
-ddns-scripts luci-app-ddns
-miniupnpd-nftables luci-app-upnp
-samba4-libs samba4-server luci-app-samba4
-minidlna luci-app-minidlna
-luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
-luci-app-diskman collectd luci-app-statistics
-luci-app-watchcat luci-theme-openwrt-2020
-luci-app-cpufreq luci-i18n-cpufreq-zh-cn
-luci-app-hd-idle hd-idle luci-i18n-hd-idle-zh-cn
-luci-app-nlbwmon nlbwmon luci-i18n-nlbwmon-zh-cn
-luci-app-smartdns smartdns luci-i18n-smartdns-zh-cn
-"
-
-for pkg in $DISABLE_PKGS; do
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
-done
-
-# Force-enable required packages
-for pkg in $ENSURE_PKGS; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
-    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-done
-
-# Ensure Clashoo packages are enabled (two-pass for robustness)
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
-    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-done
-
-# Second pass to overwrite any accidental removals
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-    echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-done
-
-# Verify critical packages are enabled
-echo "=== Verifying Clashoo packages ==="
-MISSING=0
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-        echo "[OK] CONFIG_PACKAGE_${pkg}=y"
-    else
-        echo "[FAIL] CONFIG_PACKAGE_${pkg} not enabled"
-        MISSING=1
-    fi
-done
-if [ $MISSING -eq 1 ]; then
-    echo "ERROR: Clashoo packages missing, aborting."
-    exit 1
-fi
-
-# Print final status summary
-echo "=== Final package status ==="
-check_pkg() {
-    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
-}
-echo "--- ENABLED ---"
-for pkg in $ENSURE_PKGS; do check_pkg "$pkg"; done
-echo "--- DISABLED ---"
-for pkg in $DISABLE_PKGS; do check_pkg "$pkg"; done
-
-cd ..
-echo "All configurations applied and verified."
+  cleanup_self:
+    name: Cleanup Self Workflow History
+    runs-on: ubuntu-latest
+    needs: [prepare_release, build]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 0
+          retain_days: 0
+          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
+          repository: ${{ github.repository }}
