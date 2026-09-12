@@ -36,6 +36,8 @@ env:
   AUTO_REPLACE_TAG: 'false'
   # === 内核版本（改这里即可切换内核）===
   KERNEL_VERSION: '6.12'
+  # === 发行名称（用于 tag 和产物命名）===
+  DISTRO_NAME: 'OpenWrt'
 
 jobs:
   prepare_release:
@@ -50,7 +52,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="FriendlyWrt-$(date +%Y-%m-%d)"
+          KV="${{ env.KERNEL_VERSION }}"
+          BASE_TAG="OpenWrt-R5S-K${KV}-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -163,7 +166,7 @@ jobs:
         source ../scripts/custome_config.sh
 
     # ============================================================
-    # [新增] 强制内核版本为 6.12（在 build.sh 生成 .config 之前）
+    # 强制内核版本为 6.12（在 build.sh 生成 .config 之前）
     # ============================================================
     - name: Force kernel to ${{ env.KERNEL_VERSION }}
       run: |
@@ -176,15 +179,11 @@ jobs:
         echo "===== 修改前 ====="
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' "$MAKEFILE" || true
 
-        # 统一格式并强制为 6.12
         sed -i 's/^KERNEL_PATCHVER:=/KERNEL_PATCHVER := /' "$MAKEFILE"
         sed -i 's/^KERNEL_PATCHVER[[:space:]]*:=.*/KERNEL_PATCHVER := ${{ env.KERNEL_VERSION }}/' "$MAKEFILE"
-        # 若原文件用不同写法（如 KERNEL_PATCHVER?=），也一并覆盖
         if ! grep -qE "^KERNEL_PATCHVER[[:space:]]*:=" "$MAKEFILE"; then
           echo "KERNEL_PATCHVER := ${{ env.KERNEL_VERSION }}" >> "$MAKEFILE"
         fi
-
-        # 顺便确保 TESTING_KERNEL 关闭（避免自动切到更新的 testing 内核）
         sed -i 's/^KERNEL_TESTING_PATCHVER.*/# &/' "$MAKEFILE" 2>/dev/null || true
 
         echo "===== 修改后 ====="
@@ -222,7 +221,7 @@ jobs:
         make oldconfig
 
     # ============================================================
-    # [新增] make oldconfig 后再次强制 6.12（防止被 defconfig 重置）
+    # make oldconfig 后再次强制 6.12
     # ============================================================
     - name: Re-assert kernel ${{ env.KERNEL_VERSION }}
       run: |
@@ -262,7 +261,7 @@ jobs:
         cd project
         source .current_config.mk
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        rootfs_filename="rootfs-openwrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
         tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
               ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
@@ -328,7 +327,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
+        fileName: "rootfs-openwrt-${{ matrix.VERSION }}.tgz"
 
     - name: Download friendlywrt rootfs (docker)
       if: matrix.SET == 'docker'
@@ -338,7 +337,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker.tgz"
+        fileName: "rootfs-openwrt-${{ matrix.VERSION }}-docker.tgz"
 
     - name: Download host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -365,8 +364,10 @@ jobs:
           ;;
         esac
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.img
-        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.tgz
+        KV="${{ env.KERNEL_VERSION }}"
+        DN="${{ env.DISTRO_NAME }}"
+        IMG_FILE=${MODEL}-${DN}-K${KV}-${{ matrix.VERSION }}${SUFFIX}.img
+        TGZ_FILE=images-${MODEL}-${DN}-K${KV}-${{ matrix.VERSION }}${SUFFIX}.tgz
         DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
 
         CONFIG=rockchip${SUFFIX}
@@ -386,7 +387,7 @@ jobs:
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        tar xzf "../rootfs-openwrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -395,8 +396,7 @@ jobs:
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
     # ============================================================
-    # [新增] 编译 uboot / kernel 前，第三次强制 6.12
-    # （build.sh kernel 会读取 target/linux/rockchip/Makefile）
+    # 编译 uboot / kernel 前，第三次强制 6.12
     # ============================================================
     - name: Re-assert kernel ${{ env.KERNEL_VERSION }} before kernel build
       run: |
@@ -452,7 +452,7 @@ jobs:
         overwrite: true
 
   # ============================================================
-  # 定时/自动构建（同样含内核强制 6.12）
+  # 定时/自动构建
   # ============================================================
   build_auto:
     needs: prepare_release
@@ -512,7 +512,7 @@ jobs:
         source ../scripts/custome_config.sh
 
     # ============================================================
-    # [新增] 强制内核版本为 6.12（build.sh 之前）
+    # 强制内核版本为 6.12（build.sh 之前）
     # ============================================================
     - name: Force kernel to ${{ env.KERNEL_VERSION }}
       run: |
@@ -566,7 +566,7 @@ jobs:
         make oldconfig
 
     # ============================================================
-    # [新增] 二次强制 6.12
+    # 二次强制 6.12
     # ============================================================
     - name: Re-assert kernel ${{ env.KERNEL_VERSION }}
       run: |
@@ -604,7 +604,7 @@ jobs:
         cd project
         source .current_config.mk
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        rootfs_filename="rootfs-openwrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
         tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
               ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
@@ -669,7 +669,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}.tgz"
+        fileName: "rootfs-openwrt-${{ matrix.VERSION }}.tgz"
 
     - name: Download friendlywrt rootfs (docker)
       if: matrix.SET == 'docker'
@@ -679,7 +679,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker.tgz"
+        fileName: "rootfs-openwrt-${{ matrix.VERSION }}-docker.tgz"
 
     - name: Download host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -705,8 +705,10 @@ jobs:
           ;;
         esac
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.img
-        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}.tgz
+        KV="${{ env.KERNEL_VERSION }}"
+        DN="${{ env.DISTRO_NAME }}"
+        IMG_FILE=${MODEL}-${DN}-K${KV}-${{ matrix.VERSION }}${SUFFIX}.img
+        TGZ_FILE=images-${MODEL}-${DN}-K${KV}-${{ matrix.VERSION }}${SUFFIX}.tgz
         DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
 
         CONFIG=rockchip${SUFFIX}
@@ -726,7 +728,7 @@ jobs:
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
+        tar xzf "../rootfs-openwrt-${{ matrix.VERSION }}${SUFFIX}.tgz"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -735,7 +737,7 @@ jobs:
         tar xzf "../host-pm-${{ matrix.VERSION }}.tgz"
 
     # ============================================================
-    # [新增] 编译 uboot / kernel 前，第三次强制 6.12
+    # 编译 uboot / kernel 前，第三次强制 6.12
     # ============================================================
     - name: Re-assert kernel ${{ env.KERNEL_VERSION }} before kernel build
       run: |
@@ -803,7 +805,7 @@ jobs:
         gh release view "$RELEASE_TAG" \
           --repo "$GITHUB_REPOSITORY" \
           --json assets \
-          --jq '.assets[] | select(.name | startswith("rootfs-friendlywrt-") or startswith("host-pm-")) | .name' \
+          --jq '.assets[] | select(.name | startswith("rootfs-openwrt-") or startswith("host-pm-")) | .name' \
         | while read -r asset; do
             [ -z "$asset" ] && continue
             echo "Deleting asset: $asset"
