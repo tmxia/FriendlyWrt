@@ -90,10 +90,18 @@ jobs:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq build-essential clang flex bison g++ gawk \
-          gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
-          python3 python3-distutils python3-setuptools rsync unzip zlib1g-dev \
-          file wget subversion libelf-dev ecj fastjar swig time xsltproc zip
+        sudo apt-get install -y -qq \
+          build-essential ccache ecj fastjar file g++ gawk gettext git \
+          java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
+          libssl-dev python3 python3-dev python3-distutils python3-setuptools \
+          python3-pip python3-venv rsync subversion swig time xsltproc zlib1g-dev \
+          bison flex libtool libtool-bin pkg-config \
+          libgmp-dev libmpc-dev libmpfr-dev \
+          gperf patch quilt cpio \
+          liblzma-dev libbz2-dev \
+          device-tree-compiler u-boot-tools \
+          bzip2 xz-utils zip unzip wget curl \
+          autoconf automake autopoint texinfo help2man
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
         mkdir -p ./artifact
         echo "CPU cores: $(nproc)"
@@ -105,11 +113,8 @@ jobs:
         git clone --depth 1 -b ${{ env.OPENWRT_BRANCH }} \
           https://github.com/openwrt/openwrt.git friendlywrt > /dev/null 2>&1
         cd friendlywrt
-        # 用 feeds.conf.default 更新/安装 feeds（feeds 元数据随后保留在 feeds/ 目录中）
         ./scripts/feeds update -a > /dev/null 2>&1
         ./scripts/feeds install -a > /dev/null 2>&1
-        # 关键：删除 feeds.conf，让 add_packages.sh 依其原逻辑自行创建
-        # （否则 [ ! -f feeds.conf ] 为 false，配合 set -e 会导致脚本立即退出）
         rm -f feeds.conf
         cd ..
         mkdir -p configs/rockchip
@@ -142,7 +147,6 @@ jobs:
     - name: Bridge add_packages.sh kernel config path
       run: |
         cd project/friendlywrt/target/linux/rockchip
-        # add_packages.sh 内部 fallback 到 config-6.1，通过符号链接桥接到实际生效的 armv8/config-6.12
         if [ ! -e config-6.1 ]; then
           ln -s armv8/config-6.12 config-6.1
         fi
@@ -164,13 +168,24 @@ jobs:
     - name: Download packages
       run: |
         cd project/friendlywrt
-        make download -j$(nproc) > /dev/null 2>&1
-        echo "Package download completed"
+        if make download -j$(nproc) > /tmp/dl.log 2>&1; then
+          echo "Package download completed"
+        else
+          echo "::warning::make download reported errors, showing context:"
+          grep -iE "error|fail|404|not found|unable|invalid|denied|timeout|refused|missing" /tmp/dl.log | head -30 || true
+          echo "Continuing; make will retry missing sources during compile."
+        fi
 
     - name: Compile OpenWrt
       run: |
         cd project/friendlywrt
-        make -j$(nproc) > /dev/null 2>&1
+        if ! make -j$(nproc) > /tmp/build.log 2>&1; then
+          echo "Build failed. Last 100 lines:"
+          tail -100 /tmp/build.log
+          echo "--- Errors summary ---"
+          grep -iE "error:|ERROR|failed" /tmp/build.log | tail -30 || true
+          exit 1
+        fi
         echo "Compile finished"
 
     - name: Collect artifacts
