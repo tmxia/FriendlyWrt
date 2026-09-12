@@ -35,6 +35,7 @@ on:
 env:
   AUTO_REPLACE_TAG: 'false'
   KERNEL_VERSION: '6.12'
+  FLAVOR: 'r5s'
 
 jobs:
   prepare_release:
@@ -49,7 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="FriendlyWrt-K6.12-$(date +%Y-%m-%d)"
+          BASE_TAG="OpenWrt-R5S-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -148,7 +149,7 @@ jobs:
         cd project
         source ../scripts/custome_config.sh
 
-    - name: Configure OpenWrt 6.12 kernel
+    - name: Configure OpenWrt kernel
       run: |
         cd project
         if [ -f friendlywrt/target/linux/rockchip/Makefile ]; then
@@ -207,7 +208,7 @@ jobs:
         make download -j$(nproc) > /dev/null 2>&1
         echo "Package download completed"
 
-    - name: Compile friendlyWrt (OpenWrt kernel 6.12)
+    - name: Compile OpenWrt
       id: compile
       run: |
         cd project/friendlywrt
@@ -220,7 +221,7 @@ jobs:
         cd project
         source .current_config.mk
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.tgz"
+        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.tgz"
         tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
               ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
@@ -249,7 +250,7 @@ jobs:
             exit 1
           fi
         fi
-        host_pm_filename="host-pm-${{ matrix.VERSION }}-k6.12.tgz"
+        host_pm_filename="host-pm-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
         tar czf ../artifact/${host_pm_filename} "$PM_BIN"
         echo "host_pm_filename=$host_pm_filename" >> $GITHUB_OUTPUT
         echo "Created $host_pm_filename"
@@ -281,7 +282,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-k6.12.tgz"
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
 
     - name: Download friendlywrt rootfs (docker)
       if: matrix.SET == 'docker'
@@ -291,7 +292,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker-k6.12.tgz"
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker-${{ env.FLAVOR }}.tgz"
 
     - name: Download host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -301,7 +302,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "host-pm-${{ matrix.VERSION }}-k6.12.tgz"
+        fileName: "host-pm-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
 
     - name: Prepare config for img
       id: config
@@ -310,8 +311,8 @@ jobs:
         CPU=rk3568
         MODEL=R5S-R5C-Series
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.img
-        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.tgz
+        IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.img
+        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.tgz
         DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
         CONFIG=rockchip${SUFFIX}
         cat > .current_config.mk <<EOL
@@ -329,15 +330,15 @@ jobs:
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.tgz"
+        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.tgz"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
       run: |
         cd project
-        tar xzf "../host-pm-${{ matrix.VERSION }}-k6.12.tgz"
+        tar xzf "../host-pm-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
 
-    - name: Compile uboot and kernel (OpenWrt 6.12)
+    - name: Compile uboot and kernel
       run: |
         cd project
         ./build.sh uboot > /dev/null 2>&1
@@ -432,7 +433,7 @@ jobs:
         cd project
         source ../scripts/custome_config.sh
 
-    - name: Configure OpenWrt 6.12 kernel
+    - name: Configure OpenWrt kernel
       run: |
         cd project
         if [ -f friendlywrt/target/linux/rockchip/Makefile ]; then
@@ -491,7 +492,7 @@ jobs:
         make download -j$(nproc) > /dev/null 2>&1
         echo "Package download completed"
 
-    - name: Compile friendlyWrt (OpenWrt kernel 6.12)
+    - name: Compile OpenWrt
       run: |
         cd project/friendlywrt
         make -j$(nproc) > /dev/null 2>&1
@@ -503,7 +504,7 @@ jobs:
         cd project
         source .current_config.mk
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.tgz"
+        rootfs_filename="rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.tgz"
         tar czf ../artifact/${rootfs_filename} ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_ROOTFS} \
               ${FRIENDLYWRT_SRC}/${FRIENDLYWRT_PACKAGE_DIR}
         echo "rootfs_filename=$rootfs_filename" >> $GITHUB_OUTPUT
@@ -518,7 +519,7 @@ jobs:
         [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk ]  && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/apk
         [ -f ${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg ] && PM_BIN=${FRIENDLYWRT_SRC}/staging_dir/host/bin/opkg
         if [ -z "$PM_BIN" ]; then echo "ERROR: PM not found"; exit 1; fi
-        host_pm_filename="host-pm-${{ matrix.VERSION }}-k6.12.tgz"
+        host_pm_filename="host-pm-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
         tar czf ../artifact/${host_pm_filename} "$PM_BIN"
         echo "host_pm_filename=$host_pm_filename" >> $GITHUB_OUTPUT
 
@@ -549,7 +550,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-k6.12.tgz"
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
 
     - name: Download friendlywrt rootfs (docker)
       if: matrix.SET == 'docker'
@@ -559,7 +560,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker-k6.12.tgz"
+        fileName: "rootfs-friendlywrt-${{ matrix.VERSION }}-docker-${{ env.FLAVOR }}.tgz"
 
     - name: Download host package-manager bundle
       if: matrix.SET == 'non-docker'
@@ -569,7 +570,7 @@ jobs:
       with:
         repository: ${{ github.repository }}
         tag: ${{ needs.prepare_release.outputs.release_tag }}
-        fileName: "host-pm-${{ matrix.VERSION }}-k6.12.tgz"
+        fileName: "host-pm-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
 
     - name: Prepare config for img
       id: config
@@ -578,8 +579,8 @@ jobs:
         CPU=rk3568
         MODEL=R5S-R5C-Series
         [ "${{ matrix.SET }}" == "docker" ] && SUFFIX="-docker"
-        IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.img
-        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.tgz
+        IMG_FILE=${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.img
+        TGZ_FILE=images-${MODEL}-FriendlyWrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.tgz
         DIST_DIR=friendlywrt$(echo ${{ matrix.VERSION }}|awk -F . '{print $1}')${SUFFIX}
         CONFIG=rockchip${SUFFIX}
         cat > .current_config.mk <<EOL
@@ -597,15 +598,15 @@ jobs:
       run: |
         cd project
         SUFFIX="${{ steps.config.outputs.suffix }}"
-        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-k6.12.tgz"
+        tar xzf "../rootfs-friendlywrt-${{ matrix.VERSION }}${SUFFIX}-${{ env.FLAVOR }}.tgz"
 
     - name: Unpack host package-manager bundle
       if: matrix.SET == 'non-docker'
       run: |
         cd project
-        tar xzf "../host-pm-${{ matrix.VERSION }}-k6.12.tgz"
+        tar xzf "../host-pm-${{ matrix.VERSION }}-${{ env.FLAVOR }}.tgz"
 
-    - name: Compile uboot and kernel (OpenWrt 6.12)
+    - name: Compile uboot and kernel
       run: |
         cd project
         ./build.sh uboot > /dev/null 2>&1
