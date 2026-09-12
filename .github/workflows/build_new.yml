@@ -88,7 +88,8 @@ jobs:
         sudo rm -rf /etc/apt/sources.list.d
         sudo apt-get update
         sudo apt-get install -y build-essential libncurses5-dev libncursesw5-dev zlib1g-dev gawk git gettext \
-            libssl-dev xsltproc rsync wget unzip python3 python3-distutils file time ccache
+            libssl-dev xsltproc rsync wget unzip python3 python3-distutils file time ccache \
+            python3-pyelftools python3-setuptools swig
         git config --global user.name 'GitHub Actions'
         git config --global user.email 'noreply@github.com'
         git config --global color.ui false
@@ -107,6 +108,12 @@ jobs:
         echo "--- 确认内核版本 ---"
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
 
+        # 修正 Makefile 格式：KERNEL_PATCHVER:=6.12 -> KERNEL_PATCHVER := 6.12
+        # 这样 custome_config.sh 里的 awk '{print $3}' 才能取到 6.12
+        sed -i 's/^KERNEL_PATCHVER:=/KERNEL_PATCHVER := /' target/linux/rockchip/Makefile
+        echo "--- 修正后 ---"
+        grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile
+
         # 准备初始 .config（目标平台 + 设备）
         cat > .config <<'EOF'
         CONFIG_TARGET_rockchip=y
@@ -115,14 +122,22 @@ jobs:
         CONFIG_TARGET_KERNEL_VERSION_6_12=y
         EOF
 
-        # 关键：脚本在 project/ 目录下执行，CONFIG_FILE="configs/rockchip/01-nanopi"
-        # 所以符号链接必须建在 project/configs/rockchip/01-nanopi，指向 project/friendlywrt/.config
+        # 让脚本里的 configs/rockchip/01-nanopi 实际写入 .config
         cd ..
         mkdir -p configs/rockchip
         ln -sf "$(pwd)/friendlywrt/.config" configs/rockchip/01-nanopi
         echo "--- 符号链接确认 ---"
         ls -la configs/rockchip/
         readlink -f configs/rockchip/01-nanopi
+
+    - name: Update all standard feeds
+      run: |
+        cd project/friendlywrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+        echo "--- 确认关键依赖存在 ---"
+        ls feeds/packages/lang/golang 2>/dev/null && echo "[OK] golang feed present" || echo "[WARN] golang missing"
+        ls feeds/packages/utils/yq 2>/dev/null && echo "[OK] yq present" || echo "[WARN] yq missing"
 
     - name: Apply customizations (scripts/custome_config.sh)
       run: |
@@ -139,6 +154,8 @@ jobs:
         cd project/friendlywrt
         echo "=== 内核版本 ==="
         grep -E '^KERNEL_(PATCHVER|TESTING_PATCHVER)' target/linux/rockchip/Makefile || true
+        echo "=== config-6.12 文件 ==="
+        ls -la target/linux/rockchip/config-6.12* 2>/dev/null || echo "(no config-6.12 file)"
         echo "=== Clashoo 相关 ==="
         grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || echo "WARNING"
         echo "=== 屏蔽包 ==="
