@@ -132,9 +132,6 @@ jobs:
         mkdir -p ./artifact
         echo "CPU cores: $(nproc)"
 
-    # ============================================================
-    # 阶段 1：准备 OpenWrt 官方 25.12（6.12 内核）
-    # ============================================================
     - name: Prepare OpenWrt workspace
       run: |
         mkdir -p project
@@ -266,43 +263,43 @@ jobs:
         done
         echo "=== OpenWrt 编译完成 ==="
 
-    # ============================================================
-    # 阶段 2：定位内核产物
-    # ============================================================
+    # ---- 修正后的产物定位步骤 ----
     - name: Locate kernel artifacts
       run: |
         cd project/friendlywrt
 
-        KDIR=$(ls -d build_dir/target-aarch64_cortex-a53_musl/linux-rockchip_armv8 2>/dev/null | head -1)
-        [ -z "$KDIR" ] && { echo "::error::Linux build dir not found"; exit 1; }
+        TRIPLE_DIR=$(find build_dir -maxdepth 1 -type d -name "target-*_musl" | head -1)
+        [ -z "$TRIPLE_DIR" ] && { echo "::error::target triple not found"; ls -la build_dir/ | head -20; exit 1; }
+        echo "TRIPLE_DIR=$TRIPLE_DIR"
+        echo "TRIPLE_DIR=$TRIPLE_DIR" >> $GITHUB_ENV
+
+        KDIR=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "linux-rockchip*" | head -1)
+        [ -z "$KDIR" ] && { echo "::error::linux-rockchip dir not found"; ls -la "$TRIPLE_DIR/"; exit 1; }
         echo "KDIR=$KDIR" >> $GITHUB_ENV
+        echo "[OK] KDIR: $KDIR"
 
         IMG=$(find "$KDIR" -path "*/arch/arm64/boot/Image" -type f 2>/dev/null | head -1)
-        [ -z "$IMG" ] && IMG=$(find "$KDIR" -maxdepth 2 -name "Image" -type f 2>/dev/null | head -1)
-        [ -z "$IMG" ] && { echo "::error::Kernel Image not found"; exit 1; }
+        [ -z "$IMG" ] && IMG=$(find "$KDIR" -maxdepth 4 -name "Image" -type f 2>/dev/null | head -1)
+        [ -z "$IMG" ] && { echo "::error::Kernel Image not found"; find "$KDIR" -name Image -type f | head; exit 1; }
         echo "IMAGE_PATH=$IMG" >> $GITHUB_ENV
         echo "[OK] Image: $IMG ($(du -h $IMG | awk '{print $1}'))"
 
         DTB_DIR=$(find "$KDIR" -path "*/arch/arm64/boot/dts/rockchip" -type d 2>/dev/null | head -1)
-        [ -z "$DTB_DIR" ] && { echo "::error::DTB dir not found"; exit 1; }
+        [ -z "$DTB_DIR" ] && DTB_DIR=$(find "$KDIR" -maxdepth 5 -type d -name "rockchip" -path "*dts*" | head -1)
+        [ -z "$DTB_DIR" ] && { echo "::error::DTB dir not found"; find "$KDIR" -type d -name "dts*" | head; exit 1; }
         echo "DTB_DIR=$DTB_DIR" >> $GITHUB_ENV
         echo "[OK] DTB dir: $DTB_DIR"
 
-        ROOTFS_SRC=$(ls -d build_dir/target-aarch64_cortex-a53_musl/root-* 2>/dev/null | head -1)
-        [ -z "$ROOTFS_SRC" ] && { echo "::error::Rootfs dir not found"; exit 1; }
+        ROOTFS_SRC=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "root-*" | head -1)
+        [ -z "$ROOTFS_SRC" ] && { echo "::error::Rootfs dir not found"; ls "$TRIPLE_DIR/" | head; exit 1; }
         echo "ROOTFS_SRC=$ROOTFS_SRC" >> $GITHUB_ENV
         echo "[OK] Rootfs: $ROOTFS_SRC ($(du -sh $ROOTFS_SRC | awk '{print $1}'))"
 
         KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
+        echo "KV=$KV" >> $GITHUB_ENV
         echo "[OK] Kernel modules version: $KV"
-        if [[ ! "$KV" == 6.12* ]]; then
-          echo "::error::rootfs 内核模块不是 6.12，实际为 $KV"
-          exit 1
-        fi
+        [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules 不是 6.12，实际 $KV"; exit 1; }
 
-    # ============================================================
-    # 阶段 3：Clone sd-fuse 工具集
-    # ============================================================
     - name: Clone sd-fuse_rk3568
       run: |
         cd project
@@ -311,9 +308,6 @@ jobs:
         [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
         echo "[OK] sd-fuse ready"
 
-    # ============================================================
-    # 阶段 4：打包 6.12 内核
-    # ============================================================
     - name: Package 6.12 kernel
       run: |
         cd project
@@ -321,17 +315,12 @@ jobs:
         TGT="$SF/$TARGET_OS"
         mkdir -p "$TGT"
 
-        echo "===== mkkrnlimg 打包 kernel.img ====="
         "$SF/tools/mkkrnlimg" "$IMAGE_PATH" "$TGT/kernel.img"
         [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img 未生成"; exit 1; }
         ls -lh "$TGT/kernel.img"
 
-        echo "===== 复制为 boot.img（保险）====="
         cp "$TGT/kernel.img" "$TGT/boot.img"
 
-    # ============================================================
-    # 阶段 5：打包 dtb → resource.img
-    # ============================================================
     - name: Package resource.img
       run: |
         cd project
@@ -359,9 +348,6 @@ jobs:
         [ -f "$TGT/resource.img" ] || { echo "::error::resource.img 未生成"; exit 1; }
         ls -lh "$TGT/resource.img"
 
-    # ============================================================
-    # 阶段 6：组装 U-Boot 启动链
-    # ============================================================
     - name: Stage U-Boot binaries
       run: |
         cd project/sd-fuse
@@ -370,9 +356,6 @@ jobs:
           [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
         done
 
-    # ============================================================
-    # 阶段 7：生成 rootfs.img
-    # ============================================================
     - name: Build rootfs.img
       run: |
         cd project/sd-fuse
@@ -381,6 +364,10 @@ jobs:
         rm -rf /tmp/rootfs-pack
         cp -a "$GITHUB_WORKSPACE/project/friendlywrt/$ROOTFS_SRC" /tmp/rootfs-pack
         (cd /tmp/rootfs-pack/dev && find . ! -type d -exec rm -f {} \; ) 2>/dev/null || true
+
+        echo "=== rootfs 内核模块 ==="
+        ls /tmp/rootfs-pack/lib/modules/
+        find /tmp/rootfs-pack/lib/modules -name "*.ko" | wc -l
 
         MKFS="$PWD/tools/mke2fs"
         MKFS_CONF="$PWD/tools/mke2fs.conf"
@@ -399,9 +386,6 @@ jobs:
         ls -lh "$TGT/rootfs.img"
         echo "ROOTFS_SIZE_BYTES=$(stat -c%s "$TGT/rootfs.img")" >> $GITHUB_ENV
 
-    # ============================================================
-    # 阶段 8：生成 parameter.txt
-    # ============================================================
     - name: Generate parameter.txt
       run: |
         cd project/sd-fuse
@@ -410,9 +394,6 @@ jobs:
         echo "=== parameter.txt ==="
         cat "$TARGET_OS/parameter.txt"
 
-    # ============================================================
-    # 阶段 9：生成 SD 卡镜像
-    # ============================================================
     - name: Build SD card image
       run: |
         cd project/sd-fuse
@@ -423,9 +404,6 @@ jobs:
         }
         ls -lh out/ 2>/dev/null || echo "(无 out/)"
 
-    # ============================================================
-    # 阶段 10：生成 eMMC 刷机包
-    # ============================================================
     - name: Build eMMC flasher image
       run: |
         cd project/sd-fuse
@@ -436,43 +414,30 @@ jobs:
         }
         ls -lh out/images-for-eflasher/ 2>/dev/null || true
 
-    # ============================================================
-    # 阶段 11：重命名为清晰产物名（参照原 FriendlyWrt 风格）
-    # ============================================================
     - name: Rename artifacts with clear FriendlyWrt-style names
       run: |
         cd project/sd-fuse
 
-        echo "=== 生成前 out/ 内容 ==="
-        find out -maxdepth 3 -type f | head -20
-
-        # ---- SD 卡镜像重命名 ----
-        # 原始：out/rk3568-sd-friendlywrt25-YYYYMMDD.img
-        # 目标：R5S-R5C-Series-FriendlyWrt-25.12.img.gz
         SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f | head -1)
         if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
           DST_NAME="${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.img"
           cp "$SRC_IMG" "/tmp/${DST_NAME}"
           gzip -f "/tmp/${DST_NAME}"
           cp "/tmp/${DST_NAME}.gz" ../../artifact/
-          echo "[OK] SD image: ${DST_NAME}.gz ($(du -h ../../artifact/${DST_NAME}.gz | awk '{print $1}'))"
+          echo "[OK] SD image: ${DST_NAME}.gz"
         else
           echo "::warning::未找到 sd-fuse 生成的 .img"
         fi
 
-        # ---- eMMC 刷机包重命名 ----
-        # 原始：out/images-for-eflasher/friendlywrt25-images.tgz
-        # 目标：images-R5S-R5C-Series-FriendlyWrt-25.12.tgz
         SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f | head -1)
         if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
           DST_NAME="images-${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.tgz"
           cp "$SRC_TGZ" "../../artifact/${DST_NAME}"
-          echo "[OK] eMMC pack: ${DST_NAME} ($(du -h ../../artifact/${DST_NAME} | awk '{print $1}'))"
+          echo "[OK] eMMC pack: ${DST_NAME}"
         else
           echo "::warning::未找到 eMMC 刷机包"
         fi
 
-        # ---- 兜底：OpenWrt 官方 sysupgrade（可作为独立 SD 镜像使用）----
         OPENWRT_SYSUP=$(find ../friendlywrt/bin/targets/rockchip/armv8 -maxdepth 1 \
           -name "*nanopi-r5s*sysupgrade.img.gz" -type f 2>/dev/null | head -1)
         if [ -n "$OPENWRT_SYSUP" ]; then
@@ -485,72 +450,42 @@ jobs:
           -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
         [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "../../artifact/"
 
-    # ============================================================
-    # 阶段 12：生成 SHA256 校验和 README
-    # ============================================================
     - name: Generate SHA256 and README
       run: |
         cd artifact
-
-        # 计算 SHA256
         for f in *; do
           [ -f "$f" ] && sha256sum "$f" >> SHA256SUMS
         done
 
-        # 生成说明文件
         cat > README.txt <<EOF
         FriendlyWrt for NanoPi R5S — Build $(date +%Y-%m-%d)
         ============================================================
-
         发行标签: ${{ needs.prepare_release.outputs.release_tag }}
         内核版本: 6.12 (OpenWrt 官方 openwrt-25.12 分支)
-        基础系统: OpenWrt 25.12 + Clashoo + Bootstrap 主题 + Docker
+        基础系统: OpenWrt 25.12 + Clashoo + Bootstrap 主题
 
         产物说明
         --------
         1. ${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.img.gz
-           → SD 卡完整镜像（推荐）
-           → 刷写：gunzip 后 dd if=xxx.img of=/dev/sdX bs=4M conv=fsync
-           → 插卡到 R5S，按住 MASK 按钮上电，从 SD 卡启动
-
+           → SD 卡完整镜像，gunzip 后 dd 到 SD 卡
         2. images-${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.tgz
            → eMMC 刷机包
-           → 用法：SD 卡启动系统后，在 LuCI 后台的 "eMMC 刷机助手" 上传此文件
-           → 或通过 U-Boot 的 eflasher 系统引导使用
-
         3. ${MODEL_NAME}-OpenWrt-${FRIENDLY_VER}-sysupgrade.img.gz
-           → OpenWrt 官方原生 SD 镜像（备用，不含 FriendlyElec U-Boot）
-           → 仅用于调试对比
-
+           → OpenWrt 官方原生镜像（备用）
         4. SHA256SUMS
-           → 所有产物的 SHA256 校验和
+           → 所有产物校验和
 
-        刷机后验证
-        ----------
-        SSH 登录后执行：
-          uname -r            应显示 6.12.x
-          cat /etc/openwrt_release   应显示 OpenWrt 25.12
-
+        刷机后验证：uname -r 应显示 6.12.x
         EOF
 
-        echo "=== artifact/ 最终内容 ==="
         ls -lh
 
-    # ============================================================
-    # 阶段 13：验证内核版本确实是 6.12
-    # ============================================================
     - name: Verify 6.12 kernel in final firmware
       run: |
         cd project/sd-fuse
         echo "=== 最终固件内核版本核验 ==="
-        echo "kernel.img 中的 Linux version："
         strings "$TARGET_OS/kernel.img" 2>/dev/null | grep -oE "Linux version [0-9]+\.[0-9]+\.[0-9]+" | head -1
-        echo ""
-        echo "rootfs 中的内核模块目录："
         ls /tmp/rootfs-pack/lib/modules/ 2>/dev/null
-        echo ""
-        echo "rootfs 中的模块数量："
-        find /tmp/rootfs-pack/lib/modules -name "*.ko" 2>/dev/null | wc -l
 
     - name: Upload all artifacts to release
       uses: svenstaro/upload-release-action@v2
