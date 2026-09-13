@@ -147,7 +147,6 @@ jobs:
         cd friendlywrt
         ./scripts/feeds update -a > /dev/null 2>&1 || ./scripts/feeds update -a
         ./scripts/feeds install -a > /dev/null 2>&1
-        rm -f feeds.conf
         cd ..
         mkdir -p configs/rockchip
         touch configs/rockchip/01-nanopi
@@ -199,9 +198,22 @@ jobs:
         fi
         ls -la config-6.1
 
+    # ==========================================================
+    #  Apply customizations（修复 add_packages.sh 内核路径 Bug）
+    # ==========================================================
     - name: Apply customizations
       run: |
         cd project
+        # ===== 修复 add_packages.sh 的内核配置路径 Bug =====
+        # 原路径 target/linux/rockchip/config-6.12 在 6.12 内核上无效
+        # 真实路径 target/linux/rockchip/armv8/config-6.12
+        echo "=== 修复前 ==="
+        grep -n "KERNEL_CONFIG_FILE=" ../scripts/add_packages.sh || true
+        sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' ../scripts/add_packages.sh
+        echo "=== 修复后 ==="
+        grep -n "KERNEL_CONFIG_FILE=" ../scripts/add_packages.sh || true
+
+        # 运行（已修复的）自定义脚本
         bash ../scripts/add_packages.sh
 
     - name: Patch file Makefile dependencies
@@ -337,7 +349,6 @@ jobs:
       run: |
         cd project/friendlywrt
 
-        # 强制恢复关键配置（set -e 安全版本）
         restore_critical_cfg() {
           local need_save=false
           if ! grep -q "^CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config; then
@@ -379,7 +390,6 @@ jobs:
         echo "===== 编译前关键配置 ====="
         restore_critical_cfg
 
-        # ---- 分阶段编译 ----
         for s in tools/compile toolchain/compile target/compile package/compile; do
           echo "========== STAGE: $s ($(date +%H:%M:%S)) =========="
           restore_critical_cfg > /dev/null 2>&1
@@ -394,7 +404,6 @@ jobs:
           echo "  [DONE] $s ($(date +%H:%M:%S))"
         done
 
-        # ---- 最终 make ----
         echo "========== STAGE: final make ($(date +%H:%M:%S)) =========="
         restore_critical_cfg > /dev/null 2>&1
         LOG="/tmp/build_final.log"
@@ -406,7 +415,6 @@ jobs:
           grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
           grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
 
-          # 场景 1：rootfs 磁盘空间不足
           if grep -qE "out of space|failed to allocate" "$LOG"; then
             echo "===== 检测到 rootfs 空间不足，扩大分区 ====="
             grep -E "Size: [0-9]+|out of space" "$LOG" | tail -5 || true
@@ -429,7 +437,6 @@ jobs:
             fi
           fi
 
-          # 场景 2：target/linux install 失败（内核配置漂移）
           if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
             echo "===== 检测到 target/linux 失败，尝试内核配置同步 ====="
             make defconfig > /dev/null 2>&1 || true
@@ -440,7 +447,6 @@ jobs:
             make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
           fi
 
-          # 场景 3：其他包失败
           FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
           if [ -n "$FAILED_PKG" ]; then
             echo "===== $FAILED_PKG 失败，详细重跑 ====="
@@ -468,10 +474,6 @@ jobs:
         ccache -s || true
         du -sh "$CCACHE_DIR" 2>/dev/null || true
 
-    # ==========================================================
-    #  关键修复：使用 realpath 规范化所有路径为绝对路径
-    #  后续所有步骤不再需要拼接前缀
-    # ==========================================================
     - name: Locate kernel artifacts
       run: |
         cd project/friendlywrt
@@ -521,9 +523,6 @@ jobs:
         [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
         echo "[OK] sd-fuse ready"
 
-    # ==========================================================
-    #  Package 6.12 kernel（IMAGE_PATH 已是绝对路径）
-    # ==========================================================
     - name: Package 6.12 kernel
       run: |
         cd project
@@ -539,9 +538,6 @@ jobs:
 
         cp "$TGT/kernel.img" "$TGT/boot.img"
 
-    # ==========================================================
-    #  Package resource.img（DTB_DIR 已是绝对路径）
-    # ==========================================================
     - name: Package resource.img
       run: |
         cd project
@@ -579,9 +575,6 @@ jobs:
           [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
         done
 
-    # ==========================================================
-    #  Build rootfs.img（ROOTFS_SRC 已是绝对路径）
-    # ==========================================================
     - name: Build rootfs.img
       run: |
         cd project/sd-fuse
@@ -694,6 +687,13 @@ jobs:
         rootfs 分区: 1024 MB
         Docker: 已集成 (docker + dockerd + docker-compose + LuCI)
 
+        自定义功能（来自 add_packages.sh）：
+        - Clashoo 代理
+        - 必需的常用工具（bc/vsftpd/sudo/jq/lsof/...）
+        - 默认 LAN IP: 192.168.3.3/24，网关 192.168.3.1
+        - 默认 root 密码: tony
+        - LuCI 主题: bootstrap
+
         产物说明
         --------
         1. ${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.img.gz
@@ -709,6 +709,7 @@ jobs:
         - uname -r 应显示 6.12.x
         - 在 LuCI 中应看到 Docker 菜单项
         - 终端执行 docker --version 应显示 Docker 版本
+        - 默认密码: tony
         EOF
 
         ls -lh
