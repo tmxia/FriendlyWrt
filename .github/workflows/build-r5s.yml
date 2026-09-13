@@ -131,6 +131,7 @@ jobs:
         python3 -c "import elftools" 2>/dev/null || pip3 install --quiet pyelftools
         mkdir -p ./artifact
         echo "CPU cores: $(nproc)"
+        echo "ccache version: $(ccache --version | head -1)"
 
     - name: Prepare OpenWrt workspace
       run: |
@@ -155,9 +156,11 @@ jobs:
         CONFIG_TARGET_rockchip_armv8=y
         CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
         CONFIG_LUCI_LANG_zh_Hans=y
+        CONFIG_CCACHE=y
         EOF
         yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
         echo "Initial .config created"
+        grep -E "^CONFIG_CCACHE" .config
 
     - name: Verify 6.12 kernel availability
       run: |
@@ -236,6 +239,54 @@ jobs:
         yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
         echo "依赖已就位"
 
+    # ==========================================================
+    #  缓存机制（三处）
+    # ==========================================================
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ccache-${{ env.OPENWRT_BRANCH }}-${{ env.FLAVOR }}-${{ github.run_id }}
+        restore-keys: |
+          ccache-${{ env.OPENWRT_BRANCH }}-${{ env.FLAVOR }}-
+          ccache-${{ env.OPENWRT_BRANCH }}-
+
+    - name: Restore downloads (dl)
+      uses: actions/cache@v4
+      with:
+        path: project/friendlywrt/dl
+        key: dl-${{ env.OPENWRT_BRANCH }}-${{ github.run_id }}
+        restore-keys: |
+          dl-${{ env.OPENWRT_BRANCH }}-
+
+    - name: Restore Go module cache
+      uses: actions/cache@v4
+      with:
+        path: /tmp/go-mod-cache
+        key: gomod-${{ env.OPENWRT_BRANCH }}-${{ github.run_id }}
+        restore-keys: |
+          gomod-${{ env.OPENWRT_BRANCH }}-
+
+    - name: Configure ccache
+      run: |
+        export CCACHE_DIR=$HOME/.ccache
+        ccache --max-size=3G
+        ccache --set-config=compression=true
+        ccache --set-config=compiler_check=content
+        ccache -s || true
+
+    - name: Verify ccache enabled in .config
+      run: |
+        cd project/friendlywrt
+        if ! grep -q "^CONFIG_CCACHE=y" .config; then
+          echo "CONFIG_CCACHE=y" >> .config
+          yes "" | make oldconfig > /dev/null 2>&1 || true
+        fi
+        grep -E "^CONFIG_CCACHE" .config
+
+    # ==========================================================
+    #  下载与编译
+    # ==========================================================
     - name: Download packages
       run: |
         cd project/friendlywrt
@@ -247,11 +298,21 @@ jobs:
         make download -j$(nproc) > /tmp/dl2.log 2>&1 || true
         echo "dl: $(find dl -type f | wc -l) 文件, $(du -sh dl | awk '{print $1}')"
 
+    # ==========================================================
+    #  关键修复：完整编译流程
+    #  1) 4 个分阶段编译（便于定位失败）
+    #  2) 最终 make 完成 rootfs 组装 + 镜像生成（原脚本缺失）
+    # ==========================================================
     - name: Compile OpenWrt
       run: |
         cd project/friendlywrt
+        export CCACHE_DIR=$HOME/.ccache
+        export PATH="/usr/lib/ccache:$PATH"
+        echo "CCACHE_DIR=$CCACHE_DIR"
+
+        # ---- 分阶段编译（保留诊断能力）----
         for s in tools/compile toolchain/compile target/compile package/compile; do
-          echo "========== STAGE: $s =========="
+          echo "========== STAGE: $s ($(date +%H:%M:%S)) =========="
           LOG="/tmp/build_$(echo $s|tr '/' '_').log"
           if ! make -j$(nproc) "$s" > "$LOG" 2>&1; then
             echo "::error::STAGE FAILED: $s"
@@ -260,10 +321,32 @@ jobs:
             [ -n "$FAILED" ] && { echo "=== Verbose rebuild ==="; make -j1 V=s "$FAILED/compile" 2>&1 | tail -150 || true; }
             exit 1
           fi
+          echo "  [DONE] $s ($(date +%H:%M:%S))"
         done
-        echo "=== OpenWrt 编译完成 ==="
 
-    # ---- 修正后的产物定位步骤 ----
+        # ---- 关键修复：完成剩余步骤（install + world）----
+        echo "========== STAGE: final make (rootfs + image) ($(date +%H:%M:%S)) =========="
+        LOG="/tmp/build_final.log"
+        if ! make -j$(nproc) > "$LOG" 2>&1; then
+          echo "::error::STAGE FAILED: final make"
+          tail -100 "$LOG"
+          exit 1
+        fi
+        echo "  [DONE] final make ($(date +%H:%M:%S))"
+
+        echo "=== OpenWrt 编译完成 ==="
+        echo "--- rootfs 目录 ---"
+        ls -la build_dir/target-*/root-* 2>/dev/null | head -5 || echo "(未找到 rootfs)"
+        echo "--- 原生镜像产物 ---"
+        ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || echo "(未找到原生镜像)"
+
+    - name: Show ccache stats
+      if: always()
+      run: |
+        export CCACHE_DIR=$HOME/.ccache
+        ccache -s || true
+
+    # ---- 以下步骤保持原样 ----
     - name: Locate kernel artifacts
       run: |
         cd project/friendlywrt
