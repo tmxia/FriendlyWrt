@@ -1,4 +1,4 @@
-name: Build OpenWrt for NanoPi R5S (FriendlyWrt-style)
+name: Build OpenWrt for NanoPi R5S
 
 on:
   watch:
@@ -178,8 +178,18 @@ jobs:
       run: |
         cd project/friendlywrt
         if ! make -j$(nproc) > /tmp/build.log 2>&1; then
-          echo "Build failed. Last 100 lines:"
-          tail -100 /tmp/build.log
+          echo "=== Build failed. Extracting context ==="
+          FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed to build" /tmp/build.log | head -1 | awk '{print $2}')
+          echo "Failed package path: ${FAILED_PKG:-<unknown>}"
+          echo "--- Last 40 lines of log ---"
+          tail -40 /tmp/build.log
+          if [ -n "$FAILED_PKG" ]; then
+            echo "=== Rebuilding ${FAILED_PKG} verbosely to capture root cause ==="
+            make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -120 || true
+            echo "=== Also try clean+rebuild ==="
+            make "$FAILED_PKG/clean" V=s 2>&1 | tail -20 || true
+            make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -80 || true
+          fi
           exit 1
         fi
         echo "OpenWrt compile finished"
@@ -190,7 +200,6 @@ jobs:
         cd project
         git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse
         cd sd-fuse
-        # sd-fuse 需要一个 prebuilt 目录来存放内核和 rootfs
         mkdir -p prebuilt
         echo "sd-fuse cloned"
 
@@ -221,8 +230,6 @@ jobs:
           echo "::error::Rootfs build dir not found"
           exit 1
         fi
-        # sd-fuse 期望 rootfs.img（ext4 镜像）
-        # OpenWrt 已构建出 rootfs 目录，直接用 mkfs.ext4 打成镜像
         ROOTFS_SIZE_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1+80}')
         rm -f sd-fuse/prebuilt/rootfs.img
         dd if=/dev/zero of=sd-fuse/prebuilt/rootfs.img bs=1M count=${ROOTFS_SIZE_MB} status=none
@@ -244,17 +251,14 @@ jobs:
         echo "=== Looking for build scripts ==="
         ls -1 *.sh 2>/dev/null || true
 
-        # sd-fuse_rk3568 的主脚本通常是 mk-sd-image.sh
         if [ ! -f ./mk-sd-image.sh ]; then
           echo "::error::mk-sd-image.sh not found"
           exit 1
         fi
 
-        # 检查 prebuilt 目录结构
         echo "=== prebuilt content ==="
         ls -la prebuilt/ || true
 
-        # 执行打包（需要 sudo 因为要 mount loop 设备）
         sudo ./mk-sd-image.sh rk3568 2>&1 | tee /tmp/sd-fuse.log || {
           echo "::warning::mk-sd-image.sh returned non-zero, checking output"
           tail -50 /tmp/sd-fuse.log
@@ -268,11 +272,9 @@ jobs:
       run: |
         cd project
 
-        # 优先收集 sd-fuse 生成的完整镜像
         find sd-fuse -maxdepth 2 -type f \( -name "*.img" -o -name "*.img.gz" \) \
           -exec cp {} ../artifact/ \; 2>/dev/null || true
 
-        # 同时收集 OpenWrt 原生产物作为备用
         find friendlywrt/bin/targets/rockchip/armv8/ -maxdepth 1 -type f \
           \( -name "*nanopi-r5s*.img.gz" -o -name "*nanopi-r5s*.tar.gz" -o -name "*nanopi-r5s*.manifest" \) \
           -exec cp {} ../artifact/ \; 2>/dev/null || true
@@ -304,5 +306,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S (FriendlyWrt-style)"
+          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
           repository: ${{ github.repository }}
