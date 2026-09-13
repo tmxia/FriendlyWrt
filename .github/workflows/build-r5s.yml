@@ -27,7 +27,8 @@ env:
   CCACHE_DIR: '/home/runner/.ccache'
   CCACHE_COMPRESS: 'true'
   CCACHE_MAXSIZE: '3G'
-  ROOTFS_PARTSIZE: '512'
+  ROOTFS_PARTSIZE: '1024'
+  ENABLE_DOCKER: 'true'
 
 jobs:
   prepare_release:
@@ -152,9 +153,6 @@ jobs:
         touch configs/rockchip/01-nanopi
         echo "OpenWrt workspace prepared"
 
-    # ==========================================================
-    #  关键修复：初始化 .config 时写入 ROOTFS_PARTSIZE 和 CCACHE_DIR
-    # ==========================================================
     - name: Initialize .config with R5S target
       run: |
         cd project/friendlywrt
@@ -166,10 +164,22 @@ jobs:
         CONFIG_CCACHE=y
         CONFIG_CCACHE_DIR="$CCACHE_DIR"
         CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
+
+        # ===== Docker 相关 =====
+        CONFIG_PACKAGE_docker=y
+        CONFIG_PACKAGE_dockerd=y
+        CONFIG_PACKAGE_docker-compose=y
+        CONFIG_PACKAGE_luci-app-dockerman=y
+        CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
+        CONFIG_PACKAGE_luci-lib-docker=y
+
+        # ===== Docker 内核选项 =====
+        CONFIG_DOCKER_KERNEL_OPTIONS=y
+        CONFIG_DOCKER_NET_OVERLAY=y
         EOF
         yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
         echo "=== 初始配置检查 ==="
-        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE)" .config
+        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config
 
     - name: Verify 6.12 kernel availability
       run: |
@@ -248,9 +258,6 @@ jobs:
         yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
         echo "依赖已就位"
 
-    # ==========================================================
-    #  缓存恢复
-    # ==========================================================
     - name: Restore ccache
       uses: actions/cache@v4
       with:
@@ -285,29 +292,39 @@ jobs:
         ccache --set-config=cache_dir="$CCACHE_DIR"
         ccache -s || true
 
-    # ==========================================================
-    #  强制修正配置（不再运行 make oldconfig）
-    # ==========================================================
     - name: Force correct .config values
       run: |
         cd project/friendlywrt
+
         # CCACHE
         sed -i '/^CONFIG_CCACHE_DIR=/d' .config
         sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
+        echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
         sed -i '/^CONFIG_CCACHE=/d' .config
         sed -i '/^# CONFIG_CCACHE is not set/d' .config
         echo "CONFIG_CCACHE=y" >> .config
-        echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
+
         # ROOTFS_PARTSIZE
         sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
         sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
         echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
-        echo "=== 强制修正后的关键配置 ==="
-        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE)" .config
 
-    # ==========================================================
-    #  下载
-    # ==========================================================
+        # Docker 相关包
+        for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker; do
+          sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+          sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+          echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+        done
+
+        # Docker 内核选项
+        sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
+        echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
+        sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
+        echo "CONFIG_DOCKER_NET_OVERLAY=y" >> .config
+
+        echo "=== 强制修正后的关键配置 ==="
+        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config
+
     - name: Download packages
       run: |
         cd project/friendlywrt
@@ -316,14 +333,11 @@ jobs:
         make download -j$(nproc) > /tmp/dl2.log 2>&1 || true
         echo "dl: $(find dl -type f | wc -l) 文件, $(du -sh dl | awk '{print $1}')"
 
-    # ==========================================================
-    #  编译
-    # ==========================================================
     - name: Compile OpenWrt
       run: |
         cd project/friendlywrt
 
-        # 强制恢复关键配置
+        # 强制恢复关键配置（set -e 安全版本）
         restore_critical_cfg() {
           local need_save=false
           if ! grep -q "^CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config; then
@@ -342,7 +356,24 @@ jobs:
             echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
             need_save=true
           fi
-          [ "$need_save" = "true" ] && grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE)" .config
+          for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker; do
+            if ! grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+              sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+              sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+              echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+              need_save=true
+            fi
+          done
+          if ! grep -q "^CONFIG_DOCKER_KERNEL_OPTIONS=y" .config; then
+            sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
+            echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
+            need_save=true
+          fi
+          if [ "$need_save" = "true" ]; then
+            echo "[CFG] 已修复配置："
+            grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config
+          fi
+          return 0
         }
 
         echo "===== 编译前关键配置 ====="
@@ -380,21 +411,18 @@ jobs:
             echo "===== 检测到 rootfs 空间不足，扩大分区 ====="
             grep -E "Size: [0-9]+|out of space" "$LOG" | tail -5 || true
 
-            # 计算需要的分区大小
             ROOTFS_DIR=$(find build_dir/target-* -maxdepth 1 -type d -name "root-*" | head -1)
             if [ -n "$ROOTFS_DIR" ]; then
               ACTUAL_MB=$(du -s -m "$ROOTFS_DIR" | awk '{print $1}')
-              NEEDED_MB=$(( (ACTUAL_MB + 64 + 63) / 64 * 64 ))  # 向上取 64MB 对齐
-              NEW_PARTSIZE=$(( NEEDED_MB + 256 ))              # 再留 256MB 余量
+              NEEDED_MB=$(( (ACTUAL_MB + 64 + 63) / 64 * 64 ))
+              NEW_PARTSIZE=$(( NEEDED_MB + 256 ))
               echo "当前 rootfs 实际大小: ${ACTUAL_MB} MB"
               echo "新分区大小: ${NEW_PARTSIZE} MB"
 
-              # 更新 .config
               sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
               echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$NEW_PARTSIZE" >> .config
               grep -E "^CONFIG_TARGET_ROOTFS_PARTSIZE" .config
 
-              # 清除旧的 root.ext4 和 squashfs 缓存
               rm -f build_dir/target-*/linux-rockchip_armv8/root.ext4* 2>/dev/null || true
               rm -f build_dir/target-*/linux-rockchip_armv8/root.squashfs 2>/dev/null || true
               rm -f build_dir/target-*/linux-rockchip_armv8/*.img 2>/dev/null || true
@@ -404,13 +432,10 @@ jobs:
           # 场景 2：target/linux install 失败（内核配置漂移）
           if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
             echo "===== 检测到 target/linux 失败，尝试内核配置同步 ====="
-            # 用 defconfig 生成完整配置，再 oldconfig
             make defconfig > /dev/null 2>&1 || true
             yes "" | make oldconfig > /dev/null 2>&1 || true
-            # 重新应用关键配置
             restore_critical_cfg > /dev/null 2>&1
 
-            # 详细重跑 install
             echo "----- 详细重跑 target/linux/install -----"
             make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
           fi
@@ -422,7 +447,6 @@ jobs:
             make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
           fi
 
-          # 重试完整 make
           echo "===== 诊断完成，重试完整 final make ====="
           restore_critical_cfg > /dev/null 2>&1
           if ! make -j$(nproc) > /tmp/build_final_retry.log 2>&1; then
@@ -644,7 +668,8 @@ jobs:
         发行标签: ${{ needs.prepare_release.outputs.release_tag }}
         内核版本: 6.12 (OpenWrt 官方 openwrt-25.12 分支)
         基础系统: OpenWrt 25.12 + Clashoo + Bootstrap 主题
-        rootfs 分区: 512 MB
+        rootfs 分区: 1024 MB
+        Docker: 已集成 (docker + dockerd + docker-compose + LuCI)
 
         产物说明
         --------
@@ -657,7 +682,10 @@ jobs:
         4. SHA256SUMS
            → 所有产物校验和
 
-        刷机后验证：uname -r 应显示 6.12.x
+        刷机后验证：
+        - uname -r 应显示 6.12.x
+        - 在 LuCI 中应看到 Docker 菜单项
+        - 终端执行 docker --version 应显示 Docker 版本
         EOF
 
         ls -lh
