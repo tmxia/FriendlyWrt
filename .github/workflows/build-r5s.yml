@@ -135,7 +135,6 @@ jobs:
         mkdir -p ./artifact
         echo "CPU cores: $(nproc)"
         echo "ccache version: $(ccache --version | head -1)"
-        echo "CCACHE_DIR=$CCACHE_DIR"
 
     - name: Prepare OpenWrt workspace
       run: |
@@ -152,18 +151,24 @@ jobs:
         touch configs/rockchip/01-nanopi
         echo "OpenWrt workspace prepared"
 
+    # ==========================================================
+    #  初始化 .config（直接写入正确的 CCACHE_DIR，避免后续被重置）
+    # ==========================================================
     - name: Initialize .config with R5S target
       run: |
         cd project/friendlywrt
-        cat > .config <<'EOF'
+        cat > .config <<EOF
         CONFIG_TARGET_rockchip=y
         CONFIG_TARGET_rockchip_armv8=y
         CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
         CONFIG_LUCI_LANG_zh_Hans=y
         CONFIG_CCACHE=y
+        CONFIG_CCACHE_DIR="$CCACHE_DIR"
         EOF
         yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
         echo "Initial .config created"
+        echo "=== 初始 CCACHE 配置 ==="
+        grep -E "^CONFIG_CCACHE" .config
 
     - name: Verify 6.12 kernel availability
       run: |
@@ -243,7 +248,7 @@ jobs:
         echo "依赖已就位"
 
     # ==========================================================
-    #  缓存机制（三处）
+    #  缓存恢复
     # ==========================================================
     - name: Restore ccache
       uses: actions/cache@v4
@@ -271,8 +276,7 @@ jobs:
           gomod-${{ env.OPENWRT_BRANCH }}-
 
     # ==========================================================
-    #  ccache 修复配置
-    #  关键：CONFIG_CCACHE_DIR 必须非空，否则 ccache 完全失效
+    #  ccache 初始化（修正版）
     # ==========================================================
     - name: Configure ccache
       run: |
@@ -281,21 +285,23 @@ jobs:
         ccache --set-config=compression=true
         ccache --set-config=compiler_check=content
         ccache --set-config=cache_dir="$CCACHE_DIR"
+        echo "=== ccache 配置 ==="
+        ccache -p | grep -E "cache_dir|max_size|compression|compiler_check" || true
         ccache -s || true
 
-    - name: Fix CONFIG_CCACHE_DIR in .config
+    # 关键修复：设置后不再运行 make oldconfig，避免被重置
+    - name: Force CONFIG_CCACHE_DIR in .config
       run: |
         cd project/friendlywrt
-        # 移除旧的空值
+        # 移除所有可能存在的行
         sed -i '/^CONFIG_CCACHE_DIR=/d' .config
         sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
-        # 强制写入正确路径
-        echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
-        # 确保 CCACHE 已启用
         sed -i '/^CONFIG_CCACHE=/d' .config
+        sed -i '/^# CONFIG_CCACHE is not set/d' .config
+        # 直接追加，不运行 make oldconfig
         echo "CONFIG_CCACHE=y" >> .config
-        yes "" | make oldconfig > /dev/null 2>&1 || true
-        echo "=== 修正后的 CCACHE 配置 ==="
+        echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
+        echo "=== 强制修正后的 CCACHE 配置 ==="
         grep -E "^CONFIG_CCACHE" .config
 
     # ==========================================================
@@ -310,18 +316,34 @@ jobs:
         echo "dl: $(find dl -type f | wc -l) 文件, $(du -sh dl | awk '{print $1}')"
 
     # ==========================================================
-    #  编译流程（强化诊断 + 自动恢复）
+    #  编译（每阶段前强制恢复 CCACHE_DIR）
     # ==========================================================
     - name: Compile OpenWrt
       run: |
         cd project/friendlywrt
-        export CCACHE_DIR="$CCACHE_DIR"
-        export CCACHE_COMPRESS=true
-        export CCACHE_MAXSIZE=3G
+
+        # 定义强制恢复函数
+        restore_ccache_cfg() {
+          if ! grep -q "^CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config; then
+            echo "[CCACHE] 检测到 CONFIG_CCACHE_DIR 丢失，正在恢复..."
+            sed -i '/^CONFIG_CCACHE_DIR=/d' .config
+            sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
+            echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
+          fi
+          if ! grep -q "^CONFIG_CCACHE=y" .config; then
+            echo "CONFIG_CCACHE=y" >> .config
+          fi
+          grep -E "^CONFIG_CCACHE" .config
+        }
+
+        # 首次验证
+        echo "===== 编译前 CCACHE 配置 ====="
+        restore_ccache_cfg
 
         # ---- 分阶段编译 ----
         for s in tools/compile toolchain/compile target/compile package/compile; do
           echo "========== STAGE: $s ($(date +%H:%M:%S)) =========="
+          restore_ccache_cfg > /dev/null 2>&1
           LOG="/tmp/build_$(echo $s|tr '/' '_').log"
           if ! make -j$(nproc) "$s" > "$LOG" 2>&1; then
             echo "::error::STAGE FAILED: $s"
@@ -333,68 +355,46 @@ jobs:
           echo "  [DONE] $s ($(date +%H:%M:%S))"
         done
 
-        # ---- 最终 make（rootfs + 镜像）----
+        # ---- 最终 make ----
         echo "========== STAGE: final make ($(date +%H:%M:%S)) =========="
+        restore_ccache_cfg > /dev/null 2>&1
         LOG="/tmp/build_final.log"
         if make -j$(nproc) > "$LOG" 2>&1; then
           echo "  [DONE] final make ($(date +%H:%M:%S))"
         else
           echo "::warning::首次 final make 失败，启动诊断流程..."
-
-          # 提取失败目标
-          echo "===== 抓取失败目标 ====="
           grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
           grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
 
-          # -------------- 场景 A：target/linux 失败 --------------
           if grep -qE "ERROR: target/linux failed" "$LOG"; then
-            echo "===== 检测到 target/linux 失败，执行内核配置同步 ====="
-
-            # 1. 详细重跑 install
-            echo "----- 详细重跑 target/linux/install -----"
+            echo "===== target/linux 失败，同步内核配置 ====="
             make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -200 || true
-
-            # 2. 内核配置漂移检测
-            echo "----- 检查内核 .config 与符号校验 -----"
-            KCFG=$(find build_dir/target-* -path "*/linux-*/.config" -type f 2>/dev/null | head -1)
-            if [ -n "$KCFG" ]; then
-              echo "内核 .config: $KCFG"
-              grep -E "CONFIG_KMOD|CONFIG_PACKAGE_kmod-inet-diag" project/friendlywrt/.config 2>/dev/null | head -5 || true
-            fi
-
-            # 3. 强制重新生成内核配置
-            echo "----- 清理内核配置，强制重生成 -----"
             rm -f build_dir/target-*/linux-rockchip_armv8/linux-*/.config 2>/dev/null || true
             rm -f build_dir/target-*/linux-rockchip_armv8/linux-*/.config.old 2>/dev/null || true
             rm -f build_dir/target-*/linux-rockchip_armv8/modules 2>/dev/null || true
 
-            # 4. 重新编译内核 + 安装
-            echo "----- 重跑 target/linux/compile -----"
+            restore_ccache_cfg > /dev/null 2>&1
             if ! make -j$(nproc) target/linux/compile > /tmp/kernel_recompile.log 2>&1; then
               echo "::error::内核重编译失败"
               tail -200 /tmp/kernel_recompile.log
               exit 1
             fi
-            echo "  [OK] target/linux/compile"
 
-            echo "----- 重跑 target/linux/install -----"
+            restore_ccache_cfg > /dev/null 2>&1
             if ! make -j$(nproc) target/linux/install > /tmp/kernel_reinstall.log 2>&1; then
               echo "::error::内核重安装失败"
               tail -200 /tmp/kernel_reinstall.log
               exit 1
             fi
-            echo "  [OK] target/linux/install"
           fi
 
-          # -------------- 场景 B：任意包失败 --------------
           FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
           if [ -n "$FAILED_PKG" ]; then
-            echo "===== 检测到 $FAILED_PKG 失败，详细重跑 ====="
+            echo "===== $FAILED_PKG 失败，详细重跑 ====="
             make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
           fi
 
-          # -------------- 重试完整 make --------------
-          echo "===== 诊断完成，重试完整 final make ====="
+          restore_ccache_cfg > /dev/null 2>&1
           if ! make -j$(nproc) > /tmp/build_final_retry.log 2>&1; then
             echo "::error::最终 make 重试仍失败"
             tail -200 /tmp/build_final_retry.log
@@ -403,17 +403,17 @@ jobs:
           echo "  [DONE] final make (retry) ($(date +%H:%M:%S))"
         fi
 
-        # ---- 验证产物 ----
         echo "=== OpenWrt 编译完成 ==="
-        echo "--- rootfs 目录 ---"
         ls -la build_dir/target-*/root-* 2>/dev/null | head -5 || echo "(未找到 rootfs)"
-        echo "--- 原生镜像产物 ---"
         ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || echo "(未找到原生镜像)"
 
     - name: Show ccache stats
       if: always()
       run: |
+        echo "=== ccache 最终统计 ==="
         ccache -s || true
+        echo "=== ccache 目录大小 ==="
+        du -sh "$CCACHE_DIR" 2>/dev/null || true
 
     # ---- 后续步骤保持原样 ----
     - name: Locate kernel artifacts
