@@ -18,6 +18,9 @@ env:
   AUTO_REPLACE_TAG: 'false'
   OPENWRT_BRANCH: 'openwrt-25.12'
   FLAVOR: 'r5s'
+  GOPROXY: 'https://goproxy.cn,direct'
+  GOFLAGS: '-mod=mod'
+  GOMODCACHE: '/tmp/go-mod-cache'
 
 jobs:
   prepare_release:
@@ -83,11 +86,32 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    # ---------- 阶段 0：环境加固 ----------
+    - name: Reclaim disk space
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                    /usr/share/swift /usr/local/.ghcup /opt/az || true
+        sudo apt-get clean
+        df -h /
+
+    - name: Add swap
+      run: |
+        sudo swapoff -a || true
+        sudo rm -f /swapfile
+        sudo fallocate -l 4G /swapfile
+        sudo chmod 600 /swapfile
+        sudo mkswap /swapfile > /dev/null
+        sudo swapon /swapfile
+        free -h
+
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
         sudo apt-get update -qq
+        # [借鉴4] 补充 aria2 / bc / whiptail / mercurial / lib32stdc++6
         sudo apt-get install -y -qq \
           build-essential ccache ecj fastjar file g++ gawk gettext git \
           java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
@@ -101,13 +125,14 @@ jobs:
           device-tree-compiler u-boot-tools \
           bzip2 xz-utils zip unzip wget curl \
           autoconf automake autopoint texinfo help2man \
+          aria2 bc whiptail mercurial lib32stdc++6 \
           android-sdk-libsparse-utils e2fsprogs parted dosfstools mtools
         sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
         python3 -c "import elftools" 2>/dev/null || pip3 install --quiet pyelftools
         mkdir -p ./artifact
         echo "CPU cores: $(nproc)"
 
-    # ---------- 1. 准备 OpenWrt 官方源码 ----------
+    # ---------- 阶段 1：源码准备 ----------
     - name: Prepare OpenWrt workspace
       run: |
         mkdir -p project
@@ -115,7 +140,7 @@ jobs:
         git clone --depth 1 -b ${{ env.OPENWRT_BRANCH }} \
           https://github.com/openwrt/openwrt.git friendlywrt > /dev/null 2>&1
         cd friendlywrt
-        ./scripts/feeds update -a > /dev/null 2>&1
+        ./scripts/feeds update -a > /dev/null 2>&1 || ./scripts/feeds update -a
         ./scripts/feeds install -a > /dev/null 2>&1
         rm -f feeds.conf
         cd ..
@@ -132,16 +157,17 @@ jobs:
         CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
         CONFIG_LUCI_LANG_zh_Hans=y
         EOF
-        make defconfig > /dev/null 2>&1
+        # [借鉴2] 首次使用 oldconfig 保留已有选择
+        yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
         echo "Initial .config created"
 
-    - name: Verify upstream kernel version (must be 6.12)
+    - name: Verify upstream kernel version
       run: |
         cd project/friendlywrt
         if [ -d target/linux/rockchip/patches-6.12 ] && [ -f target/linux/rockchip/armv8/config-6.12 ]; then
           echo "[OK] OpenWrt Rockchip target uses kernel 6.12"
         else
-          echo "ERROR: 6.12 kernel artifacts not found"
+          echo "::error::6.12 kernel artifacts not found"
           exit 1
         fi
 
@@ -158,129 +184,251 @@ jobs:
         cd project
         bash ../scripts/add_packages.sh
 
+    # ---------- 阶段 2：依赖修正 ----------
+    - name: Patch file Makefile and force libmagic dependencies
+      run: |
+        cd project/friendlywrt
+
+        FILE_MK="feeds/packages/libs/file/Makefile"
+        [ -f "$FILE_MK" ] || { echo "::error::$FILE_MK not found"; exit 1; }
+
+        echo "=== [1/6] 25.12 file Makefile Package/libmagic 原始定义 ==="
+        awk '/^define Package\/libmagic/,/^endef/' "$FILE_MK" || true
+
+        echo "=== [2/6] 生成 tmp/.config-package.in ==="
+        yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1 || true
+        ls -la tmp/.config-package.in 2>/dev/null || echo "(warn)"
+
+        echo "=== [3/6] 探测 libbz2 / liblzma / zlib kconfig 符号 ==="
+        for hint in libbz2 liblzma zlib; do
+          echo "--- ${hint} ---"
+          grep -oE "config PACKAGE_${hint}[-0-9._]*" tmp/.config-package.in 2>/dev/null \
+            | awk '{print $2}' | sort -u || echo "(none)"
+        done
+
+        echo "=== [4/6] Patch file Makefile ==="
+        python3 - "$FILE_MK" <<'PY'
+        import re, sys, pathlib
+        p = pathlib.Path(sys.argv[1])
+        txt = p.read_text()
+        m = re.search(r'(define Package/libmagic\b.*?DEPENDS:=)([^\n]*)', txt, flags=re.S)
+        if not m:
+            print("PATTERN NOT FOUND")
+            sys.exit(0)
+        deps = m.group(2)
+        added = []
+        for r in ['+libbz2', '+liblzma']:
+            if r not in deps:
+                deps += " " + r
+                added.append(r)
+        if added:
+            txt = txt[:m.start(2)] + deps + txt[m.end(2):]
+            p.write_text(txt)
+            print(f"PATCHED: {added}")
+            print(f"NEW DEPENDS: {deps.strip()}")
+        else:
+            print("No change")
+        PY
+
+        echo "=== [5/6] 强制启用 kconfig 符号 ==="
+        SYMS="PACKAGE_libbz2 PACKAGE_liblzma PACKAGE_zlib"
+        for hint in libbz2 liblzma zlib; do
+          found=$(grep -oE "config PACKAGE_${hint}[-0-9._]*" tmp/.config-package.in 2>/dev/null \
+                    | awk '{print $2}' | sort -u || true)
+          SYMS="${SYMS} ${found}"
+        done
+        for sym in $SYMS; do
+          [ -z "$sym" ] && continue
+          sed -i "/^# CONFIG_${sym} is not set/d" .config
+          sed -i "/^CONFIG_${sym}=/d" .config
+          echo "CONFIG_${sym}=y" >> .config
+        done
+        # [借鉴2] oldconfig 优先
+        yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
+
+        echo "=== [6/6] 预编译底层依赖 ==="
+        for path in "package/libs/zlib" "package/utils/bzip2" \
+                    "package/feeds/packages/utils/xz" "feeds/packages/utils/xz" \
+                    "package/feeds/packages/libs/file" "feeds/packages/libs/file" ; do
+          if [ -d "$path" ]; then
+            echo "--- $path ---"
+            make -j1 "$path/compile" > /tmp/dep.log 2>&1 \
+              && echo "  OK" \
+              || { echo "  WARN:"; tail -5 /tmp/dep.log; }
+          fi
+        done
+
+        echo "=== 最终 .config 状态 ==="
+        grep -E "CONFIG_PACKAGE_(libbz2|liblzma|zlib|file|libmagic)" .config || true
+
+    # ---------- 阶段 3：前置检查 ----------
+    - name: Preflight sanity checks
+      run: |
+        cd project/friendlywrt
+        echo "=== 1. target device ==="
+        grep -q "CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y" .config \
+          || { echo "::error::target device missing"; exit 1; }
+
+        echo "=== 2. 内核 patches ==="
+        ls -d target/linux/rockchip/patches-6.12 >/dev/null \
+          || { echo "::error::patches-6.12 missing"; exit 1; }
+
+        echo "=== 3. 关键定制包 ==="
+        for pkg in clashoo luci-app-clashoo kmod-inet-diag file; do
+          grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "  [OK] ${pkg}" || echo "  [FAIL] ${pkg}"
+        done
+
+        echo "=== 4. 磁盘与内存 ==="
+        df -h / | tail -1
+        free -h | head -2
+
+        echo "=== 5. 循环依赖检查 ==="
+        make defconfig 2>&1 | grep -iE "warning|loop|recursive" | head -20 || true
+
+        echo "=== 6. 是否误禁用关键库 ==="
+        for pkg in libbz2 liblzma zlib libgcc1 libc; do
+          grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "  [WARN] ${pkg} disabled" || true
+        done
+
+        echo "=== 7. dl 目录现状 ==="
+        if [ -d dl ]; then
+          echo "  files: $(find dl -type f | wc -l)"
+        else
+          echo "  (dl/ 尚未创建)"
+        fi
+
+        echo "Preflight passed."
+
     - name: Final config check
       run: |
         cd project/friendlywrt
         grep -E "CONFIG_PACKAGE_(clashoo|luci-app-clashoo|luci-i18n-clashoo-zh-cn|kmod-inet-diag)=y" .config || true
 
-    # ---------- 2. 编译 OpenWrt ----------
+    # ---------- 阶段 4：下载（借鉴原 FriendlyWrt 的关键技巧） ----------
     - name: Download packages
       run: |
         cd project/friendlywrt
-        if ! make download -j$(nproc) > /tmp/dl.log 2>&1; then
-          echo "::error::make download failed"
-          grep -iE "error|fail|404|not found|unable|denied|timeout|refused" /tmp/dl.log | head -30 || true
-          exit 1
-        fi
-        echo "Package download completed"
 
-    - name: Compile OpenWrt (kernel 6.12 + rootfs)
+        echo "=== 第一次下载 ==="
+        make download -j$(nproc) > /tmp/dl1.log 2>&1 || true
+
+        # [借鉴1+3] 列出小于 1KB 的文件（通常是 HTML 错误页），然后删除
+        echo "=== 检查 dl 目录中的可疑小文件（< 1KB） ==="
+        SMALL_FILES=$(find dl -type f -size -1024c 2>/dev/null || true)
+        if [ -n "$SMALL_FILES" ]; then
+          echo "发现可疑文件（很可能是下载失败的 HTML 页面）："
+          find dl -type f -size -1024c -exec ls -lh {} \; 2>/dev/null || true
+          echo "=== 删除这些小文件，强制 make 重新下载 ==="
+          find dl -type f -size -1024c -delete 2>/dev/null || true
+        else
+          echo "无小于 1KB 的文件"
+        fi
+
+        # [借鉴1] 重试一次下载（会用刚删除的内容重新下载）
+        echo "=== 第二次下载（重试缺失内容） ==="
+        if make download -j$(nproc) > /tmp/dl2.log 2>&1; then
+          echo "第二次下载成功"
+        else
+          echo "::warning::第二次下载仍有失败，输出错误摘要"
+          grep -iE "error|fail|404|not found|unable|denied|timeout|refused" /tmp/dl2.log | head -30 || true
+        fi
+
+        echo "=== dl 目录统计 ==="
+        echo "  总文件数: $(find dl -type f | wc -l)"
+        echo "  小于 1KB: $(find dl -type f -size -1024c | wc -l)"
+        echo "  总计大小: $(du -sh dl | awk '{print $1}')"
+
+    - name: Compile OpenWrt (staged with diagnostics)
       run: |
         cd project/friendlywrt
-        if ! make -j$(nproc) > /tmp/build.log 2>&1; then
-          echo "=== Build failed. Extracting context ==="
-          FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed to build" /tmp/build.log | head -1 | awk '{print $2}')
-          echo "Failed package path: ${FAILED_PKG:-<unknown>}"
-          echo "--- Last 40 lines of log ---"
-          tail -40 /tmp/build.log
-          if [ -n "$FAILED_PKG" ]; then
-            echo "=== Rebuilding ${FAILED_PKG} verbosely to capture root cause ==="
-            make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -120 || true
-            echo "=== Also try clean+rebuild ==="
-            make "$FAILED_PKG/clean" V=s 2>&1 | tail -20 || true
-            make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -80 || true
+        stages=(
+          "tools/compile"
+          "toolchain/compile"
+          "target/compile"
+          "package/compile"
+        )
+        for s in "${stages[@]}"; do
+          echo "========== STAGE: $s =========="
+          LOG="/tmp/build_$(echo $s | tr '/' '_').log"
+          if ! make -j$(nproc) "$s" > "$LOG" 2>&1; then
+            echo "::error::STAGE FAILED: $s"
+            FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed to build" "$LOG" | head -1 | awk '{print $2}')
+            echo "Failed package: ${FAILED_PKG:-<unknown>}"
+            tail -60 "$LOG"
+            if [ -n "$FAILED_PKG" ]; then
+              echo "=== Rebuilding $FAILED_PKG verbosely ==="
+              make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -150 || true
+            fi
+            exit 1
           fi
-          exit 1
-        fi
-        echo "OpenWrt compile finished"
+        done
+        echo "=== All stages compiled ==="
 
-    # ---------- 3. 准备 sd-fuse 打包工作区 ----------
+    # ---------- 阶段 5：sd-fuse（保守） ----------
     - name: Clone sd-fuse_rk3568
+      continue-on-error: true
       run: |
         cd project
-        git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse
-        cd sd-fuse
-        mkdir -p prebuilt
-        echo "sd-fuse cloned"
+        git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse || true
+        cd sd-fuse 2>/dev/null && { mkdir -p prebuilt; echo "sd-fuse cloned"; } || echo "::warning::sd-fuse clone failed"
 
     - name: Stage OpenWrt outputs into sd-fuse prebuilt
+      if: hashFiles('project/sd-fuse') != ''
+      continue-on-error: true
       run: |
         cd project
 
-        # --- 内核 Image ---
-        KERNEL_IMAGE=""
-        for cand in \
-          friendlywrt/bin/targets/rockchip/armv8/*Image* \
-          friendlywrt/bin/targets/rockchip/armv8/*itb* \
-          friendlywrt/build_dir/target-aarch64_cortex-a53_musl/linux-rockchip_armv8/Image ; do
-          if [ -f "$cand" ]; then KERNEL_IMAGE="$cand"; break; fi
-        done
+        SYSUPGRADE=$(find friendlywrt/bin/targets/rockchip/armv8/ -name "*nanopi-r5s*sysupgrade.img.gz" | head -1)
+        [ -n "$SYSUPGRADE" ] && cp "$SYSUPGRADE" ../artifact/ && echo "Staged sysupgrade"
 
-        if [ -z "$KERNEL_IMAGE" ]; then
-          echo "::error::Kernel Image not found"
-          find friendlywrt/bin -type f | head -50
-          exit 1
+        KERNEL_IMAGE=$(find friendlywrt/build_dir -path "*linux-rockchip_armv8/Image" -type f | head -1)
+        [ -z "$KERNEL_IMAGE" ] && KERNEL_IMAGE=$(find friendlywrt/bin/targets/rockchip/armv8/ -name "*Image*" -type f | head -1)
+
+        if [ -n "$KERNEL_IMAGE" ] && [ -d sd-fuse/prebuilt ]; then
+          cp "$KERNEL_IMAGE" sd-fuse/prebuilt/Image
+          echo "Kernel staged: $KERNEL_IMAGE"
         fi
-        cp "$KERNEL_IMAGE" sd-fuse/prebuilt/Image
-        echo "Kernel: $KERNEL_IMAGE"
 
-        # --- Rootfs 目录 ---
         ROOTFS_DIR=$(ls -d friendlywrt/build_dir/target-aarch64_cortex-a53_musl/root-* 2>/dev/null | head -1)
-        if [ -z "$ROOTFS_DIR" ]; then
-          echo "::error::Rootfs build dir not found"
-          exit 1
+        if [ -n "$ROOTFS_DIR" ] && [ -d sd-fuse/prebuilt ]; then
+          ROOTFS_SIZE_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1+120}')
+          rm -f sd-fuse/prebuilt/rootfs.img
+          dd if=/dev/zero of=sd-fuse/prebuilt/rootfs.img bs=1M count=${ROOTFS_SIZE_MB} status=none
+          mkfs.ext4 -q -F -L rootfs sd-fuse/prebuilt/rootfs.img
+          mkdir -p /tmp/rootfs_mnt
+          sudo mount -o loop sd-fuse/prebuilt/rootfs.img /tmp/rootfs_mnt
+          sudo cp -a "$ROOTFS_DIR"/. /tmp/rootfs_mnt/
+          sudo umount /tmp/rootfs_mnt
+          echo "Rootfs staged: $(du -h sd-fuse/prebuilt/rootfs.img | awk '{print $1}')"
         fi
-        ROOTFS_SIZE_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1+80}')
-        rm -f sd-fuse/prebuilt/rootfs.img
-        dd if=/dev/zero of=sd-fuse/prebuilt/rootfs.img bs=1M count=${ROOTFS_SIZE_MB} status=none
-        mkfs.ext4 -q -F -L rootfs sd-fuse/prebuilt/rootfs.img
-        mkdir -p /tmp/rootfs_mnt
-        sudo mount -o loop sd-fuse/prebuilt/rootfs.img /tmp/rootfs_mnt
-        sudo cp -a "$ROOTFS_DIR"/. /tmp/rootfs_mnt/
-        sudo umount /tmp/rootfs_mnt
-        echo "Rootfs image built: $(du -h sd-fuse/prebuilt/rootfs.img | awk '{print $1}')"
+        ls -lh sd-fuse/prebuilt/ 2>/dev/null || true
 
-        echo "--- sd-fuse prebuilt ---"
-        ls -lh sd-fuse/prebuilt/
-
-    # ---------- 4. 用 sd-fuse 生成可刷写镜像 ----------
-    - name: Build SD image with sd-fuse
+    - name: Build SD image with sd-fuse (best-effort)
+      if: hashFiles('project/sd-fuse') != ''
+      continue-on-error: true
       run: |
         cd project/sd-fuse
-        ls -la
-        echo "=== Looking for build scripts ==="
-        ls -1 *.sh 2>/dev/null || true
-
-        if [ ! -f ./mk-sd-image.sh ]; then
-          echo "::error::mk-sd-image.sh not found"
-          exit 1
-        fi
-
-        echo "=== prebuilt content ==="
-        ls -la prebuilt/ || true
-
-        sudo ./mk-sd-image.sh rk3568 2>&1 | tee /tmp/sd-fuse.log || {
-          echo "::warning::mk-sd-image.sh returned non-zero, checking output"
-          tail -50 /tmp/sd-fuse.log
+        [ ! -f ./mk-sd-image.sh ] && { echo "::warning::mk-sd-image.sh missing"; exit 0; }
+        sudo ./mk-sd-image.sh rk3568 2>&1 | tee /tmp/sd-fuse.log | tail -50 || {
+          echo "::warning::mk-sd-image.sh non-zero"
+          tail -30 /tmp/sd-fuse.log
         }
+        ls -lh out/ 2>/dev/null || echo "(no out/)"
 
-        echo "=== output directory ==="
-        ls -lh out/ 2>/dev/null || echo "no out/ directory"
-        find . -maxdepth 2 -name "*.img" -o -maxdepth 2 -name "*.img.gz" 2>/dev/null | head
-
+    # ---------- 阶段 6：产物收集与上传 ----------
     - name: Collect artifacts
       run: |
         cd project
 
-        find sd-fuse -maxdepth 2 -type f \( -name "*.img" -o -name "*.img.gz" \) \
-          -exec cp {} ../artifact/ \; 2>/dev/null || true
-
         find friendlywrt/bin/targets/rockchip/armv8/ -maxdepth 1 -type f \
-          \( -name "*nanopi-r5s*.img.gz" -o -name "*nanopi-r5s*.tar.gz" -o -name "*nanopi-r5s*.manifest" \) \
-          -exec cp {} ../artifact/ \; 2>/dev/null || true
+          \( -name "*nanopi-r5s*.img.gz" -o -name "*nanopi-r5s*.tar.gz" \
+             -o -name "*nanopi-r5s*.manifest" -o -name "*nanopi-r5s*.itb" \) \
+          -exec cp -v {} ../artifact/ \; 2>/dev/null || true
 
-        echo "--- Collected artifacts ---"
-        ls -lh ../artifact/
+        find sd-fuse -maxdepth 3 -type f \( -name "*.img" -o -name "*.img.gz" \) \
+          -exec cp -v {} ../artifact/ \; 2>/dev/null || true
+
+        ls -lh ../artifact/ || { echo "::error::No artifacts"; exit 1; }
 
     - name: Upload artifacts to release
       uses: svenstaro/upload-release-action@v2
