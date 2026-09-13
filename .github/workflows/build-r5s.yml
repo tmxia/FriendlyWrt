@@ -27,6 +27,7 @@ env:
   CCACHE_DIR: '/home/runner/.ccache'
   CCACHE_COMPRESS: 'true'
   CCACHE_MAXSIZE: '3G'
+  ROOTFS_PARTSIZE: '512'
 
 jobs:
   prepare_release:
@@ -152,7 +153,7 @@ jobs:
         echo "OpenWrt workspace prepared"
 
     # ==========================================================
-    #  初始化 .config（直接写入正确的 CCACHE_DIR，避免后续被重置）
+    #  关键修复：初始化 .config 时写入 ROOTFS_PARTSIZE 和 CCACHE_DIR
     # ==========================================================
     - name: Initialize .config with R5S target
       run: |
@@ -164,11 +165,11 @@ jobs:
         CONFIG_LUCI_LANG_zh_Hans=y
         CONFIG_CCACHE=y
         CONFIG_CCACHE_DIR="$CCACHE_DIR"
+        CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
         EOF
         yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
-        echo "Initial .config created"
-        echo "=== 初始 CCACHE 配置 ==="
-        grep -E "^CONFIG_CCACHE" .config
+        echo "=== 初始配置检查 ==="
+        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE)" .config
 
     - name: Verify 6.12 kernel availability
       run: |
@@ -275,9 +276,6 @@ jobs:
         restore-keys: |
           gomod-${{ env.OPENWRT_BRANCH }}-
 
-    # ==========================================================
-    #  ccache 初始化（修正版）
-    # ==========================================================
     - name: Configure ccache
       run: |
         mkdir -p "$CCACHE_DIR"
@@ -285,24 +283,27 @@ jobs:
         ccache --set-config=compression=true
         ccache --set-config=compiler_check=content
         ccache --set-config=cache_dir="$CCACHE_DIR"
-        echo "=== ccache 配置 ==="
-        ccache -p | grep -E "cache_dir|max_size|compression|compiler_check" || true
         ccache -s || true
 
-    # 关键修复：设置后不再运行 make oldconfig，避免被重置
-    - name: Force CONFIG_CCACHE_DIR in .config
+    # ==========================================================
+    #  强制修正配置（不再运行 make oldconfig）
+    # ==========================================================
+    - name: Force correct .config values
       run: |
         cd project/friendlywrt
-        # 移除所有可能存在的行
+        # CCACHE
         sed -i '/^CONFIG_CCACHE_DIR=/d' .config
         sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
         sed -i '/^CONFIG_CCACHE=/d' .config
         sed -i '/^# CONFIG_CCACHE is not set/d' .config
-        # 直接追加，不运行 make oldconfig
         echo "CONFIG_CCACHE=y" >> .config
         echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
-        echo "=== 强制修正后的 CCACHE 配置 ==="
-        grep -E "^CONFIG_CCACHE" .config
+        # ROOTFS_PARTSIZE
+        sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+        sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
+        echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
+        echo "=== 强制修正后的关键配置 ==="
+        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE)" .config
 
     # ==========================================================
     #  下载
@@ -316,34 +317,41 @@ jobs:
         echo "dl: $(find dl -type f | wc -l) 文件, $(du -sh dl | awk '{print $1}')"
 
     # ==========================================================
-    #  编译（每阶段前强制恢复 CCACHE_DIR）
+    #  编译
     # ==========================================================
     - name: Compile OpenWrt
       run: |
         cd project/friendlywrt
 
-        # 定义强制恢复函数
-        restore_ccache_cfg() {
+        # 强制恢复关键配置
+        restore_critical_cfg() {
+          local need_save=false
           if ! grep -q "^CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config; then
-            echo "[CCACHE] 检测到 CONFIG_CCACHE_DIR 丢失，正在恢复..."
             sed -i '/^CONFIG_CCACHE_DIR=/d' .config
             sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
             echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
+            need_save=true
           fi
           if ! grep -q "^CONFIG_CCACHE=y" .config; then
             echo "CONFIG_CCACHE=y" >> .config
+            need_save=true
           fi
-          grep -E "^CONFIG_CCACHE" .config
+          if ! grep -q "^CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" .config; then
+            sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+            sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
+            echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
+            need_save=true
+          fi
+          [ "$need_save" = "true" ] && grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE)" .config
         }
 
-        # 首次验证
-        echo "===== 编译前 CCACHE 配置 ====="
-        restore_ccache_cfg
+        echo "===== 编译前关键配置 ====="
+        restore_critical_cfg
 
         # ---- 分阶段编译 ----
         for s in tools/compile toolchain/compile target/compile package/compile; do
           echo "========== STAGE: $s ($(date +%H:%M:%S)) =========="
-          restore_ccache_cfg > /dev/null 2>&1
+          restore_critical_cfg > /dev/null 2>&1
           LOG="/tmp/build_$(echo $s|tr '/' '_').log"
           if ! make -j$(nproc) "$s" > "$LOG" 2>&1; then
             echo "::error::STAGE FAILED: $s"
@@ -357,44 +365,66 @@ jobs:
 
         # ---- 最终 make ----
         echo "========== STAGE: final make ($(date +%H:%M:%S)) =========="
-        restore_ccache_cfg > /dev/null 2>&1
+        restore_critical_cfg > /dev/null 2>&1
         LOG="/tmp/build_final.log"
         if make -j$(nproc) > "$LOG" 2>&1; then
           echo "  [DONE] final make ($(date +%H:%M:%S))"
         else
           echo "::warning::首次 final make 失败，启动诊断流程..."
+          echo "===== 失败目标 ====="
           grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
           grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
 
-          if grep -qE "ERROR: target/linux failed" "$LOG"; then
-            echo "===== target/linux 失败，同步内核配置 ====="
-            make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -200 || true
-            rm -f build_dir/target-*/linux-rockchip_armv8/linux-*/.config 2>/dev/null || true
-            rm -f build_dir/target-*/linux-rockchip_armv8/linux-*/.config.old 2>/dev/null || true
-            rm -f build_dir/target-*/linux-rockchip_armv8/modules 2>/dev/null || true
+          # 场景 1：rootfs 磁盘空间不足
+          if grep -qE "out of space|failed to allocate" "$LOG"; then
+            echo "===== 检测到 rootfs 空间不足，扩大分区 ====="
+            grep -E "Size: [0-9]+|out of space" "$LOG" | tail -5 || true
 
-            restore_ccache_cfg > /dev/null 2>&1
-            if ! make -j$(nproc) target/linux/compile > /tmp/kernel_recompile.log 2>&1; then
-              echo "::error::内核重编译失败"
-              tail -200 /tmp/kernel_recompile.log
-              exit 1
-            fi
+            # 计算需要的分区大小
+            ROOTFS_DIR=$(find build_dir/target-* -maxdepth 1 -type d -name "root-*" | head -1)
+            if [ -n "$ROOTFS_DIR" ]; then
+              ACTUAL_MB=$(du -s -m "$ROOTFS_DIR" | awk '{print $1}')
+              NEEDED_MB=$(( (ACTUAL_MB + 64 + 63) / 64 * 64 ))  # 向上取 64MB 对齐
+              NEW_PARTSIZE=$(( NEEDED_MB + 256 ))              # 再留 256MB 余量
+              echo "当前 rootfs 实际大小: ${ACTUAL_MB} MB"
+              echo "新分区大小: ${NEW_PARTSIZE} MB"
 
-            restore_ccache_cfg > /dev/null 2>&1
-            if ! make -j$(nproc) target/linux/install > /tmp/kernel_reinstall.log 2>&1; then
-              echo "::error::内核重安装失败"
-              tail -200 /tmp/kernel_reinstall.log
-              exit 1
+              # 更新 .config
+              sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+              echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$NEW_PARTSIZE" >> .config
+              grep -E "^CONFIG_TARGET_ROOTFS_PARTSIZE" .config
+
+              # 清除旧的 root.ext4 和 squashfs 缓存
+              rm -f build_dir/target-*/linux-rockchip_armv8/root.ext4* 2>/dev/null || true
+              rm -f build_dir/target-*/linux-rockchip_armv8/root.squashfs 2>/dev/null || true
+              rm -f build_dir/target-*/linux-rockchip_armv8/*.img 2>/dev/null || true
             fi
           fi
 
+          # 场景 2：target/linux install 失败（内核配置漂移）
+          if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
+            echo "===== 检测到 target/linux 失败，尝试内核配置同步 ====="
+            # 用 defconfig 生成完整配置，再 oldconfig
+            make defconfig > /dev/null 2>&1 || true
+            yes "" | make oldconfig > /dev/null 2>&1 || true
+            # 重新应用关键配置
+            restore_critical_cfg > /dev/null 2>&1
+
+            # 详细重跑 install
+            echo "----- 详细重跑 target/linux/install -----"
+            make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
+          fi
+
+          # 场景 3：其他包失败
           FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
           if [ -n "$FAILED_PKG" ]; then
             echo "===== $FAILED_PKG 失败，详细重跑 ====="
             make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
           fi
 
-          restore_ccache_cfg > /dev/null 2>&1
+          # 重试完整 make
+          echo "===== 诊断完成，重试完整 final make ====="
+          restore_critical_cfg > /dev/null 2>&1
           if ! make -j$(nproc) > /tmp/build_final_retry.log 2>&1; then
             echo "::error::最终 make 重试仍失败"
             tail -200 /tmp/build_final_retry.log
@@ -412,7 +442,6 @@ jobs:
       run: |
         echo "=== ccache 最终统计 ==="
         ccache -s || true
-        echo "=== ccache 目录大小 ==="
         du -sh "$CCACHE_DIR" 2>/dev/null || true
 
     # ---- 后续步骤保持原样 ----
@@ -615,6 +644,7 @@ jobs:
         发行标签: ${{ needs.prepare_release.outputs.release_tag }}
         内核版本: 6.12 (OpenWrt 官方 openwrt-25.12 分支)
         基础系统: OpenWrt 25.12 + Clashoo + Bootstrap 主题
+        rootfs 分区: 512 MB
 
         产物说明
         --------
