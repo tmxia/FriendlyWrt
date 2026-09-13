@@ -468,35 +468,43 @@ jobs:
         ccache -s || true
         du -sh "$CCACHE_DIR" 2>/dev/null || true
 
-    # ---- 后续步骤保持原样 ----
+    # ==========================================================
+    #  关键修复：使用 realpath 规范化所有路径为绝对路径
+    #  后续所有步骤不再需要拼接前缀
+    # ==========================================================
     - name: Locate kernel artifacts
       run: |
         cd project/friendlywrt
 
         TRIPLE_DIR=$(find build_dir -maxdepth 1 -type d -name "target-*_musl" | head -1)
         [ -z "$TRIPLE_DIR" ] && { echo "::error::target triple not found"; ls -la build_dir/ | head -20; exit 1; }
-        echo "TRIPLE_DIR=$TRIPLE_DIR"
+        TRIPLE_DIR=$(realpath "$TRIPLE_DIR")
         echo "TRIPLE_DIR=$TRIPLE_DIR" >> $GITHUB_ENV
+        echo "[OK] TRIPLE_DIR: $TRIPLE_DIR"
 
         KDIR=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "linux-rockchip*" | head -1)
         [ -z "$KDIR" ] && { echo "::error::linux-rockchip dir not found"; ls -la "$TRIPLE_DIR/"; exit 1; }
+        KDIR=$(realpath "$KDIR")
         echo "KDIR=$KDIR" >> $GITHUB_ENV
         echo "[OK] KDIR: $KDIR"
 
         IMG=$(find "$KDIR" -path "*/arch/arm64/boot/Image" -type f 2>/dev/null | head -1)
         [ -z "$IMG" ] && IMG=$(find "$KDIR" -maxdepth 4 -name "Image" -type f 2>/dev/null | head -1)
         [ -z "$IMG" ] && { echo "::error::Kernel Image not found"; find "$KDIR" -name Image -type f | head; exit 1; }
+        IMG=$(realpath "$IMG")
         echo "IMAGE_PATH=$IMG" >> $GITHUB_ENV
         echo "[OK] Image: $IMG ($(du -h $IMG | awk '{print $1}'))"
 
         DTB_DIR=$(find "$KDIR" -path "*/arch/arm64/boot/dts/rockchip" -type d 2>/dev/null | head -1)
         [ -z "$DTB_DIR" ] && DTB_DIR=$(find "$KDIR" -maxdepth 5 -type d -name "rockchip" -path "*dts*" | head -1)
         [ -z "$DTB_DIR" ] && { echo "::error::DTB dir not found"; find "$KDIR" -type d -name "dts*" | head; exit 1; }
+        DTB_DIR=$(realpath "$DTB_DIR")
         echo "DTB_DIR=$DTB_DIR" >> $GITHUB_ENV
         echo "[OK] DTB dir: $DTB_DIR"
 
         ROOTFS_SRC=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "root-*" | head -1)
         [ -z "$ROOTFS_SRC" ] && { echo "::error::Rootfs dir not found"; ls "$TRIPLE_DIR/" | head; exit 1; }
+        ROOTFS_SRC=$(realpath "$ROOTFS_SRC")
         echo "ROOTFS_SRC=$ROOTFS_SRC" >> $GITHUB_ENV
         echo "[OK] Rootfs: $ROOTFS_SRC ($(du -sh $ROOTFS_SRC | awk '{print $1}'))"
 
@@ -513,6 +521,9 @@ jobs:
         [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
         echo "[OK] sd-fuse ready"
 
+    # ==========================================================
+    #  Package 6.12 kernel（IMAGE_PATH 已是绝对路径）
+    # ==========================================================
     - name: Package 6.12 kernel
       run: |
         cd project
@@ -520,17 +531,24 @@ jobs:
         TGT="$SF/$TARGET_OS"
         mkdir -p "$TGT"
 
+        [ -f "$IMAGE_PATH" ] || { echo "::error::Image not found: $IMAGE_PATH"; exit 1; }
+
         "$SF/tools/mkkrnlimg" "$IMAGE_PATH" "$TGT/kernel.img"
         [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img 未生成"; exit 1; }
         ls -lh "$TGT/kernel.img"
 
         cp "$TGT/kernel.img" "$TGT/boot.img"
 
+    # ==========================================================
+    #  Package resource.img（DTB_DIR 已是绝对路径）
+    # ==========================================================
     - name: Package resource.img
       run: |
         cd project
         SF="sd-fuse"
         TGT="$SF/$TARGET_OS"
+
+        [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
 
         rm -rf /tmp/dtb-pack
         mkdir -p /tmp/dtb-pack
@@ -561,13 +579,18 @@ jobs:
           [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
         done
 
+    # ==========================================================
+    #  Build rootfs.img（ROOTFS_SRC 已是绝对路径）
+    # ==========================================================
     - name: Build rootfs.img
       run: |
         cd project/sd-fuse
         TGT="$TARGET_OS"
 
+        [ -d "$ROOTFS_SRC" ] || { echo "::error::Rootfs src not found: $ROOTFS_SRC"; exit 1; }
+
         rm -rf /tmp/rootfs-pack
-        cp -a "$GITHUB_WORKSPACE/project/friendlywrt/$ROOTFS_SRC" /tmp/rootfs-pack
+        cp -a "$ROOTFS_SRC" /tmp/rootfs-pack
         (cd /tmp/rootfs-pack/dev && find . ! -type d -exec rm -f {} \; ) 2>/dev/null || true
 
         echo "=== rootfs 内核模块 ==="
