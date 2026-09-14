@@ -1,0 +1,54 @@
+30d3e1c2470a7282f37b96fdd4354314dda69aa3
+
+# 上游更新摘要（UTC 2026-09-14）
+
+Bluetooth: hci_aic: Add module ready check to setup
+Signed-off-by: Jensen Huang <jensenhuang@friendlyarm.com>
+ARM64: dts: rockchip: use virtual-connector for nanopi-r3s
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+ARM64: dts: rockchip: Add dts for nanopi-r28s
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+arm64: configs: enable BT_HCIUART_AIC for nanopi5/6
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+Bluetooth: hci_uart: Add aic8800 support
+This is a simple H4 driver based hci_mrvl.c for hciattach any.
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+ARM64: dts: rockchip: add eeprom node for nanopi-r3s LTS
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+ARM64: dts: rockchip: Add dts for nanopi-m6 v2
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+arm64: configs: make NET_SCH_FQ_CODEL builtin for nanopi5/6
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+ARM64: dts: rockchip: Add dts for nanopi-neo3 plus
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+ARM64: dts: rockchip: add cts-detect-wait-ms for rtl8822cs-bt
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+Bluetooth: hci_uart: detect removable modules via CTS
+With removable bluetooth module, the driver can get stuck in the HCI
+sync phase when the module is not present, hence add a CTS-based check
+to avoid this situation.
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+ARM64: dts: rockchip: add support for nanopc-t6 plus
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+arm64: configs: add bifrost_csf.config fragment for mali-g610
+Signed-off-by: jensen <jensenhuang@friendlyarm.com>
+drm/panfrost: Set HW_FEATURE_AARCH64_MMU feature flag on Bifrost models
+commit db599be9f393f74fc437b21d16adc50debd5ad2c upstream.
+Set this feature flag on all Mali Bifrost platforms as the MMU supports
+AARCH64 4K page table format.
+Signed-off-by: Ariel D'Alessandro <ariel.dalessandro@collabora.com>
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Steven Price <steven.price@arm.com>
+Reviewed-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Reviewed-by: Adrián Larumbe <adrian.larumbe@collabora.com>
+Signed-off-by: Steven Price <steven.price@arm.com>
+Link: https://lore.kernel.org/r/20250324185801.168664-4-ariel.dalessandro@collabora.com
+drm/panfrost: Use GPU_MMU_FEATURES_VA_BITS/PA_BITS macros
+commit 0b9bcf9a762e7bdb022e6428096a83d92bb90b27 upstream.
+As done in panthor, define and use these GPU_MMU_FEATURES_* macros,
+which makes code easier to read and reuse.
+Signed-off-by: Ariel D'Alessandro <ariel.dalessandro@collabora.com>
+Reviewed-by: Boris Brezillon <boris.brezillon@collabora.com>
+Reviewed-by: Steven Price <steven.price@arm.com>
+Reviewed-by: AngeloGioacchino Del Regno <angelogioacchino.delregno@collabora.com>
+Reviewed-by: Adrián Larumbe <adrian.larumbe@collabora.com>
