@@ -11,7 +11,7 @@
 #   5. .config 去重
 #   6. 修补 file Makefile 依赖
 #   7. 强制修正关键配置
-#   8. 下载软件包源码
+#   8. 清理污染的 go-mod-cache + 下载软件包源码
 #   9. 分阶段编译（tools → toolchain → target → package → final make）
 #  10. 编译失败自动诊断恢复
 # =============================================================
@@ -270,11 +270,22 @@ step_force_config() {
 }
 
 # =============================================================
-# 9. 下载软件包源码
+# 9. 清理污染的 go-mod-cache + 下载软件包源码
 # =============================================================
 step_download_packages() {
     log "===== 9. 下载软件包源码 ====="
     cd "$FRIENDLYWRT_DIR"
+
+    # 清理污染的 go-mod-cache（来自其他 run 的残留）
+    # 该目录包含 Go 编译期间自动下载的模块，跨 run 缓存可能导致：
+    #   - internal 子包缺失（如 cty/internal/graphemes）
+    #   - Go 版本/架构不兼容（如 go-isatty 的 build constraints）
+    if [ -d "dl/go-mod-cache" ]; then
+        log "清理 dl/go-mod-cache（避免跨 run 缓存污染）"
+        du -sh dl/go-mod-cache 2>/dev/null || true
+        rm -rf dl/go-mod-cache
+    fi
+
     make download -j"$(nproc)" > /tmp/dl1.log 2>&1 || true
     find dl -type f -size -1024c -delete 2>/dev/null || true
     make download -j"$(nproc)" > /tmp/dl2.log 2>&1 || true
