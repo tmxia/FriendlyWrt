@@ -198,22 +198,14 @@ jobs:
         fi
         ls -la config-6.1
 
-    # ==========================================================
-    #  Apply customizations（修复 add_packages.sh 内核路径 Bug）
-    # ==========================================================
     - name: Apply customizations
       run: |
         cd project
-        # ===== 修复 add_packages.sh 的内核配置路径 Bug =====
-        # 原路径 target/linux/rockchip/config-6.12 在 6.12 内核上无效
-        # 真实路径 target/linux/rockchip/armv8/config-6.12
         echo "=== 修复前 ==="
         grep -n "KERNEL_CONFIG_FILE=" ../scripts/add_packages.sh || true
         sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' ../scripts/add_packages.sh
         echo "=== 修复后 ==="
         grep -n "KERNEL_CONFIG_FILE=" ../scripts/add_packages.sh || true
-
-        # 运行（已修复的）自定义脚本
         bash ../scripts/add_packages.sh
 
     - name: Patch file Makefile dependencies
@@ -308,7 +300,6 @@ jobs:
       run: |
         cd project/friendlywrt
 
-        # CCACHE
         sed -i '/^CONFIG_CCACHE_DIR=/d' .config
         sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
         echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
@@ -316,19 +307,16 @@ jobs:
         sed -i '/^# CONFIG_CCACHE is not set/d' .config
         echo "CONFIG_CCACHE=y" >> .config
 
-        # ROOTFS_PARTSIZE
         sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
         sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
         echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
 
-        # Docker 相关包
         for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker; do
           sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
           sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
           echo "CONFIG_PACKAGE_${pkg}=y" >> .config
         done
 
-        # Docker 内核选项
         sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
         echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
         sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
@@ -538,6 +526,9 @@ jobs:
 
         cp "$TGT/kernel.img" "$TGT/boot.img"
 
+    # ==========================================================
+    #  关键修复：只打包 R5S 所需的 dtb（避免参数过长 + 索引表溢出）
+    # ==========================================================
     - name: Package resource.img
       run: |
         cd project
@@ -546,19 +537,50 @@ jobs:
 
         [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
 
+        echo "=== DTB 源目录内容（rk3568 系列）==="
+        ls -la "$DTB_DIR"/rk3568-*.dtb 2>/dev/null || echo "(none)"
+
         rm -rf /tmp/dtb-pack
         mkdir -p /tmp/dtb-pack
-        cp -a "$DTB_DIR"/*.dtb /tmp/dtb-pack/ 2>/dev/null || true
 
-        if [ -f /tmp/dtb-pack/rk3568-nanopi-r5s.dtb ]; then
-          cp /tmp/dtb-pack/rk3568-nanopi-r5s.dtb /tmp/dtb-pack/rk-kernel.dtb
+        # 1) 直接拷贝 R5S 的 dtb 作为 rk-kernel.dtb（这是 sd-fuse 需要的核心 dtb）
+        R5S_DTB=""
+        for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
+          if [ -f "$DTB_DIR/$cand" ]; then
+            R5S_DTB="$cand"
+            break
+          fi
+        done
+
+        if [ -z "$R5S_DTB" ]; then
+          echo "::error::找不到 rk3568-nanopi-r5s.dtb / rk3568-nanopi-r5c.dtb"
+          ls "$DTB_DIR"/*.dtb 2>/dev/null | head -20
+          exit 1
         fi
 
+        echo "[OK] 主 dtb: $R5S_DTB"
+        cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
+
+        # 2) 同时保留 r5s 和 r5c 原始 dtb（便于资源区里含多个机型 dtb）
+        for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
+          if [ -f "$DTB_DIR/$cand" ]; then
+            cp "$DTB_DIR/$cand" /tmp/dtb-pack/
+            echo "[OK] 附带 dtb: $cand"
+          fi
+        done
+
+        # 3) 构建 dtb 列表（用 find，避免 ls 与通配符问题）
         cd /tmp/dtb-pack
-        DTB_LIST=$(ls *.dtb 2>/dev/null | tr '\n' ' ')
+        DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
         cd - > /dev/null
+
         [ -z "$DTB_LIST" ] && { echo "::error::no dtb files"; exit 1; }
 
+        echo "=== 待打包 dtb 列表 ==="
+        echo "$DTB_LIST"
+        echo "总数: $(echo "$DTB_LIST" | wc -l)"
+
+        # 4) 打包 resource.img
         "$SF/tools/resource_tool" --pack \
           --root=/tmp/dtb-pack \
           --image="$PWD/$TGT/resource.img" \
