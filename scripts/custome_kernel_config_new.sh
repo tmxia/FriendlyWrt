@@ -5,7 +5,7 @@
 #
 # 负责：
 #   1. ccache 初始化 + staging_dir 缓存完整性验证
-#   2. 6.12 内核产物验证 + 版本解析（从 include/kernel-6.12）
+#   2. 6.12 内核产物验证 + 版本解析（从 target/linux/generic/kernel-6.12）
 #   3. 初始化 .config（目标设备 + Docker + PCIe + luci-app-amlogic）
 #   4. 集成 luci-app-amlogic + 执行 add_packages.sh
 #   5. .config 去重
@@ -63,6 +63,7 @@ step_setup_ccache_and_staging() {
     du -sh "$STAGING" 2>/dev/null || true
 
     local HOST_GCC TOOLCHAIN_DIR TC_GCC
+    # host gcc 可能叫 "gcc"，也可能叫 "*-gcc"，也可能叫 "gcc-*"
     HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 \
         \( -name "gcc" -o -name "*-gcc" -o -name "gcc-*" \) \
         2>/dev/null | head -1)
@@ -106,62 +107,18 @@ step_verify_kernel() {
     log "[OK] 6.12 内核产物已就绪"
 
     # ---------- 2.2 解析内核版本号 ----------
-    # OpenWrt 24.10+ 结构：
-    #   include/kernel-version.mk —— 通用逻辑（含变量引用）
-    #   include/kernel-6.12       —— 具体版本号（LINUX_VERSION-6.12 = .87）
-    # 因此正确来源是 include/kernel-6.12
-    local KVER=""
+    # 正确来源：target/linux/generic/kernel-6.12
+    # 格式：LINUX_VERSION-6.12 = .87
+    local KVER_FILE="target/linux/generic/kernel-6.12"
+    [ -f "$KVER_FILE" ] || err "内核版本文件不存在: $KVER_FILE"
 
-    # 首选：include/kernel-6.12
-    if [ -f "include/kernel-6.12" ]; then
-        local VP
-        # 匹配 "LINUX_VERSION-6.12 = .87"
-        VP=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" include/kernel-6.12 2>/dev/null \
-             | head -1 | awk '{print $3}' || true)
-        if [ -n "$VP" ]; then
-            KVER="6.12${VP}"
-        fi
-        # 备选：匹配 "LINUX_KERNEL_HASH-6.12.87"
-        if [ -z "$KVER" ]; then
-            KVER=$(grep -oE "LINUX_KERNEL_HASH-6\.12\.[0-9]+" include/kernel-6.12 2>/dev/null \
-                   | head -1 | sed 's/LINUX_KERNEL_HASH-//' || true)
-        fi
-    fi
+    local VP
+    VP=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" "$KVER_FILE" \
+         | head -1 | awk '{print $3}')
 
-    # 兜底 1：include/kernel-version.mk
-    if [ -z "$KVER" ] && [ -f "include/kernel-version.mk" ]; then
-        local VP
-        VP=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" include/kernel-version.mk 2>/dev/null \
-             | head -1 | awk '{print $3}' || true)
-        if [ -n "$VP" ]; then
-            KVER="6.12${VP}"
-        fi
-        if [ -z "$KVER" ]; then
-            KVER=$(grep -oE "LINUX_KERNEL_HASH-6\.12\.[0-9]+" include/kernel-version.mk 2>/dev/null \
-                   | head -1 | sed 's/LINUX_KERNEL_HASH-//' || true)
-        fi
-    fi
+    [ -n "$VP" ] || err "无法从 $KVER_FILE 中解析 6.12.x 内核版本号"
 
-    # 兜底 2：只取大版本（无法判断补丁号）
-    if [ -z "$KVER" ]; then
-        local VP
-        VP=$(grep -oE "KERNEL_PATCHVER[:?]?= *[0-9]+\.[0-9]+" target/linux/rockchip/Makefile 2>/dev/null \
-             | head -1 | grep -oE "[0-9]+\.[0-9]+" || true)
-        if [ -n "$VP" ]; then
-            KVER="${VP}.0"   # 补丁号占位 0
-            warn "只能解析到大版本号 ${VP}（补丁号未知），无法判断 PCIe 修复版本"
-            warn "ImmortalWrt 25.12 分支通常使用 6.12.87+，已包含 PCIe 修复"
-            return 0
-        fi
-    fi
-
-    if [ -z "$KVER" ]; then
-        warn "内核版本号无法解析（不影响编译）"
-        warn "调试："
-        ls -la include/kernel-* 2>/dev/null | head -5 || true
-        return 0
-    fi
-
+    local KVER="6.12${VP}"
     log "[INFO] 内核版本: $KVER"
 
     # ---------- 2.3 PCIe 修复版本检查（>= 6.12.17） ----------
