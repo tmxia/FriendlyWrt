@@ -21,8 +21,22 @@ jobs:
       - name: Get latest commit SHA for nanopi6-v6.1.y
         id: sha
         run: |
-          SHA=$(curl -s https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y | jq -r .sha)
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: kernel-watcher" \
+            "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y" \
+            || true)
+          SHA=$(printf '%s' "$RESP" | jq -r '.sha // empty' 2>/dev/null || true)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::warning::Cannot fetch upstream SHA, skipping this cycle."
+            echo "--- GitHub API response (head) ---"
+            printf '%s' "$RESP" | head -c 500
+            echo
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Current SHA: $SHA"
 
       - name: Read recorded SHA
@@ -33,21 +47,38 @@ jobs:
           else
             RECORDED="none"
           fi
+          if [ -z "$RECORDED" ]; then
+            RECORDED="none"
+          fi
           echo "recorded=$RECORDED" >> $GITHUB_OUTPUT
           echo "Recorded SHA: $RECORDED"
 
       - name: Fetch upstream commit titles
         id: commits
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: |
+          steps.sha.outputs.ok == 'true' &&
+          steps.sha.outputs.sha != steps.recorded.outputs.recorded
         run: |
           if [ "${{ steps.recorded.outputs.recorded }}" = "none" ]; then
-            TITLES=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=50" \
-                     | jq -r '.[] | .commit.message | split("\n")[0]')
+            URL="https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=50"
+            TITLES=$(curl -sS -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: kernel-watcher" "$URL" \
+              | jq -r 'if type=="array" then (.[] | .commit.message | split("\n")[0]) else empty end' \
+              2>/dev/null || true)
           else
-            TITLES=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/compare/${{ steps.recorded.outputs.recorded }}...${{ steps.sha.outputs.sha }}" \
-                     | jq -r '.commits[].commit.message | split("\n")[0]')
+            URL="https://api.github.com/repos/friendlyarm/kernel-rockchip/compare/${{ steps.recorded.outputs.recorded }}...${{ steps.sha.outputs.sha }}"
+            TITLES=$(curl -sS -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: kernel-watcher" "$URL" \
+              | jq -r 'if type=="object" and .commits then (.commits[] | .commit.message | split("\n")[0]) else empty end' \
+              2>/dev/null || true)
           fi
           TITLES=$(printf '%s\n' "$TITLES" | awk 'NF' | head -n 50 | cut -c1-250)
+          if [ -z "$TITLES" ]; then
+            echo "::warning::No titles fetched from GitHub API."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
           {
             echo "titles<<__EOF__"
             echo "$TITLES"
@@ -56,7 +87,10 @@ jobs:
           echo "Commit titles count: $(printf '%s\n' "$TITLES" | wc -l)"
 
       - name: Cache HuggingFace models
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: |
+          steps.sha.outputs.ok == 'true' &&
+          steps.commits.outputs.ok == 'true' &&
+          steps.sha.outputs.sha != steps.recorded.outputs.recorded
         uses: actions/cache@v4
         with:
           path: |
@@ -66,7 +100,10 @@ jobs:
 
       - name: Translate titles with opus-mt-en-zh
         id: translate
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: |
+          steps.sha.outputs.ok == 'true' &&
+          steps.commits.outputs.ok == 'true' &&
+          steps.sha.outputs.sha != steps.recorded.outputs.recorded
         timeout-minutes: 20
         env:
           TITLES: ${{ steps.commits.outputs.titles }}
@@ -94,7 +131,6 @@ jobs:
                 sys.stderr.write(f"LOAD_FAIL: {e}\n")
                 sys.exit(2)
 
-            # 术语保护：含数字/下划线/连字符/斜杠、或全大写的 token 视为技术名词
             TERM_RE = re.compile(r'[A-Za-z0-9_./-]*[0-9_/.-][A-Za-z0-9_./-]*|[A-Z][A-Z0-9_]{3,}')
 
             def protect(text):
@@ -130,7 +166,6 @@ jobs:
                         )
                         zh = tok.batch_decode(out, skip_special_tokens=True)[0].strip()
                         zh = restore(zh, terms)
-                        # 检测坏输出：连续重复的单字
                         if re.search(r'(\S)\1{3,}', zh) or not zh:
                             zh = t
                             fail += 1
@@ -198,7 +233,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Compare and trigger build if changed
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: |
+          steps.sha.outputs.ok == 'true' &&
+          steps.commits.outputs.ok == 'true' &&
+          steps.sha.outputs.sha != steps.recorded.outputs.recorded
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -206,7 +244,10 @@ jobs:
           gh workflow run build.yml -f version=both -f set=both --repo ${{ github.repository }}
 
       - name: Update recorded SHA with summary
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: |
+          steps.sha.outputs.ok == 'true' &&
+          steps.commits.outputs.ok == 'true' &&
+          steps.sha.outputs.sha != steps.recorded.outputs.recorded
         env:
           SHA: ${{ steps.sha.outputs.sha }}
           SUMMARY: ${{ steps.translate.outputs.summary }}
