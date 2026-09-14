@@ -37,138 +37,146 @@ jobs:
           echo "recorded=$RECORDED" >> $GITHUB_OUTPUT
           echo "Recorded SHA: $RECORDED"
 
-      - name: Fetch upstream commit messages
+      - name: Fetch upstream commit titles
         id: commits
         if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
         run: |
           if [ "${{ steps.recorded.outputs.recorded }}" = "none" ]; then
-            RAW=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=30" \
-                   | jq -r '.[].commit.message')
+            TITLES=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=50" \
+                     | jq -r '.[] | .commit.message | split("\n")[0]')
           else
-            RAW=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/compare/${{ steps.recorded.outputs.recorded }}...${{ steps.sha.outputs.sha }}" \
-                   | jq -r '.commits[].commit.message')
+            TITLES=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/compare/${{ steps.recorded.outputs.recorded }}...${{ steps.sha.outputs.sha }}" \
+                     | jq -r '.commits[].commit.message | split("\n")[0]')
           fi
-
-          # 过滤掉签核/链接/上游 SHA 等噪音行，只保留标题与关键描述
-          MSGS=$(printf '%s\n' "$RAW" \
-                   | grep -vE '^(Signed-off-by:|Reviewed-by:|Acked-by:|Tested-by:|Reported-by:|Suggested-by:|Link:|\[ Upstream commit|commit [0-9a-f]{40})' \
-                   | grep -vE '^[[:space:]]+Signed-off-by' \
-                   | awk 'NF' \
-                   | head -n 60 \
-                   | cut -c1-300)
-
+          TITLES=$(printf '%s\n' "$TITLES" | awk 'NF' | head -n 50 | cut -c1-250)
           {
-            echo "msgs<<__EOF__"
-            echo "$MSGS"
+            echo "titles<<__EOF__"
+            echo "$TITLES"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
-          echo "Filtered message lines: $(printf '%s\n' "$MSGS" | wc -l)"
+          echo "Commit titles count: $(printf '%s\n' "$TITLES" | wc -l)"
 
       - name: Generate Chinese summary
         id: summary
         if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_MSGS: ${{ steps.commits.outputs.msgs }}
+          TITLES: ${{ steps.commits.outputs.titles }}
         run: |
-          if [ -z "$UPSTREAM_MSGS" ]; then
-            echo "No upstream messages to summarize."
+          if [ -z "$TITLES" ]; then
             echo "summary=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # ---------- 规则式中文兜底 ----------
-          fallback_summary() {
-            printf '%s\n' "$1" | awk 'NF' | grep -E '^[A-Za-z]' | head -n 20 \
-            | while IFS= read -r line; do
-                prefix="${line%%:*}"
-                subject="${line#*:}"
-                if [ "$subject" = "$line" ]; then
-                  subject=""
-                fi
-                subject="${subject# }"
+          printf '%s\n' "$TITLES" > /tmp/titles.txt
+          INPUT_COUNT=$(awk 'NF' /tmp/titles.txt | wc -l | tr -d ' ')
+          echo "Input titles: $INPUT_COUNT"
 
-                case "$prefix" in
-                  *Bluetooth*|*hci*|*BT*)       cn="蓝牙";;
-                  *dts*|*DTS*)                  cn="设备树";;
-                  *arm64*|*ARM64*)              cn="ARM64";;
-                  *configs*|*config*)           cn="内核配置";;
-                  *drm*|*panfrost*|*mali*)      cn="图形驱动";;
-                  *net*|*stmmac*|*gmac*)        cn="网络";;
-                  *usb*|*USB*)                  cn="USB";;
-                  *pci*|*PCI*)                  cn="PCI";;
-                  *mmc*|*MMC*)                  cn="MMC";;
-                  *firmware*|*fw*)              cn="固件";;
-                  *i2c*|*spi*)                  cn="I2C/SPI";;
-                  "")                           cn="";;
-                  *)                            cn="$prefix";;
-                esac
+          # =================================================================
+          # 路径 1：GitHub Models —— LLM 自主翻译
+          # =================================================================
+          PROMPT=$(cat <<EOF
+你是 Linux 内核更新日志翻译助手。请把下列英文提交标题逐条翻译成中文要点。
 
-                subject=$(printf '%s' "$subject" | sed -E \
-                  -e 's/^Add /新增 /I' \
-                  -e 's/^enable /启用 /I' \
-                  -e 's/^use /使用 /I' \
-                  -e 's/^Set /设置 /I' \
-                  -e 's/^detect /检测 /I' \
-                  -e 's/^support /支持 /I' \
-                  -e 's/^fix /修复 /I' \
-                  -e 's/^update /更新 /I' \
-                  -e 's/^remove /移除 /I' \
-                  -e 's/^make /将 /I' \
-                  -e 's/^revert /回退 /I')
+严格规则：
+1. 输入 N 条，输出 N 条，每条一行，以 "- " 开头；不得合并、拆分或遗漏
+2. 术语保留英文原文（例如 hci_uart、hci_aic、dts、panfrost、Bifrost、BT_HCIUART_AIC、nanopi-r28s、rtl8822cs-bt、NET_SCH_FQ_CODEL、virtual-connector、cts-detect-wait-ms）
+3. 子系统前缀翻译成中文类别：
+   - Bluetooth: → 蓝牙
+   - dts: rockchip: 或 ARM64: dts: rockchip: → 设备树
+   - arm64: configs: 或 ARM64: configs: → 内核配置
+   - drm/panfrost: → 图形驱动 panfrost
+4. 不输出 Signed-off-by、Reviewed-by、Link、上游 commit id 等元信息
+5. 不编造输入中不存在的内容
+6. 直接输出要点列表，不要代码块、不要标题、不要前后缀说明
 
-                if [ -n "$subject" ]; then
-                  if [ -n "$cn" ]; then
-                    echo "- 【${cn}】${subject}"
-                  else
-                    echo "- ${subject}"
-                  fi
-                else
-                  echo "- ${line}"
-                fi
-              done
-          }
+示例输入：
+Bluetooth: hci_aic: Add module ready check to setup
+ARM64: dts: rockchip: Add dts for nanopi-r28s
+arm64: configs: enable BT_HCIUART_AIC for nanopi5/6
+drm/panfrost: Set HW_FEATURE_AARCH64_MMU feature flag on Bifrost models
 
-          PROMPT="请把下面 Linux 内核上游提交信息用中文总结。要求：
-          - 输出 3-8 条要点，每行以 - 开头
-          - 保留模块名/驱动名/子系统名等必要英文术语（如 Bluetooth、hci_uart、dts、drm、panfrost）
-          - 按功能归类（例如 蓝牙 / 设备树 / 内核配置 / 图形驱动 / 网络 / USB）
-          - 不要编造未出现的信息
-          - 不要输出 Signed-off-by、Reviewed-by、Link 等元信息
-          - 直接输出中文要点列表，不要任何前后缀说明
+示例输出：
+- 蓝牙 hci_aic 在 setup 中增加模块就绪检查
+- 设备树新增 nanopi-r28s 的 dts
+- 为 nanopi5/6 启用 BT_HCIUART_AIC
+- 图形驱动 panfrost 在 Bifrost 模型上设置 HW_FEATURE_AARCH64_MMU 特性标志
 
-          上游提交信息：
-          $UPSTREAM_MSGS"
+现在请翻译以下 ${INPUT_COUNT} 条提交标题：
+$TITLES
+EOF
+)
 
           SUMMARY=""
-          for MODEL in "gpt-4o-mini" "gpt-4o" "meta-llama-3.1-70b-instruct"; do
+          for MODEL in "gpt-4o-mini" "gpt-4o" "gpt-4.1" "gpt-4.1-mini"; do
             for EP in "https://models.github.ai/inference/chat/completions" \
                       "https://models.inference.ai.azure.com/chat/completions"; do
-              echo "Trying model=$MODEL endpoint=$EP"
+              echo "== Path1: model=$MODEL endpoint=$EP =="
               BODY=$(jq -n --arg p "$PROMPT" --arg m "$MODEL" \
-                '{model:$m,temperature:0.2,messages:[{role:"user",content:$p}]}')
-              RESP=$(curl -s "$EP" \
+                '{model:$m,temperature:0.1,messages:[{role:"user",content:$p}]}')
+              RESP=$(curl -s --max-time 60 "$EP" \
                 -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Content-Type: application/json" \
                 -d "$BODY" || true)
-              SUMMARY=$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
-              if [ -n "$SUMMARY" ]; then
-                echo "Summary generated via $MODEL @ $EP"
-                break 2
+              CAND=$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+              if [ -n "$CAND" ]; then
+                CN=$(printf '%s' "$CAND" | grep -oP '[\x{4e00}-\x{9fff}]' | wc -l | tr -d ' ')
+                BULLETS=$(printf '%s\n' "$CAND" | grep -c '^- ' || true)
+                echo "   candidate: CN=$CN bullets=$BULLETS"
+                if [ "$CN" -ge 20 ] && [ "$BULLETS" -ge "$(( INPUT_COUNT * 2 / 3 ))" ]; then
+                  SUMMARY="$CAND"
+                  echo "   accepted."
+                  break 2
+                fi
               fi
             done
           done
 
-          # 若模型返回中文太少（或为空），改用规则式中文兜底
-          CN_COUNT=0
-          if [ -n "$SUMMARY" ]; then
-            CN_COUNT=$(printf '%s' "$SUMMARY" | grep -oP '[\p{Han}]' | wc -l | tr -d ' ')
-          fi
-          echo "Chinese char count in model output: $CN_COUNT"
+          # =================================================================
+          # 路径 2：deep-translator + Google 免费端点 —— 真正的翻译引擎
+          # =================================================================
+          if [ -z "$SUMMARY" ]; then
+            echo "== Path1 failed; Path2: Google Translate via deep-translator =="
+            python3 -m pip install --quiet --disable-pip-version-check deep-translator >/dev/null 2>&1 || true
+            if python3 -c "import deep_translator" 2>/dev/null; then
+              python3 << 'PYEOF' > /tmp/summary_google.txt 2>/tmp/trans_err.log || true
+from deep_translator import GoogleTranslator
+import sys
 
-          if [ -z "$SUMMARY" ] || [ "$CN_COUNT" -lt 10 ]; then
-            echo "Model output unusable, using rule-based Chinese fallback."
-            SUMMARY=$(fallback_summary "$UPSTREAM_MSGS")
+with open('/tmp/titles.txt', encoding='utf-8') as f:
+    titles = [l.strip() for l in f if l.strip()]
+
+try:
+    tr = GoogleTranslator(source='en', target='zh-CN')
+except Exception as e:
+    sys.stderr.write(f"init failed: {e}\n")
+    sys.exit(1)
+
+for t in titles:
+    try:
+        zh = tr.translate(t)
+    except Exception as e:
+        sys.stderr.write(f"translate failed: {t} :: {e}\n")
+        zh = t
+    print('- ' + (zh or t))
+PYEOF
+              if [ -s /tmp/summary_google.txt ]; then
+                SUMMARY=$(cat /tmp/summary_google.txt)
+                echo "   Path2 produced $(printf '%s\n' "$SUMMARY" | grep -c '^- ') bullets."
+              else
+                echo "   Path2 produced empty output."
+              fi
+            else
+              echo "   deep-translator not available."
+            fi
+          fi
+
+          # =================================================================
+          # 路径 3：最终兜底 —— 原样列出，不做硬编码拼接
+          # =================================================================
+          if [ -z "$SUMMARY" ]; then
+            echo "== All translation engines failed; listing original titles =="
+            SUMMARY=$(awk 'NF {print "- " $0}' /tmp/titles.txt)
           fi
 
           {
@@ -228,30 +236,18 @@ jobs:
 
           WF_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
             --jq ".workflows[] | select(.name == \"$TARGET_NAME\") | .id" | head -n1)
-
           if [ -z "$WF_ID" ]; then
             echo "Workflow '$TARGET_NAME' not found. Skip."
             exit 0
           fi
-          echo "Workflow '$TARGET_NAME' ID: $WF_ID"
 
           RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs?per_page=100" \
             --jq '.workflow_runs[].id')
 
-          echo "Runs found:"
-          echo "$RUNS"
-
           i=0
           for run_id in $RUNS; do
             i=$((i+1))
-            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
-              echo "Keep current run: $run_id"
-              continue
-            fi
-            if [ "$i" -le "$KEEP" ]; then
-              echo "Keep recent run: $run_id"
-              continue
-            fi
-            echo "Deleting run: $run_id"
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then continue; fi
+            if [ "$i" -le "$KEEP" ]; then continue; fi
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" || true
           done
