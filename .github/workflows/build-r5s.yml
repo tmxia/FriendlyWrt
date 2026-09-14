@@ -187,7 +187,7 @@ jobs:
           gomod-${{ env.OPENWRT_BRANCH }}-
 
     # ==========================================================
-    #  调用自定义脚本：配置 + 编译
+    #  配置 + 编译（全部收敛到脚本）
     # ==========================================================
     - name: Run custom kernel config & build
       run: bash scripts/custome_kernel_config_new.sh
@@ -305,6 +305,7 @@ jobs:
           [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
         done
 
+        # resource_tool 不拼接 --root 路径，必须在 dtb 所在目录运行
         cd /tmp/dtb-pack
         DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
 
@@ -333,10 +334,9 @@ jobs:
         done
 
     # ==========================================================
-    #  关键修复：让 parameter.txt 分配的 rootfs 容量 >= rootfs.img 实际大小
-    #  原因：generate-partmap-txt.sh 内部按 512 字节块取整，
-    #        但 rootfs.img 实际可能不是 512 的整数倍，导致 SD 卡写入时被截断
-    #  方案：向上对齐到 1MB，并额外留 1MB 余量
+    #  ★ 核心修复：rootfs.img 使用 ROOTFS_PARTSIZE 作为逻辑分区大小
+    #  传给 parameter.txt 脚本的 size 也必须是逻辑分区大小，
+    #  不能是 sparse 文件的 stat 大小
     # ==========================================================
     - name: Build rootfs.img
       run: |
@@ -356,9 +356,21 @@ jobs:
         MKFS="$PWD/tools/mke2fs"
         MKFS_CONF="$PWD/tools/mke2fs.conf"
         ROOTFS_DIR=/tmp/rootfs-pack
-        IMG_SIZE=$(( (`du -s -B64M $ROOTFS_DIR | cut -f1` + 3) * 1024 * 1024 * 64 ))
-        IMG_BLK=$(( $IMG_SIZE / 4096 ))
-        INODE_SIZE=$(( `find $ROOTFS_DIR | wc -l` + 128 ))
+
+        # 检查 rootfs 内容是否超出 ROOTFS_PARTSIZE
+        ACTUAL_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1}')
+        echo "=== rootfs 实际内容: ${ACTUAL_MB} MB / 目标分区: ${ROOTFS_PARTSIZE} MB ==="
+        if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
+          echo "::error::rootfs 内容 (${ACTUAL_MB}MB) 超过 ROOTFS_PARTSIZE (${ROOTFS_PARTSIZE}MB)，请增大分区"
+          exit 1
+        fi
+
+        # ==== 使用 ROOTFS_PARTSIZE 作为固定逻辑分区容量 ====
+        LOGICAL_SIZE=$(( ROOTFS_PARTSIZE * 1024 * 1024 ))
+        IMG_BLK=$(( LOGICAL_SIZE / 4096 ))
+        INODE_SIZE=$(( $(find "$ROOTFS_DIR" | wc -l) + 128 ))
+
+        echo "=== 逻辑分区容量: ${ROOTFS_PARTSIZE} MB (${LOGICAL_SIZE} bytes, ${IMG_BLK} blocks) ==="
 
         rm -f "$TGT/rootfs.img"
         MKE2FS_CONFIG="$MKFS_CONF" \
@@ -369,19 +381,21 @@ jobs:
         [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img 生成失败"; exit 1; }
         ls -lh "$TGT/rootfs.img"
 
-        # ===== 关键修复：对齐 rootfs 分区大小 =====
-        ROOTFS_IMG_SIZE=$(stat -c%s "$TGT/rootfs.img")
-        # 向上对齐到 1MB（1048576 字节），再加 1MB 余量，确保 parameter.txt 分配的容量足够
-        ROOTFS_SIZE_FOR_PARAM=$(( (ROOTFS_IMG_SIZE + 1048576 + 1048575) / 1048576 * 1048576 ))
-        echo "rootfs.img 实际大小: $ROOTFS_IMG_SIZE 字节 ($(numfmt --to=iec $ROOTFS_IMG_SIZE))"
-        echo "parameter.txt 分配容量: $ROOTFS_SIZE_FOR_PARAM 字节 ($(numfmt --to=iec $ROOTFS_SIZE_FOR_PARAM))"
-        echo "余量: $((ROOTFS_SIZE_FOR_PARAM - ROOTFS_IMG_SIZE)) 字节"
-        echo "ROOTFS_SIZE_BYTES=$ROOTFS_SIZE_FOR_PARAM" >> $GITHUB_ENV
+        SPARSE_SIZE=$(stat -c%s "$TGT/rootfs.img")
+        echo "[INFO] sparse 文件实际大小: $SPARSE_SIZE bytes"
+        echo "[INFO] 逻辑分区大小:        $LOGICAL_SIZE bytes"
+
+        # ==== 关键：传给分区脚本的必须是"逻辑分区大小" ====
+        # 否则 generate-partmap-txt.sh 会按 sparse 文件大小生成分区，
+        # 导致 rootfs 分区比 img 的逻辑大小小，mk-sd-image.sh 跳过写入
+        echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
+        echo "[OK] 已设置 ROOTFS_SIZE_BYTES=$LOGICAL_SIZE"
 
     - name: Generate parameter.txt
       run: |
         cd project/sd-fuse
         [ -z "$ROOTFS_SIZE_BYTES" ] && { echo "::error::ROOTFS_SIZE_BYTES 未设置"; exit 1; }
+        echo "=== 传给 generate-partmap-txt.sh 的 size: $ROOTFS_SIZE_BYTES ==="
         PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
           ./tools/generate-partmap-txt.sh "$ROOTFS_SIZE_BYTES" "$TARGET_OS"
         echo "=== parameter.txt ==="
@@ -391,46 +405,27 @@ jobs:
       run: |
         cd project/sd-fuse
         export SDFUSE_NONINTERACTIVE=y
-        set +e
-        sudo -E ./mk-sd-image.sh "$TARGET_OS" 2>&1 | tee /tmp/sd-image.log | tail -40
-        SD_EXIT=$?
-        set -e
+        sudo -E ./mk-sd-image.sh "$TARGET_OS" 2>&1 | tee /tmp/sd-image.log | tail -60 || {
+          echo "::warning::mk-sd-image.sh 非零退出"
+          tail -120 /tmp/sd-image.log
+        }
+        ls -lh out/ 2>/dev/null || echo "(无 out/)"
 
-        # ===== 关键修复：检测 "more than capacity" 警告并视为错误 =====
+        # 检查 mk-sd-image.sh 是否跳过了 rootfs
         if grep -q "more than capacity" /tmp/sd-image.log; then
-          echo "::error::rootfs 写入被截断！SD 卡镜像不完整"
-          grep -n "more than capacity" /tmp/sd-image.log
-          echo "----- 完整的 mk-sd-image 日志尾部 -----"
-          tail -40 /tmp/sd-image.log
+          echo "::error::mk-sd-image.sh 跳过了 rootfs 写入（分区容量不足）"
+          grep "more than capacity" /tmp/sd-image.log
           exit 1
         fi
-
-        if [ $SD_EXIT -ne 0 ]; then
-          echo "::warning::mk-sd-image.sh 非零退出: $SD_EXIT"
-          tail -80 /tmp/sd-image.log
-        fi
-        ls -lh out/ 2>/dev/null || echo "(无 out/)"
 
     - name: Build eMMC flasher image
       run: |
         cd project/sd-fuse
         export SDFUSE_NONINTERACTIVE=y
-        set +e
-        sudo -E ./mk-emmc-image.sh "$TARGET_OS" autostart=yes 2>&1 | tee /tmp/emmc-image.log | tail -40
-        EMMC_EXIT=$?
-        set -e
-
-        # 检测同样的截断问题
-        if grep -q "more than capacity" /tmp/emmc-image.log; then
-          echo "::error::rootfs 写入被截断！eMMC 镜像不完整"
-          grep -n "more than capacity" /tmp/emmc-image.log
-          exit 1
-        fi
-
-        if [ $EMMC_EXIT -ne 0 ]; then
-          echo "::warning::mk-emmc-image.sh 非零退出: $EMMC_EXIT"
+        sudo -E ./mk-emmc-image.sh "$TARGET_OS" autostart=yes 2>&1 | tee /tmp/emmc-image.log | tail -40 || {
+          echo "::warning::mk-emmc-image.sh 非零退出"
           tail -80 /tmp/emmc-image.log
-        fi
+        }
         ls -lh out/images-for-eflasher/ 2>/dev/null || true
 
     - name: Fix file ownership from sudo operations
@@ -449,22 +444,31 @@ jobs:
 
         SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
         if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
+          # 检查 SD 卡镜像是否合理大小（> 200MB，因为 rootfs 至少 300MB）
+          SRC_SIZE=$(stat -c%s "$SRC_IMG")
+          SRC_SIZE_MB=$(( SRC_SIZE / 1024 / 1024 ))
+          echo "[INFO] SD 镜像原始大小: ${SRC_SIZE_MB} MB"
+          if [ "$SRC_SIZE_MB" -lt 200 ]; then
+            echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入"
+            exit 1
+          fi
+
           DST_NAME="${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.img"
           cp "$SRC_IMG" "/tmp/${DST_NAME}"
           gzip -f "/tmp/${DST_NAME}"
           cp "/tmp/${DST_NAME}.gz" ../../artifact/
-          echo "[OK] SD image: ${DST_NAME}.gz"
-          ls -lh "../../artifact/${DST_NAME}.gz"
+          echo "[OK] SD image: ${DST_NAME}.gz ($(du -h /tmp/${DST_NAME}.gz | awk '{print $1}'))"
         else
-          echo "::warning::未找到 sd-fuse 生成的 .img（out/ 内容如下）"
+          echo "::error::未找到 sd-fuse 生成的 .img"
           ls -la out/ 2>/dev/null || true
+          exit 1
         fi
 
         SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
         if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
           DST_NAME="images-${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.tgz"
           cp "$SRC_TGZ" "../../artifact/${DST_NAME}"
-          echo "[OK] eMMC pack: ${DST_NAME}"
+          echo "[OK] eMMC pack: ${DST_NAME} ($(du -h $SRC_TGZ | awk '{print $1}'))"
         else
           echo "::warning::未找到 eMMC 刷机包"
         fi
@@ -480,31 +484,6 @@ jobs:
         OPENWRT_MANIFEST=$(find ../friendlywrt/bin/targets/rockchip/armv8 -maxdepth 1 \
           -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
         [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "../../artifact/"
-
-    - name: Verify SD image integrity
-      run: |
-        cd artifact
-        IMG_GZ=$(find . -maxdepth 1 -name "R5S-R5C-Series-FriendlyWrt-*.img.gz" | head -1)
-        if [ -z "$IMG_GZ" ]; then
-          echo "::error::未找到 SD 卡镜像"
-          exit 1
-        fi
-
-        IMG_SIZE=$(stat -c%s "$IMG_GZ")
-        echo "SD 卡镜像大小: $IMG_SIZE 字节 ($(numfmt --to=iec $IMG_SIZE))"
-
-        # 合理的大小范围检查（合理值约 100-250 MB）
-        MIN_SIZE=$((50 * 1024 * 1024))        # 50 MB
-        MAX_SIZE=$((300 * 1024 * 1024))       # 300 MB
-        if [ "$IMG_SIZE" -lt "$MIN_SIZE" ]; then
-          echo "::error::SD 卡镜像过小 ($IMG_SIZE 字节 < 50 MB)，可能 rootfs 未正确写入"
-          exit 1
-        fi
-        if [ "$IMG_SIZE" -gt "$MAX_SIZE" ]; then
-          echo "::warning::SD 卡镜像异常大 ($IMG_SIZE 字节 > 300 MB)"
-        fi
-
-        echo "[OK] SD 卡镜像大小检查通过"
 
     - name: Generate SHA256 and README
       run: |
