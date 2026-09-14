@@ -1,4 +1,4 @@
-name: Build OpenWrt for NanoPi R5S
+name: Build ImmortalWrt for NanoPi R5S
 
 on:
   watch:
@@ -17,6 +17,7 @@ on:
 env:
   AUTO_REPLACE_TAG: 'false'
   OPENWRT_BRANCH: 'openwrt-25.12'
+  IMMORTALWRT_REPO: 'https://github.com/immortalwrt/immortalwrt.git'
   FLAVOR: 'r5s'
   TARGET_OS: 'friendlywrt25'
   MODEL_NAME: 'R5S-R5C-Series'
@@ -138,19 +139,19 @@ jobs:
         echo "CPU cores: $(nproc)"
         echo "ccache version: $(ccache --version | head -1)"
 
-    - name: Prepare OpenWrt workspace
+    - name: Prepare ImmortalWrt workspace
       run: |
         mkdir -p project
         cd project
         git clone --depth 1 -b ${{ env.OPENWRT_BRANCH }} \
-          https://github.com/openwrt/openwrt.git friendlywrt > /dev/null 2>&1
+          ${{ env.IMMORTALWRT_REPO }} friendlywrt > /dev/null 2>&1
         cd friendlywrt
         ./scripts/feeds update -a > /dev/null 2>&1 || ./scripts/feeds update -a
         ./scripts/feeds install -a > /dev/null 2>&1
         cd ..
         mkdir -p configs/rockchip
         touch configs/rockchip/01-nanopi
-        echo "OpenWrt workspace prepared"
+        echo "ImmortalWrt workspace prepared"
 
     - name: Restore staging_dir (toolchain + host)
       uses: actions/cache@v4
@@ -192,7 +193,6 @@ jobs:
     - name: Clean go-mod-cache before saving
       if: always()
       run: |
-        # 确保 dl/go-mod-cache 不被写入缓存
         rm -rf project/friendlywrt/dl/go-mod-cache
         echo "=== dl 大小（清理后）==="
         du -sh project/friendlywrt/dl 2>/dev/null || true
@@ -247,7 +247,8 @@ jobs:
         KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
         echo "KV=$KV" >> $GITHUB_ENV
         echo "[OK] Kernel modules version: $KV"
-        [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules 不是 6.12，实际 $KV"; exit 1; }
+        # 放宽版本检查，允许 6.12.x 系列
+        [[ "$KV" == 6.12.* ]] || { echo "::error::kernel modules 不是 6.12.x，实际 $KV"; exit 1; }
 
     - name: Clone sd-fuse_rk3568
       run: |
@@ -310,7 +311,6 @@ jobs:
           [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
         done
 
-        # resource_tool 不拼接 --root 路径，必须在 dtb 所在目录运行
         cd /tmp/dtb-pack
         DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
 
@@ -338,11 +338,6 @@ jobs:
           [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
         done
 
-    # ==========================================================
-    #  ★ 核心修复：rootfs.img 使用 ROOTFS_PARTSIZE 作为逻辑分区大小
-    #  传给 parameter.txt 脚本的 size 也必须是逻辑分区大小，
-    #  不能是 sparse 文件的 stat 大小
-    # ==========================================================
     - name: Build rootfs.img
       run: |
         cd project/sd-fuse
@@ -362,7 +357,6 @@ jobs:
         MKFS_CONF="$PWD/tools/mke2fs.conf"
         ROOTFS_DIR=/tmp/rootfs-pack
 
-        # 检查 rootfs 内容是否超出 ROOTFS_PARTSIZE
         ACTUAL_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1}')
         echo "=== rootfs 实际内容: ${ACTUAL_MB} MB / 目标分区: ${ROOTFS_PARTSIZE} MB ==="
         if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
@@ -370,7 +364,6 @@ jobs:
           exit 1
         fi
 
-        # ==== 使用 ROOTFS_PARTSIZE 作为固定逻辑分区容量 ====
         LOGICAL_SIZE=$(( ROOTFS_PARTSIZE * 1024 * 1024 ))
         IMG_BLK=$(( LOGICAL_SIZE / 4096 ))
         INODE_SIZE=$(( $(find "$ROOTFS_DIR" | wc -l) + 128 ))
@@ -390,7 +383,6 @@ jobs:
         echo "[INFO] sparse 文件实际大小: $SPARSE_SIZE bytes"
         echo "[INFO] 逻辑分区大小:        $LOGICAL_SIZE bytes"
 
-        # ==== 关键：传给分区脚本的必须是"逻辑分区大小" ====
         echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
         echo "[OK] 已设置 ROOTFS_SIZE_BYTES=$LOGICAL_SIZE"
 
@@ -495,11 +487,11 @@ jobs:
         done
 
         cat > README.txt <<EOF
-        FriendlyWrt for NanoPi R5S — Build $(date +%Y-%m-%d)
+        ImmortalWrt for NanoPi R5S — Build $(date +%Y-%m-%d)
         ============================================================
         发行标签: ${{ needs.prepare_release.outputs.release_tag }}
-        内核版本: 6.12 (OpenWrt 官方 openwrt-25.12 分支)
-        基础系统: OpenWrt 25.12 + Clashoo + Bootstrap 主题
+        内核版本: 6.12 (ImmortalWrt ${OPENWRT_BRANCH} 分支)
+        基础系统: ImmortalWrt + Clashoo + Bootstrap 主题
         rootfs 分区: 1024 MB
         Docker: 已集成 (docker + dockerd + docker-compose + LuCI)
 
@@ -561,5 +553,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
+          delete_workflow_pattern: "Build ImmortalWrt for NanoPi R5S"
           repository: ${{ github.repository }}
