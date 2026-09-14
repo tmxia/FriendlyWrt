@@ -42,21 +42,27 @@ jobs:
         if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
         run: |
           if [ "${{ steps.recorded.outputs.recorded }}" = "none" ]; then
-            RAW=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=20" \
+            RAW=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=30" \
                    | jq -r '.[].commit.message')
           else
             RAW=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/compare/${{ steps.recorded.outputs.recorded }}...${{ steps.sha.outputs.sha }}" \
                    | jq -r '.commits[].commit.message')
           fi
 
-          # 只保留非空行、最多 50 行、每行最多 300 字符，避免 prompt 过长
-          MSGS=$(printf '%s\n' "$RAW" | awk 'NF' | head -n 50 | cut -c1-300)
+          # 过滤掉签核/链接/上游 SHA 等噪音行，只保留标题与关键描述
+          MSGS=$(printf '%s\n' "$RAW" \
+                   | grep -vE '^(Signed-off-by:|Reviewed-by:|Acked-by:|Tested-by:|Reported-by:|Suggested-by:|Link:|\[ Upstream commit|commit [0-9a-f]{40})' \
+                   | grep -vE '^[[:space:]]+Signed-off-by' \
+                   | awk 'NF' \
+                   | head -n 60 \
+                   | cut -c1-300)
 
           {
             echo "msgs<<__EOF__"
             echo "$MSGS"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
+          echo "Filtered message lines: $(printf '%s\n' "$MSGS" | wc -l)"
 
       - name: Generate Chinese summary
         id: summary
@@ -71,34 +77,98 @@ jobs:
             exit 0
           fi
 
-          PROMPT="请用中文简要总结以下 Linux 内核仓库上游更新的主要内容。要求：要点形式（3-6 条），保留必要的技术术语（如模块名、驱动名、子系统名），不要编造未出现的信息，不要输出多余前后缀。
+          # ---------- 规则式中文兜底 ----------
+          fallback_summary() {
+            printf '%s\n' "$1" | awk 'NF' | grep -E '^[A-Za-z]' | head -n 20 \
+            | while IFS= read -r line; do
+                prefix="${line%%:*}"
+                subject="${line#*:}"
+                if [ "$subject" = "$line" ]; then
+                  subject=""
+                fi
+                subject="${subject# }"
 
-          上游提交信息如下：
+                case "$prefix" in
+                  *Bluetooth*|*hci*|*BT*)       cn="蓝牙";;
+                  *dts*|*DTS*)                  cn="设备树";;
+                  *arm64*|*ARM64*)              cn="ARM64";;
+                  *configs*|*config*)           cn="内核配置";;
+                  *drm*|*panfrost*|*mali*)      cn="图形驱动";;
+                  *net*|*stmmac*|*gmac*)        cn="网络";;
+                  *usb*|*USB*)                  cn="USB";;
+                  *pci*|*PCI*)                  cn="PCI";;
+                  *mmc*|*MMC*)                  cn="MMC";;
+                  *firmware*|*fw*)              cn="固件";;
+                  *i2c*|*spi*)                  cn="I2C/SPI";;
+                  "")                           cn="";;
+                  *)                            cn="$prefix";;
+                esac
+
+                subject=$(printf '%s' "$subject" | sed -E \
+                  -e 's/^Add /新增 /I' \
+                  -e 's/^enable /启用 /I' \
+                  -e 's/^use /使用 /I' \
+                  -e 's/^Set /设置 /I' \
+                  -e 's/^detect /检测 /I' \
+                  -e 's/^support /支持 /I' \
+                  -e 's/^fix /修复 /I' \
+                  -e 's/^update /更新 /I' \
+                  -e 's/^remove /移除 /I' \
+                  -e 's/^make /将 /I' \
+                  -e 's/^revert /回退 /I')
+
+                if [ -n "$subject" ]; then
+                  if [ -n "$cn" ]; then
+                    echo "- 【${cn}】${subject}"
+                  else
+                    echo "- ${subject}"
+                  fi
+                else
+                  echo "- ${line}"
+                fi
+              done
+          }
+
+          PROMPT="请把下面 Linux 内核上游提交信息用中文总结。要求：
+          - 输出 3-8 条要点，每行以 - 开头
+          - 保留模块名/驱动名/子系统名等必要英文术语（如 Bluetooth、hci_uart、dts、drm、panfrost）
+          - 按功能归类（例如 蓝牙 / 设备树 / 内核配置 / 图形驱动 / 网络 / USB）
+          - 不要编造未出现的信息
+          - 不要输出 Signed-off-by、Reviewed-by、Link 等元信息
+          - 直接输出中文要点列表，不要任何前后缀说明
+
+          上游提交信息：
           $UPSTREAM_MSGS"
 
-          BODY=$(jq -n --arg p "$PROMPT" '{
-            model: "gpt-4o-mini",
-            temperature: 0.2,
-            messages: [{role:"user", content:$p}]
-          }')
-
           SUMMARY=""
-          for EP in "https://models.github.ai/inference/chat/completions" "https://models.inference.ai.azure.com/chat/completions"; do
-            echo "Trying endpoint: $EP"
-            RESP=$(curl -s "$EP" \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$BODY" || true)
-            SUMMARY=$(echo "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
-            if [ -n "$SUMMARY" ]; then
-              echo "Summary generated via $EP"
-              break
-            fi
+          for MODEL in "gpt-4o-mini" "gpt-4o" "meta-llama-3.1-70b-instruct"; do
+            for EP in "https://models.github.ai/inference/chat/completions" \
+                      "https://models.inference.ai.azure.com/chat/completions"; do
+              echo "Trying model=$MODEL endpoint=$EP"
+              BODY=$(jq -n --arg p "$PROMPT" --arg m "$MODEL" \
+                '{model:$m,temperature:0.2,messages:[{role:"user",content:$p}]}')
+              RESP=$(curl -s "$EP" \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d "$BODY" || true)
+              SUMMARY=$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
+              if [ -n "$SUMMARY" ]; then
+                echo "Summary generated via $MODEL @ $EP"
+                break 2
+              fi
+            done
           done
 
-          if [ -z "$SUMMARY" ]; then
-            echo "Model endpoint unavailable, fallback to raw messages."
-            SUMMARY="$UPSTREAM_MSGS"
+          # 若模型返回中文太少（或为空），改用规则式中文兜底
+          CN_COUNT=0
+          if [ -n "$SUMMARY" ]; then
+            CN_COUNT=$(printf '%s' "$SUMMARY" | grep -oP '[\p{Han}]' | wc -l | tr -d ' ')
+          fi
+          echo "Chinese char count in model output: $CN_COUNT"
+
+          if [ -z "$SUMMARY" ] || [ "$CN_COUNT" -lt 10 ]; then
+            echo "Model output unusable, using rule-based Chinese fallback."
+            SUMMARY=$(fallback_summary "$UPSTREAM_MSGS")
           fi
 
           {
