@@ -2,19 +2,6 @@
 # =============================================================
 # custome_kernel_config_new.sh
 # ImmortalWrt NanoPi R5S 编译配置 + 构建脚本
-#
-# 本脚本运行在 ImmortalWrt 源码树（immortalwrt/immortalwrt）之上，
-# 负责：
-#   1. ccache 初始化 + staging_dir 缓存完整性验证（含 host gcc 匹配修复）
-#   2. 6.12 内核产物验证 + 版本解析（含 PCIe 修复检查）
-#   3. 初始化 .config（目标设备 + Docker + PCIe + luci-app-amlogic）
-#   4. 集成 luci-app-amlogic 刷机工具 + 执行 add_packages.sh
-#   5. .config 去重
-#   6. 修补 file Makefile 依赖
-#   7. 强制修正关键配置
-#   8. 清理污染的 go-mod-cache + 下载软件包源码
-#   9. 分阶段编译（tools → toolchain → target → package → final make）
-#  10. 编译失败自动诊断恢复
 # =============================================================
 
 set -e
@@ -62,10 +49,9 @@ step_setup_ccache_and_staging() {
 
     log "=== staging_dir 结构 ==="
     du -sh "$STAGING" 2>/dev/null || true
-    ls -la "$STAGING/" | head -20 || true
 
     local HOST_GCC TOOLCHAIN_DIR TC_GCC
-    # 修复：host gcc 可能叫 "gcc"，也可能叫 "*-gcc"，也可能叫 "gcc-*"
+    # host gcc 可能叫 "gcc"，也可能叫 "*-gcc"，也可能叫 "gcc-*"
     HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 \
         \( -name "gcc" -o -name "*-gcc" -o -name "gcc-*" \) \
         2>/dev/null | head -1)
@@ -97,85 +83,40 @@ step_setup_ccache_and_staging() {
 }
 
 # =============================================================
-# 2. 6.12 内核产物验证（含 PCIe 修复版本检查）
+# 2. 6.12 内核产物验证 + 版本号解析
 # =============================================================
 step_verify_kernel() {
     log "===== 2. 验证 6.12 内核产物 ====="
     cd "$FRIENDLYWRT_DIR"
 
     # ---------- 2.1 检查内核补丁和配置文件是否存在 ----------
-    if [ ! -d "target/linux/rockchip/patches-6.12" ]; then
-        err "6.12 内核补丁目录不存在"
-    fi
-    if [ ! -f "target/linux/rockchip/armv8/config-6.12" ]; then
-        err "6.12 内核配置文件不存在"
-    fi
+    [ -d "target/linux/rockchip/patches-6.12" ]      || err "6.12 内核补丁目录不存在"
+    [ -f "target/linux/rockchip/armv8/config-6.12" ] || err "6.12 内核配置文件不存在"
     log "[OK] 6.12 内核产物已就绪"
 
-    # ---------- 2.2 解析内核版本号（多来源尝试） ----------
-    local KVER=""
+    # ---------- 2.2 从 kernel-version.mk 解析内核版本号 ----------
+    # 权威来源：include/kernel-version.mk
+    # 文件内定义：LINUX_KERNEL_HASH-6.12.87 = <hash>
+    # 直接抓取 6.12.87 部分
+    local KVER_FILE="include/kernel-version.mk"
+    [ -f "$KVER_FILE" ] || err "内核版本文件不存在: $KVER_FILE"
 
-    # 来源 1：include/kernel-6.12（ImmortalWrt / OpenWrt 25.12+）
-    if [ -z "$KVER" ] && [ -f "include/kernel-6.12" ]; then
-        local VER_PART
-        # 匹配 "LINUX_VERSION-6.12 = .87"
-        VER_PART=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" include/kernel-6.12 2>/dev/null \
-                   | head -1 | awk '{print $3}' || true)
-        if [ -n "$VER_PART" ]; then
-            KVER="6.12${VER_PART}"   # 例如 "6.12.87"
-        fi
-        # 备选匹配 "LINUX_KERNEL_HASH-6.12.87 = ..."
-        if [ -z "$KVER" ]; then
-            KVER=$(grep -oE "^LINUX_KERNEL_HASH-6\.12\.[0-9]+" include/kernel-6.12 2>/dev/null \
-                   | head -1 | sed 's/LINUX_KERNEL_HASH-//' || true)
-        fi
-    fi
+    local KVER
+    KVER=$(grep -oE "LINUX_KERNEL_HASH-6\.12\.[0-9]+" "$KVER_FILE" \
+           | head -1 | sed 's/LINUX_KERNEL_HASH-//')
 
-    # 来源 2：include/kernel-version.mk（旧版 OpenWrt / 部分分支）
-    if [ -z "$KVER" ] && [ -f "include/kernel-version.mk" ]; then
-        local VER_PART
-        VER_PART=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" include/kernel-version.mk 2>/dev/null \
-                   | head -1 | awk '{print $3}' || true)
-        if [ -n "$VER_PART" ]; then
-            KVER="6.12${VER_PART}"
-        fi
-    fi
+    [ -n "$KVER" ] || err "无法从 $KVER_FILE 中解析 6.12.x 内核版本号"
 
-    # 来源 3：target/linux/rockchip/Makefile（只能得到大版本，如 "6.12"）
-    if [ -z "$KVER" ]; then
-        KVER=$(grep -oE "KERNEL_PATCHVER[:?]?= *[0-9]+\.[0-9]+" target/linux/rockchip/Makefile 2>/dev/null \
-               | head -1 | grep -oE "[0-9]+\.[0-9]+" || true)
-        [ -n "$KVER" ] && KVER="${KVER}.0"   # 补上补丁号占位
-    fi
+    log "[INFO] 内核版本: $KVER"
 
-    # ---------- 2.3 版本检查 ----------
-    if [ -z "$KVER" ]; then
-        warn "无法解析内核版本号，跳过 PCIe 版本检查"
-        warn "调试信息："
-        ls -la include/kernel-* 2>/dev/null | head -5 || true
-        return 0
-    fi
-
-    log "[INFO] 检测到内核版本: $KVER"
-
-    local MAJOR MINOR PATCH
-    MAJOR=$(echo "$KVER" | cut -d. -f1)
-    MINOR=$(echo "$KVER" | cut -d. -f2)
+    # ---------- 2.3 PCIe 修复版本检查（>= 6.12.17） ----------
+    local PATCH
     PATCH=$(echo "$KVER" | cut -d. -f3)
-
-    if [ "$MAJOR" -eq 6 ] && [ "$MINOR" -eq 12 ]; then
-        if [ "$PATCH" -lt 17 ] 2>/dev/null && [ "$PATCH" -gt 0 ] 2>/dev/null; then
-            warn "内核版本 $KVER 低于 6.12.17，可能缺少 PCIe 修复补丁"
-            warn "R5S LAN 口（PCIe 转接）可能无法识别"
-            warn "建议：使用 ImmortalWrt 25.12 分支的 6.12.87 或更高版本"
-        elif [ "$PATCH" -eq 0 ] 2>/dev/null; then
-            warn "只能解析到主版本 $KVER（无补丁号），无法判断是否包含 PCIe 修复"
-            log "[INFO] ImmortalWrt 25.12 分支默认使用 6.12.87+，通常已包含修复"
-        else
-            log "[OK] 内核版本 $KVER 已包含 PCIe 修复补丁（>= 6.12.17）"
-        fi
+    if [ "$PATCH" -lt 17 ] 2>/dev/null; then
+        warn "内核版本 $KVER < 6.12.17，可能缺少 PCIe 修复补丁"
+        warn "R5S LAN 口（PCIe 转接）可能无法识别"
     else
-        warn "非预期的内核版本: $KVER（预期 6.12.x）"
+        log "[OK] 内核版本 $KVER 已包含 PCIe 修复补丁（>= 6.12.17）"
     fi
 }
 
@@ -194,14 +135,11 @@ CONFIG_CCACHE=y
 CONFIG_CCACHE_DIR="$CCACHE_DIR"
 CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
 
-# ===== 内核版本指定 =====
 CONFIG_LINUX_6_12=y
 
-# ===== PCIe 主机控制器（R5S LAN 口必需） =====
 CONFIG_PCIE_ROCKCHIP_DW_HOST=y
 CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y
 
-# ===== Docker =====
 CONFIG_PACKAGE_docker=y
 CONFIG_PACKAGE_dockerd=y
 CONFIG_PACKAGE_docker-compose=y
@@ -211,7 +149,6 @@ CONFIG_PACKAGE_luci-lib-docker=y
 CONFIG_DOCKER_KERNEL_OPTIONS=y
 CONFIG_DOCKER_NET_OVERLAY=y
 
-# ===== luci-app-amlogic 刷机工具 =====
 CONFIG_PACKAGE_luci-app-amlogic=y
 EOF
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
@@ -400,13 +337,11 @@ step_force_config() {
     sed -i '/^CONFIG_LINUX_6_12=/d' .config
     echo "CONFIG_LINUX_6_12=y" >> .config
 
-    # PCIe 相关配置
     sed -i '/^CONFIG_PCIE_ROCKCHIP_DW_HOST=/d' .config
     echo "CONFIG_PCIE_ROCKCHIP_DW_HOST=y" >> .config
     sed -i '/^CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=/d' .config
     echo "CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y" >> .config
 
-    # luci-app-amlogic
     sed -i "/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d" .config 2>/dev/null || true
     sed -i "/^CONFIG_PACKAGE_luci-app-amlogic=/d" .config 2>/dev/null || true
     echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
@@ -422,7 +357,6 @@ step_download_packages() {
     log "===== 8. 下载软件包源码 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # 清理污染的 go-mod-cache（来自其他 run 的残留）
     if [ -d "dl/go-mod-cache" ]; then
         log "清理 dl/go-mod-cache（避免跨 run 缓存污染）"
         du -sh dl/go-mod-cache 2>/dev/null || true
@@ -532,7 +466,6 @@ step_compile() {
         grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
         grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
 
-        # 场景 1：rootfs 空间不足
         if grep -qE "out of space|failed to allocate" "$LOG"; then
             log "----- 场景 1: rootfs 空间不足，尝试扩大分区 -----"
             local ROOTFS_DIR ACTUAL_MB NEEDED_MB NEW_PARTSIZE
@@ -550,7 +483,6 @@ step_compile() {
             fi
         fi
 
-        # 场景 2：target/linux 失败（内核配置漂移）
         if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
             log "----- 场景 2: target/linux 失败，尝试内核配置同步 -----"
             make defconfig > /dev/null 2>&1 || true
@@ -559,7 +491,6 @@ step_compile() {
             make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
         fi
 
-        # 场景 3：其它包失败
         local FAILED_PKG
         FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
         if [ -n "$FAILED_PKG" ]; then
@@ -567,7 +498,6 @@ step_compile() {
             make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
         fi
 
-        # 重试
         log "----- 诊断完成，重试完整 final make -----"
         restore_critical_cfg > /dev/null 2>&1
         if ! make -j"$(nproc)" > /tmp/build_final_retry.log 2>&1; then
