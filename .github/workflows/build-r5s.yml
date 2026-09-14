@@ -152,9 +152,6 @@ jobs:
         touch configs/rockchip/01-nanopi
         echo "OpenWrt workspace prepared"
 
-    # ==========================================================
-    #  缓存恢复
-    # ==========================================================
     - name: Restore staging_dir (toolchain + host)
       uses: actions/cache@v4
       with:
@@ -190,7 +187,7 @@ jobs:
           gomod-${{ env.OPENWRT_BRANCH }}-
 
     # ==========================================================
-    #  调用自定义脚本：配置 + 编译（所有逻辑都在这一个脚本里）
+    #  调用自定义脚本：配置 + 编译
     # ==========================================================
     - name: Run custom kernel config & build
       run: bash scripts/custome_kernel_config_new.sh
@@ -206,9 +203,6 @@ jobs:
         echo "=== dl 大小 ==="
         du -sh project/friendlywrt/dl 2>/dev/null || true
 
-    # ==========================================================
-    #  以下步骤保持不变（打包 / 上传）
-    # ==========================================================
     - name: Locate kernel artifacts
       run: |
         cd project/friendlywrt
@@ -311,7 +305,6 @@ jobs:
           [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
         done
 
-        # resource_tool 不拼接 --root 路径，必须在 dtb 所在目录运行
         cd /tmp/dtb-pack
         DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
 
@@ -339,6 +332,12 @@ jobs:
           [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
         done
 
+    # ==========================================================
+    #  关键修复：让 parameter.txt 分配的 rootfs 容量 >= rootfs.img 实际大小
+    #  原因：generate-partmap-txt.sh 内部按 512 字节块取整，
+    #        但 rootfs.img 实际可能不是 512 的整数倍，导致 SD 卡写入时被截断
+    #  方案：向上对齐到 1MB，并额外留 1MB 余量
+    # ==========================================================
     - name: Build rootfs.img
       run: |
         cd project/sd-fuse
@@ -369,7 +368,15 @@ jobs:
 
         [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img 生成失败"; exit 1; }
         ls -lh "$TGT/rootfs.img"
-        echo "ROOTFS_SIZE_BYTES=$(stat -c%s "$TGT/rootfs.img")" >> $GITHUB_ENV
+
+        # ===== 关键修复：对齐 rootfs 分区大小 =====
+        ROOTFS_IMG_SIZE=$(stat -c%s "$TGT/rootfs.img")
+        # 向上对齐到 1MB（1048576 字节），再加 1MB 余量，确保 parameter.txt 分配的容量足够
+        ROOTFS_SIZE_FOR_PARAM=$(( (ROOTFS_IMG_SIZE + 1048576 + 1048575) / 1048576 * 1048576 ))
+        echo "rootfs.img 实际大小: $ROOTFS_IMG_SIZE 字节 ($(numfmt --to=iec $ROOTFS_IMG_SIZE))"
+        echo "parameter.txt 分配容量: $ROOTFS_SIZE_FOR_PARAM 字节 ($(numfmt --to=iec $ROOTFS_SIZE_FOR_PARAM))"
+        echo "余量: $((ROOTFS_SIZE_FOR_PARAM - ROOTFS_IMG_SIZE)) 字节"
+        echo "ROOTFS_SIZE_BYTES=$ROOTFS_SIZE_FOR_PARAM" >> $GITHUB_ENV
 
     - name: Generate parameter.txt
       run: |
@@ -384,20 +391,46 @@ jobs:
       run: |
         cd project/sd-fuse
         export SDFUSE_NONINTERACTIVE=y
-        sudo -E ./mk-sd-image.sh "$TARGET_OS" 2>&1 | tee /tmp/sd-image.log | tail -40 || {
-          echo "::warning::mk-sd-image.sh 非零退出"
+        set +e
+        sudo -E ./mk-sd-image.sh "$TARGET_OS" 2>&1 | tee /tmp/sd-image.log | tail -40
+        SD_EXIT=$?
+        set -e
+
+        # ===== 关键修复：检测 "more than capacity" 警告并视为错误 =====
+        if grep -q "more than capacity" /tmp/sd-image.log; then
+          echo "::error::rootfs 写入被截断！SD 卡镜像不完整"
+          grep -n "more than capacity" /tmp/sd-image.log
+          echo "----- 完整的 mk-sd-image 日志尾部 -----"
+          tail -40 /tmp/sd-image.log
+          exit 1
+        fi
+
+        if [ $SD_EXIT -ne 0 ]; then
+          echo "::warning::mk-sd-image.sh 非零退出: $SD_EXIT"
           tail -80 /tmp/sd-image.log
-        }
+        fi
         ls -lh out/ 2>/dev/null || echo "(无 out/)"
 
     - name: Build eMMC flasher image
       run: |
         cd project/sd-fuse
         export SDFUSE_NONINTERACTIVE=y
-        sudo -E ./mk-emmc-image.sh "$TARGET_OS" autostart=yes 2>&1 | tee /tmp/emmc-image.log | tail -40 || {
-          echo "::warning::mk-emmc-image.sh 非零退出"
+        set +e
+        sudo -E ./mk-emmc-image.sh "$TARGET_OS" autostart=yes 2>&1 | tee /tmp/emmc-image.log | tail -40
+        EMMC_EXIT=$?
+        set -e
+
+        # 检测同样的截断问题
+        if grep -q "more than capacity" /tmp/emmc-image.log; then
+          echo "::error::rootfs 写入被截断！eMMC 镜像不完整"
+          grep -n "more than capacity" /tmp/emmc-image.log
+          exit 1
+        fi
+
+        if [ $EMMC_EXIT -ne 0 ]; then
+          echo "::warning::mk-emmc-image.sh 非零退出: $EMMC_EXIT"
           tail -80 /tmp/emmc-image.log
-        }
+        fi
         ls -lh out/images-for-eflasher/ 2>/dev/null || true
 
     - name: Fix file ownership from sudo operations
@@ -421,6 +454,7 @@ jobs:
           gzip -f "/tmp/${DST_NAME}"
           cp "/tmp/${DST_NAME}.gz" ../../artifact/
           echo "[OK] SD image: ${DST_NAME}.gz"
+          ls -lh "../../artifact/${DST_NAME}.gz"
         else
           echo "::warning::未找到 sd-fuse 生成的 .img（out/ 内容如下）"
           ls -la out/ 2>/dev/null || true
@@ -446,6 +480,31 @@ jobs:
         OPENWRT_MANIFEST=$(find ../friendlywrt/bin/targets/rockchip/armv8 -maxdepth 1 \
           -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
         [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "../../artifact/"
+
+    - name: Verify SD image integrity
+      run: |
+        cd artifact
+        IMG_GZ=$(find . -maxdepth 1 -name "R5S-R5C-Series-FriendlyWrt-*.img.gz" | head -1)
+        if [ -z "$IMG_GZ" ]; then
+          echo "::error::未找到 SD 卡镜像"
+          exit 1
+        fi
+
+        IMG_SIZE=$(stat -c%s "$IMG_GZ")
+        echo "SD 卡镜像大小: $IMG_SIZE 字节 ($(numfmt --to=iec $IMG_SIZE))"
+
+        # 合理的大小范围检查（合理值约 100-250 MB）
+        MIN_SIZE=$((50 * 1024 * 1024))        # 50 MB
+        MAX_SIZE=$((300 * 1024 * 1024))       # 300 MB
+        if [ "$IMG_SIZE" -lt "$MIN_SIZE" ]; then
+          echo "::error::SD 卡镜像过小 ($IMG_SIZE 字节 < 50 MB)，可能 rootfs 未正确写入"
+          exit 1
+        fi
+        if [ "$IMG_SIZE" -gt "$MAX_SIZE" ]; then
+          echo "::warning::SD 卡镜像异常大 ($IMG_SIZE 字节 > 300 MB)"
+        fi
+
+        echo "[OK] SD 卡镜像大小检查通过"
 
     - name: Generate SHA256 and README
       run: |
