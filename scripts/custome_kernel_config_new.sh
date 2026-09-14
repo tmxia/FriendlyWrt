@@ -1,4 +1,21 @@
 #!/usr/bin/env bash
+# =============================================================
+# custome_kernel_config_new.sh
+# ImmortalWrt NanoPi R5S 编译配置 + 构建脚本
+#
+# 本脚本运行在 ImmortalWrt 源码树（immortalwrt/immortalwrt）之上，
+# 负责：
+#   1. ccache 初始化 + staging_dir 缓存完整性验证（含 host gcc 匹配修复）
+#   2. 6.12 内核产物验证 + 版本解析（含 PCIe 修复检查）
+#   3. 初始化 .config（目标设备 + Docker + PCIe + luci-app-amlogic）
+#   4. 集成 luci-app-amlogic 刷机工具 + 执行 add_packages.sh
+#   5. .config 去重
+#   6. 修补 file Makefile 依赖
+#   7. 强制修正关键配置
+#   8. 清理污染的 go-mod-cache + 下载软件包源码
+#   9. 分阶段编译（tools → toolchain → target → package → final make）
+#  10. 编译失败自动诊断恢复
+# =============================================================
 
 set -e
 
@@ -45,17 +62,29 @@ step_setup_ccache_and_staging() {
 
     log "=== staging_dir 结构 ==="
     du -sh "$STAGING" 2>/dev/null || true
+    ls -la "$STAGING/" | head -20 || true
 
     local HOST_GCC TOOLCHAIN_DIR TC_GCC
-    HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 -name "*-gcc*" 2>/dev/null | head -1)
+    # 修复：host gcc 可能叫 "gcc"，也可能叫 "*-gcc"，也可能叫 "gcc-*"
+    HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 \
+        \( -name "gcc" -o -name "*-gcc" -o -name "gcc-*" \) \
+        2>/dev/null | head -1)
+
     TOOLCHAIN_DIR=$(find "$STAGING" -maxdepth 1 -type d -name "toolchain-*" 2>/dev/null | head -1)
     TC_GCC=""
     if [ -n "$TOOLCHAIN_DIR" ]; then
-        TC_GCC=$(find "$TOOLCHAIN_DIR/bin" -maxdepth 1 -name "*-gcc" 2>/dev/null | head -1)
+        TC_GCC=$(find "$TOOLCHAIN_DIR/bin" -maxdepth 1 \
+            \( -name "*-gcc" -o -name "*-gcc-*" \) \
+            2>/dev/null | head -1)
     fi
+
+    log "  host gcc: ${HOST_GCC:-(未找到)}"
+    log "  toolchain dir: ${TOOLCHAIN_DIR:-(未找到)}"
+    log "  toolchain gcc: ${TC_GCC:-(未找到)}"
 
     local MISSING=0
     [ -z "$HOST_GCC" ] && { warn "host gcc 未找到"; MISSING=1; }
+    [ -z "$TOOLCHAIN_DIR" ] && { warn "toolchain 目录未找到"; MISSING=1; }
     [ -z "$TC_GCC" ] && { warn "toolchain gcc 未找到"; MISSING=1; }
 
     if [ "$MISSING" = "1" ]; then
@@ -63,42 +92,90 @@ step_setup_ccache_and_staging() {
         rm -rf "$STAGING"
         log "[OK] 已清除 staging_dir，将重新编译 tools + toolchain"
     else
-        log "[OK] staging_dir 缓存完整"
-        log "  host gcc: $HOST_GCC"
-        log "  toolchain gcc: $TC_GCC"
+        log "[OK] staging_dir 缓存完整，跳过 tools + toolchain 编译"
     fi
 }
 
 # =============================================================
-# 2. 6.12 内核产物验证
+# 2. 6.12 内核产物验证（含 PCIe 修复版本检查）
 # =============================================================
 step_verify_kernel() {
     log "===== 2. 验证 6.12 内核产物 ====="
     cd "$FRIENDLYWRT_DIR"
-    if [ ! -d "target/linux/rockchip/patches-6.12" ] || [ ! -f "target/linux/rockchip/armv8/config-6.12" ]; then
-        err "6.12 内核产物不存在"
+
+    # ---------- 2.1 检查内核补丁和配置文件是否存在 ----------
+    if [ ! -d "target/linux/rockchip/patches-6.12" ]; then
+        err "6.12 内核补丁目录不存在"
+    fi
+    if [ ! -f "target/linux/rockchip/armv8/config-6.12" ]; then
+        err "6.12 内核配置文件不存在"
     fi
     log "[OK] 6.12 内核产物已就绪"
 
-    # 验证内核版本是否包含 PCIe 修复（>= 6.12.17）
-    local KVER_FILE="target/linux/rockchip/armv8/config-6.12"
-    local KVER
-    KVER=$(grep -oE "LINUX_VERSION-[0-9]+\.[0-9]+\.[0-9]+" "$KVER_FILE" 2>/dev/null | head -1 | sed 's/LINUX_VERSION-//' || true)
-    if [ -n "$KVER" ]; then
-        log "[INFO] 检测到内核版本: $KVER"
-        # 简单比较版本号
-        local MAJOR MINOR PATCH
-        MAJOR=$(echo "$KVER" | cut -d. -f1)
-        MINOR=$(echo "$KVER" | cut -d. -f2)
-        PATCH=$(echo "$KVER" | cut -d. -f3)
-        if [ "$MAJOR" -eq 6 ] && [ "$MINOR" -eq 12 ] && [ "$PATCH" -lt 17 ]; then
+    # ---------- 2.2 解析内核版本号（多来源尝试） ----------
+    local KVER=""
+
+    # 来源 1：include/kernel-6.12（ImmortalWrt / OpenWrt 25.12+）
+    if [ -z "$KVER" ] && [ -f "include/kernel-6.12" ]; then
+        local VER_PART
+        # 匹配 "LINUX_VERSION-6.12 = .87"
+        VER_PART=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" include/kernel-6.12 2>/dev/null \
+                   | head -1 | awk '{print $3}' || true)
+        if [ -n "$VER_PART" ]; then
+            KVER="6.12${VER_PART}"   # 例如 "6.12.87"
+        fi
+        # 备选匹配 "LINUX_KERNEL_HASH-6.12.87 = ..."
+        if [ -z "$KVER" ]; then
+            KVER=$(grep -oE "^LINUX_KERNEL_HASH-6\.12\.[0-9]+" include/kernel-6.12 2>/dev/null \
+                   | head -1 | sed 's/LINUX_KERNEL_HASH-//' || true)
+        fi
+    fi
+
+    # 来源 2：include/kernel-version.mk（旧版 OpenWrt / 部分分支）
+    if [ -z "$KVER" ] && [ -f "include/kernel-version.mk" ]; then
+        local VER_PART
+        VER_PART=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" include/kernel-version.mk 2>/dev/null \
+                   | head -1 | awk '{print $3}' || true)
+        if [ -n "$VER_PART" ]; then
+            KVER="6.12${VER_PART}"
+        fi
+    fi
+
+    # 来源 3：target/linux/rockchip/Makefile（只能得到大版本，如 "6.12"）
+    if [ -z "$KVER" ]; then
+        KVER=$(grep -oE "KERNEL_PATCHVER[:?]?= *[0-9]+\.[0-9]+" target/linux/rockchip/Makefile 2>/dev/null \
+               | head -1 | grep -oE "[0-9]+\.[0-9]+" || true)
+        [ -n "$KVER" ] && KVER="${KVER}.0"   # 补上补丁号占位
+    fi
+
+    # ---------- 2.3 版本检查 ----------
+    if [ -z "$KVER" ]; then
+        warn "无法解析内核版本号，跳过 PCIe 版本检查"
+        warn "调试信息："
+        ls -la include/kernel-* 2>/dev/null | head -5 || true
+        return 0
+    fi
+
+    log "[INFO] 检测到内核版本: $KVER"
+
+    local MAJOR MINOR PATCH
+    MAJOR=$(echo "$KVER" | cut -d. -f1)
+    MINOR=$(echo "$KVER" | cut -d. -f2)
+    PATCH=$(echo "$KVER" | cut -d. -f3)
+
+    if [ "$MAJOR" -eq 6 ] && [ "$MINOR" -eq 12 ]; then
+        if [ "$PATCH" -lt 17 ] 2>/dev/null && [ "$PATCH" -gt 0 ] 2>/dev/null; then
             warn "内核版本 $KVER 低于 6.12.17，可能缺少 PCIe 修复补丁"
-            warn "建议升级到 ImmortalWrt 25.12 的 6.12.87 或更高版本"
+            warn "R5S LAN 口（PCIe 转接）可能无法识别"
+            warn "建议：使用 ImmortalWrt 25.12 分支的 6.12.87 或更高版本"
+        elif [ "$PATCH" -eq 0 ] 2>/dev/null; then
+            warn "只能解析到主版本 $KVER（无补丁号），无法判断是否包含 PCIe 修复"
+            log "[INFO] ImmortalWrt 25.12 分支默认使用 6.12.87+，通常已包含修复"
         else
-            log "[OK] 内核版本 $KVER 已包含 PCIe 修复补丁"
+            log "[OK] 内核版本 $KVER 已包含 PCIe 修复补丁（>= 6.12.17）"
         fi
     else
-        warn "无法从 config-6.12 中解析内核版本号"
+        warn "非预期的内核版本: $KVER（预期 6.12.x）"
     fi
 }
 
@@ -160,7 +237,10 @@ step_apply_customizations() {
     local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
     if [ -f "$add_pkgs" ]; then
         log "修复 add_packages.sh 内核配置路径..."
+        log "  before: $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
         sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' "$add_pkgs"
+        log "  after:  $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
+
         cd "$PROJECT_DIR"
         bash "$add_pkgs"
         log "[OK] add_packages.sh 执行完成"
@@ -241,7 +321,10 @@ step_patch_file_makefile() {
     cd "$FRIENDLYWRT_DIR"
 
     local FILE_MK="feeds/packages/libs/file/Makefile"
-    [ -f "$FILE_MK" ] || err "$FILE_MK 不存在"
+    if [ ! -f "$FILE_MK" ]; then
+        warn "$FILE_MK 不存在（feeds 可能未安装或版本不同），跳过"
+        return 0
+    fi
 
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1 || true
 
@@ -317,13 +400,13 @@ step_force_config() {
     sed -i '/^CONFIG_LINUX_6_12=/d' .config
     echo "CONFIG_LINUX_6_12=y" >> .config
 
-    # 确保 PCIe 相关配置已启用
+    # PCIe 相关配置
     sed -i '/^CONFIG_PCIE_ROCKCHIP_DW_HOST=/d' .config
     echo "CONFIG_PCIE_ROCKCHIP_DW_HOST=y" >> .config
     sed -i '/^CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=/d' .config
     echo "CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y" >> .config
 
-    # 确保 luci-app-amlogic 已启用
+    # luci-app-amlogic
     sed -i "/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d" .config 2>/dev/null || true
     sed -i "/^CONFIG_PACKAGE_luci-app-amlogic=/d" .config 2>/dev/null || true
     echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
@@ -339,6 +422,7 @@ step_download_packages() {
     log "===== 8. 下载软件包源码 ====="
     cd "$FRIENDLYWRT_DIR"
 
+    # 清理污染的 go-mod-cache（来自其他 run 的残留）
     if [ -d "dl/go-mod-cache" ]; then
         log "清理 dl/go-mod-cache（避免跨 run 缓存污染）"
         du -sh dl/go-mod-cache 2>/dev/null || true
@@ -448,6 +532,7 @@ step_compile() {
         grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
         grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
 
+        # 场景 1：rootfs 空间不足
         if grep -qE "out of space|failed to allocate" "$LOG"; then
             log "----- 场景 1: rootfs 空间不足，尝试扩大分区 -----"
             local ROOTFS_DIR ACTUAL_MB NEEDED_MB NEW_PARTSIZE
@@ -465,6 +550,7 @@ step_compile() {
             fi
         fi
 
+        # 场景 2：target/linux 失败（内核配置漂移）
         if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
             log "----- 场景 2: target/linux 失败，尝试内核配置同步 -----"
             make defconfig > /dev/null 2>&1 || true
@@ -473,6 +559,7 @@ step_compile() {
             make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
         fi
 
+        # 场景 3：其它包失败
         local FAILED_PKG
         FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
         if [ -n "$FAILED_PKG" ]; then
@@ -480,6 +567,7 @@ step_compile() {
             make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
         fi
 
+        # 重试
         log "----- 诊断完成，重试完整 final make -----"
         restore_critical_cfg > /dev/null 2>&1
         if ! make -j"$(nproc)" > /tmp/build_final_retry.log 2>&1; then
