@@ -1,0 +1,54 @@
+30d3e1c2470a7282f37b96fdd4354314dda69aa3
+
+# 上游更新摘要（UTC 2026-09-14）
+
+- 蓝牙：hci_AIC：已添加模块就绪检查功能到设置中
+- ARM64：dts：Rockchip：在nanopi-R3s中使用虚拟连接器
+- ARM64：dts：Rockchip：为nanopi-R28s添加dts文件
+- arm64：配置选项：启用BT_HCI UART AIC功能，适用于nanopi5和nanopi6
+- 蓝牙：hci_uART：添加aic8800支持功能
+- ARM64：dts：rockchip：为nanopi-R3S LTS添加eeprom节点
+- ARM64：dts：Rockchip：为nanopi-m6v2添加dts文件
+- arm64：配置：构建用于nanopi5／6的NET_SCH_FQF_CODEL内置模块
+- ARM64：dts：Rockchip：为nanopi-Neo3 Plus添加dts文件
+- ARM64：dts：rockchip：为rtl8822 cs-bt添加cts-detect-Wait-Ms参数
+- 蓝牙：hci_UART：通过CTS检测可移除模块
+- ARM64：dts：rockchip：增加对nanopc-T6 plus的支持
+- arm64：配置：添加用于mali-g610的bifrost_cSF.config片段
+- Drm/Panfrost：在Bifrost型号上启用HW_FEATURE_Aарх64_MMMU功能标志
+- DRM/PANFROST：使用GPU_MMU.features_VA_bits/PA_bits宏定义
+- Drm/Panfrost：设置IOMMU缓存标志
+- ARM64：dts：rockchip：为nanoPi5 / 6添加双块imx415支持
+- ARM64：dts：rockchip：为nanopi-R76s添加已禁用的I2C4功能
+- serdev：不要声称拥有具有“no-serifdev”属性的串行设备
+- DRM/bridge：DW-HDMI-QP：解决在“atomic_disable”模式下进行SCDC写入时出现的NACK问题
+- arm64：配置：合并Rockchip对nanopi5/06的更新内容
+- 输入：触摸屏：GT1x：增加对GT911芯片类型的支持
+- DRM/面板：rm67191：添加Rockchip DRM子设备，用于加载器保护
+- 合并远程跟踪分支‘rk/ develop-6 .1’
+- A SoC：编解码器：es8389：将跟踪日志移动到调试级别
+- arm64：配置：启用SND Soc ES8389功能，适用于nanopi5 / 6
+- phy：Rockchip-Samsung-HDPTX-HDMI：通过DT添加phy（传输驱动）配置
+- 合并提交‘fb db94 a0 c7 b7 d d c f16 d5 e0 15 88 e5 d0 a e d65 a e 4 3 f2’
+- hwspinlock：rockchip：添加最大用户数配置
+- dt-Bindings：hwlock：rockchip：添加最大用户数属性
+- 邮箱：Rockchip：添加获取属性辅助工具
+- 邮箱：Rockchip：添加版本信息并支持锁定寄存器
+- arm64：dts：rockchip：rv1126a-evb：添加“调节器稳定时间上限”配置
+- 电源：供电：sc89601充电器：修复充电图标异常显示问题
+- arm64：DTS：Rockchip：为RK3576s-RK309提供平板电脑板开发设备树
+- arm64：DTS：Rockchip：rv1126B：已修复与can节点的兼容性问题
+- arm64：dts：rockchip：rk3576：已修复与can节点的兼容性问题
+- ARM：dts：rockchip：rk3506：确保与can节点兼容
+- arm64：配置项：rockchip_Linux Defconfig，启用CONFIG_CAN_Rk3576配置
+- 净量：可：Rockchip：将rk3576CANFD.c重命名为rk3276CAN.c
+- Drm/Rockchip：dw-dp：支持更多功能，包括主动协议转换适配器
+- 媒体：Rockchip：Vicap在初始化流时强制更新缓冲区地址
+- 媒体：Rockchip：Vicap更改，停止从DMA转换为FS用于DVP
+- 媒体：Rockchip：Vicap修复了因DVP导致流停止的错误
+- 媒体：Rockchip：Vicap修复了Toisp模式下的FPS错误信息
+- iio：imu：添加inv icm44607支持
+- arm64：dts：rockchip：rv11226b-evv2：添加rk96x_Wake_AOV_IRQ驱动程序的dts信息。
+- spi：Rockchip-SFC：在rockchip_SFC_get_GPIO_descs执行前，需等待Thunder启动的DMA状态发生变化
+- clk：Rockchip；clk-pvtPLL：RV1126BJ；调整CPU的pvtPLL配置
+- arm64：dts：rockchip：rv1126bj：调整CPU相关的OPP表
