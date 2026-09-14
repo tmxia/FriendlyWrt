@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ImmortalWrt NanoPi R5S 编译脚本
-# 关键约束：只用 make oldconfig，绝不用 make defconfig（会重置 CONFIG_CCACHE）
+# 关键约束：oldconfig 会重置 CONFIG_CCACHE 等顶层符号，追加必须在 oldconfig 前后各做一次
 
 set -e
 
@@ -186,9 +186,8 @@ PY
     log "[OK] file Makefile 依赖已修补"
 }
 
-# ---------- 7. 强制配置 + 同步（只用 oldconfig） ----------
-step_force_config() {
-    log "===== 7. 强制修正关键配置 + 一次性同步 ====="
+# ---------- 关键配置写入 helper ----------
+apply_critical_cfg() {
     cd "$FRIENDLYWRT_DIR"
 
     local pkg
@@ -199,10 +198,12 @@ step_force_config() {
     done
 
     local kv
-    while IFS='=' read -r k v; do
-        sed -i "/^${k}=/d" .config
-        sed -i "/^# ${k} is not set/d" .config
-        echo "${k}=${v}" >> .config
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        kv="${line%%=*}"
+        sed -i "/^${kv}=/d" .config
+        sed -i "/^# ${kv} is not set/d" .config
+        echo "$line" >> .config
     done <<EOF
 CONFIG_CCACHE=y
 CONFIG_CCACHE_DIR="$CCACHE_DIR"
@@ -213,12 +214,26 @@ CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y
 CONFIG_DOCKER_KERNEL_OPTIONS=y
 CONFIG_DOCKER_NET_OVERLAY=y
 EOF
+}
 
-    # 只用 oldconfig：保留已有显式值 + 重算 tmp/.config-package.in
-    # 切勿用 defconfig：会把 CONFIG_CCACHE 重置为 n
+# ---------- 7. 强制修正（追加 → oldconfig → 再追加） ----------
+step_force_config() {
+    log "===== 7. 强制修正关键配置 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    # 第 1 次追加：写入全部目标配置
+    apply_critical_cfg
+
+    # 同步 tmp/.config-package.in（消除 out-of-sync）
     log "同步 .config 与 tmp/.config-package.in（oldconfig）..."
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
-    log "[OK] 关键配置已强制修正并同步（配置已冻结）"
+
+    # 第 2 次追加：oldconfig 会把 CONFIG_CCACHE 等顶层符号重置为默认值，
+    # 这里重新写入，确保关键符号在 oldconfig 之后依然存在
+    apply_critical_cfg
+
+    log "[OK] 关键配置已强制修正并冻结"
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|LINUX_6|PCIE_ROCKCHIP|PHY_ROCKCHIP|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_)" .config
 }
 
 # ---------- 8. 下载源码 ----------
@@ -261,7 +276,7 @@ verify_critical_cfg() {
 
 # ---------- 10. 编译 ----------
 step_compile() {
-    log "===== 9. 编译（配置已冻结，单次执行）====="
+    log "===== 9. 编译（配置已冻结）====="
     cd "$FRIENDLYWRT_DIR"
     verify_critical_cfg
 
