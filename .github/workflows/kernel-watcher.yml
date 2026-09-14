@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   actions: write
+  models: read
 
 jobs:
   check_kernel:
@@ -29,11 +30,82 @@ jobs:
         id: recorded
         run: |
           if [ -f .kernel-version ]; then
-            RECORDED=$(cat .kernel-version)
+            RECORDED=$(head -n1 .kernel-version | tr -d '[:space:]')
           else
             RECORDED="none"
           fi
           echo "recorded=$RECORDED" >> $GITHUB_OUTPUT
+          echo "Recorded SHA: $RECORDED"
+
+      - name: Fetch upstream commit messages
+        id: commits
+        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        run: |
+          if [ "${{ steps.recorded.outputs.recorded }}" = "none" ]; then
+            RAW=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=20" \
+                   | jq -r '.[].commit.message')
+          else
+            RAW=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/compare/${{ steps.recorded.outputs.recorded }}...${{ steps.sha.outputs.sha }}" \
+                   | jq -r '.commits[].commit.message')
+          fi
+
+          # 只保留非空行、最多 50 行、每行最多 300 字符，避免 prompt 过长
+          MSGS=$(printf '%s\n' "$RAW" | awk 'NF' | head -n 50 | cut -c1-300)
+
+          {
+            echo "msgs<<__EOF__"
+            echo "$MSGS"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate Chinese summary
+        id: summary
+        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_MSGS: ${{ steps.commits.outputs.msgs }}
+        run: |
+          if [ -z "$UPSTREAM_MSGS" ]; then
+            echo "No upstream messages to summarize."
+            echo "summary=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PROMPT="请用中文简要总结以下 Linux 内核仓库上游更新的主要内容。要求：要点形式（3-6 条），保留必要的技术术语（如模块名、驱动名、子系统名），不要编造未出现的信息，不要输出多余前后缀。
+
+          上游提交信息如下：
+          $UPSTREAM_MSGS"
+
+          BODY=$(jq -n --arg p "$PROMPT" '{
+            model: "gpt-4o-mini",
+            temperature: 0.2,
+            messages: [{role:"user", content:$p}]
+          }')
+
+          SUMMARY=""
+          for EP in "https://models.github.ai/inference/chat/completions" "https://models.inference.ai.azure.com/chat/completions"; do
+            echo "Trying endpoint: $EP"
+            RESP=$(curl -s "$EP" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$BODY" || true)
+            SUMMARY=$(echo "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+            if [ -n "$SUMMARY" ]; then
+              echo "Summary generated via $EP"
+              break
+            fi
+          done
+
+          if [ -z "$SUMMARY" ]; then
+            echo "Model endpoint unavailable, fallback to raw messages."
+            SUMMARY="$UPSTREAM_MSGS"
+          fi
+
+          {
+            echo "summary<<__EOF__"
+            echo "$SUMMARY"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Compare and trigger build if changed
         if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
@@ -43,14 +115,28 @@ jobs:
           echo "Kernel updated, triggering build..."
           gh workflow run build.yml -f version=both -f set=both --repo ${{ github.repository }}
 
-      - name: Update recorded SHA
+      - name: Update recorded SHA with summary
         if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        env:
+          SHA: ${{ steps.sha.outputs.sha }}
+          SUMMARY: ${{ steps.summary.outputs.summary }}
         run: |
-          echo "${{ steps.sha.outputs.sha }}" > .kernel-version
+          {
+            echo "$SHA"
+            echo ""
+            echo "# 上游更新摘要（UTC $(date -u +%Y-%m-%d)）"
+            echo ""
+            if [ -n "$SUMMARY" ]; then
+              echo "$SUMMARY"
+            else
+              echo "- （本次未生成摘要）"
+            fi
+          } > .kernel-version
+
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .kernel-version
-          git commit -m "Update kernel SHA"
+          git commit -m "chore: update kernel SHA $(echo $SHA | cut -c1-8)"
           git push
 
   cleanup_self:
@@ -62,11 +148,40 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          keep_minimum_runs: 0
-          retain_days: 0
-          delete_workflow_pattern: "Kernel Watcher"
-          repository: ${{ github.repository }}
+      - name: Delete old runs of exactly this workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_NAME="Kernel Watcher"
+          KEEP=1
+          CURRENT_RUN_ID="${{ github.run_id }}"
+
+          WF_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq ".workflows[] | select(.name == \"$TARGET_NAME\") | .id" | head -n1)
+
+          if [ -z "$WF_ID" ]; then
+            echo "Workflow '$TARGET_NAME' not found. Skip."
+            exit 0
+          fi
+          echo "Workflow '$TARGET_NAME' ID: $WF_ID"
+
+          RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs?per_page=100" \
+            --jq '.workflow_runs[].id')
+
+          echo "Runs found:"
+          echo "$RUNS"
+
+          i=0
+          for run_id in $RUNS; do
+            i=$((i+1))
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+              echo "Keep current run: $run_id"
+              continue
+            fi
+            if [ "$i" -le "$KEEP" ]; then
+              echo "Keep recent run: $run_id"
+              continue
+            fi
+            echo "Deleting run: $run_id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" || true
+          done
