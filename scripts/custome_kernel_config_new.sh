@@ -79,37 +79,26 @@ step_verify_kernel() {
         err "6.12 内核产物不存在"
     fi
     log "[OK] 6.12 内核产物已就绪"
-}
 
-# =============================================================
-# 2.5 PCIe 启动延迟补丁（提升 R5S LAN 口稳定性）
-# =============================================================
-step_patch_pcie_delay() {
-    log "===== 2.5 应用 PCIe 启动延迟补丁 ====="
-    cd "$FRIENDLYWRT_DIR"
-
-    local PCIE_FILE
-    PCIE_FILE=$(find target/linux/rockchip/patches-6.12 -name "*pcie*rockchip*" -o -name "*pcie_dw*" 2>/dev/null | head -1)
-
-    if [ -z "$PCIE_FILE" ]; then
-        warn "未找到 PCIe 驱动补丁文件，跳过延迟补丁"
-        return 0
-    fi
-
-    if grep -q "R5S_LAN_PCIE_DELAY" "$PCIE_FILE" 2>/dev/null; then
-        log "[OK] PCIe 延迟补丁已应用"
-        return 0
-    fi
-
-    if grep -q "rockchip_pcie_init_port" "$PCIE_FILE"; then
-        sed -i "/rockchip_pcie_init_port/,/^{/ {
-            /^{/ a\\
-    /* R5S_LAN_PCIE_DELAY: 100ms delay for stable PCIe link training */\\
-    udelay(100000);
-        }" "$PCIE_FILE"
-        log "[OK] PCIe 延迟补丁已应用: $PCIE_FILE"
+    # 验证内核版本是否包含 PCIe 修复（>= 6.12.17）
+    local KVER_FILE="target/linux/rockchip/armv8/config-6.12"
+    local KVER
+    KVER=$(grep -oE "LINUX_VERSION-[0-9]+\.[0-9]+\.[0-9]+" "$KVER_FILE" 2>/dev/null | head -1 | sed 's/LINUX_VERSION-//' || true)
+    if [ -n "$KVER" ]; then
+        log "[INFO] 检测到内核版本: $KVER"
+        # 简单比较版本号
+        local MAJOR MINOR PATCH
+        MAJOR=$(echo "$KVER" | cut -d. -f1)
+        MINOR=$(echo "$KVER" | cut -d. -f2)
+        PATCH=$(echo "$KVER" | cut -d. -f3)
+        if [ "$MAJOR" -eq 6 ] && [ "$MINOR" -eq 12 ] && [ "$PATCH" -lt 17 ]; then
+            warn "内核版本 $KVER 低于 6.12.17，可能缺少 PCIe 修复补丁"
+            warn "建议升级到 ImmortalWrt 25.12 的 6.12.87 或更高版本"
+        else
+            log "[OK] 内核版本 $KVER 已包含 PCIe 修复补丁"
+        fi
     else
-        warn "未找到 rockchip_pcie_init_port 函数，无法插入延迟"
+        warn "无法从 config-6.12 中解析内核版本号"
     fi
 }
 
@@ -131,6 +120,10 @@ CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
 # ===== 内核版本指定 =====
 CONFIG_LINUX_6_12=y
 
+# ===== PCIe 主机控制器（R5S LAN 口必需） =====
+CONFIG_PCIE_ROCKCHIP_DW_HOST=y
+CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y
+
 # ===== Docker =====
 CONFIG_PACKAGE_docker=y
 CONFIG_PACKAGE_dockerd=y
@@ -146,7 +139,7 @@ CONFIG_PACKAGE_luci-app-amlogic=y
 EOF
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
     log "[OK] .config 初始化完成"
-    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_|LINUX_6)" .config || true
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|PCIE_ROCKCHIP|PHY_ROCKCHIP|DOCKER_|LINUX_6)" .config || true
 }
 
 # =============================================================
@@ -167,9 +160,7 @@ step_apply_customizations() {
     local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
     if [ -f "$add_pkgs" ]; then
         log "修复 add_packages.sh 内核配置路径..."
-        log "  before: $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
         sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' "$add_pkgs"
-        log "  after:  $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
         cd "$PROJECT_DIR"
         bash "$add_pkgs"
         log "[OK] add_packages.sh 执行完成"
@@ -177,11 +168,10 @@ step_apply_customizations() {
         warn "add_packages.sh 不存在，跳过"
     fi
 
-    # ---------- 4.3 确保 amlogic 依赖包已启用 ----------
+    # ---------- 4.3 确保 luci-app-amlogic 依赖包已启用 ----------
     log "确保 luci-app-amlogic 依赖包已启用..."
     cd "$FRIENDLYWRT_DIR"
 
-    # luci-app-amlogic 的必需依赖（参考官方 README）
     local AML_DEPS="
         luci-base
         luci-compat
@@ -205,7 +195,6 @@ step_apply_customizations() {
     "
 
     for pkg in $AML_DEPS; do
-        # 移除未设置的标记
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config 2>/dev/null || true
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config 2>/dev/null || true
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
@@ -328,13 +317,19 @@ step_force_config() {
     sed -i '/^CONFIG_LINUX_6_12=/d' .config
     echo "CONFIG_LINUX_6_12=y" >> .config
 
+    # 确保 PCIe 相关配置已启用
+    sed -i '/^CONFIG_PCIE_ROCKCHIP_DW_HOST=/d' .config
+    echo "CONFIG_PCIE_ROCKCHIP_DW_HOST=y" >> .config
+    sed -i '/^CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=/d' .config
+    echo "CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y" >> .config
+
     # 确保 luci-app-amlogic 已启用
     sed -i "/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d" .config 2>/dev/null || true
     sed -i "/^CONFIG_PACKAGE_luci-app-amlogic=/d" .config 2>/dev/null || true
     echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
 
     log "[OK] 关键配置已强制修正"
-    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_|LINUX_6)" .config
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|PCIE_ROCKCHIP|PHY_ROCKCHIP|DOCKER_|LINUX_6)" .config
 }
 
 # =============================================================
@@ -394,6 +389,16 @@ restore_critical_cfg() {
     if ! grep -q "^CONFIG_LINUX_6_12=y" .config; then
         sed -i '/^CONFIG_LINUX_6_12=/d' .config
         echo "CONFIG_LINUX_6_12=y" >> .config
+        need_save=true
+    fi
+    if ! grep -q "^CONFIG_PCIE_ROCKCHIP_DW_HOST=y" .config; then
+        sed -i '/^CONFIG_PCIE_ROCKCHIP_DW_HOST=/d' .config
+        echo "CONFIG_PCIE_ROCKCHIP_DW_HOST=y" >> .config
+        need_save=true
+    fi
+    if ! grep -q "^CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y" .config; then
+        sed -i '/^CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=/d' .config
+        echo "CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y" >> .config
         need_save=true
     fi
     if ! grep -q "^CONFIG_PACKAGE_luci-app-amlogic=y" .config; then
@@ -502,7 +507,6 @@ main() {
 
     step_setup_ccache_and_staging
     step_verify_kernel
-    step_patch_pcie_delay
     step_init_config
     step_apply_customizations
     step_dedupe_config
