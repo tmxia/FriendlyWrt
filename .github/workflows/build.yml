@@ -38,7 +38,9 @@ env:
 jobs:
   prepare_release:
     runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
+    if: |
+      github.event.repository.owner.id == github.event.sender.id ||
+      github.actor == 'github-actions[bot]'
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
       upload_url: ${{ steps.release.outputs.upload_url }}
@@ -102,7 +104,8 @@ jobs:
     needs: prepare_release
     runs-on: ubuntu-22.04
     if: |
-      github.event.repository.owner.id == github.event.sender.id &&
+      (github.event.repository.owner.id == github.event.sender.id ||
+       github.actor == 'github-actions[bot]') &&
       github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
@@ -395,7 +398,8 @@ jobs:
     needs: prepare_release
     runs-on: ubuntu-22.04
     if: |
-      github.event.repository.owner.id == github.event.sender.id &&
+      (github.event.repository.owner.id == github.event.sender.id ||
+       github.actor == 'github-actions[bot]') &&
       github.event_name == 'watch'
     strategy:
       matrix:
@@ -683,13 +687,19 @@ jobs:
   cleanup_intermediate_assets:
     needs: [prepare_release, build_manual, build_auto]
     runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
+    if: |
+      github.event.repository.owner.id == github.event.sender.id ||
+      github.actor == 'github-actions[bot]'
     steps:
     - name: Delete intermediate assets from release
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         RELEASE_TAG: ${{ needs.prepare_release.outputs.release_tag }}
       run: |
+        if [ -z "$RELEASE_TAG" ]; then
+          echo "No release tag, skip."
+          exit 0
+        fi
         gh release view "$RELEASE_TAG" \
           --repo "$GITHUB_REPOSITORY" \
           --json assets \
@@ -709,11 +719,40 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          keep_minimum_runs: 0
-          retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt"
-          repository: ${{ github.repository }}
+      - name: Delete old runs of exactly this workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_NAME="Build FriendlyWrt"
+          KEEP=1
+          CURRENT_RUN_ID="${{ github.run_id }}"
+
+          WF_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq ".workflows[] | select(.name == \"$TARGET_NAME\") | .id" | head -n1)
+
+          if [ -z "$WF_ID" ]; then
+            echo "Workflow '$TARGET_NAME' not found. Skip."
+            exit 0
+          fi
+          echo "Workflow '$TARGET_NAME' ID: $WF_ID"
+
+          RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs?per_page=100" \
+            --jq '.workflow_runs[].id')
+
+          echo "Runs found:"
+          echo "$RUNS"
+
+          i=0
+          for run_id in $RUNS; do
+            i=$((i+1))
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+              echo "Keep current run: $run_id"
+              continue
+            fi
+            if [ "$i" -le "$KEEP" ]; then
+              echo "Keep recent run: $run_id"
+              continue
+            fi
+            echo "Deleting run: $run_id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" || true
+          done
