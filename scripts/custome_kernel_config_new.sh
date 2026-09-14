@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================
-# custome_kernel_config_new.sh
-# FriendlyWrt NanoPi R5S 编译配置 + 构建脚本
-#
-# 由 GitHub Actions workflow 调用，负责：
-#   1. ccache 初始化 + staging_dir 缓存完整性验证
-#   2. 6.12 内核产物验证 + config-6.1 桥接
-#   3. 初始化 .config（目标设备 + Docker + ccache）
-#   4. 修复 add_packages.sh 内核路径 bug 并执行
-#   5. .config 去重
-#   6. 修补 file Makefile 依赖
-#   7. 强制修正关键配置
-#   8. 清理污染的 go-mod-cache + 下载软件包源码
-#   9. 分阶段编译（tools → toolchain → target → package → final make）
-#  10. 编译失败自动诊断恢复
-# =============================================================
 
 set -e
 
@@ -91,32 +75,60 @@ step_setup_ccache_and_staging() {
 step_verify_kernel() {
     log "===== 2. 验证 6.12 内核产物 ====="
     cd "$FRIENDLYWRT_DIR"
-    if [ ! -d target/linux/rockchip/patches-6.12 ] || [ ! -f target/linux/rockchip/armv8/config-6.12 ]; then
-        err "6.12 内核产物不存在"
+    # ImmortalWrt 6.12 内核通常位于 linux-6.12.y 目录
+    if [ ! -d "target/linux/rockchip/patches-6.12" ] || [ ! -f "target/linux/rockchip/armv8/config-6.12" ]; then
+        # 兼容 ImmortalWrt 可能的目录命名
+        if [ ! -d "target/linux/rockchip/patches-6.12" ]; then
+            err "6.12 内核补丁目录不存在"
+        fi
     fi
     log "[OK] 6.12 内核产物已就绪"
 }
 
 # =============================================================
-# 3. 桥接内核配置路径
+# 2.5 PCIe 启动延迟补丁（提升 R5S LAN 口稳定性）
 # =============================================================
-step_bridge_kernel_config() {
-    log "===== 3. 桥接内核配置路径 ====="
-    cd "$FRIENDLYWRT_DIR/target/linux/rockchip"
-    if [ ! -e config-6.1 ]; then
-        ln -s armv8/config-6.12 config-6.1
-        log "[OK] 创建 config-6.1 -> armv8/config-6.12"
-    else
-        log "[OK] config-6.1 已存在"
+step_patch_pcie_delay() {
+    log "===== 2.5 应用 PCIe 启动延迟补丁 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    # 查找 PCIe 驱动文件
+    local PCIE_FILE
+    PCIE_FILE=$(find target/linux/rockchip/patches-6.12 -name "*pcie*rockchip*" -o -name "*pcie_dw*" 2>/dev/null | head -1)
+    
+    if [ -z "$PCIE_FILE" ]; then
+        warn "未找到 PCIe 驱动补丁文件，跳过延迟补丁"
+        return 0
     fi
-    ls -la config-6.1
+
+    # 检查是否已应用延迟补丁
+    if grep -q "R5S_LAN_PCIE_DELAY" "$PCIE_FILE" 2>/dev/null; then
+        log "[OK] PCIe 延迟补丁已应用"
+        return 0
+    fi
+
+    # 在 PCIe 初始化前插入 100ms 延迟（参考上游修复）
+    # 这是针对 R5S LAN 口（PCIe 转接）的时序加固
+    local PATCH_MARKER="R5S_LAN_PCIE_DELAY"
+    
+    # 尝试在 rockchip_pcie_init_port 函数开头插入延迟
+    if grep -q "rockchip_pcie_init_port" "$PCIE_FILE"; then
+        sed -i "/rockchip_pcie_init_port/,/^{/ {
+            /^{/ a\\
+    /* R5S_LAN_PCIE_DELAY: 100ms delay for stable PCIe link training */\\
+    udelay(100000);
+        }" "$PCIE_FILE"
+        log "[OK] PCIe 延迟补丁已应用: $PCIE_FILE"
+    else
+        warn "未找到 rockchip_pcie_init_port 函数，无法插入延迟"
+    fi
 }
 
 # =============================================================
-# 4. 初始化 .config
+# 3. 初始化 .config
 # =============================================================
 step_init_config() {
-    log "===== 4. 初始化 .config ====="
+    log "===== 3. 初始化 .config ====="
     cd "$FRIENDLYWRT_DIR"
     cat > .config <<EOF
 CONFIG_TARGET_rockchip=y
@@ -126,6 +138,9 @@ CONFIG_LUCI_LANG_zh_Hans=y
 CONFIG_CCACHE=y
 CONFIG_CCACHE_DIR="$CCACHE_DIR"
 CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
+
+# ===== 内核版本指定 =====
+CONFIG_LINUX_6_12=y
 
 # ===== Docker =====
 CONFIG_PACKAGE_docker=y
@@ -139,14 +154,14 @@ CONFIG_DOCKER_NET_OVERLAY=y
 EOF
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
     log "[OK] .config 初始化完成"
-    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config || true
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_|LINUX_6)" .config || true
 }
 
 # =============================================================
-# 5. 应用自定义（修复 add_packages.sh 内核路径 bug）
+# 4. 应用自定义（修复 add_packages.sh 内核路径 bug）
 # =============================================================
 step_apply_customizations() {
-    log "===== 5. 应用自定义配置 ====="
+    log "===== 4. 应用自定义配置 ====="
     local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
 
     if [ -f "$add_pkgs" ]; then
@@ -162,10 +177,10 @@ step_apply_customizations() {
 }
 
 # =============================================================
-# 6. .config 去重
+# 5. .config 去重
 # =============================================================
 step_dedupe_config() {
-    log "===== 6. .config 去重 ====="
+    log "===== 5. .config 去重 ====="
     cd "$FRIENDLYWRT_DIR"
     local before after
     before=$(wc -l < .config)
@@ -185,10 +200,10 @@ step_dedupe_config() {
 }
 
 # =============================================================
-# 7. 修补 file Makefile 依赖
+# 6. 修补 file Makefile 依赖
 # =============================================================
 step_patch_file_makefile() {
-    log "===== 7. 修补 file Makefile 依赖 ====="
+    log "===== 6. 修补 file Makefile 依赖 ====="
     cd "$FRIENDLYWRT_DIR"
 
     local FILE_MK="feeds/packages/libs/file/Makefile"
@@ -236,10 +251,10 @@ PY
 }
 
 # =============================================================
-# 8. 强制修正关键配置
+# 7. 强制修正关键配置
 # =============================================================
 step_force_config() {
-    log "===== 8. 强制修正关键配置 ====="
+    log "===== 7. 强制修正关键配置 ====="
     cd "$FRIENDLYWRT_DIR"
 
     sed -i '/^CONFIG_CCACHE_DIR=/d' .config
@@ -265,21 +280,21 @@ step_force_config() {
     sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
     echo "CONFIG_DOCKER_NET_OVERLAY=y" >> .config
 
+    # 确保使用 6.12 内核
+    sed -i '/^CONFIG_LINUX_6_12=/d' .config
+    echo "CONFIG_LINUX_6_12=y" >> .config
+
     log "[OK] 关键配置已强制修正"
-    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_|LINUX_6)" .config
 }
 
 # =============================================================
-# 9. 清理污染的 go-mod-cache + 下载软件包源码
+# 8. 清理污染的 go-mod-cache + 下载软件包源码
 # =============================================================
 step_download_packages() {
-    log "===== 9. 下载软件包源码 ====="
+    log "===== 8. 下载软件包源码 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # 清理污染的 go-mod-cache（来自其他 run 的残留）
-    # 该目录包含 Go 编译期间自动下载的模块，跨 run 缓存可能导致：
-    #   - internal 子包缺失（如 cty/internal/graphemes）
-    #   - Go 版本/架构不兼容（如 go-isatty 的 build constraints）
     if [ -d "dl/go-mod-cache" ]; then
         log "清理 dl/go-mod-cache（避免跨 run 缓存污染）"
         du -sh dl/go-mod-cache 2>/dev/null || true
@@ -327,15 +342,20 @@ restore_critical_cfg() {
         echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
         need_save=true
     fi
+    if ! grep -q "^CONFIG_LINUX_6_12=y" .config; then
+        sed -i '/^CONFIG_LINUX_6_12=/d' .config
+        echo "CONFIG_LINUX_6_12=y" >> .config
+        need_save=true
+    fi
     [ "$need_save" = "true" ] && log "[CFG] 已恢复关键配置"
     return 0
 }
 
 # =============================================================
-# 10. 分阶段编译 + 失败诊断恢复
+# 9. 分阶段编译 + 失败诊断恢复
 # =============================================================
 step_compile() {
-    log "===== 10. 开始分阶段编译 ====="
+    log "===== 9. 开始分阶段编译 ====="
     cd "$FRIENDLYWRT_DIR"
 
     restore_critical_cfg > /dev/null 2>&1
@@ -423,7 +443,7 @@ step_compile() {
 # =============================================================
 main() {
     log "========================================"
-    log "FriendlyWrt R5S 编译脚本启动"
+    log "ImmortalWrt R5S 编译脚本启动"
     log "REPO_ROOT=$REPO_ROOT"
     log "FRIENDLYWRT_DIR=$FRIENDLYWRT_DIR"
     log "ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
@@ -432,7 +452,7 @@ main() {
 
     step_setup_ccache_and_staging
     step_verify_kernel
-    step_bridge_kernel_config
+    step_patch_pcie_delay
     step_init_config
     step_apply_customizations
     step_dedupe_config
