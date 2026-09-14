@@ -62,6 +62,52 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLES: ${{ steps.commits.outputs.titles }}
+          PROMPT_HEADER: |
+            你是 Linux 内核更新日志翻译助手。请把下列英文提交标题逐条翻译成中文要点。
+
+            严格规则：
+            1. 输入 N 条，输出 N 条，每条一行，以 "- " 开头；不得合并、拆分或遗漏
+            2. 术语保留英文原文（例如 hci_uart、hci_aic、dts、panfrost、Bifrost、BT_HCIUART_AIC、nanopi-r28s、rtl8822cs-bt、NET_SCH_FQ_CODEL、virtual-connector、cts-detect-wait-ms）
+            3. 子系统前缀翻译成中文类别：
+               - Bluetooth: -> 蓝牙
+               - dts: rockchip: 或 ARM64: dts: rockchip: -> 设备树
+               - arm64: configs: 或 ARM64: configs: -> 内核配置
+               - drm/panfrost: -> 图形驱动 panfrost
+            4. 不输出 Signed-off-by、Reviewed-by、Link、上游 commit id 等元信息
+            5. 不编造输入中不存在的内容
+            6. 直接输出要点列表，不要代码块、不要标题、不要前后缀说明
+
+            示例输入：
+            Bluetooth: hci_aic: Add module ready check to setup
+            ARM64: dts: rockchip: Add dts for nanopi-r28s
+            arm64: configs: enable BT_HCIUART_AIC for nanopi5/6
+            drm/panfrost: Set HW_FEATURE_AARCH64_MMU feature flag on Bifrost models
+
+            示例输出：
+            - 蓝牙 hci_aic 在 setup 中增加模块就绪检查
+            - 设备树新增 nanopi-r28s 的 dts
+            - 为 nanopi5/6 启用 BT_HCIUART_AIC
+            - 图形驱动 panfrost 在 Bifrost 模型上设置 HW_FEATURE_AARCH64_MMU 特性标志
+
+            现在请翻译以下提交标题：
+          PY_TRANSLATE: |
+            import sys
+            from deep_translator import GoogleTranslator
+
+            titles = [l.strip() for l in sys.stdin if l.strip()]
+            try:
+                tr = GoogleTranslator(source='en', target='zh-CN')
+            except Exception as e:
+                sys.stderr.write(f"init failed: {e}\n")
+                sys.exit(1)
+
+            for t in titles:
+                try:
+                    zh = tr.translate(t)
+                except Exception as e:
+                    sys.stderr.write(f"translate failed: {t} :: {e}\n")
+                    zh = t
+                print('- ' + (zh or t))
         run: |
           if [ -z "$TITLES" ]; then
             echo "summary=" >> "$GITHUB_OUTPUT"
@@ -72,42 +118,14 @@ jobs:
           INPUT_COUNT=$(awk 'NF' /tmp/titles.txt | wc -l | tr -d ' ')
           echo "Input titles: $INPUT_COUNT"
 
-          # =================================================================
-          # 路径 1：GitHub Models —— LLM 自主翻译
-          # =================================================================
-          PROMPT=$(cat <<EOF
-你是 Linux 内核更新日志翻译助手。请把下列英文提交标题逐条翻译成中文要点。
-
-严格规则：
-1. 输入 N 条，输出 N 条，每条一行，以 "- " 开头；不得合并、拆分或遗漏
-2. 术语保留英文原文（例如 hci_uart、hci_aic、dts、panfrost、Bifrost、BT_HCIUART_AIC、nanopi-r28s、rtl8822cs-bt、NET_SCH_FQ_CODEL、virtual-connector、cts-detect-wait-ms）
-3. 子系统前缀翻译成中文类别：
-   - Bluetooth: → 蓝牙
-   - dts: rockchip: 或 ARM64: dts: rockchip: → 设备树
-   - arm64: configs: 或 ARM64: configs: → 内核配置
-   - drm/panfrost: → 图形驱动 panfrost
-4. 不输出 Signed-off-by、Reviewed-by、Link、上游 commit id 等元信息
-5. 不编造输入中不存在的内容
-6. 直接输出要点列表，不要代码块、不要标题、不要前后缀说明
-
-示例输入：
-Bluetooth: hci_aic: Add module ready check to setup
-ARM64: dts: rockchip: Add dts for nanopi-r28s
-arm64: configs: enable BT_HCIUART_AIC for nanopi5/6
-drm/panfrost: Set HW_FEATURE_AARCH64_MMU feature flag on Bifrost models
-
-示例输出：
-- 蓝牙 hci_aic 在 setup 中增加模块就绪检查
-- 设备树新增 nanopi-r28s 的 dts
-- 为 nanopi5/6 启用 BT_HCIUART_AIC
-- 图形驱动 panfrost 在 Bifrost 模型上设置 HW_FEATURE_AARCH64_MMU 特性标志
-
-现在请翻译以下 ${INPUT_COUNT} 条提交标题：
-$TITLES
-EOF
-)
+          PROMPT="${PROMPT_HEADER}
+          ${TITLES}"
 
           SUMMARY=""
+
+          # =============================================================
+          # 路径 1：GitHub Models —— LLM 自主翻译
+          # =============================================================
           for MODEL in "gpt-4o-mini" "gpt-4o" "gpt-4.1" "gpt-4.1-mini"; do
             for EP in "https://models.github.ai/inference/chat/completions" \
                       "https://models.inference.ai.azure.com/chat/completions"; do
@@ -132,48 +150,30 @@ EOF
             done
           done
 
-          # =================================================================
+          # =============================================================
           # 路径 2：deep-translator + Google 免费端点 —— 真正的翻译引擎
-          # =================================================================
+          # =============================================================
           if [ -z "$SUMMARY" ]; then
             echo "== Path1 failed; Path2: Google Translate via deep-translator =="
             python3 -m pip install --quiet --disable-pip-version-check deep-translator >/dev/null 2>&1 || true
             if python3 -c "import deep_translator" 2>/dev/null; then
-              python3 << 'PYEOF' > /tmp/summary_google.txt 2>/tmp/trans_err.log || true
-from deep_translator import GoogleTranslator
-import sys
-
-with open('/tmp/titles.txt', encoding='utf-8') as f:
-    titles = [l.strip() for l in f if l.strip()]
-
-try:
-    tr = GoogleTranslator(source='en', target='zh-CN')
-except Exception as e:
-    sys.stderr.write(f"init failed: {e}\n")
-    sys.exit(1)
-
-for t in titles:
-    try:
-        zh = tr.translate(t)
-    except Exception as e:
-        sys.stderr.write(f"translate failed: {t} :: {e}\n")
-        zh = t
-    print('- ' + (zh or t))
-PYEOF
+              printf '%s\n' "$PY_TRANSLATE" > /tmp/translate.py
+              python3 /tmp/translate.py < /tmp/titles.txt > /tmp/summary_google.txt 2>/tmp/trans_err.log || true
               if [ -s /tmp/summary_google.txt ]; then
                 SUMMARY=$(cat /tmp/summary_google.txt)
                 echo "   Path2 produced $(printf '%s\n' "$SUMMARY" | grep -c '^- ') bullets."
               else
                 echo "   Path2 produced empty output."
+                [ -s /tmp/trans_err.log ] && head -n 20 /tmp/trans_err.log
               fi
             else
               echo "   deep-translator not available."
             fi
           fi
 
-          # =================================================================
-          # 路径 3：最终兜底 —— 原样列出，不做硬编码拼接
-          # =================================================================
+          # =============================================================
+          # 路径 3：最终兜底 —— 原样列出，不拼接
+          # =============================================================
           if [ -z "$SUMMARY" ]; then
             echo "== All translation engines failed; listing original titles =="
             SUMMARY=$(awk 'NF {print "- " $0}' /tmp/titles.txt)
