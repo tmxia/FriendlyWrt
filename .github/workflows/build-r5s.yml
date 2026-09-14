@@ -152,122 +152,8 @@ jobs:
         touch configs/rockchip/01-nanopi
         echo "OpenWrt workspace prepared"
 
-    - name: Initialize .config with R5S target
-      run: |
-        cd project/friendlywrt
-        cat > .config <<EOF
-        CONFIG_TARGET_rockchip=y
-        CONFIG_TARGET_rockchip_armv8=y
-        CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
-        CONFIG_LUCI_LANG_zh_Hans=y
-        CONFIG_CCACHE=y
-        CONFIG_CCACHE_DIR="$CCACHE_DIR"
-        CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
-
-        # ===== Docker 相关 =====
-        CONFIG_PACKAGE_docker=y
-        CONFIG_PACKAGE_dockerd=y
-        CONFIG_PACKAGE_docker-compose=y
-        CONFIG_PACKAGE_luci-app-dockerman=y
-        CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
-        CONFIG_PACKAGE_luci-lib-docker=y
-
-        # ===== Docker 内核选项 =====
-        CONFIG_DOCKER_KERNEL_OPTIONS=y
-        CONFIG_DOCKER_NET_OVERLAY=y
-        EOF
-        yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
-        echo "=== 初始配置检查 ==="
-        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config
-
-    - name: Verify 6.12 kernel availability
-      run: |
-        cd project/friendlywrt
-        if [ -d target/linux/rockchip/patches-6.12 ] && [ -f target/linux/rockchip/armv8/config-6.12 ]; then
-          echo "[OK] OpenWrt Rockchip target uses kernel 6.12"
-        else
-          echo "::error::6.12 kernel artifacts not found"
-          exit 1
-        fi
-
-    - name: Bridge add_packages.sh kernel config path
-      run: |
-        cd project/friendlywrt/target/linux/rockchip
-        if [ ! -e config-6.1 ]; then
-          ln -s armv8/config-6.12 config-6.1
-        fi
-        ls -la config-6.1
-
-    - name: Apply customizations
-      run: |
-        cd project
-        echo "=== 修复前 ==="
-        grep -n "KERNEL_CONFIG_FILE=" ../scripts/add_packages.sh || true
-        sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' ../scripts/add_packages.sh
-        echo "=== 修复后 ==="
-        grep -n "KERNEL_CONFIG_FILE=" ../scripts/add_packages.sh || true
-        bash ../scripts/add_packages.sh
-
-    - name: Patch file Makefile dependencies
-      run: |
-        cd project/friendlywrt
-        FILE_MK="feeds/packages/libs/file/Makefile"
-        [ -f "$FILE_MK" ] || { echo "::error::$FILE_MK not found"; exit 1; }
-
-        echo "=== file Makefile Package/libmagic 原始定义 ==="
-        awk '/^define Package\/libmagic/,/^endef/' "$FILE_MK" || true
-
-        yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1 || true
-
-        for hint in libbz2 liblzma zlib; do
-          echo "--- kconfig ${hint} ---"
-          grep -oE "config PACKAGE_${hint}[-0-9._]*" tmp/.config-package.in 2>/dev/null \
-            | awk '{print $2}' | sort -u || echo "(none)"
-        done
-
-        python3 - "$FILE_MK" <<'PY'
-        import re, sys, pathlib
-        p = pathlib.Path(sys.argv[1])
-        txt = p.read_text()
-        m = re.search(r'(define Package/libmagic\b.*?DEPENDS:=)([^\n]*)', txt, flags=re.S)
-        if not m:
-            print("PATTERN NOT FOUND")
-            sys.exit(0)
-        deps = m.group(2)
-        added = []
-        for r in ['+libbz2', '+liblzma']:
-            if r not in deps:
-                deps += " " + r
-                added.append(r)
-        if added:
-            txt = txt[:m.start(2)] + deps + txt[m.end(2):]
-            p.write_text(txt)
-            print(f"PATCHED: {added}")
-        else:
-            print("No change")
-        PY
-
-        SYMS="PACKAGE_libbz2 PACKAGE_liblzma PACKAGE_zlib"
-        for hint in libbz2 liblzma zlib; do
-          found=$(grep -oE "config PACKAGE_${hint}[-0-9._]*" tmp/.config-package.in 2>/dev/null \
-                    | awk '{print $2}' | sort -u || true)
-          SYMS="${SYMS} ${found}"
-        done
-        for sym in $SYMS; do
-          [ -z "$sym" ] && continue
-          sed -i "/^# CONFIG_${sym} is not set/d" .config
-          sed -i "/^CONFIG_${sym}=/d" .config
-          echo "CONFIG_${sym}=y" >> .config
-        done
-        yes "" | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
-        echo "依赖已就位"
-
     # ==========================================================
-    #  缓存机制（4 层）：
-    #  1. staging_dir — 主机工具 + 交叉工具链（最大收益）
-    #  2. ccache      — 单文件编译缓存
-    #  3. dl          — 下载的源码包
-    #  4. gomod       — Go 模块
+    #  缓存恢复
     # ==========================================================
     - name: Restore staging_dir (toolchain + host)
       uses: actions/cache@v4
@@ -303,176 +189,11 @@ jobs:
         restore-keys: |
           gomod-${{ env.OPENWRT_BRANCH }}-
 
-    - name: Configure ccache
-      run: |
-        mkdir -p "$CCACHE_DIR"
-        ccache --max-size=3G
-        ccache --set-config=compression=true
-        ccache --set-config=compiler_check=content
-        ccache --set-config=cache_dir="$CCACHE_DIR"
-        ccache -s || true
-        echo "=== staging_dir 状态 ==="
-        du -sh project/friendlywrt/staging_dir 2>/dev/null || echo "(无 staging_dir 缓存)"
-        ls project/friendlywrt/staging_dir/ 2>/dev/null || true
-
-    - name: Force correct .config values
-      run: |
-        cd project/friendlywrt
-
-        sed -i '/^CONFIG_CCACHE_DIR=/d' .config
-        sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
-        echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
-        sed -i '/^CONFIG_CCACHE=/d' .config
-        sed -i '/^# CONFIG_CCACHE is not set/d' .config
-        echo "CONFIG_CCACHE=y" >> .config
-
-        sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
-        sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
-        echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
-
-        for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker; do
-          sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-          sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-          echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-        done
-
-        sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
-        echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
-        sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
-        echo "CONFIG_DOCKER_NET_OVERLAY=y" >> .config
-
-        echo "=== 强制修正后的关键配置 ==="
-        grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config
-
-    - name: Download packages
-      run: |
-        cd project/friendlywrt
-        make download -j$(nproc) > /tmp/dl1.log 2>&1 || true
-        find dl -type f -size -1024c -delete 2>/dev/null || true
-        make download -j$(nproc) > /tmp/dl2.log 2>&1 || true
-        echo "dl: $(find dl -type f | wc -l) 文件, $(du -sh dl | awk '{print $1}')"
-
-    - name: Compile OpenWrt
-      run: |
-        cd project/friendlywrt
-
-        restore_critical_cfg() {
-          local need_save=false
-          if ! grep -q "^CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config; then
-            sed -i '/^CONFIG_CCACHE_DIR=/d' .config
-            sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
-            echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
-            need_save=true
-          fi
-          if ! grep -q "^CONFIG_CCACHE=y" .config; then
-            echo "CONFIG_CCACHE=y" >> .config
-            need_save=true
-          fi
-          if ! grep -q "^CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" .config; then
-            sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
-            sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
-            echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
-            need_save=true
-          fi
-          for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker; do
-            if ! grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-              sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-              sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-              echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-              need_save=true
-            fi
-          done
-          if ! grep -q "^CONFIG_DOCKER_KERNEL_OPTIONS=y" .config; then
-            sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
-            echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
-            need_save=true
-          fi
-          if [ "$need_save" = "true" ]; then
-            echo "[CFG] 已修复配置："
-            grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_)" .config
-          fi
-          return 0
-        }
-
-        echo "===== 编译前关键配置 ====="
-        restore_critical_cfg
-
-        for s in tools/compile toolchain/compile target/compile package/compile; do
-          echo "========== STAGE: $s ($(date +%H:%M:%S)) =========="
-          restore_critical_cfg > /dev/null 2>&1
-          LOG="/tmp/build_$(echo $s|tr '/' '_').log"
-          if ! make -j$(nproc) "$s" > "$LOG" 2>&1; then
-            echo "::error::STAGE FAILED: $s"
-            FAILED=$(grep -oE "ERROR: package/[^ ]+ failed to build" "$LOG" | head -1 | awk '{print $2}')
-            tail -80 "$LOG"
-            [ -n "$FAILED" ] && { echo "=== Verbose rebuild ==="; make -j1 V=s "$FAILED/compile" 2>&1 | tail -150 || true; }
-            exit 1
-          fi
-          echo "  [DONE] $s ($(date +%H:%M:%S))"
-        done
-
-        echo "========== STAGE: final make ($(date +%H:%M:%S)) =========="
-        restore_critical_cfg > /dev/null 2>&1
-        LOG="/tmp/build_final.log"
-        if make -j$(nproc) > "$LOG" 2>&1; then
-          echo "  [DONE] final make ($(date +%H:%M:%S))"
-        else
-          echo "::warning::首次 final make 失败，启动诊断流程..."
-          echo "===== 失败目标 ====="
-          grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
-          grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
-
-          if grep -qE "out of space|failed to allocate" "$LOG"; then
-            echo "===== 检测到 rootfs 空间不足，扩大分区 ====="
-            grep -E "Size: [0-9]+|out of space" "$LOG" | tail -5 || true
-
-            ROOTFS_DIR=$(find build_dir/target-* -maxdepth 1 -type d -name "root-*" | head -1)
-            if [ -n "$ROOTFS_DIR" ]; then
-              ACTUAL_MB=$(du -s -m "$ROOTFS_DIR" | awk '{print $1}')
-              NEEDED_MB=$(( (ACTUAL_MB + 64 + 63) / 64 * 64 ))
-              NEW_PARTSIZE=$(( NEEDED_MB + 256 ))
-              echo "当前 rootfs 实际大小: ${ACTUAL_MB} MB"
-              echo "新分区大小: ${NEW_PARTSIZE} MB"
-
-              sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
-              echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$NEW_PARTSIZE" >> .config
-              grep -E "^CONFIG_TARGET_ROOTFS_PARTSIZE" .config
-
-              rm -f build_dir/target-*/linux-rockchip_armv8/root.ext4* 2>/dev/null || true
-              rm -f build_dir/target-*/linux-rockchip_armv8/root.squashfs 2>/dev/null || true
-              rm -f build_dir/target-*/linux-rockchip_armv8/*.img 2>/dev/null || true
-            fi
-          fi
-
-          if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
-            echo "===== 检测到 target/linux 失败，尝试内核配置同步 ====="
-            make defconfig > /dev/null 2>&1 || true
-            yes "" | make oldconfig > /dev/null 2>&1 || true
-            restore_critical_cfg > /dev/null 2>&1
-
-            echo "----- 详细重跑 target/linux/install -----"
-            make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
-          fi
-
-          FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
-          if [ -n "$FAILED_PKG" ]; then
-            echo "===== $FAILED_PKG 失败，详细重跑 ====="
-            make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
-          fi
-
-          echo "===== 诊断完成，重试完整 final make ====="
-          restore_critical_cfg > /dev/null 2>&1
-          if ! make -j$(nproc) > /tmp/build_final_retry.log 2>&1; then
-            echo "::error::最终 make 重试仍失败"
-            tail -200 /tmp/build_final_retry.log
-            exit 1
-          fi
-          echo "  [DONE] final make (retry) ($(date +%H:%M:%S))"
-        fi
-
-        echo "=== OpenWrt 编译完成 ==="
-        ls -la build_dir/target-*/root-* 2>/dev/null | head -5 || echo "(未找到 rootfs)"
-        ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || echo "(未找到原生镜像)"
+    # ==========================================================
+    #  调用自定义脚本：配置 + 编译（所有逻辑都在这一个脚本里）
+    # ==========================================================
+    - name: Run custom kernel config & build
+      run: bash scripts/custome_kernel_config_new.sh
 
     - name: Show cache stats
       if: always()
@@ -485,6 +206,9 @@ jobs:
         echo "=== dl 大小 ==="
         du -sh project/friendlywrt/dl 2>/dev/null || true
 
+    # ==========================================================
+    #  以下步骤保持不变（打包 / 上传）
+    # ==========================================================
     - name: Locate kernel artifacts
       run: |
         cd project/friendlywrt
@@ -529,6 +253,7 @@ jobs:
     - name: Clone sd-fuse_rk3568
       run: |
         cd project
+        rm -rf sd-fuse
         git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse
         cd sd-fuse
         [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
@@ -552,13 +277,15 @@ jobs:
     - name: Package resource.img
       run: |
         cd project
-        SF="sd-fuse"
+        SF="$PWD/sd-fuse"
         TGT="$SF/$TARGET_OS"
+        IMGFILE="$TGT/resource.img"
+        mkdir -p "$TGT"
 
         [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
 
-        echo "=== DTB 源目录内容（rk3568 系列）==="
-        ls -la "$DTB_DIR"/rk3568-*.dtb 2>/dev/null || echo "(none)"
+        echo "=== DTB 源目录内容（rk3568-nanopi 系列）==="
+        ls -la "$DTB_DIR"/rk3568-nanopi-*.dtb 2>/dev/null || true
 
         rm -rf /tmp/dtb-pack
         mkdir -p /tmp/dtb-pack
@@ -581,15 +308,12 @@ jobs:
         cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
 
         for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
-          if [ -f "$DTB_DIR/$cand" ]; then
-            cp "$DTB_DIR/$cand" /tmp/dtb-pack/
-            echo "[OK] 附带 dtb: $cand"
-          fi
+          [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
         done
 
+        # resource_tool 不拼接 --root 路径，必须在 dtb 所在目录运行
         cd /tmp/dtb-pack
         DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
-        cd - > /dev/null
 
         [ -z "$DTB_LIST" ] && { echo "::error::no dtb files"; exit 1; }
 
@@ -598,12 +322,14 @@ jobs:
         echo "总数: $(echo "$DTB_LIST" | wc -l)"
 
         "$SF/tools/resource_tool" --pack \
-          --root=/tmp/dtb-pack \
-          --image="$PWD/$TGT/resource.img" \
+          --root=. \
+          --image="$IMGFILE" \
           $DTB_LIST
 
-        [ -f "$TGT/resource.img" ] || { echo "::error::resource.img 未生成"; exit 1; }
-        ls -lh "$TGT/resource.img"
+        cd - > /dev/null
+
+        [ -f "$IMGFILE" ] || { echo "::error::resource.img 未生成: $IMGFILE"; exit 1; }
+        ls -lh "$IMGFILE"
 
     - name: Stage U-Boot binaries
       run: |
@@ -648,6 +374,7 @@ jobs:
     - name: Generate parameter.txt
       run: |
         cd project/sd-fuse
+        [ -z "$ROOTFS_SIZE_BYTES" ] && { echo "::error::ROOTFS_SIZE_BYTES 未设置"; exit 1; }
         PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
           ./tools/generate-partmap-txt.sh "$ROOTFS_SIZE_BYTES" "$TARGET_OS"
         echo "=== parameter.txt ==="
@@ -673,11 +400,21 @@ jobs:
         }
         ls -lh out/images-for-eflasher/ 2>/dev/null || true
 
+    - name: Fix file ownership from sudo operations
+      run: |
+        cd project/sd-fuse
+        if [ -d "out" ]; then
+          sudo chown -R "$(id -u):$(id -g)" out/ 2>/dev/null || true
+        fi
+        if [ -d "$TARGET_OS" ]; then
+          sudo chown -R "$(id -u):$(id -g)" "$TARGET_OS" 2>/dev/null || true
+        fi
+
     - name: Rename artifacts with clear FriendlyWrt-style names
       run: |
         cd project/sd-fuse
 
-        SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f | head -1)
+        SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
         if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
           DST_NAME="${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.img"
           cp "$SRC_IMG" "/tmp/${DST_NAME}"
@@ -685,10 +422,11 @@ jobs:
           cp "/tmp/${DST_NAME}.gz" ../../artifact/
           echo "[OK] SD image: ${DST_NAME}.gz"
         else
-          echo "::warning::未找到 sd-fuse 生成的 .img"
+          echo "::warning::未找到 sd-fuse 生成的 .img（out/ 内容如下）"
+          ls -la out/ 2>/dev/null || true
         fi
 
-        SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f | head -1)
+        SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
         if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
           DST_NAME="images-${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.tgz"
           cp "$SRC_TGZ" "../../artifact/${DST_NAME}"
@@ -712,8 +450,9 @@ jobs:
     - name: Generate SHA256 and README
       run: |
         cd artifact
+        rm -f SHA256SUMS
         for f in *; do
-          [ -f "$f" ] && sha256sum "$f" >> SHA256SUMS
+          [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
         done
 
         cat > README.txt <<EOF
