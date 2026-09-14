@@ -9,6 +9,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: kernel-watcher
+  cancel-in-progress: false
+
 jobs:
   check_kernel:
     runs-on: ubuntu-latest
@@ -93,7 +97,7 @@ jobs:
           path: |
             ~/.cache/huggingface
             ~/.cache/torch
-          key: hf-hy-mt2-1.8b-v1
+          key: hf-hy-mt2-1.8b-v2
 
       - name: Translate titles with Hy-MT2-1.8B
         id: translate
@@ -101,7 +105,7 @@ jobs:
           steps.sha.outputs.ok == 'true' &&
           steps.commits.outputs.ok == 'true' &&
           steps.sha.outputs.sha != steps.recorded.outputs.recorded
-        timeout-minutes: 25
+        timeout-minutes: 30
         env:
           TITLES: ${{ steps.commits.outputs.titles }}
           PY_TRANSLATE: |
@@ -134,43 +138,32 @@ jobs:
                 sys.stderr.write(f"LOAD_FAIL: {type(e).__name__}: {e}\n")
                 sys.exit(2)
 
-            # 术语保护：含数字 / 含下划线 / 全大写 4+ 的 token
-            TERM_RE = re.compile(
-                r'\b[A-Za-z][A-Za-z0-9_.-]*[0-9][A-Za-z0-9_.-]*\b'
-                r'|\b[A-Za-z0-9]*_[A-Za-z0-9_]+\b'
-                r'|\b[A-Z]{4,}\b'
-            )
-
-            def protect(text):
-                terms = []
-                def repl(m):
-                    terms.append(m.group(0))
-                    return f'<t{len(terms)-1}>'
-                return TERM_RE.sub(repl, text), terms
-
-            def restore(text, terms):
-                for i, t in enumerate(terms):
-                    text = re.sub(rf'<\s*[tT]\s*{i}\s*>', t, text)
-                    text = re.sub(rf'<\s*/?\s*[tT]\s*{i}\s*/?\s*>', t, text)
-                return text
-
             PROMPT_TEMPLATE = (
                 "将以下文本翻译为中文，注意只需要输出翻译后的结果，不要额外解释：\n\n{src}"
             )
 
-            # 坏输出判定
+            # 坏输出判定：只检测最明显的故障
             def is_bad(text):
                 if not text:
                     return True
-                if re.search(r'(\S)\1{3,}', text):
+                if re.search(r'(\S)\1{4,}', text):           # 连续同字 5+
                     return True
-                if re.search(r'<\s*/?\s*[tT]\s*\d+\s*/?\s*>', text):
+                if re.search(r'[〈＜]\s*[tT]\s*\d+', text):   # 残留占位符
                     return True
-                if text.count('子') >= 5:
+                if re.search(r'<\s*[tT]\s*\d+', text):
                     return True
-                if len(text) > 400:
+                if text.count('子') >= 8:                    # 死循环特征
+                    return True
+                if len(text) > 500:
                     return True
                 return False
+
+            # 清理：去掉模型可能吐出的括号残渣
+            def cleanup(text):
+                text = re.sub(r'[〈＜]\s*[tT]?\s*\d+\s*[〉＞]', '', text)
+                text = re.sub(r'<\s*[tT]?\s*\d+\s*[\]>]', '', text)
+                text = re.sub(r'\s+', ' ', text).strip()
+                return text
 
             titles = [l.rstrip("\n") for l in sys.stdin if l.strip()]
             sys.stderr.write(f"Input titles: {len(titles)}\n")
@@ -180,8 +173,7 @@ jobs:
             with torch.no_grad():
                 for i, t in enumerate(titles, 1):
                     try:
-                        masked, terms = protect(t)
-                        prompt = PROMPT_TEMPLATE.format(src=masked)
+                        prompt = PROMPT_TEMPLATE.format(src=t)
                         messages = [{"role": "user", "content": prompt}]
 
                         input_ids = tok.apply_chat_template(
@@ -194,7 +186,7 @@ jobs:
 
                         out = model.generate(
                             input_ids,
-                            max_new_tokens=256,
+                            max_new_tokens=220,
                             num_beams=4,
                             no_repeat_ngram_size=3,
                             repetition_penalty=1.2,
@@ -203,7 +195,7 @@ jobs:
                         )
                         generated = out[0][input_ids.shape[-1]:]
                         zh = tok.decode(generated, skip_special_tokens=True).strip()
-                        zh = restore(zh, terms)
+                        zh = cleanup(zh)
 
                         if is_bad(zh):
                             sys.stderr.write(f"REJECT[{i}]: {t[:60]} -> {zh[:60]}\n")
@@ -238,7 +230,7 @@ jobs:
           printf '%s\n' "$PY_TRANSLATE" > /tmp/translate.py
 
           echo "== Running Hy-MT2-1.8B translation =="
-          timeout 1200 python3 /tmp/translate.py < /tmp/titles.txt > /tmp/summary.txt 2>/tmp/trans.log || true
+          timeout 1500 python3 /tmp/translate.py < /tmp/titles.txt > /tmp/summary.txt 2>/tmp/trans.log || true
 
           echo "---- translator stderr ----"
           cat /tmp/trans.log || true
@@ -292,6 +284,10 @@ jobs:
           SHA: ${{ steps.sha.outputs.sha }}
           SUMMARY: ${{ steps.translate.outputs.summary }}
         run: |
+          # 先同步 remote，避免 push 被拒
+          git fetch origin master
+          git reset --soft origin/master 2>/dev/null || true
+
           {
             echo "$SHA"
             echo ""
@@ -307,8 +303,33 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .kernel-version
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
           git commit -m "chore: update kernel SHA $(echo $SHA | cut -c1-8)"
-          git push
+
+          # push 带重试和 rebase
+          for attempt in 1 2 3; do
+            echo "== Push attempt $attempt =="
+            if git push origin HEAD:master; then
+              echo "Push succeeded."
+              exit 0
+            fi
+            echo "Push failed, syncing with remote..."
+            git fetch origin master
+            git rebase origin/master || {
+              echo "Rebase conflict, aborting and resetting to remote."
+              git rebase --abort || true
+              git reset --hard origin/master
+              exit 1
+            }
+            sleep 3
+          done
+          echo "::error::Push failed after 3 attempts."
+          exit 1
 
   cleanup_self:
     name: Cleanup Self Workflow History
