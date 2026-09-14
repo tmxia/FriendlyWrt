@@ -75,12 +75,8 @@ step_setup_ccache_and_staging() {
 step_verify_kernel() {
     log "===== 2. 验证 6.12 内核产物 ====="
     cd "$FRIENDLYWRT_DIR"
-    # ImmortalWrt 6.12 内核通常位于 linux-6.12.y 目录
     if [ ! -d "target/linux/rockchip/patches-6.12" ] || [ ! -f "target/linux/rockchip/armv8/config-6.12" ]; then
-        # 兼容 ImmortalWrt 可能的目录命名
-        if [ ! -d "target/linux/rockchip/patches-6.12" ]; then
-            err "6.12 内核补丁目录不存在"
-        fi
+        err "6.12 内核产物不存在"
     fi
     log "[OK] 6.12 内核产物已就绪"
 }
@@ -92,26 +88,19 @@ step_patch_pcie_delay() {
     log "===== 2.5 应用 PCIe 启动延迟补丁 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # 查找 PCIe 驱动文件
     local PCIE_FILE
     PCIE_FILE=$(find target/linux/rockchip/patches-6.12 -name "*pcie*rockchip*" -o -name "*pcie_dw*" 2>/dev/null | head -1)
-    
+
     if [ -z "$PCIE_FILE" ]; then
         warn "未找到 PCIe 驱动补丁文件，跳过延迟补丁"
         return 0
     fi
 
-    # 检查是否已应用延迟补丁
     if grep -q "R5S_LAN_PCIE_DELAY" "$PCIE_FILE" 2>/dev/null; then
         log "[OK] PCIe 延迟补丁已应用"
         return 0
     fi
 
-    # 在 PCIe 初始化前插入 100ms 延迟（参考上游修复）
-    # 这是针对 R5S LAN 口（PCIe 转接）的时序加固
-    local PATCH_MARKER="R5S_LAN_PCIE_DELAY"
-    
-    # 尝试在 rockchip_pcie_init_port 函数开头插入延迟
     if grep -q "rockchip_pcie_init_port" "$PCIE_FILE"; then
         sed -i "/rockchip_pcie_init_port/,/^{/ {
             /^{/ a\\
@@ -151,29 +140,85 @@ CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
 CONFIG_PACKAGE_luci-lib-docker=y
 CONFIG_DOCKER_KERNEL_OPTIONS=y
 CONFIG_DOCKER_NET_OVERLAY=y
+
+# ===== luci-app-amlogic 刷机工具 =====
+CONFIG_PACKAGE_luci-app-amlogic=y
 EOF
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
     log "[OK] .config 初始化完成"
-    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_|LINUX_6)" .config || true
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_|LINUX_6)" .config || true
 }
 
 # =============================================================
-# 4. 应用自定义（修复 add_packages.sh 内核路径 bug）
+# 4. 应用自定义配置（含 luci-app-amlogic 集成）
 # =============================================================
 step_apply_customizations() {
     log "===== 4. 应用自定义配置 ====="
-    local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
 
+    # ---------- 4.1 克隆 luci-app-amlogic 源码 ----------
+    log "克隆 luci-app-amlogic 插件..."
+    cd "$FRIENDLYWRT_DIR"
+    rm -rf package/luci-app-amlogic
+    git clone --depth 1 -b main https://github.com/ophub/luci-app-amlogic.git package/luci-app-amlogic
+    [ -d "package/luci-app-amlogic" ] || err "luci-app-amlogic 克隆失败"
+    log "[OK] luci-app-amlogic 已克隆到 package/luci-app-amlogic"
+
+    # ---------- 4.2 执行 add_packages.sh ----------
+    local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
     if [ -f "$add_pkgs" ]; then
         log "修复 add_packages.sh 内核配置路径..."
         log "  before: $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
         sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' "$add_pkgs"
         log "  after:  $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
+        cd "$PROJECT_DIR"
+        bash "$add_pkgs"
+        log "[OK] add_packages.sh 执行完成"
+    else
+        warn "add_packages.sh 不存在，跳过"
     fi
 
-    cd "$PROJECT_DIR"
-    bash "$add_pkgs"
-    log "[OK] add_packages.sh 执行完成"
+    # ---------- 4.3 确保 amlogic 依赖包已启用 ----------
+    log "确保 luci-app-amlogic 依赖包已启用..."
+    cd "$FRIENDLYWRT_DIR"
+
+    # luci-app-amlogic 的必需依赖（参考官方 README）
+    local AML_DEPS="
+        luci-base
+        luci-compat
+        luci-lib-jsonc
+        luci-lib-nixio
+        block-mount
+        e2fsprogs
+        tune2fs
+        tar
+        gzip
+        curl
+        wget
+        unzip
+        dosfstools
+        parted
+        coreutils
+        coreutils-stat
+        kmod-fs-vfat
+        kmod-fs-ext4
+        kmod-fs-btrfs
+    "
+
+    for pkg in $AML_DEPS; do
+        # 移除未设置的标记
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config 2>/dev/null || true
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config 2>/dev/null || true
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+    log "[OK] luci-app-amlogic 依赖包已启用"
+
+    # ---------- 4.4 确保 luci-app-amlogic 本身已启用 ----------
+    sed -i "/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d" .config 2>/dev/null || true
+    sed -i "/^CONFIG_PACKAGE_luci-app-amlogic=/d" .config 2>/dev/null || true
+    echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
+
+    log "[OK] luci-app-amlogic 已启用"
+    grep -E "CONFIG_PACKAGE_(luci-app-amlogic|tune2fs|block-mount|e2fsprogs)" .config || true
 }
 
 # =============================================================
@@ -280,12 +325,16 @@ step_force_config() {
     sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
     echo "CONFIG_DOCKER_NET_OVERLAY=y" >> .config
 
-    # 确保使用 6.12 内核
     sed -i '/^CONFIG_LINUX_6_12=/d' .config
     echo "CONFIG_LINUX_6_12=y" >> .config
 
+    # 确保 luci-app-amlogic 已启用
+    sed -i "/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d" .config 2>/dev/null || true
+    sed -i "/^CONFIG_PACKAGE_luci-app-amlogic=/d" .config 2>/dev/null || true
+    echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
+
     log "[OK] 关键配置已强制修正"
-    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|DOCKER_|LINUX_6)" .config
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_|LINUX_6)" .config
 }
 
 # =============================================================
@@ -347,6 +396,12 @@ restore_critical_cfg() {
         echo "CONFIG_LINUX_6_12=y" >> .config
         need_save=true
     fi
+    if ! grep -q "^CONFIG_PACKAGE_luci-app-amlogic=y" .config; then
+        sed -i "/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d" .config 2>/dev/null || true
+        sed -i "/^CONFIG_PACKAGE_luci-app-amlogic=/d" .config 2>/dev/null || true
+        echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
+        need_save=true
+    fi
     [ "$need_save" = "true" ] && log "[CFG] 已恢复关键配置"
     return 0
 }
@@ -378,7 +433,6 @@ step_compile() {
         log "[DONE] $s"
     done
 
-    # ===== final make =====
     log "---- STAGE: final make ----"
     restore_critical_cfg > /dev/null 2>&1
     LOG="/tmp/build_final.log"
@@ -389,7 +443,6 @@ step_compile() {
         grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
         grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
 
-        # 场景 1：rootfs 空间不足
         if grep -qE "out of space|failed to allocate" "$LOG"; then
             log "----- 场景 1: rootfs 空间不足，尝试扩大分区 -----"
             local ROOTFS_DIR ACTUAL_MB NEEDED_MB NEW_PARTSIZE
@@ -407,7 +460,6 @@ step_compile() {
             fi
         fi
 
-        # 场景 2：target/linux 失败（内核配置漂移）
         if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
             log "----- 场景 2: target/linux 失败，尝试内核配置同步 -----"
             make defconfig > /dev/null 2>&1 || true
@@ -416,7 +468,6 @@ step_compile() {
             make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
         fi
 
-        # 场景 3：其它包失败
         local FAILED_PKG
         FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
         if [ -n "$FAILED_PKG" ]; then
@@ -424,7 +475,6 @@ step_compile() {
             make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
         fi
 
-        # 重试
         log "----- 诊断完成，重试完整 final make -----"
         restore_critical_cfg > /dev/null 2>&1
         if ! make -j"$(nproc)" > /tmp/build_final_retry.log 2>&1; then
