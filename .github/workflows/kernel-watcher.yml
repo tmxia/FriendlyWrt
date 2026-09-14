@@ -9,6 +9,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: kernel-watcher
+  cancel-in-progress: false
+
 jobs:
   check_kernel:
     runs-on: ubuntu-latest
@@ -21,32 +25,70 @@ jobs:
       - name: Get latest commit SHA for nanopi6-v6.1.y
         id: sha
         run: |
-          SHA=$(curl -s https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y | jq -r .sha)
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: kernel-watcher" \
+            "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y" \
+            || true)
+          SHA=$(printf '%s' "$RESP" | jq -r '.sha // empty' 2>/dev/null || true)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::warning::Cannot fetch upstream SHA, skipping this cycle."
+            printf '%s' "$RESP" | head -c 500
+            echo
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "sha=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Current SHA: $SHA"
 
-      - name: Read recorded SHA
-        id: recorded
+      - name: Check if SHA already processed
+        id: check
+        if: steps.sha.outputs.ok == 'true'
         run: |
-          if [ -f .kernel-version ]; then
-            RECORDED=$(head -n1 .kernel-version | tr -d '[:space:]')
-          else
-            RECORDED="none"
+          SHA="${{ steps.sha.outputs.sha }}"
+          SHA8="${SHA:0:8}"
+
+          # 确保拿到远端 master 最新历史
+          git fetch origin master || true
+
+          echo "== Searching git log for existing processing record =="
+          # 主要判据：git log 中是否已有处理该 SHA 的提交
+          MATCH=$(git log origin/master --pretty=format:'%H %s' | grep "update kernel SHA ${SHA8}" || true)
+          if [ -n "$MATCH" ]; then
+            echo "Found existing commit: $MATCH"
+            echo "Already processed SHA ${SHA8}, skip."
+            echo "processed=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          [ -z "$RECORDED" ] && RECORDED="none"
-          echo "recorded=$RECORDED" >> $GITHUB_OUTPUT
-          echo "Recorded SHA: $RECORDED"
+
+          echo "== Fallback: check .kernel-version on origin/master =="
+          if git cat-file -e origin/master:.kernel-version 2>/dev/null; then
+            RECORDED=$(git show origin/master:.kernel-version 2>/dev/null | head -n1 | tr -d '[:space:]' || true)
+            echo "origin/master:.kernel-version first line = '$RECORDED'"
+            if [ -n "$RECORDED" ] && [ "$RECORDED" != "none" ]; then
+              if [ "$RECORDED" = "$SHA" ]; then
+                echo "SHA matches .kernel-version, skip."
+                echo "processed=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+          else
+            echo "origin/master:.kernel-version does not exist."
+          fi
+
+          echo "SHA ${SHA8} not processed yet, proceeding."
+          echo "processed=false" >> "$GITHUB_OUTPUT"
 
       - name: Fetch latest upstream commit message
         id: commits
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: steps.check.outputs.processed == 'false'
         run: |
-          MSG=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/${{ steps.sha.outputs.sha }}" \
+          MSG=$(curl -sS -H "Accept: application/vnd.github+json" \
+                -H "User-Agent: kernel-watcher" \
+                "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/${{ steps.sha.outputs.sha }}" \
                 | jq -r '.commit.message // empty')
-          if [ -z "$MSG" ]; then
-            echo "::warning::Cannot fetch commit message."
-            MSG="(no message)"
-          fi
+          [ -z "$MSG" ] && MSG="(no message)"
           echo "Commit message length: ${#MSG}"
           {
             echo "msg<<__EOF__"
@@ -55,7 +97,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Compare and trigger build if changed
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: steps.check.outputs.processed == 'false'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -63,12 +105,11 @@ jobs:
           gh workflow run build.yml -f version=both -f set=both --repo ${{ github.repository }}
 
       - name: Update recorded SHA with latest commit log
-        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: steps.check.outputs.processed == 'false'
         env:
           SHA: ${{ steps.sha.outputs.sha }}
           MSG: ${{ steps.commits.outputs.msg }}
         run: |
-          # 同步远端，避免 push 被拒
           git fetch origin master || true
 
           {
@@ -140,9 +181,6 @@ jobs:
 
           RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs?per_page=100" \
             --jq '.workflow_runs[].id')
-
-          echo "Runs found:"
-          echo "$RUNS"
 
           i=0
           for run_id in $RUNS; do
