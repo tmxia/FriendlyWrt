@@ -186,11 +186,16 @@ jobs:
         restore-keys: |
           gomod-${{ env.OPENWRT_BRANCH }}-
 
-    # ==========================================================
-    #  配置 + 编译（全部收敛到脚本）
-    # ==========================================================
     - name: Run custom kernel config & build
       run: bash scripts/custome_kernel_config_new.sh
+
+    - name: Clean go-mod-cache before saving
+      if: always()
+      run: |
+        # 确保 dl/go-mod-cache 不被写入缓存
+        rm -rf project/friendlywrt/dl/go-mod-cache
+        echo "=== dl 大小（清理后）==="
+        du -sh project/friendlywrt/dl 2>/dev/null || true
 
     - name: Show cache stats
       if: always()
@@ -386,8 +391,6 @@ jobs:
         echo "[INFO] 逻辑分区大小:        $LOGICAL_SIZE bytes"
 
         # ==== 关键：传给分区脚本的必须是"逻辑分区大小" ====
-        # 否则 generate-partmap-txt.sh 会按 sparse 文件大小生成分区，
-        # 导致 rootfs 分区比 img 的逻辑大小小，mk-sd-image.sh 跳过写入
         echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
         echo "[OK] 已设置 ROOTFS_SIZE_BYTES=$LOGICAL_SIZE"
 
@@ -411,7 +414,6 @@ jobs:
         }
         ls -lh out/ 2>/dev/null || echo "(无 out/)"
 
-        # 检查 mk-sd-image.sh 是否跳过了 rootfs
         if grep -q "more than capacity" /tmp/sd-image.log; then
           echo "::error::mk-sd-image.sh 跳过了 rootfs 写入（分区容量不足）"
           grep "more than capacity" /tmp/sd-image.log
@@ -444,7 +446,6 @@ jobs:
 
         SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
         if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
-          # 检查 SD 卡镜像是否合理大小（> 200MB，因为 rootfs 至少 300MB）
           SRC_SIZE=$(stat -c%s "$SRC_IMG")
           SRC_SIZE_MB=$(( SRC_SIZE / 1024 / 1024 ))
           echo "[INFO] SD 镜像原始大小: ${SRC_SIZE_MB} MB"
