@@ -9,10 +9,6 @@ permissions:
   contents: write
   actions: write
 
-concurrency:
-  group: kernel-watcher
-  cancel-in-progress: false
-
 jobs:
   check_kernel:
     runs-on: ubuntu-latest
@@ -25,21 +21,8 @@ jobs:
       - name: Get latest commit SHA for nanopi6-v6.1.y
         id: sha
         run: |
-          RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
-            -H "User-Agent: kernel-watcher" \
-            "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y" \
-            || true)
-          SHA=$(printf '%s' "$RESP" | jq -r '.sha // empty' 2>/dev/null || true)
-          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
-            echo "::warning::Cannot fetch upstream SHA, skipping this cycle."
-            printf '%s' "$RESP" | head -c 500
-            echo
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "sha=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "ok=true" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          SHA=$(curl -s https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y | jq -r .sha)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
           echo "Current SHA: $SHA"
 
       - name: Read recorded SHA
@@ -54,249 +37,49 @@ jobs:
           echo "recorded=$RECORDED" >> $GITHUB_OUTPUT
           echo "Recorded SHA: $RECORDED"
 
-      - name: Fetch upstream commit titles
+      - name: Fetch latest upstream commit message
         id: commits
-        if: |
-          steps.sha.outputs.ok == 'true' &&
-          steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
         run: |
-          if [ "${{ steps.recorded.outputs.recorded }}" = "none" ]; then
-            URL="https://api.github.com/repos/friendlyarm/kernel-rockchip/commits?sha=${{ steps.sha.outputs.sha }}&per_page=50"
-            TITLES=$(curl -sS -H "Accept: application/vnd.github+json" \
-              -H "User-Agent: kernel-watcher" "$URL" \
-              | jq -r 'if type=="array" then (.[] | .commit.message | split("\n")[0]) else empty end' \
-              2>/dev/null || true)
-          else
-            URL="https://api.github.com/repos/friendlyarm/kernel-rockchip/compare/${{ steps.recorded.outputs.recorded }}...${{ steps.sha.outputs.sha }}"
-            TITLES=$(curl -sS -H "Accept: application/vnd.github+json" \
-              -H "User-Agent: kernel-watcher" "$URL" \
-              | jq -r 'if type=="object" and .commits then (.commits[] | .commit.message | split("\n")[0]) else empty end' \
-              2>/dev/null || true)
+          MSG=$(curl -s "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/${{ steps.sha.outputs.sha }}" \
+                | jq -r '.commit.message // empty')
+          if [ -z "$MSG" ]; then
+            echo "::warning::Cannot fetch commit message."
+            MSG="(no message)"
           fi
-          TITLES=$(printf '%s\n' "$TITLES" | awk 'NF' | head -n 50 | cut -c1-250)
-          if [ -z "$TITLES" ]; then
-            echo "::warning::No titles fetched from GitHub API."
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "ok=true" >> "$GITHUB_OUTPUT"
+          echo "Commit message length: ${#MSG}"
           {
-            echo "titles<<__EOF__"
-            echo "$TITLES"
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
-          echo "Commit titles count: $(printf '%s\n' "$TITLES" | wc -l)"
-
-      - name: Cache HuggingFace models
-        if: |
-          steps.sha.outputs.ok == 'true' &&
-          steps.commits.outputs.ok == 'true' &&
-          steps.sha.outputs.sha != steps.recorded.outputs.recorded
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/huggingface
-            ~/.cache/torch
-          key: hf-hy-mt2-1.8b-v2
-
-      - name: Translate titles with Hy-MT2-1.8B
-        id: translate
-        if: |
-          steps.sha.outputs.ok == 'true' &&
-          steps.commits.outputs.ok == 'true' &&
-          steps.sha.outputs.sha != steps.recorded.outputs.recorded
-        timeout-minutes: 30
-        env:
-          TITLES: ${{ steps.commits.outputs.titles }}
-          PY_TRANSLATE: |
-            import os, re, sys
-            os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-            os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-
-            try:
-                import torch
-                from transformers import AutoTokenizer, AutoModelForCausalLM
-            except Exception as e:
-                sys.stderr.write(f"IMPORT_FAIL: {e}\n")
-                sys.exit(1)
-
-            MODEL = "tencent/Hy-MT2-1.8B"
-
-            try:
-                sys.stderr.write(f"Loading tokenizer: {MODEL}\n")
-                tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-                sys.stderr.write(f"Loading model: {MODEL}\n")
-                model = AutoModelForCausalLM.from_pretrained(
-                    MODEL,
-                    torch_dtype=torch.float32,
-                    device_map="cpu",
-                    trust_remote_code=True,
-                )
-                model.eval()
-            except Exception as e:
-                sys.stderr.write(f"LOAD_FAIL: {type(e).__name__}: {e}\n")
-                sys.exit(2)
-
-            PROMPT_TEMPLATE = (
-                "将以下文本翻译为中文，注意只需要输出翻译后的结果，不要额外解释：\n\n{src}"
-            )
-
-            # 坏输出判定：只检测最明显的故障
-            def is_bad(text):
-                if not text:
-                    return True
-                if re.search(r'(\S)\1{4,}', text):           # 连续同字 5+
-                    return True
-                if re.search(r'[〈＜]\s*[tT]\s*\d+', text):   # 残留占位符
-                    return True
-                if re.search(r'<\s*[tT]\s*\d+', text):
-                    return True
-                if text.count('子') >= 8:                    # 死循环特征
-                    return True
-                if len(text) > 500:
-                    return True
-                return False
-
-            # 清理：去掉模型可能吐出的括号残渣
-            def cleanup(text):
-                text = re.sub(r'[〈＜]\s*[tT]?\s*\d+\s*[〉＞]', '', text)
-                text = re.sub(r'<\s*[tT]?\s*\d+\s*[\]>]', '', text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                return text
-
-            titles = [l.rstrip("\n") for l in sys.stdin if l.strip()]
-            sys.stderr.write(f"Input titles: {len(titles)}\n")
-
-            ok = 0
-            fail = 0
-            with torch.no_grad():
-                for i, t in enumerate(titles, 1):
-                    try:
-                        prompt = PROMPT_TEMPLATE.format(src=t)
-                        messages = [{"role": "user", "content": prompt}]
-
-                        input_ids = tok.apply_chat_template(
-                            messages,
-                            add_generation_prompt=True,
-                            return_tensors="pt",
-                        )
-                        if not isinstance(input_ids, torch.Tensor):
-                            input_ids = input_ids["input_ids"]
-
-                        out = model.generate(
-                            input_ids,
-                            max_new_tokens=220,
-                            num_beams=4,
-                            no_repeat_ngram_size=3,
-                            repetition_penalty=1.2,
-                            do_sample=False,
-                            early_stopping=True,
-                        )
-                        generated = out[0][input_ids.shape[-1]:]
-                        zh = tok.decode(generated, skip_special_tokens=True).strip()
-                        zh = cleanup(zh)
-
-                        if is_bad(zh):
-                            sys.stderr.write(f"REJECT[{i}]: {t[:60]} -> {zh[:60]}\n")
-                            zh = t
-                            fail += 1
-                        else:
-                            ok += 1
-                    except Exception as e:
-                        sys.stderr.write(f"TR_FAIL[{i}]: {type(e).__name__}: {e}\n")
-                        zh = t
-                        fail += 1
-                    print("- " + zh, flush=True)
-
-            sys.stderr.write(f"DONE: ok={ok} fail={fail} total={len(titles)}\n")
-        run: |
-          if [ -z "$TITLES" ]; then
-            echo "summary=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          printf '%s\n' "$TITLES" > /tmp/titles.txt
-          INPUT_COUNT=$(awk 'NF' /tmp/titles.txt | wc -l | tr -d ' ')
-          echo "Input titles: $INPUT_COUNT"
-
-          echo "== Installing CPU-only torch and transformers>=5.6.0 =="
-          python3 -m pip install --quiet --no-cache-dir --upgrade pip
-          python3 -m pip install --quiet --no-cache-dir \
-            torch --index-url https://download.pytorch.org/whl/cpu
-          python3 -m pip install --quiet --no-cache-dir \
-            "transformers>=5.6.0" sentencepiece sacremoses accelerate
-
-          printf '%s\n' "$PY_TRANSLATE" > /tmp/translate.py
-
-          echo "== Running Hy-MT2-1.8B translation =="
-          timeout 1500 python3 /tmp/translate.py < /tmp/titles.txt > /tmp/summary.txt 2>/tmp/trans.log || true
-
-          echo "---- translator stderr ----"
-          cat /tmp/trans.log || true
-          echo "---- translator stdout head ----"
-          head -n 8 /tmp/summary.txt || true
-          echo "---- end ----"
-
-          SUMMARY=""
-          if [ -s /tmp/summary.txt ]; then
-            BULLETS=$(grep -c '^- ' /tmp/summary.txt || true)
-            CN=$(grep -oP '[\x{4e00}-\x{9fff}]' /tmp/summary.txt | wc -l | tr -d ' ')
-            echo "Translator output: bullets=$BULLETS CN=$CN"
-            if [ "$CN" -ge 20 ] && [ "$BULLETS" -ge "$(( INPUT_COUNT * 2 / 3 ))" ]; then
-              SUMMARY=$(cat /tmp/summary.txt)
-              echo "Translator output accepted."
-            else
-              echo "Translator output rejected by quality check."
-            fi
-          else
-            echo "Translator produced empty stdout."
-          fi
-
-          if [ -z "$SUMMARY" ]; then
-            echo "== Translation failed; listing original titles =="
-            SUMMARY=$(awk 'NF {print "- " $0}' /tmp/titles.txt)
-          fi
-
-          {
-            echo "summary<<__EOF__"
-            echo "$SUMMARY"
+            echo "msg<<__EOF__"
+            echo "$MSG"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
       - name: Compare and trigger build if changed
-        if: |
-          steps.sha.outputs.ok == 'true' &&
-          steps.commits.outputs.ok == 'true' &&
-          steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Kernel updated, triggering build..."
           gh workflow run build.yml -f version=both -f set=both --repo ${{ github.repository }}
 
-      - name: Update recorded SHA with summary
-        if: |
-          steps.sha.outputs.ok == 'true' &&
-          steps.commits.outputs.ok == 'true' &&
-          steps.sha.outputs.sha != steps.recorded.outputs.recorded
+      - name: Update recorded SHA with latest commit log
+        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
         env:
           SHA: ${{ steps.sha.outputs.sha }}
-          SUMMARY: ${{ steps.translate.outputs.summary }}
+          MSG: ${{ steps.commits.outputs.msg }}
         run: |
-          # 先同步 remote，避免 push 被拒
-          git fetch origin master
-          git reset --soft origin/master 2>/dev/null || true
+          # 同步远端，避免 push 被拒
+          git fetch origin master || true
 
           {
             echo "$SHA"
             echo ""
-            echo "# 上游更新摘要（UTC $(date -u +%Y-%m-%d)）"
+            echo "# 上游更新日志（UTC $(date -u +%Y-%m-%d)）"
             echo ""
-            if [ -n "$SUMMARY" ]; then
-              echo "$SUMMARY"
+            if [ -n "$MSG" ]; then
+              echo "$MSG"
             else
-              echo "- （本次未生成摘要）"
+              echo "(no message)"
             fi
           } > .kernel-version
 
@@ -311,7 +94,6 @@ jobs:
 
           git commit -m "chore: update kernel SHA $(echo $SHA | cut -c1-8)"
 
-          # push 带重试和 rebase
           for attempt in 1 2 3; do
             echo "== Push attempt $attempt =="
             if git push origin HEAD:master; then
@@ -321,9 +103,8 @@ jobs:
             echo "Push failed, syncing with remote..."
             git fetch origin master
             git rebase origin/master || {
-              echo "Rebase conflict, aborting and resetting to remote."
+              echo "Rebase conflict, aborting."
               git rebase --abort || true
-              git reset --hard origin/master
               exit 1
             }
             sleep 3
@@ -350,18 +131,30 @@ jobs:
 
           WF_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
             --jq ".workflows[] | select(.name == \"$TARGET_NAME\") | .id" | head -n1)
+
           if [ -z "$WF_ID" ]; then
             echo "Workflow '$TARGET_NAME' not found. Skip."
             exit 0
           fi
+          echo "Workflow '$TARGET_NAME' ID: $WF_ID"
 
           RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs?per_page=100" \
             --jq '.workflow_runs[].id')
 
+          echo "Runs found:"
+          echo "$RUNS"
+
           i=0
           for run_id in $RUNS; do
             i=$((i+1))
-            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then continue; fi
-            if [ "$i" -le "$KEEP" ]; then continue; fi
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+              echo "Keep current run: $run_id"
+              continue
+            fi
+            if [ "$i" -le "$KEEP" ]; then
+              echo "Keep recent run: $run_id"
+              continue
+            fi
+            echo "Deleting run: $run_id"
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" || true
           done
