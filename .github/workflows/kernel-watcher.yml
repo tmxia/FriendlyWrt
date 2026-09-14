@@ -8,7 +8,6 @@ on:
 permissions:
   contents: write
   actions: write
-  models: read
 
 jobs:
   check_kernel:
@@ -56,62 +55,93 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Commit titles count: $(printf '%s\n' "$TITLES" | wc -l)"
 
-      - name: Generate Chinese summary
-        id: summary
+      - name: Cache HuggingFace models
         if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+          key: hf-nllb-200-distilled-600M-v1
+
+      - name: Translate with NLLB-200
+        id: translate
+        if: steps.sha.outputs.sha != steps.recorded.outputs.recorded
+        timeout-minutes: 25
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TITLES: ${{ steps.commits.outputs.titles }}
-          PROMPT_HEADER: |
-            你是 Linux 内核更新日志翻译助手。请把下列英文提交标题逐条翻译成中文要点。
-
-            严格规则：
-            1. 输入 N 条，输出 N 条，每条一行，以 "- " 开头；不得合并、拆分或遗漏
-            2. 术语保留英文原文（例如 hci_uart、hci_aic、dts、panfrost、Bifrost、BT_HCIUART_AIC、nanopi-r28s、rtl8822cs-bt、NET_SCH_FQ_CODEL、virtual-connector、cts-detect-wait-ms）
-            3. 子系统前缀翻译成中文类别：
-               - Bluetooth: -> 蓝牙
-               - dts: rockchip: 或 ARM64: dts: rockchip: -> 设备树
-               - arm64: configs: 或 ARM64: configs: -> 内核配置
-               - drm/panfrost: -> 图形驱动 panfrost
-            4. 不输出 Signed-off-by、Reviewed-by、Link、上游 commit id 等元信息
-            5. 不编造输入中不存在的内容
-            6. 直接输出要点列表，不要代码块、不要标题、不要前后缀说明
-
-            示例输入：
-            Bluetooth: hci_aic: Add module ready check to setup
-            ARM64: dts: rockchip: Add dts for nanopi-r28s
-            arm64: configs: enable BT_HCIUART_AIC for nanopi5/6
-            drm/panfrost: Set HW_FEATURE_AARCH64_MMU feature flag on Bifrost models
-
-            示例输出：
-            - 蓝牙 hci_aic 在 setup 中增加模块就绪检查
-            - 设备树新增 nanopi-r28s 的 dts
-            - 为 nanopi5/6 启用 BT_HCIUART_AIC
-            - 图形驱动 panfrost 在 Bifrost 模型上设置 HW_FEATURE_AARCH64_MMU 特性标志
-
-            现在请翻译以下提交标题：
           PY_TRANSLATE: |
-            import sys, json, urllib.parse, urllib.request
+            import os, sys
+            os.environ["TRANSFORMERS_VERBOSITY"] = "error"
+            os.environ["TOKENIZERS_PARALLELISM"] = "false"
+            os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 
-            def translate(text):
-                url = ("https://translate.googleapis.com/translate_a/single"
-                       "?client=gtx&sl=en&tl=zh-CN&dt=t&q="
-                       + urllib.parse.quote(text))
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    data = json.loads(r.read().decode('utf-8'))
-                return ''.join(seg[0] for seg in data[0] if seg and seg[0])
+            try:
+                import torch
+                from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+            except Exception as e:
+                sys.stderr.write(f"IMPORT_FAIL: {e}\n")
+                sys.exit(1)
 
-            for raw in sys.stdin:
-                t = raw.strip()
-                if not t:
-                    continue
+            MODEL = "facebook/nllb-200-distilled-600M"
+            SRC_LANG = "eng_Latn"
+            TGT_LANG = "zho_Hans"
+
+            try:
+                sys.stderr.write(f"Loading tokenizer: {MODEL}\n")
+                tok = AutoTokenizer.from_pretrained(MODEL, src_lang=SRC_LANG)
+                sys.stderr.write(f"Loading model: {MODEL}\n")
+                model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
+                model.eval()
+            except Exception as e:
+                sys.stderr.write(f"LOAD_FAIL: {e}\n")
+                sys.exit(2)
+
+            bos_id = None
+            try:
+                bos_id = tok.convert_tokens_to_ids(TGT_LANG)
+            except Exception:
+                pass
+            if bos_id is None or bos_id < 0:
                 try:
-                    zh = translate(t)
-                except Exception as e:
-                    sys.stderr.write(f"fail: {t} :: {e}\n")
-                    zh = t
-                print('- ' + (zh or t))
+                    bos_id = tok.lang_code_to_id[TGT_LANG]
+                except Exception:
+                    bos_id = None
+            if bos_id is None or bos_id < 0:
+                sys.stderr.write("BOS_FAIL: cannot resolve zho_Hans token id\n")
+                sys.exit(3)
+
+            sys.stderr.write(f"BOS token id for {TGT_LANG}: {bos_id}\n")
+
+            titles = [l.rstrip("\n") for l in sys.stdin if l.strip()]
+            sys.stderr.write(f"Input titles: {len(titles)}\n")
+
+            ok = 0
+            fail = 0
+            with torch.no_grad():
+                for i, t in enumerate(titles, 1):
+                    try:
+                        enc = tok(t, return_tensors="pt", truncation=True, max_length=256)
+                        out = model.generate(
+                            **enc,
+                            forced_bos_token_id=bos_id,
+                            max_length=256,
+                            num_beams=1,
+                            do_sample=False,
+                        )
+                        zh = tok.batch_decode(out, skip_special_tokens=True)[0].strip()
+                        if not zh:
+                            zh = t
+                            fail += 1
+                        else:
+                            ok += 1
+                    except Exception as e:
+                        sys.stderr.write(f"TR_FAIL[{i}]: {type(e).__name__}: {e}\n")
+                        zh = t
+                        fail += 1
+                    print("- " + zh, flush=True)
+
+            sys.stderr.write(f"DONE: ok={ok} fail={fail} total={len(titles)}\n")
         run: |
           if [ -z "$TITLES" ]; then
             echo "summary=" >> "$GITHUB_OUTPUT"
@@ -122,73 +152,41 @@ jobs:
           INPUT_COUNT=$(awk 'NF' /tmp/titles.txt | wc -l | tr -d ' ')
           echo "Input titles: $INPUT_COUNT"
 
-          PROMPT="${PROMPT_HEADER}
-          ${TITLES}"
+          echo "== Installing CPU-only torch and transformers =="
+          python3 -m pip install --quiet --no-cache-dir --upgrade pip
+          python3 -m pip install --quiet --no-cache-dir \
+            torch --index-url https://download.pytorch.org/whl/cpu
+          python3 -m pip install --quiet --no-cache-dir \
+            transformers sentencepiece sacremoses
+
+          printf '%s\n' "$PY_TRANSLATE" > /tmp/translate.py
+
+          echo "== Running NLLB-200 translation =="
+          timeout 900 python3 /tmp/translate.py < /tmp/titles.txt > /tmp/summary.txt 2>/tmp/trans.log || true
+
+          echo "---- translator stderr ----"
+          cat /tmp/trans.log || true
+          echo "---- translator stdout head ----"
+          head -n 8 /tmp/summary.txt || true
+          echo "---- end ----"
 
           SUMMARY=""
-
-          # =============================================================
-          # 路径 1：GitHub Models —— LLM 自主翻译（带诊断）
-          # =============================================================
-          if [ -n "$GH_TOKEN" ]; then
-            for MODEL in "gpt-4o-mini" "gpt-4o" "gpt-4.1-mini"; do
-              for EP in "https://models.github.ai/inference/chat/completions" \
-                        "https://models.inference.ai.azure.com/chat/completions"; do
-                echo "== Path1: model=$MODEL endpoint=$EP =="
-                BODY=$(jq -n --arg p "$PROMPT" --arg m "$MODEL" \
-                  '{model:$m,temperature:0.1,messages:[{role:"user",content:$p}]}')
-                RESP=$(curl -s --max-time 90 -w '\nHTTP_CODE:%{http_code}' "$EP" \
-                  -H "Authorization: Bearer $GH_TOKEN" \
-                  -H "Content-Type: application/json" \
-                  -d "$BODY" || true)
-                CODE=$(printf '%s' "$RESP" | sed -n 's/.*HTTP_CODE://p')
-                BODY_ONLY=$(printf '%s' "$RESP" | sed '/HTTP_CODE:/d')
-                echo "   HTTP code: ${CODE:-none}"
-                echo "   resp head: $(printf '%s' "$BODY_ONLY" | head -c 200)"
-                CAND=$(printf '%s' "$BODY_ONLY" | jq -r '.choices[0].message.content // empty' 2>/dev/null || true)
-                if [ -n "$CAND" ]; then
-                  CN=$(printf '%s' "$CAND" | grep -oP '[\x{4e00}-\x{9fff}]' | wc -l | tr -d ' ')
-                  BULLETS=$(printf '%s\n' "$CAND" | grep -c '^- ' || true)
-                  echo "   candidate: CN=$CN bullets=$BULLETS"
-                  if [ "$CN" -ge 20 ] && [ "$BULLETS" -ge "$(( INPUT_COUNT * 2 / 3 ))" ]; then
-                    SUMMARY="$CAND"
-                    echo "   accepted."
-                    break 2
-                  fi
-                fi
-              done
-            done
-          else
-            echo "== Path1 skipped: no GH_TOKEN =="
-          fi
-
-          # =============================================================
-          # 路径 2：Google 免费翻译端点（urllib 直连，无 pip 依赖）
-          # =============================================================
-          if [ -z "$SUMMARY" ]; then
-            echo "== Path1 failed; Path2: Google Translate (urllib, no pip) =="
-            printf '%s\n' "$PY_TRANSLATE" > /tmp/translate.py
-            timeout 240 python3 /tmp/translate.py < /tmp/titles.txt > /tmp/summary_google.txt 2>/tmp/trans_err.log || true
-            if [ -s /tmp/summary_google.txt ]; then
-              SUMMARY=$(cat /tmp/summary_google.txt)
-              BULLETS=$(printf '%s\n' "$SUMMARY" | grep -c '^- ' || true)
-              CN=$(printf '%s' "$SUMMARY" | grep -oP '[\x{4e00}-\x{9fff}]' | wc -l | tr -d ' ')
-              echo "   Path2 produced $BULLETS bullets, CN=$CN"
-              if [ "$CN" -lt 10 ] || [ "$BULLETS" -lt "$(( INPUT_COUNT * 2 / 3 ))" ]; then
-                echo "   Path2 output rejected by quality check."
-                SUMMARY=""
-              fi
+          if [ -s /tmp/summary.txt ]; then
+            BULLETS=$(grep -c '^- ' /tmp/summary.txt || true)
+            CN=$(grep -oP '[\x{4e00}-\x{9fff}]' /tmp/summary.txt | wc -l | tr -d ' ')
+            echo "Translator output: bullets=$BULLETS CN=$CN"
+            if [ "$CN" -ge 20 ] && [ "$BULLETS" -ge "$(( INPUT_COUNT * 2 / 3 ))" ]; then
+              SUMMARY=$(cat /tmp/summary.txt)
+              echo "Translator output accepted."
             else
-              echo "   Path2 produced empty output."
-              [ -s /tmp/trans_err.log ] && head -n 20 /tmp/trans_err.log
+              echo "Translator output rejected by quality check."
             fi
+          else
+            echo "Translator produced empty stdout."
           fi
 
-          # =============================================================
-          # 路径 3：最终兜底 —— 原样列出，不做拼接
-          # =============================================================
           if [ -z "$SUMMARY" ]; then
-            echo "== All translation engines failed; listing original titles =="
+            echo "== NLLB translation failed; listing original titles =="
             SUMMARY=$(awk 'NF {print "- " $0}' /tmp/titles.txt)
           fi
 
