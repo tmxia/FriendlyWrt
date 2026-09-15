@@ -402,9 +402,25 @@ step_download_packages() {
     log "[OK] dl: $(find dl -type f | wc -l) 文件"
 }
 
+step_sync_config() {
+    log "===== 9.5 同步 .config 与内核 Kconfig ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    rm -rf tmp/.config-* tmp/.packageinfo tmp/.targetinfo 2>/dev/null || true
+
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+    make defconfig > /dev/null 2>&1 || true
+
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+
+    log "[OK] 配置同步完成"
+}
+
 step_compile() {
     log "===== 10. 分阶段编译 ====="
     cd "$FRIENDLYWRT_DIR"
+
+    step_sync_config
 
     local s
     for s in tools/compile toolchain/compile target/compile package/compile; do
