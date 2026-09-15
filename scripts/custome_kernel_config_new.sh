@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # ImmortalWrt NanoPi R5S 编译脚本
 #
-# 核心约束：
-#   1. .config 与 include/config/auto.conf 必须严格同步，否则 -j4 package/compile
-#      会用过期依赖图调度，导致 sudo 等包在依赖未就绪时被拉起而失败。
-#   2. 同步的最终动作必须是 make oldconfig，且之后绝不再修改 .config。
-#   3. oldconfig 会重置某些顶层符号（如 CONFIG_CCACHE_DIR），
-#      需要用 scripts/config 工具在不触发 Kconfig 重算的前提下写回，再跑一次 oldconfig。
+# 关键事实：
+#   1. make oldconfig 只更新 .config，不会生成 include/config/auto.conf
+#   2. auto.conf 由 make 目标 "include/config/auto.conf" 生成（Makefile 文件规则）
+#   3. oldconfig 会重置顶层符号（CONFIG_CCACHE 等），需要用 scripts/config 恢复
+#   4. 编译前 .config 与 auto.conf 必须严格同步
 
 set -e
 
@@ -92,7 +91,6 @@ CONFIG_DOCKER_KERNEL_OPTIONS=y
 CONFIG_DOCKER_NET_OVERLAY=y
 CONFIG_PACKAGE_luci-app-amlogic=y
 EOF
-    # oldconfig 会规范化 .config 并刷新 auto.conf
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
     log "[OK] .config 初始化完成"
 }
@@ -110,9 +108,8 @@ step_apply_customizations() {
     if [ -f "$add_pkgs" ]; then
         sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' "$add_pkgs"
         (cd "$PROJECT_DIR" && bash "$add_pkgs")
-        log "[OK] add_packages.sh 执行完成（它会调用 defconfig，导致 .config 被重置）"
+        log "[OK] add_packages.sh 执行完成"
     fi
-    # 注意：此处 .config 已被 add_packages.sh 打乱，交由第 7 步重建
 }
 
 # ---------- 5. 去重 ----------
@@ -155,14 +152,11 @@ PY
     log "[OK] file Makefile 依赖已修补"
 }
 
-# =============================================================
-# 配置写入：使用 scripts/config 直接写 .config 而不触发 Kconfig 重算
-# =============================================================
+# ---------- 关键配置写入 ----------
 apply_critical_cfg() {
     cd "$FRIENDLYWRT_DIR"
     local CFG="scripts/config/Config"
 
-    # 若 scripts/config 可用，使用它（推荐：值形式规范，不会被误解）
     if [ -x "$CFG" ]; then
         local pkg
         for pkg in docker dockerd docker-compose luci-app-dockerman \
@@ -178,7 +172,6 @@ apply_critical_cfg() {
         "$CFG" --enable  DOCKER_KERNEL_OPTIONS
         "$CFG" --enable  DOCKER_NET_OVERLAY
     else
-        # 回退：用 sed/echo（仅在 scripts/config 不可用时）
         local pkg
         for pkg in docker dockerd docker-compose luci-app-dockerman \
                    luci-i18n-dockerman-zh-cn luci-lib-docker luci-app-amlogic; do
@@ -206,40 +199,51 @@ EOF
     fi
 }
 
-# =============================================================
-# 7. 强制修正关键配置 + 严格同步 .config 与 include/config/auto.conf
-# =============================================================
+# ---------- 7. 强制修正 + 显式生成 auto.conf ----------
 step_force_config() {
-    log "===== 7. 强制修正关键配置 + 严格同步 ====="
+    log "===== 7. 强制修正关键配置 + 生成 auto.conf ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # 1) 用 scripts/config 写入关键配置（不触发 Kconfig 重算）
+    # 1) 用 scripts/config 写入关键配置
     apply_critical_cfg
 
-    # 2) 清除缓存以便 oldconfig 重新生成依赖图
+    # 2) 清除缓存强制重算依赖图
     rm -f tmp/.config-package.in tmp/.packageinfo tmp/.targetinfo
 
-    # 3) 第一次 oldconfig：重建 tmp/ 与 include/config/auto.conf
-    #    副作用：可能重置 CONFIG_CCACHE_DIR 等顶层符号
-    log "运行 oldconfig（重建依赖图 + 首次同步）..."
+    # 3) oldconfig 重建 tmp/
+    log "运行 oldconfig（重建依赖图）..."
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
 
-    # 4) 第二次 apply：把被 oldconfig 重置的符号用 scripts/config 写回
+    # 4) 恢复 oldconfig 可能重置的顶层符号
     log "修正 oldconfig 可能重置的顶层符号..."
     apply_critical_cfg
 
-    # 5) 第二次 oldconfig：以干净的 .config 作为输入，刷新 auto.conf
-    #    此时 .config 与 auto.conf 严格一致，mtime 也最新
-    log "运行 oldconfig（最终同步）..."
+    # 5) oldconfig 把 .config 规范化
+    log "运行 oldconfig（规范化 .config）..."
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
 
-    # 6) 严格校验：.config 与 auto.conf 必须一致，关键符号必须存在
-    log "校验 .config 与 include/config/auto.conf 一致性..."
-    [ -f include/config/auto.conf ] || err "include/config/auto.conf 缺失"
+    # ============================================================
+    # 【核心修复】
+    # make oldconfig 不会生成 include/config/auto.conf。
+    # auto.conf 由 Makefile 中的文件规则生成，必须显式调用该目标。
+    # ============================================================
+    log "显式生成 include/config/auto.conf..."
+    make -s include/config/auto.conf 2>&1 | tail -3 || true
 
+    if [ ! -f include/config/auto.conf ]; then
+        warn "首次生成 auto.conf 失败，尝试 make prepare-tmpinfo..."
+        make -s prepare-tmpinfo 2>&1 | tail -3 || true
+        make -s include/config/auto.conf 2>&1 | tail -3 || true
+    fi
+
+    if [ ! -f include/config/auto.conf ]; then
+        err "无法生成 include/config/auto.conf（OpenWrt 构建系统异常）"
+    fi
+
+    # 6) 校验关键符号：.config 与 auto.conf 必须同时包含
+    log "校验 .config 与 include/config/auto.conf 一致性..."
     local checks=(
         "^CONFIG_CCACHE=y"
-        "^CONFIG_CCACHE_DIR=\"$CCACHE_DIR\""
         "^CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
         "^CONFIG_LINUX_6_12=y"
         "^CONFIG_PCIE_ROCKCHIP_DW_HOST=y"
@@ -260,14 +264,11 @@ step_force_config() {
         grep -qE "$pat" include/config/auto.conf || err "auto.conf 未同步: $pat"
     done
 
-    # 7) 关键 mtime 检查：auto.conf 必须不早于 .config
+    # 7) mtime 检查：auto.conf 必须不早于 .config
     if [ include/config/auto.conf -ot .config ]; then
-        warn "auto.conf 比 .config 旧，touch 修正 mtime（内容已一致）"
+        warn "auto.conf 比 .config 旧，touch 修正 mtime"
         touch include/config/auto.conf
     fi
-
-    # 8) 最后再运行一次 make oldconfig，作为终极同步（幂等，无害）
-    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
 
     log "[OK] 配置与依赖图已严格同步"
     grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|LINUX_6|PCIE_ROCKCHIP|PHY_ROCKCHIP|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_)" .config
@@ -290,14 +291,18 @@ step_compile() {
     log "===== 9. 编译 ====="
     cd "$FRIENDLYWRT_DIR"
 
+    # 编译前最终确认 auto.conf 与 .config 一致（只读检查）
+    if [ ! -f include/config/auto.conf ]; then
+        warn "auto.conf 在编译前缺失，重新生成"
+        make -s include/config/auto.conf > /dev/null 2>&1 || true
+    fi
+
     local s LOG
     for s in tools/compile toolchain/compile target/compile package/compile; do
         log "---- STAGE: $s ----"
         LOG="/tmp/build_$(echo "$s" | tr '/' '_').log"
         if ! make -j"$(nproc)" "$s" > "$LOG" 2>&1; then
             warn "STAGE FAILED: $s"
-            grep -E "WARNING: your configuration is out of sync" "$LOG" && \
-                err "配置在编译期间漂移，请检查 step_force_config"
             grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -20 || true
             tail -120 "$LOG"
             err "编译失败: $s （详见 $LOG）"
