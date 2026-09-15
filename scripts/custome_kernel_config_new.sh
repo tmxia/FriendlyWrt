@@ -18,6 +18,35 @@ err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
 [ -d "$FRIENDLYWRT_DIR" ] || err "friendlywrt 源码目录不存在"
 [ -f "$SCRIPTS_DIR/add_packages.sh" ] || err "add_packages.sh 不存在"
 
+resolve_kconfig() {
+    local cand
+    for cand in \
+        "target/linux/rockchip/armv8/config-6.12" \
+        "target/linux/rockchip/config-6.12"; do
+        if [ -f "$cand" ]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo ""
+    return 1
+}
+
+resolve_r5s_dts() {
+    local cand
+    for cand in \
+        "target/linux/rockchip/armv8/base-files/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" \
+        "target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" \
+        "target/linux/rockchip/armv8/base-files/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dtsi"; do
+        if [ -f "$cand" ]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo ""
+    return 1
+}
+
 step_ccache_and_staging() {
     log "===== 1. ccache + staging_dir 验证 ====="
 
@@ -54,7 +83,6 @@ step_verify_kernel() {
     find target/linux/rockchip -maxdepth 3 \( -type d -name "patches-*" -o -type f -name "config-*" \) 2>/dev/null
 }
 
-# add_packages.sh 硬编码 config-6.1 路径，通过软链指向真实 6.12 配置
 step_bridge_kernel_config() {
     log "===== 3. 桥接 config-6.1 -> config-6.12 ====="
     cd "$FRIENDLYWRT_DIR/target/linux/rockchip" || return
@@ -62,6 +90,197 @@ step_bridge_kernel_config() {
     [ -f armv8/config-6.12 ] || err "找不到 armv8/config-6.12"
     [ -e config-6.1 ] || ln -s armv8/config-6.12 config-6.1
     ls -la config-6.1
+}
+
+step_patch_gpio() {
+    log "===== 3.5 修复 Rockchip GPIO 动态基地址 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    local PATCH_DIR="target/linux/rockchip/patches-6.12"
+    mkdir -p "$PATCH_DIR"
+
+    local GPIO_PATCH="$PATCH_DIR/999-gpio-rockchip-fix-dynamic-base.patch"
+
+    if [ -f "$GPIO_PATCH" ]; then
+        log "GPIO 修复补丁已存在，跳过"
+        return
+    fi
+
+    cat > "$GPIO_PATCH" << 'PATCH_EOF'
+--- a/drivers/gpio/gpio-rockchip.c
++++ b/drivers/gpio/gpio-rockchip.c
+@@ -108,7 +108,7 @@ static int rockchip_gpio_probe(struct platform_device *pdev)
+ 	bank->gpio_chip.parent = &pdev->dev;
+ 	bank->gpio_chip.of_node = pdev->dev.of_node;
+ 	bank->gpio_chip.ngpio = bank->nr_pins;
+-	bank->gpio_chip.base = -1;
++	bank->gpio_chip.base = bank->pin_base;
+ 
+ 	gc = &bank->gpio_chip;
+ 	ret = devm_gpiochip_add_data(&pdev->dev, gc, bank);
+PATCH_EOF
+
+    log "[OK] GPIO 驱动修复补丁已写入: $GPIO_PATCH"
+}
+
+step_fix_led_dts() {
+    log "===== 3.6 修正 R5S LED 设备树 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    local DTS_FILE
+    DTS_FILE=$(resolve_r5s_dts)
+
+    if [ -z "$DTS_FILE" ]; then
+        warn "未找到 R5S DTS 文件，跳过 DTS 修改"
+        return
+    fi
+
+    log "找到 DTS: $DTS_FILE"
+
+    if ! grep -q "led-boot" "$DTS_FILE"; then
+        python3 - "$DTS_FILE" << 'PYEOF'
+import sys, re, pathlib
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
+if 'led-boot' in txt:
+    sys.exit(0)
+aliases_block = '''
+	aliases {
+		led-boot = &sys_led;
+		led-failsafe = &sys_led;
+		led-running = &sys_led;
+		led-upgrade = &sys_led;
+	};
+'''
+m = re.search(r'^/\s*\{', txt, flags=re.M)
+if m:
+    insert_pos = txt.index('{', m.start()) + 1
+    txt = txt[:insert_pos] + aliases_block + txt[insert_pos:]
+    p.write_text(txt)
+    print("[OK] 已插入 LED aliases")
+else:
+    print("[WARN] 未找到顶层 / 节点，跳过 aliases 插入")
+PYEOF
+    else
+        log "LED aliases 已存在"
+    fi
+
+    sed -i 's|linux,default-trigger = "default-on"|linux,default-trigger = "heartbeat"|g' "$DTS_FILE" || true
+    sed -i 's|linux,default-trigger = "netdev"|linux,default-trigger = "none"|g' "$DTS_FILE" || true
+
+    log "[OK] LED 触发器配置已修正"
+}
+
+step_patch_kconfig() {
+    log "===== 3.7 补齐内核 Kconfig 选项 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    local KCONFIG
+    KCONFIG=$(resolve_kconfig)
+
+    if [ -z "$KCONFIG" ]; then
+        warn "未找到 config-6.12，跳过 Kconfig 补齐"
+        return
+    fi
+
+    local opt
+    for opt in \
+        CONFIG_GPIO_ROCKCHIP \
+        CONFIG_PINCTRL_ROCKCHIP \
+        CONFIG_LEDS_GPIO \
+        CONFIG_LEDS_TRIGGER_HEARTBEAT \
+        CONFIG_PHY_ROCKCHIP_NANENG_COMBO_PHY \
+        CONFIG_PHY_ROCKCHIP_SNPS_PCIE3 \
+        CONFIG_PCIE_ROCKCHIP_HOST \
+        CONFIG_ROCKCHIP_THERMAL \
+        CONFIG_PWM_ROCKCHIP \
+        CONFIG_PWM_FAN \
+        CONFIG_USB_EHCI_HCD \
+        CONFIG_USB_EHCI_PCI \
+        CONFIG_USB_OHCI_HCD \
+        CONFIG_USB_UHCI_HCD \
+        CONFIG_USB_XHCI_HCD \
+        CONFIG_USB_XHCI_PCI \
+        CONFIG_CGROUPS \
+        CONFIG_CGROUP_FREEZER \
+        CONFIG_CGROUP_PIDS \
+        CONFIG_CGROUP_DEVICE \
+        CONFIG_CPUSETS \
+        CONFIG_MEMCG \
+        CONFIG_CGROUP_BPF \
+        CONFIG_NAMESPACES \
+        CONFIG_OVERLAY_FS \
+        CONFIG_BRIDGE \
+        CONFIG_VETH \
+        CONFIG_NF_NAT \
+        CONFIG_IP_NF_NAT \
+        CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
+        if ! grep -q "^${opt}=y" "$KCONFIG"; then
+            sed -i "/^${opt}=/d" "$KCONFIG"
+            sed -i "/^# ${opt} is not set/d" "$KCONFIG"
+            echo "${opt}=y" >> "$KCONFIG"
+        fi
+    done
+
+    for opt in \
+        CONFIG_LEDS_TRIGGER_NETDEV \
+        CONFIG_LEDS_TRIGGER_DEFAULT_ON \
+        CONFIG_LEDS_TRIGGER_TIMER \
+        CONFIG_LEDS_TRIGGER_TRANSIENT; do
+        if ! grep -q "^${opt} is not set" "$KCONFIG"; then
+            sed -i "/^${opt}=/d" "$KCONFIG"
+            echo "# ${opt} is not set" >> "$KCONFIG"
+        fi
+    done
+
+    log "[OK] 内核 Kconfig 选项已补齐"
+}
+
+step_add_fan_control() {
+    log "===== 3.8 添加 PWM 风扇控制 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    mkdir -p files/etc/init.d
+
+    cat > files/etc/init.d/fancontrol << 'EOF'
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+
+start() {
+    [ -d /sys/class/thermal/thermal_zone0 ] || return
+    [ -d /sys/class/pwm/pwmchip0 ] || return
+    [ -d /sys/class/pwm/pwmchip0/pwm0 ] || {
+        echo 0 > /sys/class/pwm/pwmchip0/export 2>/dev/null
+        sleep 1
+    }
+    echo 10000 > /sys/class/pwm/pwmchip0/pwm0/period 2>/dev/null
+    echo 1 > /sys/class/pwm/pwmchip0/pwm0/enable 2>/dev/null
+    while true; do
+        temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null)
+        [ -z "$temp" ] && sleep 10 && continue
+        temp=$((temp / 1000))
+        if [ "$temp" -gt 70 ]; then
+            echo 10000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
+        elif [ "$temp" -gt 55 ]; then
+            echo 5000 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
+        elif [ "$temp" -gt 45 ]; then
+            echo 2500 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
+        else
+            echo 0 > /sys/class/pwm/pwmchip0/pwm0/duty_cycle 2>/dev/null
+        fi
+        sleep 10
+    done
+}
+
+stop() {
+    echo 0 > /sys/class/pwm/pwmchip0/pwm0/enable 2>/dev/null
+}
+EOF
+
+    chmod +x files/etc/init.d/fancontrol
+    log "[OK] 风扇控制脚本已写入"
 }
 
 step_init_config() {
@@ -76,7 +295,6 @@ CONFIG_CCACHE=y
 CONFIG_CCACHE_DIR="$CCACHE_DIR"
 CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
 
-# Docker
 CONFIG_PACKAGE_docker=y
 CONFIG_PACKAGE_dockerd=y
 CONFIG_PACKAGE_docker-compose=y
@@ -85,7 +303,6 @@ CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
 CONFIG_PACKAGE_luci-lib-docker=y
 CONFIG_DOCKER_NET_OVERLAY=y
 
-# luci-app-amlogic (晶晨宝盒)
 CONFIG_PACKAGE_luci-app-amlogic=y
 CONFIG_PACKAGE_luci-lib-nixio=y
 CONFIG_PACKAGE_block-mount=y
@@ -110,14 +327,12 @@ EOF
 step_apply_customizations() {
     log "===== 5. 应用自定义配置 ====="
 
-    # luci-app-amlogic 不在 feeds 中，需手动克隆到 package/
     log "克隆 luci-app-amlogic..."
     rm -rf "$FRIENDLYWRT_DIR/package/luci-app-amlogic"
     git clone --depth 1 -b main \
         https://github.com/ophub/luci-app-amlogic.git \
         "$FRIENDLYWRT_DIR/package/luci-app-amlogic" 2>&1 | tail -1
 
-    # 克隆后刷新包索引，使 CONFIG_PACKAGE_luci-app-amlogic 可被识别
     cd "$FRIENDLYWRT_DIR"
     make defconfig > /dev/null 2>&1
     sed -i '/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d' .config
@@ -125,7 +340,6 @@ step_apply_customizations() {
     echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1
 
-    # 修正 add_packages.sh 里硬编码的 kernel config 路径
     sed -i 's|target/linux/rockchip/config-\${KERNEL_VERSION}|target/linux/rockchip/armv8/config-\${KERNEL_VERSION}|' \
         "$SCRIPTS_DIR/add_packages.sh"
 
@@ -161,8 +375,7 @@ step_patch_file_makefile() {
     local FILE_MK="feeds/packages/libs/file/Makefile"
     [ -f "$FILE_MK" ] || { log "跳过（$FILE_MK 不存在）"; return; }
 
-    # libmagic 依赖 libbz2/liblzma，需补上
-    python3 - "$FILE_MK" <<'PY'
+    python3 - "$FILE_MK" << 'PY'
 import re, sys, pathlib
 p = pathlib.Path(sys.argv[1])
 txt = p.read_text()
@@ -240,6 +453,10 @@ main() {
     step_ccache_and_staging
     step_verify_kernel
     step_bridge_kernel_config
+    step_patch_gpio
+    step_fix_led_dts
+    step_patch_kconfig
+    step_add_fan_control
     step_init_config
     step_apply_customizations
     step_dedupe_config
