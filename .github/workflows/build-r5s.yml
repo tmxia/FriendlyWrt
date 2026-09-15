@@ -1,557 +1,327 @@
-name: Build ImmortalWrt for NanoPi R5S
+#!/usr/bin/env bash
+# ImmortalWrt NanoPi R5S 编译脚本
+# 关键点：
+#   1. oldconfig 会重置顶层符号（CONFIG_CCACHE 等）→ 追加必须前后各做一次
+#   2. file Makefile 修改后必须重建 tmp/.config-package.in → 否则依赖图不同步导致 sudo 失败
 
-on:
-  watch:
-    types: started
-  workflow_dispatch:
-    inputs:
-      replace_existing:
-        description: 'Replace existing release tag (overwrite)'
-        required: false
-        default: 'true'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+set -e
 
-env:
-  AUTO_REPLACE_TAG: 'false'
-  OPENWRT_BRANCH: 'openwrt-25.12'
-  IMMORTALWRT_REPO: 'https://github.com/immortalwrt/immortalwrt.git'
-  FLAVOR: 'r5s'
-  TARGET_OS: 'friendlywrt25'
-  MODEL_NAME: 'R5S-R5C-Series'
-  FRIENDLY_VER: '25.12'
-  GOPROXY: 'https://goproxy.cn,direct'
-  GOFLAGS: '-mod=mod'
-  GOMODCACHE: '/tmp/go-mod-cache'
-  CCACHE_DIR: '/home/runner/.ccache'
-  CCACHE_COMPRESS: 'true'
-  CCACHE_MAXSIZE: '3G'
-  ROOTFS_PARTSIZE: '1024'
-  ENABLE_DOCKER: 'true'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="$REPO_ROOT/project"
+FRIENDLYWRT_DIR="$PROJECT_DIR/friendlywrt"
+SCRIPTS_DIR="$SCRIPT_DIR"
 
-jobs:
-  prepare_release:
-    runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
-    outputs:
-      release_tag: ${{ steps.release_tag.outputs.tag }}
-    steps:
-      - name: Generate unique release tag
-        id: release_tag
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          BASE_TAG="FriendlyWrt-R5S-$(date +%Y-%m-%d)"
-          FORCE_BASE=false
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
-            FORCE_BASE=true
-          elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
-            FORCE_BASE=true
-          fi
+: "${ROOTFS_PARTSIZE:=1024}"
+: "${CCACHE_DIR:=$HOME/.ccache}"
+: "${CCACHE_MAXSIZE:=3G}"
 
-          if [ "$FORCE_BASE" = "true" ]; then
-            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-            for tag in $EXISTING_TAGS; do
-              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
-              git push origin --delete "refs/tags/$tag" || true
-            done
-            TAG="$BASE_TAG"
-          else
-            EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-            if [ -z "$EXISTING_TAGS" ]; then
-              TAG="$BASE_TAG"
-            else
-              MAX_NUM=0
-              for t in $EXISTING_TAGS; do
-                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
-                  NUM=${BASH_REMATCH[1]}
-                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
-                fi
-              done
-              TAG="${BASE_TAG}-$((MAX_NUM + 1))"
-            fi
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
+log()  { echo "[$(date +%H:%M:%S)] $*"; }
+warn() { echo "[$(date +%H:%M:%S)] WARN: $*" >&2; }
+err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
 
-      - name: Create or update release
-        uses: softprops/action-gh-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.release_tag.outputs.tag }}
-          draft: false
-          prerelease: false
-          allow_updates: true
-          overwrite: true
+[ -d "$FRIENDLYWRT_DIR" ] || err "friendlywrt 源码目录不存在: $FRIENDLYWRT_DIR"
 
-  build:
-    needs: prepare_release
-    runs-on: ubuntu-22.04
-    if: github.event.repository.owner.id == github.event.sender.id
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+# ---------- 1. ccache + staging_dir ----------
+step_setup_ccache_and_staging() {
+    log "===== 1. ccache 初始化 + staging_dir 验证 ====="
+    mkdir -p "$CCACHE_DIR"
+    ccache --max-size="$CCACHE_MAXSIZE"
+    ccache --set-config=compression=true
+    ccache --set-config=compiler_check=mtime
+    ccache --set-config=cache_dir="$CCACHE_DIR"
+    ccache -s || true
 
-    - name: Reclaim disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                    /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                    /usr/share/swift /usr/local/.ghcup /opt/az || true
-        sudo apt-get clean
-        df -h /
+    local STAGING="$FRIENDLYWRT_DIR/staging_dir"
+    [ -d "$STAGING" ] || { log "[INFO] staging_dir 不存在（首次编译）"; return 0; }
+    du -sh "$STAGING" 2>/dev/null || true
 
-    - name: Add swap
-      run: |
-        sudo swapoff -a || true
-        sudo rm -f /swapfile
-        sudo fallocate -l 4G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile > /dev/null
-        sudo swapon /swapfile
-        free -h
+    local HOST_GCC TOOLCHAIN_DIR TC_GCC
+    HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 \( -name "gcc" -o -name "*-gcc" -o -name "gcc-*" \) 2>/dev/null | head -1)
+    TOOLCHAIN_DIR=$(find "$STAGING" -maxdepth 1 -type d -name "toolchain-*" 2>/dev/null | head -1)
+    [ -n "$TOOLCHAIN_DIR" ] && TC_GCC=$(find "$TOOLCHAIN_DIR/bin" -maxdepth 1 \( -name "*-gcc" -o -name "*-gcc-*" \) 2>/dev/null | head -1)
 
-    - name: Initialization environment
-      env:
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq \
-          build-essential ccache ecj fastjar file g++ gawk gettext git \
-          java-propose-classpath libelf-dev libncurses5-dev libncursesw5-dev \
-          libssl-dev python3 python3-dev python3-distutils python3-setuptools \
-          python3-pip python3-venv python3-pyelftools rsync subversion swig time \
-          xsltproc zlib1g-dev \
-          bison flex libtool libtool-bin pkg-config \
-          libgmp-dev libmpc-dev libmpfr-dev \
-          gperf patch quilt cpio \
-          liblzma-dev libbz2-dev \
-          device-tree-compiler u-boot-tools \
-          bzip2 xz-utils zip unzip wget curl \
-          autoconf automake autopoint texinfo help2man \
-          aria2 bc whiptail mercurial lib32stdc++6 \
-          android-sdk-libsparse-utils e2fsprogs parted dosfstools mtools lz4
-        sudo update-alternatives --install /usr/bin/python python /usr/bin/python3 1 || true
-        python3 -c "import elftools" 2>/dev/null || pip3 install --quiet pyelftools
-        mkdir -p ./artifact
-        echo "CPU cores: $(nproc)"
-        echo "ccache version: $(ccache --version | head -1)"
+    if [ -z "$HOST_GCC" ] || [ -z "$TOOLCHAIN_DIR" ] || [ -z "$TC_GCC" ]; then
+        warn "staging_dir 缓存不完整，清除重建"
+        rm -rf "$STAGING"
+    else
+        log "[OK] staging_dir 缓存完整，跳过 tools + toolchain 编译"
+    fi
+}
 
-    - name: Prepare ImmortalWrt workspace
-      run: |
-        mkdir -p project
-        cd project
-        git clone --depth 1 -b ${{ env.OPENWRT_BRANCH }} \
-          ${{ env.IMMORTALWRT_REPO }} friendlywrt > /dev/null 2>&1
-        cd friendlywrt
-        ./scripts/feeds update -a > /dev/null 2>&1 || ./scripts/feeds update -a
-        ./scripts/feeds install -a > /dev/null 2>&1
-        cd ..
-        mkdir -p configs/rockchip
-        touch configs/rockchip/01-nanopi
-        echo "ImmortalWrt workspace prepared"
+# ---------- 2. 内核验证 ----------
+step_verify_kernel() {
+    log "===== 2. 验证 6.12 内核产物 ====="
+    cd "$FRIENDLYWRT_DIR"
+    [ -d "target/linux/rockchip/patches-6.12" ]      || err "6.12 内核补丁目录不存在"
+    [ -f "target/linux/rockchip/armv8/config-6.12" ] || err "6.12 内核配置文件不存在"
+    local KVER_FILE="target/linux/generic/kernel-6.12"
+    [ -f "$KVER_FILE" ] || err "内核版本文件不存在"
+    local VP=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" "$KVER_FILE" | head -1 | awk '{print $3}')
+    [ -n "$VP" ] || err "无法解析内核版本"
+    log "[INFO] 内核版本: 6.12${VP}"
+}
 
-    - name: Restore staging_dir (toolchain + host)
-      uses: actions/cache@v4
-      with:
-        path: project/friendlywrt/staging_dir
-        key: staging-${{ env.OPENWRT_BRANCH }}-${{ env.FLAVOR }}-${{ github.run_id }}
-        restore-keys: |
-          staging-${{ env.OPENWRT_BRANCH }}-${{ env.FLAVOR }}-
-          staging-${{ env.OPENWRT_BRANCH }}-
+# ---------- 3. 初始化 .config ----------
+step_init_config() {
+    log "===== 3. 初始化 .config ====="
+    cd "$FRIENDLYWRT_DIR"
+    cat > .config <<EOF
+CONFIG_TARGET_rockchip=y
+CONFIG_TARGET_rockchip_armv8=y
+CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
+CONFIG_LUCI_LANG_zh_Hans=y
+CONFIG_CCACHE=y
+CONFIG_CCACHE_DIR="$CCACHE_DIR"
+CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
+CONFIG_LINUX_6_12=y
+CONFIG_PCIE_ROCKCHIP_DW_HOST=y
+CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y
+CONFIG_PACKAGE_docker=y
+CONFIG_PACKAGE_dockerd=y
+CONFIG_PACKAGE_docker-compose=y
+CONFIG_PACKAGE_luci-app-dockerman=y
+CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
+CONFIG_PACKAGE_luci-lib-docker=y
+CONFIG_DOCKER_KERNEL_OPTIONS=y
+CONFIG_DOCKER_NET_OVERLAY=y
+CONFIG_PACKAGE_luci-app-amlogic=y
+EOF
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+    log "[OK] .config 初始化完成"
+}
 
-    - name: Restore ccache
-      uses: actions/cache@v4
-      with:
-        path: ~/.ccache
-        key: ccache-${{ env.OPENWRT_BRANCH }}-${{ env.FLAVOR }}-${{ github.run_id }}
-        restore-keys: |
-          ccache-${{ env.OPENWRT_BRANCH }}-${{ env.FLAVOR }}-
-          ccache-${{ env.OPENWRT_BRANCH }}-
+# ---------- 4. 自定义配置 ----------
+step_apply_customizations() {
+    log "===== 4. 应用自定义配置 ====="
+    cd "$FRIENDLYWRT_DIR"
 
-    - name: Restore downloads (dl)
-      uses: actions/cache@v4
-      with:
-        path: project/friendlywrt/dl
-        key: dl-${{ env.OPENWRT_BRANCH }}-${{ github.run_id }}
-        restore-keys: |
-          dl-${{ env.OPENWRT_BRANCH }}-
+    rm -rf package/luci-app-amlogic
+    git clone --depth 1 -b main https://github.com/ophub/luci-app-amlogic.git package/luci-app-amlogic
+    [ -d "package/luci-app-amlogic" ] || err "luci-app-amlogic 克隆失败"
 
-    - name: Restore Go module cache
-      uses: actions/cache@v4
-      with:
-        path: /tmp/go-mod-cache
-        key: gomod-${{ env.OPENWRT_BRANCH }}-${{ github.run_id }}
-        restore-keys: |
-          gomod-${{ env.OPENWRT_BRANCH }}-
+    local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
+    if [ -f "$add_pkgs" ]; then
+        sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' "$add_pkgs"
+        (cd "$PROJECT_DIR" && bash "$add_pkgs")
+        log "[OK] add_packages.sh 执行完成"
+    fi
 
-    - name: Run custom kernel config & build
-      run: bash scripts/custome_kernel_config_new.sh
+    local pkg
+    for pkg in luci-base luci-compat luci-lib-jsonc luci-lib-nixio block-mount e2fsprogs \
+               tune2fs tar gzip curl wget unzip dosfstools parted coreutils coreutils-stat \
+               kmod-fs-vfat kmod-fs-ext4 kmod-fs-btrfs luci-app-amlogic; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config 2>/dev/null || true
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config 2>/dev/null || true
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+    log "[OK] luci-app-amlogic 及其依赖已启用"
+}
 
-    - name: Clean go-mod-cache before saving
-      if: always()
-      run: |
-        rm -rf project/friendlywrt/dl/go-mod-cache
-        echo "=== dl 大小（清理后）==="
-        du -sh project/friendlywrt/dl 2>/dev/null || true
+# ---------- 5. 去重 ----------
+step_dedupe_config() {
+    log "===== 5. .config 去重 ====="
+    cd "$FRIENDLYWRT_DIR"
+    local before=$(wc -l < .config)
+    awk -F= '
+      /^# / { print; next }
+      /^CONFIG_/ { key=$1; if (!(key in seen)) { keys[++n]=key; seen[key]=1 }; values[key]=$0; next }
+      { print }
+      END { for (i=1;i<=n;i++) print values[keys[i]] }
+    ' .config > .config.dedup && mv .config.dedup .config
+    log "[OK] 去重: $before 行 → $(wc -l < .config) 行"
+}
 
-    - name: Show cache stats
-      if: always()
-      run: |
-        echo "=== ccache 最终统计 ==="
-        ccache -s || true
-        du -sh "$CCACHE_DIR" 2>/dev/null || true
-        echo "=== staging_dir 大小 ==="
-        du -sh project/friendlywrt/staging_dir 2>/dev/null || true
-        echo "=== dl 大小 ==="
-        du -sh project/friendlywrt/dl 2>/dev/null || true
+# ---------- 6. 修补 file Makefile ----------
+step_patch_file_makefile() {
+    log "===== 6. 修补 file Makefile 依赖 ====="
+    cd "$FRIENDLYWRT_DIR"
 
-    - name: Locate kernel artifacts
-      run: |
-        cd project/friendlywrt
+    local FILE_MK="feeds/packages/libs/file/Makefile"
+    [ -f "$FILE_MK" ] || { warn "$FILE_MK 不存在，跳过"; return 0; }
 
-        TRIPLE_DIR=$(find build_dir -maxdepth 1 -type d -name "target-*_musl" | head -1)
-        [ -z "$TRIPLE_DIR" ] && { echo "::error::target triple not found"; ls -la build_dir/ | head -20; exit 1; }
-        TRIPLE_DIR=$(realpath "$TRIPLE_DIR")
-        echo "TRIPLE_DIR=$TRIPLE_DIR" >> $GITHUB_ENV
-        echo "[OK] TRIPLE_DIR: $TRIPLE_DIR"
+    python3 - "$FILE_MK" <<'PY'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1]); txt = p.read_text()
+m = re.search(r'(define Package/libmagic\b.*?DEPENDS:=)([^\n]*)', txt, flags=re.S)
+if not m: print("PATTERN NOT FOUND"); sys.exit(0)
+deps = m.group(2); added = []
+for r in ['+libbz2', '+liblzma']:
+    if r not in deps: deps += " " + r; added.append(r)
+if added:
+    p.write_text(txt[:m.start(2)] + deps + txt[m.end(2):])
+    print(f"PATCHED: {added}")
+else:
+    print("No change")
+PY
 
-        KDIR=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "linux-rockchip*" | head -1)
-        [ -z "$KDIR" ] && { echo "::error::linux-rockchip dir not found"; ls -la "$TRIPLE_DIR/"; exit 1; }
-        KDIR=$(realpath "$KDIR")
-        echo "KDIR=$KDIR" >> $GITHUB_ENV
-        echo "[OK] KDIR: $KDIR"
+    local SYMS="PACKAGE_libbz2 PACKAGE_liblzma PACKAGE_zlib" hint found
+    for hint in libbz2 liblzma zlib; do
+        found=$(grep -oE "config PACKAGE_${hint}[-0-9._]*" tmp/.config-package.in 2>/dev/null | awk '{print $2}' | sort -u || true)
+        SYMS="${SYMS} ${found}"
+    done
+    for sym in $SYMS; do
+        [ -z "$sym" ] && continue
+        sed -i "/^# CONFIG_${sym} is not set/d" .config
+        sed -i "/^CONFIG_${sym}=/d" .config
+        echo "CONFIG_${sym}=y" >> .config
+    done
+    log "[OK] file Makefile 依赖已修补"
+}
 
-        IMG=$(find "$KDIR" -path "*/arch/arm64/boot/Image" -type f 2>/dev/null | head -1)
-        [ -z "$IMG" ] && IMG=$(find "$KDIR" -maxdepth 4 -name "Image" -type f 2>/dev/null | head -1)
-        [ -z "$IMG" ] && { echo "::error::Kernel Image not found"; find "$KDIR" -name Image -type f | head; exit 1; }
-        IMG=$(realpath "$IMG")
-        echo "IMAGE_PATH=$IMG" >> $GITHUB_ENV
-        echo "[OK] Image: $IMG ($(du -h $IMG | awk '{print $1}'))"
+# ---------- 关键配置写入 ----------
+apply_critical_cfg() {
+    cd "$FRIENDLYWRT_DIR"
 
-        DTB_DIR=$(find "$KDIR" -path "*/arch/arm64/boot/dts/rockchip" -type d 2>/dev/null | head -1)
-        [ -z "$DTB_DIR" ] && DTB_DIR=$(find "$KDIR" -maxdepth 5 -type d -name "rockchip" -path "*dts*" | head -1)
-        [ -z "$DTB_DIR" ] && { echo "::error::DTB dir not found"; find "$KDIR" -type d -name "dts*" | head; exit 1; }
-        DTB_DIR=$(realpath "$DTB_DIR")
-        echo "DTB_DIR=$DTB_DIR" >> $GITHUB_ENV
-        echo "[OK] DTB dir: $DTB_DIR"
+    local pkg
+    for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker luci-app-amlogic; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config 2>/dev/null || true
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
 
-        ROOTFS_SRC=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "root-*" | head -1)
-        [ -z "$ROOTFS_SRC" ] && { echo "::error::Rootfs dir not found"; ls "$TRIPLE_DIR/" | head; exit 1; }
-        ROOTFS_SRC=$(realpath "$ROOTFS_SRC")
-        echo "ROOTFS_SRC=$ROOTFS_SRC" >> $GITHUB_ENV
-        echo "[OK] Rootfs: $ROOTFS_SRC ($(du -sh $ROOTFS_SRC | awk '{print $1}'))"
+    local kv
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        kv="${line%%=*}"
+        sed -i "/^${kv}=/d" .config
+        sed -i "/^# ${kv} is not set/d" .config
+        echo "$line" >> .config
+    done <<EOF
+CONFIG_CCACHE=y
+CONFIG_CCACHE_DIR="$CCACHE_DIR"
+CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
+CONFIG_LINUX_6_12=y
+CONFIG_PCIE_ROCKCHIP_DW_HOST=y
+CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y
+CONFIG_DOCKER_KERNEL_OPTIONS=y
+CONFIG_DOCKER_NET_OVERLAY=y
+EOF
+}
 
-        KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
-        echo "KV=$KV" >> $GITHUB_ENV
-        echo "[OK] Kernel modules version: $KV"
-        # 放宽版本检查，允许 6.12.x 系列
-        [[ "$KV" == 6.12.* ]] || { echo "::error::kernel modules 不是 6.12.x，实际 $KV"; exit 1; }
+# ---------- 核心：重建 tmp/.config-package.in ----------
+# file Makefile 修改后依赖图变了，oldconfig 不会刷新 tmp/.config-package.in，
+# 必须删除该文件强制重算，否则 package/compile 的并行调度按旧依赖图启动子 make，
+# sudo 等依赖 host 工具链的包会在依赖未就绪时被拉起导致失败。
+rebuild_config_index() {
+    cd "$FRIENDLYWRT_DIR"
+    log "重建 tmp/.config-package.in（同步依赖图）..."
+    rm -f tmp/.config-package.in tmp/.packageinfo tmp/.targetinfo
+    make prepare-tmpinfo 2>&1 | tail -3 || true
+    yes "" 2>/dev/null | make oldconfig >/dev/null 2>&1 || true
+}
 
-    - name: Clone sd-fuse_rk3568
-      run: |
-        cd project
-        rm -rf sd-fuse
-        git clone --depth 1 https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse
-        cd sd-fuse
-        [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
-        echo "[OK] sd-fuse ready"
+# ---------- 7. 强制修正 + 重建依赖图 ----------
+step_force_config() {
+    log "===== 7. 强制修正关键配置 + 重建依赖图 ====="
+    cd "$FRIENDLYWRT_DIR"
 
-    - name: Package 6.12 kernel
-      run: |
-        cd project
-        SF="sd-fuse"
-        TGT="$SF/$TARGET_OS"
-        mkdir -p "$TGT"
+    # 第 1 次追加
+    apply_critical_cfg
 
-        [ -f "$IMAGE_PATH" ] || { echo "::error::Image not found: $IMAGE_PATH"; exit 1; }
+    # 重建依赖图（file Makefile 修改后必须做，否则 out of sync）
+    rebuild_config_index
 
-        "$SF/tools/mkkrnlimg" "$IMAGE_PATH" "$TGT/kernel.img"
-        [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img 未生成"; exit 1; }
-        ls -lh "$TGT/kernel.img"
+    # 第 2 次追加（oldconfig 会重置顶层符号如 CONFIG_CCACHE）
+    apply_critical_cfg
 
-        cp "$TGT/kernel.img" "$TGT/boot.img"
+    log "[OK] 关键配置已强制修正并冻结"
+    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|LINUX_6|PCIE_ROCKCHIP|PHY_ROCKCHIP|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_)" .config
+}
 
-    - name: Package resource.img
-      run: |
-        cd project
-        SF="$PWD/sd-fuse"
-        TGT="$SF/$TARGET_OS"
-        IMGFILE="$TGT/resource.img"
-        mkdir -p "$TGT"
+# ---------- 8. 下载源码 ----------
+step_download_packages() {
+    log "===== 8. 下载软件包源码 ====="
+    cd "$FRIENDLYWRT_DIR"
+    [ -d "dl/go-mod-cache" ] && rm -rf dl/go-mod-cache
 
-        [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
+    make download -j"$(nproc)" > /tmp/dl1.log 2>&1 || true
+    find dl -type f -size -1024c -delete 2>/dev/null || true
+    make download -j"$(nproc)" > /tmp/dl2.log 2>&1 || true
+    log "[OK] dl: $(find dl -type f | wc -l) 文件"
+}
 
-        echo "=== DTB 源目录内容（rk3568-nanopi 系列）==="
-        ls -la "$DTB_DIR"/rk3568-nanopi-*.dtb 2>/dev/null || true
+# ---------- 9. 只读校验 ----------
+verify_critical_cfg() {
+    local checks=(
+        "^CONFIG_CCACHE=y"
+        "^CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
+        "^CONFIG_LINUX_6_12=y"
+        "^CONFIG_PCIE_ROCKCHIP_DW_HOST=y"
+        "^CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y"
+        "^CONFIG_PACKAGE_luci-app-amlogic=y"
+        "^CONFIG_DOCKER_KERNEL_OPTIONS=y"
+        "^CONFIG_PACKAGE_docker=y"
+        "^CONFIG_PACKAGE_dockerd=y"
+        "^CONFIG_PACKAGE_docker-compose=y"
+        "^CONFIG_PACKAGE_luci-app-dockerman=y"
+        "^CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y"
+        "^CONFIG_PACKAGE_luci-lib-docker=y"
+    )
+    local pat
+    for pat in "${checks[@]}"; do
+        grep -qE "$pat" .config || err "编译前配置校验失败：缺少 $pat"
+    done
+    grep -qF "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config \
+        || err "编译前配置校验失败：CONFIG_CCACHE_DIR 不是 \"$CCACHE_DIR\""
 
-        rm -rf /tmp/dtb-pack
-        mkdir -p /tmp/dtb-pack
+    # 校验依赖图是否已同步（tmp/.config-package.in 存在且包含 libmagic）
+    [ -f tmp/.config-package.in ] || err "tmp/.config-package.in 缺失，依赖图未生成"
+    grep -q "config PACKAGE_libmagic" tmp/.config-package.in \
+        || err "tmp/.config-package.in 未包含 libmagic，依赖图未同步"
 
-        R5S_DTB=""
-        for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
-          if [ -f "$DTB_DIR/$cand" ]; then
-            R5S_DTB="$cand"
-            break
-          fi
-        done
+    log "[OK] 编译前配置校验通过（配置与依赖图均已冻结）"
+}
 
-        if [ -z "$R5S_DTB" ]; then
-          echo "::error::找不到 rk3568-nanopi-r5s.dtb / rk3568-nanopi-r5c.dtb"
-          ls "$DTB_DIR"/*.dtb 2>/dev/null | head -20
-          exit 1
+# ---------- 10. 编译 ----------
+step_compile() {
+    log "===== 9. 编译 ====="
+    cd "$FRIENDLYWRT_DIR"
+    verify_critical_cfg
+
+    local s LOG
+    for s in tools/compile toolchain/compile target/compile package/compile; do
+        log "---- STAGE: $s ----"
+        LOG="/tmp/build_$(echo "$s" | tr '/' '_').log"
+        if ! make -j"$(nproc)" "$s" > "$LOG" 2>&1; then
+            warn "STAGE FAILED: $s"
+            grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -20 || true
+            tail -120 "$LOG"
+            err "编译失败: $s （详见 $LOG）"
         fi
+        log "[DONE] $s"
+    done
 
-        echo "[OK] 主 dtb: $R5S_DTB"
-        cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
+    log "---- STAGE: final make ----"
+    LOG="/tmp/build_final.log"
+    if ! make -j"$(nproc)" > "$LOG" 2>&1; then
+        warn "final make 失败"
+        tail -120 "$LOG"
+        err "final make 失败"
+    fi
+    log "[DONE] final make"
+    log "=== OpenWrt 编译完成 ==="
+    ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || echo "(未找到原生镜像)"
+}
 
-        for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
-          [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
-        done
+# ---------- main ----------
+main() {
+    log "========================================"
+    log "ImmortalWrt R5S 编译脚本启动"
+    log "ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE  CCACHE_DIR=$CCACHE_DIR"
+    log "========================================"
 
-        cd /tmp/dtb-pack
-        DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
+    step_setup_ccache_and_staging
+    step_verify_kernel
+    step_init_config
+    step_apply_customizations
+    step_dedupe_config
+    step_patch_file_makefile
+    step_force_config
+    step_download_packages
+    step_compile
 
-        [ -z "$DTB_LIST" ] && { echo "::error::no dtb files"; exit 1; }
+    log "全部步骤完成"
+}
 
-        echo "=== 待打包 dtb 列表 ==="
-        echo "$DTB_LIST"
-        echo "总数: $(echo "$DTB_LIST" | wc -l)"
-
-        "$SF/tools/resource_tool" --pack \
-          --root=. \
-          --image="$IMGFILE" \
-          $DTB_LIST
-
-        cd - > /dev/null
-
-        [ -f "$IMGFILE" ] || { echo "::error::resource.img 未生成: $IMGFILE"; exit 1; }
-        ls -lh "$IMGFILE"
-
-    - name: Stage U-Boot binaries
-      run: |
-        cd project/sd-fuse
-        TGT="$TARGET_OS"
-        for f in uboot.img idbloader.img MiniLoaderAll.bin misc.img dtbo.img; do
-          [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
-        done
-
-    - name: Build rootfs.img
-      run: |
-        cd project/sd-fuse
-        TGT="$TARGET_OS"
-
-        [ -d "$ROOTFS_SRC" ] || { echo "::error::Rootfs src not found: $ROOTFS_SRC"; exit 1; }
-
-        rm -rf /tmp/rootfs-pack
-        cp -a "$ROOTFS_SRC" /tmp/rootfs-pack
-        (cd /tmp/rootfs-pack/dev && find . ! -type d -exec rm -f {} \; ) 2>/dev/null || true
-
-        echo "=== rootfs 内核模块 ==="
-        ls /tmp/rootfs-pack/lib/modules/
-        find /tmp/rootfs-pack/lib/modules -name "*.ko" | wc -l
-
-        MKFS="$PWD/tools/mke2fs"
-        MKFS_CONF="$PWD/tools/mke2fs.conf"
-        ROOTFS_DIR=/tmp/rootfs-pack
-
-        ACTUAL_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1}')
-        echo "=== rootfs 实际内容: ${ACTUAL_MB} MB / 目标分区: ${ROOTFS_PARTSIZE} MB ==="
-        if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
-          echo "::error::rootfs 内容 (${ACTUAL_MB}MB) 超过 ROOTFS_PARTSIZE (${ROOTFS_PARTSIZE}MB)，请增大分区"
-          exit 1
-        fi
-
-        LOGICAL_SIZE=$(( ROOTFS_PARTSIZE * 1024 * 1024 ))
-        IMG_BLK=$(( LOGICAL_SIZE / 4096 ))
-        INODE_SIZE=$(( $(find "$ROOTFS_DIR" | wc -l) + 128 ))
-
-        echo "=== 逻辑分区容量: ${ROOTFS_PARTSIZE} MB (${LOGICAL_SIZE} bytes, ${IMG_BLK} blocks) ==="
-
-        rm -f "$TGT/rootfs.img"
-        MKE2FS_CONFIG="$MKFS_CONF" \
-          "$MKFS" -N "$INODE_SIZE" \
-            -E android_sparse -t ext4 -L rootfs -M /root -b 4096 -0 \
-            -d "$ROOTFS_DIR" "$TGT/rootfs.img" "$IMG_BLK"
-
-        [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img 生成失败"; exit 1; }
-        ls -lh "$TGT/rootfs.img"
-
-        SPARSE_SIZE=$(stat -c%s "$TGT/rootfs.img")
-        echo "[INFO] sparse 文件实际大小: $SPARSE_SIZE bytes"
-        echo "[INFO] 逻辑分区大小:        $LOGICAL_SIZE bytes"
-
-        echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
-        echo "[OK] 已设置 ROOTFS_SIZE_BYTES=$LOGICAL_SIZE"
-
-    - name: Generate parameter.txt
-      run: |
-        cd project/sd-fuse
-        [ -z "$ROOTFS_SIZE_BYTES" ] && { echo "::error::ROOTFS_SIZE_BYTES 未设置"; exit 1; }
-        echo "=== 传给 generate-partmap-txt.sh 的 size: $ROOTFS_SIZE_BYTES ==="
-        PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
-          ./tools/generate-partmap-txt.sh "$ROOTFS_SIZE_BYTES" "$TARGET_OS"
-        echo "=== parameter.txt ==="
-        cat "$TARGET_OS/parameter.txt"
-
-    - name: Build SD card image
-      run: |
-        cd project/sd-fuse
-        export SDFUSE_NONINTERACTIVE=y
-        sudo -E ./mk-sd-image.sh "$TARGET_OS" 2>&1 | tee /tmp/sd-image.log | tail -60 || {
-          echo "::warning::mk-sd-image.sh 非零退出"
-          tail -120 /tmp/sd-image.log
-        }
-        ls -lh out/ 2>/dev/null || echo "(无 out/)"
-
-        if grep -q "more than capacity" /tmp/sd-image.log; then
-          echo "::error::mk-sd-image.sh 跳过了 rootfs 写入（分区容量不足）"
-          grep "more than capacity" /tmp/sd-image.log
-          exit 1
-        fi
-
-    - name: Build eMMC flasher image
-      run: |
-        cd project/sd-fuse
-        export SDFUSE_NONINTERACTIVE=y
-        sudo -E ./mk-emmc-image.sh "$TARGET_OS" autostart=yes 2>&1 | tee /tmp/emmc-image.log | tail -40 || {
-          echo "::warning::mk-emmc-image.sh 非零退出"
-          tail -80 /tmp/emmc-image.log
-        }
-        ls -lh out/images-for-eflasher/ 2>/dev/null || true
-
-    - name: Fix file ownership from sudo operations
-      run: |
-        cd project/sd-fuse
-        if [ -d "out" ]; then
-          sudo chown -R "$(id -u):$(id -g)" out/ 2>/dev/null || true
-        fi
-        if [ -d "$TARGET_OS" ]; then
-          sudo chown -R "$(id -u):$(id -g)" "$TARGET_OS" 2>/dev/null || true
-        fi
-
-    - name: Rename artifacts with clear FriendlyWrt-style names
-      run: |
-        cd project/sd-fuse
-
-        SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
-        if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
-          SRC_SIZE=$(stat -c%s "$SRC_IMG")
-          SRC_SIZE_MB=$(( SRC_SIZE / 1024 / 1024 ))
-          echo "[INFO] SD 镜像原始大小: ${SRC_SIZE_MB} MB"
-          if [ "$SRC_SIZE_MB" -lt 200 ]; then
-            echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入"
-            exit 1
-          fi
-
-          DST_NAME="${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.img"
-          cp "$SRC_IMG" "/tmp/${DST_NAME}"
-          gzip -f "/tmp/${DST_NAME}"
-          cp "/tmp/${DST_NAME}.gz" ../../artifact/
-          echo "[OK] SD image: ${DST_NAME}.gz ($(du -h /tmp/${DST_NAME}.gz | awk '{print $1}'))"
-        else
-          echo "::error::未找到 sd-fuse 生成的 .img"
-          ls -la out/ 2>/dev/null || true
-          exit 1
-        fi
-
-        SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
-        if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
-          DST_NAME="images-${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.tgz"
-          cp "$SRC_TGZ" "../../artifact/${DST_NAME}"
-          echo "[OK] eMMC pack: ${DST_NAME} ($(du -h $SRC_TGZ | awk '{print $1}'))"
-        else
-          echo "::warning::未找到 eMMC 刷机包"
-        fi
-
-        OPENWRT_SYSUP=$(find ../friendlywrt/bin/targets/rockchip/armv8 -maxdepth 1 \
-          -name "*nanopi-r5s*sysupgrade.img.gz" -type f 2>/dev/null | head -1)
-        if [ -n "$OPENWRT_SYSUP" ]; then
-          DST_NAME="${MODEL_NAME}-OpenWrt-${FRIENDLY_VER}-sysupgrade.img.gz"
-          cp "$OPENWRT_SYSUP" "../../artifact/${DST_NAME}"
-          echo "[OK] OpenWrt native: ${DST_NAME}"
-        fi
-
-        OPENWRT_MANIFEST=$(find ../friendlywrt/bin/targets/rockchip/armv8 -maxdepth 1 \
-          -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
-        [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "../../artifact/"
-
-    - name: Generate SHA256 and README
-      run: |
-        cd artifact
-        rm -f SHA256SUMS
-        for f in *; do
-          [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
-        done
-
-        cat > README.txt <<EOF
-        ImmortalWrt for NanoPi R5S — Build $(date +%Y-%m-%d)
-        ============================================================
-        发行标签: ${{ needs.prepare_release.outputs.release_tag }}
-        内核版本: 6.12 (ImmortalWrt ${OPENWRT_BRANCH} 分支)
-        基础系统: ImmortalWrt + Clashoo + Bootstrap 主题
-        rootfs 分区: 1024 MB
-        Docker: 已集成 (docker + dockerd + docker-compose + LuCI)
-
-        自定义功能（来自 add_packages.sh）：
-        - Clashoo 代理
-        - 必需的常用工具（bc/vsftpd/sudo/jq/lsof/...）
-        - 默认 LAN IP: 192.168.3.3/24，网关 192.168.3.1
-        - 默认 root 密码: tony
-        - LuCI 主题: bootstrap
-
-        产物说明
-        --------
-        1. ${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.img.gz
-           → SD 卡完整镜像，gunzip 后 dd 到 SD 卡
-        2. images-${MODEL_NAME}-FriendlyWrt-${FRIENDLY_VER}.tgz
-           → eMMC 刷机包
-        3. ${MODEL_NAME}-OpenWrt-${FRIENDLY_VER}-sysupgrade.img.gz
-           → OpenWrt 官方原生镜像（备用）
-        4. SHA256SUMS
-           → 所有产物校验和
-
-        刷机后验证：
-        - uname -r 应显示 6.12.x
-        - 在 LuCI 中应看到 Docker 菜单项
-        - 终端执行 docker --version 应显示 Docker 版本
-        - 默认密码: tony
-        EOF
-
-        ls -lh
-
-    - name: Verify 6.12 kernel in final firmware
-      run: |
-        cd project/sd-fuse
-        echo "=== 最终固件内核版本核验 ==="
-        strings "$TARGET_OS/kernel.img" 2>/dev/null | grep -oE "Linux version [0-9]+\.[0-9]+\.[0-9]+" | head -1
-        ls /tmp/rootfs-pack/lib/modules/ 2>/dev/null
-
-    - name: Upload all artifacts to release
-      uses: svenstaro/upload-release-action@v2
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        file: ./artifact/*
-        tag: ${{ needs.prepare_release.outputs.release_tag }}
-        overwrite: true
-        file_glob: true
-
-  cleanup_self:
-    name: Cleanup Self Workflow History
-    runs-on: ubuntu-latest
-    needs: [prepare_release, build]
-    if: ${{ always() }}
-    permissions:
-      actions: write
-      contents: read
-    steps:
-      - name: Delete old workflow runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          keep_minimum_runs: 0
-          retain_days: 0
-          delete_workflow_pattern: "Build ImmortalWrt for NanoPi R5S"
-          repository: ${{ github.repository }}
+main "$@"
