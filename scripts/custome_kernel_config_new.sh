@@ -29,22 +29,7 @@ resolve_kconfig() {
         fi
     done
     echo ""
-    return 1
-}
-
-resolve_r5s_dts() {
-    local cand
-    for cand in \
-        "target/linux/rockchip/armv8/base-files/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" \
-        "target/linux/rockchip/files/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" \
-        "target/linux/rockchip/armv8/base-files/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dtsi"; do
-        if [ -f "$cand" ]; then
-            echo "$cand"
-            return 0
-        fi
-    done
-    echo ""
-    return 1
+    return 0
 }
 
 step_ccache_and_staging() {
@@ -58,7 +43,7 @@ step_ccache_and_staging() {
     ccache -s
 
     local STAGING="$FRIENDLYWRT_DIR/staging_dir"
-    [ -d "$STAGING" ] || { log "staging_dir 不存在（首次编译）"; return; }
+    [ -d "$STAGING" ] || { log "staging_dir 不存在（首次编译）"; return 0; }
 
     local HOST_GCC TC_GCC
     HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 -name "*-gcc*" 2>/dev/null | head -1)
@@ -85,7 +70,7 @@ step_verify_kernel() {
 
 step_bridge_kernel_config() {
     log "===== 3. 桥接 config-6.1 -> config-6.12 ====="
-    cd "$FRIENDLYWRT_DIR/target/linux/rockchip" || return
+    cd "$FRIENDLYWRT_DIR/target/linux/rockchip" || return 0
 
     [ -f armv8/config-6.12 ] || err "找不到 armv8/config-6.12"
     [ -e config-6.1 ] || ln -s armv8/config-6.12 config-6.1
@@ -103,7 +88,7 @@ step_patch_gpio() {
 
     if [ -f "$GPIO_PATCH" ]; then
         log "GPIO 修复补丁已存在，跳过"
-        return
+        return 0
     fi
 
     cat > "$GPIO_PATCH" << 'PATCH_EOF'
@@ -123,52 +108,40 @@ PATCH_EOF
     log "[OK] GPIO 驱动修复补丁已写入: $GPIO_PATCH"
 }
 
-step_fix_led_dts() {
-    log "===== 3.6 修正 R5S LED 设备树 ====="
+step_patch_dts_led() {
+    log "===== 3.6 通过内核补丁修改 R5S DTS LED ====="
     cd "$FRIENDLYWRT_DIR"
 
-    local DTS_FILE
-    DTS_FILE=$(resolve_r5s_dts)
+    local PATCH_DIR="target/linux/rockchip/patches-6.12"
+    mkdir -p "$PATCH_DIR"
 
-    if [ -z "$DTS_FILE" ]; then
-        warn "未找到 R5S DTS 文件，跳过 DTS 修改"
-        return
+    local DTS_PATCH="$PATCH_DIR/998-r5s-dts-led-aliases.patch"
+
+    if [ -f "$DTS_PATCH" ]; then
+        log "DTS LED 补丁已存在，跳过"
+        return 0
     fi
 
-    log "找到 DTS: $DTS_FILE"
+    cat > "$DTS_PATCH" << 'PATCH_EOF'
+--- a/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
+@@ -10,6 +10,13 @@
+ 
+ / {
+ 	model = "FriendlyElec NanoPi R5S";
++
++	aliases {
++		led-boot = &sys_led;
++		led-failsafe = &sys_led;
++		led-running = &sys_led;
++		led-upgrade = &sys_led;
++	};
+ 
+ 	chosen {
+ 		stdout-path = "serial2:1500000n8";
+PATCH_EOF
 
-    if ! grep -q "led-boot" "$DTS_FILE"; then
-        python3 - "$DTS_FILE" << 'PYEOF'
-import sys, re, pathlib
-p = pathlib.Path(sys.argv[1])
-txt = p.read_text()
-if 'led-boot' in txt:
-    sys.exit(0)
-aliases_block = '''
-	aliases {
-		led-boot = &sys_led;
-		led-failsafe = &sys_led;
-		led-running = &sys_led;
-		led-upgrade = &sys_led;
-	};
-'''
-m = re.search(r'^/\s*\{', txt, flags=re.M)
-if m:
-    insert_pos = txt.index('{', m.start()) + 1
-    txt = txt[:insert_pos] + aliases_block + txt[insert_pos:]
-    p.write_text(txt)
-    print("[OK] 已插入 LED aliases")
-else:
-    print("[WARN] 未找到顶层 / 节点，跳过 aliases 插入")
-PYEOF
-    else
-        log "LED aliases 已存在"
-    fi
-
-    sed -i 's|linux,default-trigger = "default-on"|linux,default-trigger = "heartbeat"|g' "$DTS_FILE" || true
-    sed -i 's|linux,default-trigger = "netdev"|linux,default-trigger = "none"|g' "$DTS_FILE" || true
-
-    log "[OK] LED 触发器配置已修正"
+    log "[OK] DTS LED 补丁已写入: $DTS_PATCH（失败不影响 GPIO 核心修复）"
 }
 
 step_patch_kconfig() {
@@ -180,8 +153,10 @@ step_patch_kconfig() {
 
     if [ -z "$KCONFIG" ]; then
         warn "未找到 config-6.12，跳过 Kconfig 补齐"
-        return
+        return 0
     fi
+
+    log "目标内核配置: $KCONFIG"
 
     local opt
     for opt in \
@@ -227,7 +202,7 @@ step_patch_kconfig() {
         CONFIG_LEDS_TRIGGER_DEFAULT_ON \
         CONFIG_LEDS_TRIGGER_TIMER \
         CONFIG_LEDS_TRIGGER_TRANSIENT; do
-        if ! grep -q "^${opt} is not set" "$KCONFIG"; then
+        if ! grep -q "^# ${opt} is not set" "$KCONFIG"; then
             sed -i "/^${opt}=/d" "$KCONFIG"
             echo "# ${opt} is not set" >> "$KCONFIG"
         fi
@@ -373,7 +348,7 @@ step_patch_file_makefile() {
     cd "$FRIENDLYWRT_DIR"
 
     local FILE_MK="feeds/packages/libs/file/Makefile"
-    [ -f "$FILE_MK" ] || { log "跳过（$FILE_MK 不存在）"; return; }
+    [ -f "$FILE_MK" ] || { log "跳过（$FILE_MK 不存在）"; return 0; }
 
     python3 - "$FILE_MK" << 'PY'
 import re, sys, pathlib
@@ -454,7 +429,7 @@ main() {
     step_verify_kernel
     step_bridge_kernel_config
     step_patch_gpio
-    step_fix_led_dts
+    step_patch_dts_led
     step_patch_kconfig
     step_add_fan_control
     step_init_config
