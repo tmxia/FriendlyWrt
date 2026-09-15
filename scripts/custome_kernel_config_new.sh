@@ -18,20 +18,6 @@ err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
 [ -d "$FRIENDLYWRT_DIR" ] || err "friendlywrt 源码目录不存在"
 [ -f "$SCRIPTS_DIR/add_packages.sh" ] || err "add_packages.sh 不存在"
 
-resolve_kconfig() {
-    local cand
-    for cand in \
-        "target/linux/rockchip/armv8/config-6.12" \
-        "target/linux/rockchip/config-6.12"; do
-        if [ -f "$cand" ]; then
-            echo "$cand"
-            return 0
-        fi
-    done
-    echo ""
-    return 0
-}
-
 step_ccache_and_staging() {
     log "===== 1. ccache + staging_dir 验证 ====="
 
@@ -144,73 +130,6 @@ PATCH_EOF
     log "[OK] DTS LED 补丁已写入: $DTS_PATCH（失败不影响 GPIO 核心修复）"
 }
 
-step_patch_kconfig() {
-    log "===== 3.7 补齐内核 Kconfig 选项 ====="
-    cd "$FRIENDLYWRT_DIR"
-
-    local KCONFIG
-    KCONFIG=$(resolve_kconfig)
-
-    if [ -z "$KCONFIG" ]; then
-        warn "未找到 config-6.12，跳过 Kconfig 补齐"
-        return 0
-    fi
-
-    log "目标内核配置: $KCONFIG"
-
-    local opt
-    for opt in \
-        CONFIG_GPIO_ROCKCHIP \
-        CONFIG_PINCTRL_ROCKCHIP \
-        CONFIG_LEDS_GPIO \
-        CONFIG_LEDS_TRIGGER_HEARTBEAT \
-        CONFIG_PHY_ROCKCHIP_NANENG_COMBO_PHY \
-        CONFIG_PHY_ROCKCHIP_SNPS_PCIE3 \
-        CONFIG_PCIE_ROCKCHIP_HOST \
-        CONFIG_ROCKCHIP_THERMAL \
-        CONFIG_PWM_ROCKCHIP \
-        CONFIG_PWM_FAN \
-        CONFIG_USB_EHCI_HCD \
-        CONFIG_USB_EHCI_PCI \
-        CONFIG_USB_OHCI_HCD \
-        CONFIG_USB_UHCI_HCD \
-        CONFIG_USB_XHCI_HCD \
-        CONFIG_USB_XHCI_PCI \
-        CONFIG_CGROUPS \
-        CONFIG_CGROUP_FREEZER \
-        CONFIG_CGROUP_PIDS \
-        CONFIG_CGROUP_DEVICE \
-        CONFIG_CPUSETS \
-        CONFIG_MEMCG \
-        CONFIG_CGROUP_BPF \
-        CONFIG_NAMESPACES \
-        CONFIG_OVERLAY_FS \
-        CONFIG_BRIDGE \
-        CONFIG_VETH \
-        CONFIG_NF_NAT \
-        CONFIG_IP_NF_NAT \
-        CONFIG_NETFILTER_XT_MATCH_ADDRTYPE; do
-        if ! grep -q "^${opt}=y" "$KCONFIG"; then
-            sed -i "/^${opt}=/d" "$KCONFIG"
-            sed -i "/^# ${opt} is not set/d" "$KCONFIG"
-            echo "${opt}=y" >> "$KCONFIG"
-        fi
-    done
-
-    for opt in \
-        CONFIG_LEDS_TRIGGER_NETDEV \
-        CONFIG_LEDS_TRIGGER_DEFAULT_ON \
-        CONFIG_LEDS_TRIGGER_TIMER \
-        CONFIG_LEDS_TRIGGER_TRANSIENT; do
-        if ! grep -q "^# ${opt} is not set" "$KCONFIG"; then
-            sed -i "/^${opt}=/d" "$KCONFIG"
-            echo "# ${opt} is not set" >> "$KCONFIG"
-        fi
-    done
-
-    log "[OK] 内核 Kconfig 选项已补齐"
-}
-
 step_add_fan_control() {
     log "===== 3.8 添加 PWM 风扇控制 ====="
     cd "$FRIENDLYWRT_DIR"
@@ -293,6 +212,38 @@ CONFIG_PACKAGE_uuidgen=y
 CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
+
+# ==== 内核选项（通过 .config 控制，不直接修改 config-6.12） ====
+CONFIG_KERNEL_GPIO_ROCKCHIP=y
+CONFIG_KERNEL_PINCTRL_ROCKCHIP=y
+CONFIG_KERNEL_LEDS_GPIO=y
+CONFIG_KERNEL_LEDS_TRIGGER_HEARTBEAT=y
+CONFIG_KERNEL_PHY_ROCKCHIP_NANENG_COMBO_PHY=y
+CONFIG_KERNEL_PHY_ROCKCHIP_SNPS_PCIE3=y
+CONFIG_KERNEL_PCIE_ROCKCHIP_HOST=y
+CONFIG_KERNEL_ROCKCHIP_THERMAL=y
+CONFIG_KERNEL_PWM_ROCKCHIP=y
+CONFIG_KERNEL_PWM_FAN=y
+CONFIG_KERNEL_USB_EHCI_HCD=y
+CONFIG_KERNEL_USB_EHCI_PCI=y
+CONFIG_KERNEL_USB_OHCI_HCD=y
+CONFIG_KERNEL_USB_UHCI_HCD=y
+CONFIG_KERNEL_USB_XHCI_HCD=y
+CONFIG_KERNEL_USB_XHCI_PCI=y
+CONFIG_KERNEL_CGROUPS=y
+CONFIG_KERNEL_CGROUP_FREEZER=y
+CONFIG_KERNEL_CGROUP_PIDS=y
+CONFIG_KERNEL_CGROUP_DEVICE=y
+CONFIG_KERNEL_CPUSETS=y
+CONFIG_KERNEL_MEMCG=y
+CONFIG_KERNEL_CGROUP_BPF=y
+CONFIG_KERNEL_NAMESPACES=y
+CONFIG_KERNEL_OVERLAY_FS=y
+CONFIG_KERNEL_BRIDGE=y
+CONFIG_KERNEL_VETH=y
+CONFIG_KERNEL_NF_NAT=y
+CONFIG_KERNEL_IP_NF_NAT=y
+CONFIG_KERNEL_NETFILTER_XT_MATCH_ADDRTYPE=y
 EOF
 
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1
@@ -410,8 +361,13 @@ step_sync_config() {
 
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
     make defconfig > /dev/null 2>&1 || true
-
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+
+    log "执行 make kernel_oldconfig（同步内核级别配置）..."
+    make kernel_oldconfig > /tmp/kernel_oldconfig.log 2>&1 || {
+        warn "make kernel_oldconfig 非零退出，检查日志"
+        tail -50 /tmp/kernel_oldconfig.log
+    }
 
     log "[OK] 配置同步完成"
 }
@@ -446,7 +402,6 @@ main() {
     step_bridge_kernel_config
     step_patch_gpio
     step_patch_dts_led
-    step_patch_kconfig
     step_add_fan_control
     step_init_config
     step_apply_customizations
