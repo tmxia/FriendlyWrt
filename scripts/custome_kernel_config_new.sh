@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # ImmortalWrt (rockchip/armv8, NanoPi R5S) 6.12 内核编译脚本
+# 集成 luci-app-amlogic (晶晨宝盒)
 set -e
 
 # ---------- 路径解析 ----------
@@ -163,7 +164,7 @@ step_bridge_kernel_config() {
 }
 
 # =============================================================
-# 4. 初始化 .config
+# 4. 初始化 .config（含 luci-app-amlogic 及其依赖）
 # =============================================================
 step_init_config() {
     log "===== 4. 初始化 .config ====="
@@ -186,6 +187,25 @@ CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
 CONFIG_PACKAGE_luci-lib-docker=y
 CONFIG_DOCKER_KERNEL_OPTIONS=y
 CONFIG_DOCKER_NET_OVERLAY=y
+
+# ===== luci-app-amlogic (晶晨宝盒) =====
+CONFIG_PACKAGE_luci-app-amlogic=y
+
+# ===== luci-app-amlogic 依赖包 =====
+CONFIG_PACKAGE_luci-lib-nixio=y
+CONFIG_PACKAGE_block-mount=y
+CONFIG_PACKAGE_blkid=y
+CONFIG_PACKAGE_parted=y
+CONFIG_PACKAGE_dosfstools=y
+CONFIG_PACKAGE_e2fsprogs=y
+CONFIG_PACKAGE_jq=y
+CONFIG_PACKAGE_lsblk=y
+CONFIG_PACKAGE_pv=y
+CONFIG_PACKAGE_losetup=y
+CONFIG_PACKAGE_uuidgen=y
+CONFIG_PACKAGE_bash=y
+CONFIG_PACKAGE_perl=y
+CONFIG_PACKAGE_fdisk=y
 
 # ===== cgroup / namespace =====
 CONFIG_CGROUP_SCHED=y
@@ -233,6 +253,8 @@ EOF
     for k in CONFIG_CCACHE CONFIG_TARGET_ROOTFS_PARTSIZE \
              CONFIG_PACKAGE_docker CONFIG_PACKAGE_dockerd \
              CONFIG_PACKAGE_luci-app-dockerman \
+             CONFIG_PACKAGE_luci-app-amlogic \
+             CONFIG_PACKAGE_parted CONFIG_PACKAGE_e2fsprogs \
              CONFIG_DOCKER_KERNEL_OPTIONS CONFIG_DOCKER_NET_OVERLAY \
              CONFIG_CGROUP_BPF CONFIG_MEMCG CONFIG_NET_NS \
              CONFIG_BRIDGE_NETFILTER CONFIG_NF_TABLES CONFIG_VETH \
@@ -250,12 +272,24 @@ EOF
 }
 
 # =============================================================
-# 5. 应用自定义（修复 add_packages.sh 内核路径 bug）
+# 5. 应用自定义（克隆 luci-app-amlogic + 修复 add_packages.sh）
 # =============================================================
 step_apply_customizations() {
     log "===== 5. 应用自定义配置 ====="
-    local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
 
+    # ---- 5.1 克隆 luci-app-amlogic 到 package/ ----
+    log "克隆 luci-app-amlogic (晶晨宝盒)..."
+    local AML_DIR="$FRIENDLYWRT_DIR/package/luci-app-amlogic"
+    rm -rf "$AML_DIR"
+    if git clone --depth 1 -b main https://github.com/ophub/luci-app-amlogic.git "$AML_DIR"; then
+        log "[OK] luci-app-amlogic 克隆成功"
+        ls -la "$AML_DIR" | head -10
+    else
+        warn "luci-app-amlogic 克隆失败，继续（可能导致编译时找不到该包）"
+    fi
+
+    # ---- 5.2 修复 add_packages.sh 内核路径 bug ----
+    local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
     if [ -f "$add_pkgs" ]; then
         log "修复 add_packages.sh 内核配置路径..."
         log "  before: $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
@@ -263,9 +297,12 @@ step_apply_customizations() {
         log "  after:  $(grep -n 'KERNEL_CONFIG_FILE=' "$add_pkgs" || true)"
     fi
 
+    # ---- 5.3 执行 add_packages.sh ----
     cd "$PROJECT_DIR"
-    bash "$add_pkgs"
-    log "[OK] add_packages.sh 执行完成"
+    if [ -f "$add_pkgs" ]; then
+        bash "$add_pkgs"
+        log "[OK] add_packages.sh 执行完成"
+    fi
 }
 
 # =============================================================
@@ -371,6 +408,13 @@ step_force_config() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    # luci-app-amlogic 及其依赖强制启用
+    for pkg in luci-app-amlogic luci-lib-nixio block-mount blkid parted dosfstools e2fsprogs jq lsblk pv losetup uuidgen bash perl fdisk; do
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
     sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
     echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
     sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
@@ -422,6 +466,7 @@ CONFIG_ZSMALLOC=y
     log "[OK] 关键配置已强制修正"
     echo "=== 校验 ==="
     for k in CONFIG_CCACHE CONFIG_TARGET_ROOTFS_PARTSIZE \
+             CONFIG_PACKAGE_luci-app-amlogic CONFIG_PACKAGE_parted \
              CONFIG_CGROUP_BPF CONFIG_MEMCG CONFIG_NET_NS \
              CONFIG_BRIDGE_NETFILTER CONFIG_NF_TABLES CONFIG_VETH \
              CONFIG_OVERLAY_FS CONFIG_IP_NF_NAT; do
@@ -471,6 +516,14 @@ restore_critical_cfg() {
     fi
     local pkg
     for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker; do
+        if ! grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+            sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+            sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+            need_save=true
+        fi
+    done
+    for pkg in luci-app-amlogic luci-lib-nixio block-mount blkid parted dosfstools e2fsprogs jq lsblk pv losetup uuidgen bash perl fdisk; do
         if ! grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
             sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
             sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
