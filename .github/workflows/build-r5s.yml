@@ -220,11 +220,13 @@ jobs:
         [ -z "$TRIPLE_DIR" ] && { echo "::error::target triple not found"; ls -la build_dir/ | head -20; exit 1; }
         TRIPLE_DIR=$(realpath "$TRIPLE_DIR")
         echo "TRIPLE_DIR=$TRIPLE_DIR" >> $GITHUB_ENV
+        echo "[OK] TRIPLE_DIR: $TRIPLE_DIR"
 
         KDIR=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "linux-rockchip*" | head -1)
         [ -z "$KDIR" ] && { echo "::error::linux-rockchip dir not found"; ls -la "$TRIPLE_DIR/"; exit 1; }
         KDIR=$(realpath "$KDIR")
         echo "KDIR=$KDIR" >> $GITHUB_ENV
+        echo "[OK] KDIR: $KDIR"
 
         IMG=$(find "$KDIR" -path "*/arch/arm64/boot/Image" -type f 2>/dev/null | head -1)
         [ -z "$IMG" ] && IMG=$(find "$KDIR" -maxdepth 4 -name "Image" -type f 2>/dev/null | head -1)
@@ -238,11 +240,13 @@ jobs:
         [ -z "$DTB_DIR" ] && { echo "::error::DTB dir not found"; exit 1; }
         DTB_DIR=$(realpath "$DTB_DIR")
         echo "DTB_DIR=$DTB_DIR" >> $GITHUB_ENV
+        echo "[OK] DTB dir: $DTB_DIR"
 
         ROOTFS_SRC=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "root-*" | head -1)
         [ -z "$ROOTFS_SRC" ] && { echo "::error::Rootfs dir not found"; ls "$TRIPLE_DIR/" | head; exit 1; }
         ROOTFS_SRC=$(realpath "$ROOTFS_SRC")
         echo "ROOTFS_SRC=$ROOTFS_SRC" >> $GITHUB_ENV
+        echo "[OK] Rootfs: $ROOTFS_SRC ($(du -sh $ROOTFS_SRC | awk '{print $1}'))"
 
         KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
         echo "KV=$KV" >> $GITHUB_ENV
@@ -282,7 +286,6 @@ jobs:
         IMGFILE="$TGT/resource.img"
         mkdir -p "$TGT"
         [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
-        ls -la "$DTB_DIR"/rk3568-nanopi-*.dtb 2>/dev/null || true
 
         rm -rf /tmp/dtb-pack
         mkdir -p /tmp/dtb-pack
@@ -367,7 +370,7 @@ jobs:
           ./tools/generate-partmap-txt.sh "$ROOTFS_SIZE_BYTES" "$TARGET_OS"
         cat "$TARGET_OS/parameter.txt"
 
-    # 追加 Docker 所需的 cgroup / swap 参数（sd-fuse 模板默认不含）
+    # 追加 Docker 所需的 cgroup / swap 参数（sd-fuse 默认模板不含）
     - name: Patch parameter.txt CMDLINE
       run: |
         cd project/sd-fuse
@@ -412,7 +415,7 @@ jobs:
         fi
 
     # mk-emmc-image.sh 会额外尝试生成可选的 eflasher 裸 img，
-    # 那一步失败不影响我们需要的 emmc-flasher-images.tgz，故吞掉 stderr。
+    # 那一步失败不影响 emmc-flasher-images.tgz，过滤掉这行 stderr
     - name: Build eMMC flasher image
       run: |
         cd project/sd-fuse
@@ -420,7 +423,7 @@ jobs:
         sudo -E ./mk-emmc-image.sh "$TARGET_OS" autostart=yes \
           > /tmp/emmc-image.log 2>&1 || true
 
-        tail -30 /tmp/emmc-image.log
+        grep -v "Error: out/rk3568-eflasher-" /tmp/emmc-image.log | tail -20
 
         if [ -f "out/emmc-flasher-images.tgz" ]; then
           ls -lh out/emmc-flasher-images.tgz
