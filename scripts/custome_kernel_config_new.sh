@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 适用于 ImmortalWrt (rockchip/armv8, NanoPi R5S) 6.12 内核编译
+# ImmortalWrt (rockchip/armv8, NanoPi R5S) 6.12 内核编译脚本
 set -e
 
 # ---------- 路径解析 ----------
@@ -62,7 +62,7 @@ step_setup_ccache_and_staging() {
     if [ "$MISSING" = "1" ]; then
         warn "staging_dir 缓存不完整，删除以避免半损坏状态"
         rm -rf "$STAGING"
-        log "[OK] 已清除 staging_dir，将重新编译 tools + toolchain"
+        log "[OK] 已清除 staging_dir"
     else
         log "[OK] staging_dir 缓存完整"
         log "  host gcc: $HOST_GCC"
@@ -71,64 +71,99 @@ step_setup_ccache_and_staging() {
 }
 
 # =============================================================
-# 2. 6.12 内核产物验证（ImmortalWrt 也使用 patches-6.12/config-6.12）
+# 2. 探测内核产物（非阻塞、诊断优先）
 # =============================================================
 step_verify_kernel() {
-    log "===== 2. 验证 6.12 内核产物 ====="
+    log "===== 2. 探测内核产物（不阻塞）====="
     cd "$FRIENDLYWRT_DIR"
 
-    local found=0
-    for d in patches-6.12 patches-6.6 patches-6.1; do
-        if [ -d "target/linux/rockchip/$d" ]; then
-            log "  found: target/linux/rockchip/$d"
-            found=1
-        fi
-    done
-
-    if [ "$found" = "0" ]; then
-        err "rockchip 目标下既无 patches-6.12 也无 patches-6.6/6.1，源码异常"
+    local RC_DIR="target/linux/rockchip"
+    if [ ! -d "$RC_DIR" ]; then
+        warn "$RC_DIR 不存在，打印 target/linux 顶层结构："
+        ls -la target/linux/ 2>&1 | head -40 || true
+        return 0
     fi
 
-    if [ -f target/linux/rockchip/armv8/config-6.12 ]; then
-        log "[OK] armv8/config-6.12 存在"
-    elif [ -f target/linux/rockchip/config-6.12 ]; then
-        log "[OK] rockchip/config-6.12 存在（非 armv8 子目录）"
+    echo "--- $RC_DIR 顶层内容 ---"
+    ls -la "$RC_DIR" 2>&1 | head -40
+
+    echo "--- $RC_DIR 子目录（最多 3 层）---"
+    find "$RC_DIR" -maxdepth 3 -type d 2>/dev/null | sort | head -60
+
+    local KVER=""
+    if [ -f "$RC_DIR/Makefile" ]; then
+        KVER=$(awk -F'[:=]' '/^KERNEL_PATCHVER/ {gsub(/[ \t]/,"",$2); print $2; exit}' \
+                    "$RC_DIR/Makefile" 2>/dev/null || true)
+    fi
+    echo "KERNEL_PATCHVER=${KVER:-未声明}"
+
+    local PATCH_DIRS CFG_FILES
+    PATCH_DIRS=$(find "$RC_DIR" -maxdepth 3 -type d -name "patches-*" 2>/dev/null | head -10 || true)
+    CFG_FILES=$(find  "$RC_DIR" -maxdepth 3 -type f -name "config-*"  2>/dev/null | head -10 || true)
+
+    echo "--- patches 目录 ---"
+    if [ -n "$PATCH_DIRS" ]; then echo "$PATCH_DIRS"; else echo "(无)"; fi
+
+    echo "--- config 文件 ---"
+    if [ -n "$CFG_FILES" ]; then echo "$CFG_FILES"; else echo "(无)"; fi
+
+    if [ -z "$PATCH_DIRS" ] && [ -z "$CFG_FILES" ]; then
+        warn "未探测到 patches-*/config-*，该目标可能使用纯 upstream 内核"
+        warn "继续编译流程，若后续失败请回看以上目录列表"
     else
-        warn "未找到 config-6.12，可能 ImmortalWrt master 已升级内核"
+        log "[OK] 内核产物探测完成"
     fi
 }
 
 # =============================================================
-# 3. 桥接内核配置路径（add_packages.sh 硬编码 config-6.1）
+# 3. 桥接内核配置路径（动态探测目标 config）
 # =============================================================
 step_bridge_kernel_config() {
     log "===== 3. 桥接内核配置路径 ====="
-    cd "$FRIENDLYWRT_DIR/target/linux/rockchip"
+    cd "$FRIENDLYWRT_DIR/target/linux/rockchip" || { warn "无法进入 rockchip 目录"; return 0; }
+
+    local KVER=""
+    [ -f Makefile ] && KVER=$(awk -F'[:=]' '/^KERNEL_PATCHVER/ {gsub(/[ \t]/,"",$2); print $2; exit}' \
+                                    Makefile 2>/dev/null || true)
+    log "  KERNEL_PATCHVER=${KVER:-未声明}"
 
     local TARGET_CFG=""
-    if [ -f armv8/config-6.12 ]; then
-        TARGET_CFG="armv8/config-6.12"
-    elif [ -f config-6.12 ]; then
-        TARGET_CFG="config-6.12"
-    else
-        warn "找不到 6.12 内核 config，跳过桥接"
+    local CANDIDATES=""
+    [ -n "$KVER" ] && CANDIDATES="armv8/config-${KVER} config-${KVER}"
+    CANDIDATES="$CANDIDATES armv8/config-6.12 config-6.12 armv8/config-6.6 config-6.6"
+
+    for f in $CANDIDATES; do
+        if [ -f "$f" ]; then
+            TARGET_CFG="$f"; break
+        fi
+    done
+
+    if [ -z "$TARGET_CFG" ]; then
+        TARGET_CFG=$(find . -maxdepth 2 -name "config-*" -type f 2>/dev/null | head -1)
+    fi
+
+    if [ -z "$TARGET_CFG" ]; then
+        warn "找不到内核 config 文件，跳过桥接（不影响后续编译）"
+        ls -la 2>&1 | head -30 || true
         return 0
     fi
 
+    log "  TARGET_CFG=$TARGET_CFG"
+
+    local LINKED=0
     for ver in 6.1 6.6; do
         if [ ! -e "config-$ver" ]; then
-            ln -s "$TARGET_CFG" "config-$ver"
+            ln -s "$TARGET_CFG" "config-$ver" && LINKED=1
             log "[OK] 创建 config-$ver -> $TARGET_CFG"
-        else
-            log "[OK] config-$ver 已存在"
         fi
     done
+    [ "$LINKED" = "0" ] && log "  (无需新建符号链接)"
 
     ls -la config-* 2>/dev/null || true
 }
 
 # =============================================================
-# 4. 初始化 .config（含实测得到的 Docker cgroup/netfilter/ns 强制项）
+# 4. 初始化 .config
 # =============================================================
 step_init_config() {
     log "===== 4. 初始化 .config ====="
@@ -152,7 +187,7 @@ CONFIG_PACKAGE_luci-lib-docker=y
 CONFIG_DOCKER_KERNEL_OPTIONS=y
 CONFIG_DOCKER_NET_OVERLAY=y
 
-# ===== cgroup / namespace（实测当前设备已启用 cgroup v1）=====
+# ===== cgroup / namespace =====
 CONFIG_CGROUP_SCHED=y
 CONFIG_CGROUP_CPUACCT=y
 CONFIG_CGROUP_BPF=y
@@ -170,7 +205,7 @@ CONFIG_IPC_NS=y
 CONFIG_UTS_NS=y
 CONFIG_USER_NS=y
 
-# ===== netfilter / iptables / bridge（实测 =m 需改 =y）=====
+# ===== netfilter / iptables / bridge =====
 CONFIG_BRIDGE=y
 CONFIG_BRIDGE_NETFILTER=y
 CONFIG_BRIDGE_VLAN_FILTERING=y
@@ -184,7 +219,7 @@ CONFIG_VETH=y
 CONFIG_OVERLAY_FS=y
 CONFIG_OVERLAY_FS_REDIRECT_DIR=y
 
-# ===== swap（实测 cmdline 里 swapaccount=1）=====
+# ===== swap =====
 CONFIG_SWAP=y
 CONFIG_MEMCG_SWAP_ENABLED=y
 CONFIG_ZRAM=y
@@ -205,10 +240,12 @@ EOF
         grep -E "^$k=" .config || echo "  [MISS] $k"
     done
 
-    # 设备名自检（不同分支/版本可能有差异）
     if ! grep -q "CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y" .config; then
-        warn "DEVICE_friendlyarm_nanopi-r5s 未匹配，请检查 target/linux/rockchip/image/armv8.mk"
-        grep -E "DEVICE_friendlyarm_nanopi" .config || true
+        warn "DEVICE_friendlyarm_nanopi-r5s 未匹配，可能命名有差异"
+        echo "=== 当前 .config 里所有 r5s 相关 ==="
+        grep -iE "nanopi|r5s" .config || true
+        echo "=== target/linux/rockchip/image/ 设备清单 ==="
+        grep -hE "DEVICE_.*nanopi" target/linux/rockchip/image/*.mk 2>/dev/null || true
     fi
 }
 
@@ -309,13 +346,12 @@ PY
 }
 
 # =============================================================
-# 8. 强制修正关键配置（含实测 cgroup/netfilter/ns 项）
+# 8. 强制修正关键配置
 # =============================================================
 step_force_config() {
     log "===== 8. 强制修正关键配置 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # --- 基础 ---
     sed -i '/^CONFIG_CCACHE_DIR=/d' .config
     sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
     echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
@@ -328,7 +364,6 @@ step_force_config() {
     sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
     echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
 
-    # --- Docker 包 ---
     local pkg
     for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker; do
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
@@ -341,7 +376,6 @@ step_force_config() {
     sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
     echo "CONFIG_DOCKER_NET_OVERLAY=y" >> .config
 
-    # --- 实测确认的 Docker 内核必备项（=m 改为 =y）---
     local KOPTS="
 CONFIG_CGROUP_SCHED=y
 CONFIG_CGROUP_CPUACCT=y
@@ -480,7 +514,6 @@ step_compile() {
         log "[DONE] $s"
     done
 
-    # ===== final make =====
     log "---- STAGE: final make ----"
     restore_critical_cfg > /dev/null 2>&1
     LOG="/tmp/build_final.log"
@@ -491,7 +524,6 @@ step_compile() {
         grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
         grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
 
-        # 场景 1：rootfs 空间不足
         if grep -qE "out of space|failed to allocate" "$LOG"; then
             log "----- 场景 1: rootfs 空间不足，尝试扩大分区 -----"
             local ROOTFS_DIR ACTUAL_MB NEEDED_MB NEW_PARTSIZE
@@ -509,7 +541,6 @@ step_compile() {
             fi
         fi
 
-        # 场景 2：target/linux 失败（内核配置漂移）
         if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
             log "----- 场景 2: target/linux 失败，尝试内核配置同步 -----"
             make defconfig > /dev/null 2>&1 || true
@@ -518,7 +549,6 @@ step_compile() {
             make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
         fi
 
-        # 场景 3：其它包失败
         local FAILED_PKG
         FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
         if [ -n "$FAILED_PKG" ]; then
@@ -526,7 +556,6 @@ step_compile() {
             make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
         fi
 
-        # 重试
         log "----- 诊断完成，重试完整 final make -----"
         restore_critical_cfg > /dev/null 2>&1
         if ! make -j"$(nproc)" > /tmp/build_final_retry.log 2>&1; then
