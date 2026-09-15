@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ImmortalWrt NanoPi R5S 编译脚本
-# 关键约束：oldconfig 会重置 CONFIG_CCACHE 等顶层符号，追加必须在 oldconfig 前后各做一次
+# 关键点：
+#   1. oldconfig 会重置顶层符号（CONFIG_CCACHE 等）→ 追加必须前后各做一次
+#   2. file Makefile 修改后必须重建 tmp/.config-package.in → 否则依赖图不同步导致 sudo 失败
 
 set -e
 
@@ -19,7 +21,6 @@ warn() { echo "[$(date +%H:%M:%S)] WARN: $*" >&2; }
 err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
 
 [ -d "$FRIENDLYWRT_DIR" ] || err "friendlywrt 源码目录不存在: $FRIENDLYWRT_DIR"
-[ -f "$SCRIPTS_DIR/add_packages.sh" ] || warn "add_packages.sh 不存在"
 
 # ---------- 1. ccache + staging_dir ----------
 step_setup_ccache_and_staging() {
@@ -29,7 +30,6 @@ step_setup_ccache_and_staging() {
     ccache --set-config=compression=true
     ccache --set-config=compiler_check=mtime
     ccache --set-config=cache_dir="$CCACHE_DIR"
-    ccache -p 2>/dev/null | grep -E "cache_dir|max_size|compression|compiler_check" || true
     ccache -s || true
 
     local STAGING="$FRIENDLYWRT_DIR/staging_dir"
@@ -40,10 +40,6 @@ step_setup_ccache_and_staging() {
     HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 \( -name "gcc" -o -name "*-gcc" -o -name "gcc-*" \) 2>/dev/null | head -1)
     TOOLCHAIN_DIR=$(find "$STAGING" -maxdepth 1 -type d -name "toolchain-*" 2>/dev/null | head -1)
     [ -n "$TOOLCHAIN_DIR" ] && TC_GCC=$(find "$TOOLCHAIN_DIR/bin" -maxdepth 1 \( -name "*-gcc" -o -name "*-gcc-*" \) 2>/dev/null | head -1)
-
-    log "  host gcc: ${HOST_GCC:-(未找到)}"
-    log "  toolchain dir: ${TOOLCHAIN_DIR:-(未找到)}"
-    log "  toolchain gcc: ${TC_GCC:-(未找到)}"
 
     if [ -z "$HOST_GCC" ] || [ -z "$TOOLCHAIN_DIR" ] || [ -z "$TC_GCC" ]; then
         warn "staging_dir 缓存不完整，清除重建"
@@ -59,18 +55,11 @@ step_verify_kernel() {
     cd "$FRIENDLYWRT_DIR"
     [ -d "target/linux/rockchip/patches-6.12" ]      || err "6.12 内核补丁目录不存在"
     [ -f "target/linux/rockchip/armv8/config-6.12" ] || err "6.12 内核配置文件不存在"
-
     local KVER_FILE="target/linux/generic/kernel-6.12"
-    [ -f "$KVER_FILE" ] || err "内核版本文件不存在: $KVER_FILE"
-    local VP
-    VP=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" "$KVER_FILE" | head -1 | awk '{print $3}')
-    [ -n "$VP" ] || err "无法解析 6.12.x 内核版本号"
-
-    local KVER="6.12${VP}"
-    log "[INFO] 内核版本: $KVER"
-    [ "$(echo "$KVER" | cut -d. -f3)" -lt 17 ] 2>/dev/null \
-        && warn "内核 $KVER < 6.12.17，可能缺少 PCIe 修复补丁" \
-        || log "[OK] 内核 $KVER 已含 PCIe 修复补丁"
+    [ -f "$KVER_FILE" ] || err "内核版本文件不存在"
+    local VP=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" "$KVER_FILE" | head -1 | awk '{print $3}')
+    [ -n "$VP" ] || err "无法解析内核版本"
+    log "[INFO] 内核版本: 6.12${VP}"
 }
 
 # ---------- 3. 初始化 .config ----------
@@ -107,7 +96,6 @@ step_apply_customizations() {
     log "===== 4. 应用自定义配置 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    log "克隆 luci-app-amlogic..."
     rm -rf package/luci-app-amlogic
     git clone --depth 1 -b main https://github.com/ophub/luci-app-amlogic.git package/luci-app-amlogic
     [ -d "package/luci-app-amlogic" ] || err "luci-app-amlogic 克隆失败"
@@ -134,16 +122,14 @@ step_apply_customizations() {
 step_dedupe_config() {
     log "===== 5. .config 去重 ====="
     cd "$FRIENDLYWRT_DIR"
-    local before after
-    before=$(wc -l < .config)
+    local before=$(wc -l < .config)
     awk -F= '
       /^# / { print; next }
       /^CONFIG_/ { key=$1; if (!(key in seen)) { keys[++n]=key; seen[key]=1 }; values[key]=$0; next }
       { print }
       END { for (i=1;i<=n;i++) print values[keys[i]] }
     ' .config > .config.dedup && mv .config.dedup .config
-    after=$(wc -l < .config)
-    log "[OK] 去重: $before 行 → $after 行"
+    log "[OK] 去重: $before 行 → $(wc -l < .config) 行"
 }
 
 # ---------- 6. 修补 file Makefile ----------
@@ -153,8 +139,6 @@ step_patch_file_makefile() {
 
     local FILE_MK="feeds/packages/libs/file/Makefile"
     [ -f "$FILE_MK" ] || { warn "$FILE_MK 不存在，跳过"; return 0; }
-
-    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
 
     python3 - "$FILE_MK" <<'PY'
 import re, sys, pathlib
@@ -182,11 +166,10 @@ PY
         sed -i "/^CONFIG_${sym}=/d" .config
         echo "CONFIG_${sym}=y" >> .config
     done
-    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
     log "[OK] file Makefile 依赖已修补"
 }
 
-# ---------- 关键配置写入 helper ----------
+# ---------- 关键配置写入 ----------
 apply_critical_cfg() {
     cd "$FRIENDLYWRT_DIR"
 
@@ -216,20 +199,30 @@ CONFIG_DOCKER_NET_OVERLAY=y
 EOF
 }
 
-# ---------- 7. 强制修正（追加 → oldconfig → 再追加） ----------
+# ---------- 核心：重建 tmp/.config-package.in ----------
+# file Makefile 修改后依赖图变了，oldconfig 不会刷新 tmp/.config-package.in，
+# 必须删除该文件强制重算，否则 package/compile 的并行调度按旧依赖图启动子 make，
+# sudo 等依赖 host 工具链的包会在依赖未就绪时被拉起导致失败。
+rebuild_config_index() {
+    cd "$FRIENDLYWRT_DIR"
+    log "重建 tmp/.config-package.in（同步依赖图）..."
+    rm -f tmp/.config-package.in tmp/.packageinfo tmp/.targetinfo
+    make prepare-tmpinfo 2>&1 | tail -3 || true
+    yes "" 2>/dev/null | make oldconfig >/dev/null 2>&1 || true
+}
+
+# ---------- 7. 强制修正 + 重建依赖图 ----------
 step_force_config() {
-    log "===== 7. 强制修正关键配置 ====="
+    log "===== 7. 强制修正关键配置 + 重建依赖图 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # 第 1 次追加：写入全部目标配置
+    # 第 1 次追加
     apply_critical_cfg
 
-    # 同步 tmp/.config-package.in（消除 out-of-sync）
-    log "同步 .config 与 tmp/.config-package.in（oldconfig）..."
-    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+    # 重建依赖图（file Makefile 修改后必须做，否则 out of sync）
+    rebuild_config_index
 
-    # 第 2 次追加：oldconfig 会把 CONFIG_CCACHE 等顶层符号重置为默认值，
-    # 这里重新写入，确保关键符号在 oldconfig 之后依然存在
+    # 第 2 次追加（oldconfig 会重置顶层符号如 CONFIG_CCACHE）
     apply_critical_cfg
 
     log "[OK] 关键配置已强制修正并冻结"
@@ -245,7 +238,7 @@ step_download_packages() {
     make download -j"$(nproc)" > /tmp/dl1.log 2>&1 || true
     find dl -type f -size -1024c -delete 2>/dev/null || true
     make download -j"$(nproc)" > /tmp/dl2.log 2>&1 || true
-    log "[OK] dl: $(find dl -type f | wc -l) 文件, $(du -sh dl | awk '{print $1}')"
+    log "[OK] dl: $(find dl -type f | wc -l) 文件"
 }
 
 # ---------- 9. 只读校验 ----------
@@ -271,12 +264,18 @@ verify_critical_cfg() {
     done
     grep -qF "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config \
         || err "编译前配置校验失败：CONFIG_CCACHE_DIR 不是 \"$CCACHE_DIR\""
-    log "[OK] 编译前配置校验通过（配置已冻结）"
+
+    # 校验依赖图是否已同步（tmp/.config-package.in 存在且包含 libmagic）
+    [ -f tmp/.config-package.in ] || err "tmp/.config-package.in 缺失，依赖图未生成"
+    grep -q "config PACKAGE_libmagic" tmp/.config-package.in \
+        || err "tmp/.config-package.in 未包含 libmagic，依赖图未同步"
+
+    log "[OK] 编译前配置校验通过（配置与依赖图均已冻结）"
 }
 
 # ---------- 10. 编译 ----------
 step_compile() {
-    log "===== 9. 编译（配置已冻结）====="
+    log "===== 9. 编译 ====="
     cd "$FRIENDLYWRT_DIR"
     verify_critical_cfg
 
@@ -298,7 +297,7 @@ step_compile() {
     if ! make -j"$(nproc)" > "$LOG" 2>&1; then
         warn "final make 失败"
         tail -120 "$LOG"
-        err "final make 失败（详见 $LOG）"
+        err "final make 失败"
     fi
     log "[DONE] final make"
     log "=== OpenWrt 编译完成 ==="
