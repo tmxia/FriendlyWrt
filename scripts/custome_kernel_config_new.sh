@@ -103,7 +103,7 @@ CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
 EOF
 
-    yes "" | make oldconfig > /dev/null 2>&1
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1
     log "[OK] .config 初始化完成"
 }
 
@@ -123,7 +123,7 @@ step_apply_customizations() {
     sed -i '/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d' .config
     sed -i '/^CONFIG_PACKAGE_luci-app-amlogic=/d' .config
     echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
-    yes "" | make oldconfig > /dev/null 2>&1
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1
 
     # 修正 add_packages.sh 里硬编码的 kernel config 路径
     sed -i 's|target/linux/rockchip/config-\${KERNEL_VERSION}|target/linux/rockchip/armv8/config-\${KERNEL_VERSION}|' \
@@ -178,7 +178,7 @@ PY
         sed -i "/^# CONFIG_${sym} is not set/d; /^CONFIG_${sym}=/d" .config
         echo "CONFIG_${sym}=y" >> .config
     done
-    yes "" | make oldconfig > /dev/null 2>&1
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1
     log "[OK] file Makefile 已修补"
 }
 
