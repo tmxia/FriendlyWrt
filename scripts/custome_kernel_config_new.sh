@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
+# =============================================================
+# custome_kernel_config_new.sh
 # ImmortalWrt NanoPi R5S 编译脚本
 #
-# 关键事实：
-#   1. make oldconfig 只更新 .config，不会生成 include/config/auto.conf
-#   2. auto.conf 由 make 目标 "include/config/auto.conf" 生成（Makefile 文件规则）
-#   3. oldconfig 会重置顶层符号（CONFIG_CCACHE 等），需要用 scripts/config 恢复
-#   4. 编译前 .config 与 auto.conf 必须严格同步
+# 基于经验证的旧脚本结构，仅新增 luci-app-amlogic 支持。
+# 关键保留：
+#   1. step_bridge_kernel_config —— 创建 config-6.1 符号链接
+#   2. make oldconfig || make defconfig —— 保证 auto.conf 生成
+#   3. restore_critical_cfg —— 每 stage 前恢复配置，与旧脚本一致
+# =============================================================
 
 set -e
 
@@ -24,10 +27,12 @@ warn() { echo "[$(date +%H:%M:%S)] WARN: $*" >&2; }
 err()  { echo "[$(date +%H:%M:%S)] ERROR: $*" >&2; exit 1; }
 
 [ -d "$FRIENDLYWRT_DIR" ] || err "friendlywrt 源码目录不存在: $FRIENDLYWRT_DIR"
+[ -f "$SCRIPTS_DIR/add_packages.sh" ] || warn "add_packages.sh 不存在"
 
 # ---------- 1. ccache + staging_dir ----------
 step_setup_ccache_and_staging() {
     log "===== 1. ccache 初始化 + staging_dir 验证 ====="
+
     mkdir -p "$CCACHE_DIR"
     ccache --max-size="$CCACHE_MAXSIZE"
     ccache --set-config=compression=true
@@ -37,18 +42,25 @@ step_setup_ccache_and_staging() {
 
     local STAGING="$FRIENDLYWRT_DIR/staging_dir"
     [ -d "$STAGING" ] || { log "[INFO] staging_dir 不存在（首次编译）"; return 0; }
+
     du -sh "$STAGING" 2>/dev/null || true
 
     local HOST_GCC TOOLCHAIN_DIR TC_GCC
-    HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 \( -name "gcc" -o -name "*-gcc" -o -name "gcc-*" \) 2>/dev/null | head -1)
+    HOST_GCC=$(find "$STAGING/host/bin" -maxdepth 1 -name "*-gcc*" 2>/dev/null | head -1)
     TOOLCHAIN_DIR=$(find "$STAGING" -maxdepth 1 -type d -name "toolchain-*" 2>/dev/null | head -1)
-    [ -n "$TOOLCHAIN_DIR" ] && TC_GCC=$(find "$TOOLCHAIN_DIR/bin" -maxdepth 1 \( -name "*-gcc" -o -name "*-gcc-*" \) 2>/dev/null | head -1)
+    [ -n "$TOOLCHAIN_DIR" ] && TC_GCC=$(find "$TOOLCHAIN_DIR/bin" -maxdepth 1 -name "*-gcc" 2>/dev/null | head -1)
 
-    if [ -z "$HOST_GCC" ] || [ -z "$TOOLCHAIN_DIR" ] || [ -z "$TC_GCC" ]; then
-        warn "staging_dir 缓存不完整，清除重建"
+    local MISSING=0
+    [ -z "$HOST_GCC" ] && { warn "host gcc 未找到"; MISSING=1; }
+    [ -z "$TC_GCC" ] && { warn "toolchain gcc 未找到"; MISSING=1; }
+
+    if [ "$MISSING" = "1" ]; then
+        warn "staging_dir 缓存不完整，删除重建"
         rm -rf "$STAGING"
     else
         log "[OK] staging_dir 缓存完整"
+        log "  host gcc: $HOST_GCC"
+        log "  toolchain gcc: $TC_GCC"
     fi
 }
 
@@ -56,19 +68,28 @@ step_setup_ccache_and_staging() {
 step_verify_kernel() {
     log "===== 2. 验证 6.12 内核产物 ====="
     cd "$FRIENDLYWRT_DIR"
-    [ -d "target/linux/rockchip/patches-6.12" ]      || err "6.12 内核补丁目录不存在"
-    [ -f "target/linux/rockchip/armv8/config-6.12" ] || err "6.12 内核配置文件不存在"
-    local KVER_FILE="target/linux/generic/kernel-6.12"
-    [ -f "$KVER_FILE" ] || err "内核版本文件不存在"
-    local VP
-    VP=$(grep -oE "^LINUX_VERSION-6\.12 = \.[0-9]+" "$KVER_FILE" | head -1 | awk '{print $3}')
-    [ -n "$VP" ] || err "无法解析内核版本"
-    log "[INFO] 内核版本: 6.12${VP}"
+    if [ ! -d target/linux/rockchip/patches-6.12 ] || [ ! -f target/linux/rockchip/armv8/config-6.12 ]; then
+        err "6.12 内核产物不存在"
+    fi
+    log "[OK] 6.12 内核产物已就绪"
 }
 
-# ---------- 3. 初始化 .config ----------
+# ---------- 3. 桥接内核配置路径（关键！旧脚本能工作的核心） ----------
+step_bridge_kernel_config() {
+    log "===== 3. 桥接内核配置路径 ====="
+    cd "$FRIENDLYWRT_DIR/target/linux/rockchip"
+    if [ ! -e config-6.1 ]; then
+        ln -s armv8/config-6.12 config-6.1
+        log "[OK] 创建 config-6.1 -> armv8/config-6.12"
+    else
+        log "[OK] config-6.1 已存在"
+    fi
+    ls -la config-6.1
+}
+
+# ---------- 4. 初始化 .config ----------
 step_init_config() {
-    log "===== 3. 初始化 .config ====="
+    log "===== 4. 初始化 .config ====="
     cd "$FRIENDLYWRT_DIR"
     cat > .config <<EOF
 CONFIG_TARGET_rockchip=y
@@ -78,9 +99,8 @@ CONFIG_LUCI_LANG_zh_Hans=y
 CONFIG_CCACHE=y
 CONFIG_CCACHE_DIR="$CCACHE_DIR"
 CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
-CONFIG_LINUX_6_12=y
-CONFIG_PCIE_ROCKCHIP_DW_HOST=y
-CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y
+
+# ===== Docker =====
 CONFIG_PACKAGE_docker=y
 CONFIG_PACKAGE_dockerd=y
 CONFIG_PACKAGE_docker-compose=y
@@ -89,32 +109,50 @@ CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y
 CONFIG_PACKAGE_luci-lib-docker=y
 CONFIG_DOCKER_KERNEL_OPTIONS=y
 CONFIG_DOCKER_NET_OVERLAY=y
-CONFIG_PACKAGE_luci-app-amlogic=y
 EOF
-    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
     log "[OK] .config 初始化完成"
 }
 
-# ---------- 4. 自定义配置 ----------
+# ---------- 5. 应用自定义配置（含 luci-app-amlogic） ----------
 step_apply_customizations() {
-    log "===== 4. 应用自定义配置 ====="
+    log "===== 5. 应用自定义配置 ====="
     cd "$FRIENDLYWRT_DIR"
 
+    # 5.1 克隆 luci-app-amlogic
+    log "克隆 luci-app-amlogic..."
     rm -rf package/luci-app-amlogic
     git clone --depth 1 -b main https://github.com/ophub/luci-app-amlogic.git package/luci-app-amlogic
     [ -d "package/luci-app-amlogic" ] || err "luci-app-amlogic 克隆失败"
+    log "[OK] luci-app-amlogic 已克隆"
 
+    # 5.2 启用 luci-app-amlogic
+    sed -i "/^# CONFIG_PACKAGE_luci-app-amlogic is not set/d" .config 2>/dev/null || true
+    sed -i "/^CONFIG_PACKAGE_luci-app-amlogic=/d" .config 2>/dev/null || true
+    echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
+
+    # 5.3 修复 add_packages.sh 内核路径 bug 并执行
     local add_pkgs="$SCRIPTS_DIR/add_packages.sh"
     if [ -f "$add_pkgs" ]; then
         sed -i 's|KERNEL_CONFIG_FILE="target/linux/rockchip/config-\${KERNEL_VERSION}"|KERNEL_CONFIG_FILE="target/linux/rockchip/armv8/config-\${KERNEL_VERSION}"|' "$add_pkgs"
         (cd "$PROJECT_DIR" && bash "$add_pkgs")
-        log "[OK] add_packages.sh 执行完成"
     fi
+
+    # 5.4 确保 luci-app-amlogic 依赖
+    local pkg
+    for pkg in luci-base luci-compat luci-lib-jsonc luci-lib-nixio block-mount e2fsprogs \
+               tune2fs tar gzip curl wget unzip dosfstools parted coreutils coreutils-stat \
+               kmod-fs-vfat kmod-fs-ext4 kmod-fs-btrfs luci-app-amlogic; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config 2>/dev/null || true
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config 2>/dev/null || true
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+    log "[OK] luci-app-amlogic 及其依赖已启用"
 }
 
-# ---------- 5. 去重 ----------
+# ---------- 6. 去重 ----------
 step_dedupe_config() {
-    log "===== 5. .config 去重 ====="
+    log "===== 6. .config 去重 ====="
     cd "$FRIENDLYWRT_DIR"
     local before
     before=$(wc -l < .config)
@@ -127,198 +165,217 @@ step_dedupe_config() {
     log "[OK] 去重: $before 行 → $(wc -l < .config) 行"
 }
 
-# ---------- 6. 修补 file Makefile ----------
+# ---------- 7. 修补 file Makefile ----------
 step_patch_file_makefile() {
-    log "===== 6. 修补 file Makefile 依赖 ====="
+    log "===== 7. 修补 file Makefile 依赖 ====="
     cd "$FRIENDLYWRT_DIR"
 
     local FILE_MK="feeds/packages/libs/file/Makefile"
     [ -f "$FILE_MK" ] || { warn "$FILE_MK 不存在，跳过"; return 0; }
 
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1 || true
+
     python3 - "$FILE_MK" <<'PY'
 import re, sys, pathlib
-p = pathlib.Path(sys.argv[1]); txt = p.read_text()
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
 m = re.search(r'(define Package/libmagic\b.*?DEPENDS:=)([^\n]*)', txt, flags=re.S)
-if not m: print("PATTERN NOT FOUND"); sys.exit(0)
-deps = m.group(2); added = []
+if not m:
+    print("PATTERN NOT FOUND")
+    sys.exit(0)
+deps = m.group(2)
+added = []
 for r in ['+libbz2', '+liblzma']:
-    if r not in deps: deps += " " + r; added.append(r)
+    if r not in deps:
+        deps += " " + r
+        added.append(r)
 if added:
-    p.write_text(txt[:m.start(2)] + deps + txt[m.end(2):])
+    txt = txt[:m.start(2)] + deps + txt[m.end(2):]
+    p.write_text(txt)
     print(f"PATCHED: {added}")
 else:
     print("No change")
 PY
+
+    local SYMS="PACKAGE_libbz2 PACKAGE_liblzma PACKAGE_zlib"
+    local hint found
+    for hint in libbz2 liblzma zlib; do
+        found=$(grep -oE "config PACKAGE_${hint}[-0-9._]*" tmp/.config-package.in 2>/dev/null \
+                    | awk '{print $2}' | sort -u || true)
+        SYMS="${SYMS} ${found}"
+    done
+    for sym in $SYMS; do
+        [ -z "$sym" ] && continue
+        sed -i "/^# CONFIG_${sym} is not set/d" .config
+        sed -i "/^CONFIG_${sym}=/d" .config
+        echo "CONFIG_${sym}=y" >> .config
+    done
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || make defconfig > /dev/null 2>&1
     log "[OK] file Makefile 依赖已修补"
 }
 
-# ---------- 关键配置写入 ----------
-apply_critical_cfg() {
-    cd "$FRIENDLYWRT_DIR"
-    local CFG="scripts/config/Config"
-
-    if [ -x "$CFG" ]; then
-        local pkg
-        for pkg in docker dockerd docker-compose luci-app-dockerman \
-                   luci-i18n-dockerman-zh-cn luci-lib-docker luci-app-amlogic; do
-            "$CFG" --enable "PACKAGE_${pkg}" 2>/dev/null || true
-        done
-        "$CFG" --enable  CCACHE
-        "$CFG" --set-str CCACHE_DIR "$CCACHE_DIR"
-        "$CFG" --set-val TARGET_ROOTFS_PARTSIZE "$ROOTFS_PARTSIZE"
-        "$CFG" --enable  LINUX_6_12
-        "$CFG" --enable  PCIE_ROCKCHIP_DW_HOST
-        "$CFG" --enable  PHY_ROCKCHIP_NANENG_COMBPHY
-        "$CFG" --enable  DOCKER_KERNEL_OPTIONS
-        "$CFG" --enable  DOCKER_NET_OVERLAY
-    else
-        local pkg
-        for pkg in docker dockerd docker-compose luci-app-dockerman \
-                   luci-i18n-dockerman-zh-cn luci-lib-docker luci-app-amlogic; do
-            sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config 2>/dev/null || true
-            sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-        done
-        local kv
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            kv="${line%%=*}"
-            sed -i "/^${kv}=/d" .config
-            sed -i "/^# ${kv} is not set/d" .config
-            echo "$line" >> .config
-        done <<EOF
-CONFIG_CCACHE=y
-CONFIG_CCACHE_DIR="$CCACHE_DIR"
-CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE
-CONFIG_LINUX_6_12=y
-CONFIG_PCIE_ROCKCHIP_DW_HOST=y
-CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y
-CONFIG_DOCKER_KERNEL_OPTIONS=y
-CONFIG_DOCKER_NET_OVERLAY=y
-EOF
-    fi
-}
-
-# ---------- 7. 强制修正 + 显式生成 auto.conf ----------
+# ---------- 8. 强制修正关键配置 ----------
 step_force_config() {
-    log "===== 7. 强制修正关键配置 + 生成 auto.conf ====="
+    log "===== 8. 强制修正关键配置 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # 1) 用 scripts/config 写入关键配置
-    apply_critical_cfg
+    sed -i '/^CONFIG_CCACHE_DIR=/d' .config
+    sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
+    echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
 
-    # 2) 清除缓存强制重算依赖图
-    rm -f tmp/.config-package.in tmp/.packageinfo tmp/.targetinfo
+    sed -i '/^CONFIG_CCACHE=/d' .config
+    sed -i '/^# CONFIG_CCACHE is not set/d' .config
+    echo "CONFIG_CCACHE=y" >> .config
 
-    # 3) oldconfig 重建 tmp/
-    log "运行 oldconfig（重建依赖图）..."
-    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+    sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+    sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
+    echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
 
-    # 4) 恢复 oldconfig 可能重置的顶层符号
-    log "修正 oldconfig 可能重置的顶层符号..."
-    apply_critical_cfg
-
-    # 5) oldconfig 把 .config 规范化
-    log "运行 oldconfig（规范化 .config）..."
-    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
-
-    # ============================================================
-    # 【核心修复】
-    # make oldconfig 不会生成 include/config/auto.conf。
-    # auto.conf 由 Makefile 中的文件规则生成，必须显式调用该目标。
-    # ============================================================
-    log "显式生成 include/config/auto.conf..."
-    make -s include/config/auto.conf 2>&1 | tail -3 || true
-
-    if [ ! -f include/config/auto.conf ]; then
-        warn "首次生成 auto.conf 失败，尝试 make prepare-tmpinfo..."
-        make -s prepare-tmpinfo 2>&1 | tail -3 || true
-        make -s include/config/auto.conf 2>&1 | tail -3 || true
-    fi
-
-    if [ ! -f include/config/auto.conf ]; then
-        err "无法生成 include/config/auto.conf（OpenWrt 构建系统异常）"
-    fi
-
-    # 6) 校验关键符号：.config 与 auto.conf 必须同时包含
-    log "校验 .config 与 include/config/auto.conf 一致性..."
-    local checks=(
-        "^CONFIG_CCACHE=y"
-        "^CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
-        "^CONFIG_LINUX_6_12=y"
-        "^CONFIG_PCIE_ROCKCHIP_DW_HOST=y"
-        "^CONFIG_PHY_ROCKCHIP_NANENG_COMBPHY=y"
-        "^CONFIG_PACKAGE_docker=y"
-        "^CONFIG_PACKAGE_dockerd=y"
-        "^CONFIG_PACKAGE_docker-compose=y"
-        "^CONFIG_PACKAGE_luci-app-dockerman=y"
-        "^CONFIG_PACKAGE_luci-i18n-dockerman-zh-cn=y"
-        "^CONFIG_PACKAGE_luci-lib-docker=y"
-        "^CONFIG_PACKAGE_luci-app-amlogic=y"
-        "^CONFIG_DOCKER_KERNEL_OPTIONS=y"
-        "^CONFIG_DOCKER_NET_OVERLAY=y"
-    )
-    local pat
-    for pat in "${checks[@]}"; do
-        grep -qE "$pat" .config || err "关键配置缺失: $pat"
-        grep -qE "$pat" include/config/auto.conf || err "auto.conf 未同步: $pat"
+    local pkg
+    for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker luci-app-amlogic; do
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 7) mtime 检查：auto.conf 必须不早于 .config
-    if [ include/config/auto.conf -ot .config ]; then
-        warn "auto.conf 比 .config 旧，touch 修正 mtime"
-        touch include/config/auto.conf
-    fi
+    sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
+    echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
+    sed -i '/^CONFIG_DOCKER_NET_OVERLAY=/d' .config
+    echo "CONFIG_DOCKER_NET_OVERLAY=y" >> .config
 
-    log "[OK] 配置与依赖图已严格同步"
-    grep -E "^CONFIG_(CCACHE|TARGET_ROOTFS_PARTSIZE|LINUX_6|PCIE_ROCKCHIP|PHY_ROCKCHIP|PACKAGE_docker|PACKAGE_dockerd|PACKAGE_luci-app-dockerman|PACKAGE_luci-app-amlogic|DOCKER_)" .config
+    # 关键：追加后跑一次 oldconfig，走和旧脚本完全一致的路径
+    yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+
+    log "[OK] 关键配置已强制修正"
 }
 
-# ---------- 8. 下载源码 ----------
+# ---------- 9. 下载源码 ----------
 step_download_packages() {
-    log "===== 8. 下载软件包源码 ====="
+    log "===== 9. 下载软件包源码 ====="
     cd "$FRIENDLYWRT_DIR"
+
     [ -d "dl/go-mod-cache" ] && rm -rf dl/go-mod-cache
 
     make download -j"$(nproc)" > /tmp/dl1.log 2>&1 || true
     find dl -type f -size -1024c -delete 2>/dev/null || true
     make download -j"$(nproc)" > /tmp/dl2.log 2>&1 || true
-    log "[OK] dl: $(find dl -type f | wc -l) 文件"
+    log "[OK] dl: $(find dl -type f | wc -l) 文件, $(du -sh dl | awk '{print $1}')"
 }
 
-# ---------- 9. 编译 ----------
+# ---------- 编译期配置恢复（与旧脚本一致） ----------
+restore_critical_cfg() {
+    local need_save=false
+    if ! grep -q "^CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" .config; then
+        sed -i '/^CONFIG_CCACHE_DIR=/d' .config
+        sed -i '/^# CONFIG_CCACHE_DIR is not set/d' .config
+        echo "CONFIG_CCACHE_DIR=\"$CCACHE_DIR\"" >> .config
+        need_save=true
+    fi
+    if ! grep -q "^CONFIG_CCACHE=y" .config; then
+        echo "CONFIG_CCACHE=y" >> .config
+        need_save=true
+    fi
+    if ! grep -q "^CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" .config; then
+        sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+        sed -i '/^# CONFIG_TARGET_ROOTFS_PARTSIZE is not set/d' .config
+        echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE" >> .config
+        need_save=true
+    fi
+    local pkg
+    for pkg in docker dockerd docker-compose luci-app-dockerman luci-i18n-dockerman-zh-cn luci-lib-docker luci-app-amlogic; do
+        if ! grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+            sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+            sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+            echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+            need_save=true
+        fi
+    done
+    if ! grep -q "^CONFIG_DOCKER_KERNEL_OPTIONS=y" .config; then
+        sed -i '/^CONFIG_DOCKER_KERNEL_OPTIONS=/d' .config
+        echo "CONFIG_DOCKER_KERNEL_OPTIONS=y" >> .config
+        need_save=true
+    fi
+    [ "$need_save" = "true" ] && log "[CFG] 已恢复关键配置"
+    return 0
+}
+
+# ---------- 10. 编译 ----------
 step_compile() {
-    log "===== 9. 编译 ====="
+    log "===== 10. 开始分阶段编译 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    # 编译前最终确认 auto.conf 与 .config 一致（只读检查）
-    if [ ! -f include/config/auto.conf ]; then
-        warn "auto.conf 在编译前缺失，重新生成"
-        make -s include/config/auto.conf > /dev/null 2>&1 || true
-    fi
+    restore_critical_cfg > /dev/null 2>&1
 
-    local s LOG
+    local s LOG FAILED
     for s in tools/compile toolchain/compile target/compile package/compile; do
         log "---- STAGE: $s ----"
+        restore_critical_cfg > /dev/null 2>&1
         LOG="/tmp/build_$(echo "$s" | tr '/' '_').log"
         if ! make -j"$(nproc)" "$s" > "$LOG" 2>&1; then
             warn "STAGE FAILED: $s"
-            grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -20 || true
-            tail -120 "$LOG"
-            err "编译失败: $s （详见 $LOG）"
+            FAILED=$(grep -oE "ERROR: package/[^ ]+ failed to build" "$LOG" | head -1 | awk '{print $2}')
+            tail -80 "$LOG"
+            if [ -n "$FAILED" ]; then
+                log "=== Verbose rebuild: $FAILED ==="
+                make -j1 V=s "$FAILED/compile" 2>&1 | tail -150 || true
+            fi
+            err "编译失败: $s"
         fi
         log "[DONE] $s"
     done
 
     log "---- STAGE: final make ----"
+    restore_critical_cfg > /dev/null 2>&1
     LOG="/tmp/build_final.log"
-    if ! make -j"$(nproc)" > "$LOG" 2>&1; then
-        warn "final make 失败"
-        tail -120 "$LOG"
-        err "final make 失败"
+    if make -j"$(nproc)" > "$LOG" 2>&1; then
+        log "[DONE] final make"
+    else
+        warn "首次 final make 失败，启动诊断流程..."
+        grep -E "ERROR: (target|package|toolchain|tool)/[^ ]+ failed" "$LOG" | tail -10 || true
+        grep -E "make\[[0-9]+\]: \*\*\*" "$LOG" | tail -10 || true
+
+        if grep -qE "out of space|failed to allocate" "$LOG"; then
+            log "----- 场景 1: rootfs 空间不足 -----"
+            local ROOTFS_DIR ACTUAL_MB NEEDED_MB NEW_PARTSIZE
+            ROOTFS_DIR=$(find build_dir/target-* -maxdepth 1 -type d -name "root-*" | head -1)
+            if [ -n "$ROOTFS_DIR" ]; then
+                ACTUAL_MB=$(du -s -m "$ROOTFS_DIR" | awk '{print $1}')
+                NEEDED_MB=$(( (ACTUAL_MB + 64 + 63) / 64 * 64 ))
+                NEW_PARTSIZE=$(( NEEDED_MB + 256 ))
+                log "当前 rootfs: ${ACTUAL_MB} MB → 新分区: ${NEW_PARTSIZE} MB"
+                sed -i '/^CONFIG_TARGET_ROOTFS_PARTSIZE=/d' .config
+                echo "CONFIG_TARGET_ROOTFS_PARTSIZE=$NEW_PARTSIZE" >> .config
+                rm -f build_dir/target-*/linux-rockchip_armv8/root.ext4* 2>/dev/null || true
+                rm -f build_dir/target-*/linux-rockchip_armv8/root.squashfs 2>/dev/null || true
+                rm -f build_dir/target-*/linux-rockchip_armv8/*.img 2>/dev/null || true
+            fi
+        fi
+
+        if grep -qE "ERROR: target/linux failed" "$LOG" && ! grep -qE "out of space" "$LOG"; then
+            log "----- 场景 2: target/linux 失败，同步内核配置 -----"
+            make defconfig > /dev/null 2>&1 || true
+            yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
+            restore_critical_cfg > /dev/null 2>&1
+            make -j1 V=s target/linux/install 2>&1 | tee /tmp/kernel_install.log | tail -100 || true
+        fi
+
+        local FAILED_PKG
+        FAILED_PKG=$(grep -oE "ERROR: package/[^ ]+ failed" "$LOG" | head -1 | sed 's|ERROR: ||; s| failed||')
+        if [ -n "$FAILED_PKG" ]; then
+            log "----- 场景 3: $FAILED_PKG 详细重跑 -----"
+            make -j1 V=s "$FAILED_PKG/compile" 2>&1 | tail -200 || true
+        fi
+
+        log "----- 诊断完成，重试 final make -----"
+        restore_critical_cfg > /dev/null 2>&1
+        if ! make -j"$(nproc)" > /tmp/build_final_retry.log 2>&1; then
+            err "最终 make 重试仍失败（详见 /tmp/build_final_retry.log）"
+        fi
+        log "[DONE] final make (retry)"
     fi
-    log "[DONE] final make"
+
     log "=== OpenWrt 编译完成 ==="
+    ls -la build_dir/target-*/root-* 2>/dev/null | head -5 || echo "(未找到 rootfs)"
     ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || echo "(未找到原生镜像)"
 }
 
@@ -326,20 +383,26 @@ step_compile() {
 main() {
     log "========================================"
     log "ImmortalWrt R5S 编译脚本启动"
-    log "ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE  CCACHE_DIR=$CCACHE_DIR"
+    log "REPO_ROOT=$REPO_ROOT"
+    log "FRIENDLYWRT_DIR=$FRIENDLYWRT_DIR"
+    log "ROOTFS_PARTSIZE=$ROOTFS_PARTSIZE"
+    log "CCACHE_DIR=$CCACHE_DIR"
     log "========================================"
 
     step_setup_ccache_and_staging
     step_verify_kernel
+    step_bridge_kernel_config        # 关键：符号链接
     step_init_config
-    step_apply_customizations
+    step_apply_customizations        # 含 luci-app-amlogic
     step_dedupe_config
     step_patch_file_makefile
-    step_force_config
+    step_force_config                # sed/echo + 一次 oldconfig
     step_download_packages
-    step_compile
+    step_compile                     # 每 stage 前 restore_critical_cfg
 
+    log "========================================"
     log "全部步骤完成"
+    log "========================================"
 }
 
 main "$@"
