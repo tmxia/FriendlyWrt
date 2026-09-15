@@ -16,7 +16,8 @@ on:
 
 env:
   AUTO_REPLACE_TAG: 'false'
-  IMMORTALWRT_BRANCH: 'master'
+  # 使用 openwrt-25.12 分支：KERNEL_PATCHVER:=6.12（已实测确认）
+  IMMORTALWRT_BRANCH: 'openwrt-25.12'
   IMMORTALWRT_REPO: 'https://github.com/immortalwrt/immortalwrt.git'
   FLAVOR: 'r5s'
   TARGET_OS: 'friendlywrt25'
@@ -30,7 +31,6 @@ env:
   CCACHE_MAXSIZE: '3G'
   ROOTFS_PARTSIZE: '2048'
   ENABLE_DOCKER: 'true'
-  # 实测要求的 Docker cgroup/swap 参数（写入 CMDLINE）
   DOCKER_BOOTARGS: 'cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory swapaccount=1'
 
 jobs:
@@ -149,6 +149,12 @@ jobs:
           ${{ env.IMMORTALWRT_REPO }} friendlywrt > /dev/null 2>&1
         cd friendlywrt
         git log -1 --oneline
+        echo "=== KERNEL_PATCHVER 探测 ==="
+        grep -E "KERNEL_(PATCHVER|TESTING_PATCHVER)" target/linux/rockchip/Makefile 2>/dev/null || true
+        echo "=== rockchip 目录结构 ==="
+        ls -la target/linux/rockchip/ | head -30
+        echo "=== armv8 子目录 ==="
+        ls -la target/linux/rockchip/armv8/ 2>/dev/null | head -30 || true
         ./scripts/feeds update -a > /dev/null 2>&1 || ./scripts/feeds update -a
         ./scripts/feeds install -a > /dev/null 2>&1
         cd ..
@@ -250,10 +256,9 @@ jobs:
         KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
         echo "KV=$KV" >> $GITHUB_ENV
         echo "[OK] Kernel modules version: $KV"
-        # 实测主机内核 6.1.141，目标 6.12；放宽到 6.12+ 避免将来上游升级阻塞
         case "$KV" in
-          6.1*)   echo "::warning::内核版本为 $KV，仍为 6.1" ;;
           6.12*)  echo "[OK] 内核版本 6.12 符合预期" ;;
+          6.1*)   echo "::warning::内核版本为 $KV，仍为 6.1" ;;
           *)      echo "::warning::内核版本 $KV（非 6.12），继续但请复核" ;;
         esac
 
@@ -266,19 +271,16 @@ jobs:
         [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
         echo "[OK] sd-fuse ready"
 
-    - name: Package 6.12 kernel
+    - name: Package kernel
       run: |
         cd project
         SF="sd-fuse"
         TGT="$SF/$TARGET_OS"
         mkdir -p "$TGT"
-
         [ -f "$IMAGE_PATH" ] || { echo "::error::Image not found: $IMAGE_PATH"; exit 1; }
-
         "$SF/tools/mkkrnlimg" "$IMAGE_PATH" "$TGT/kernel.img"
         [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img 未生成"; exit 1; }
         ls -lh "$TGT/kernel.img"
-
         cp "$TGT/kernel.img" "$TGT/boot.img"
 
     - name: Package resource.img
@@ -288,17 +290,13 @@ jobs:
         TGT="$SF/$TARGET_OS"
         IMGFILE="$TGT/resource.img"
         mkdir -p "$TGT"
-
         [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
-
         echo "=== DTB 源目录内容（rk3568-nanopi 系列）==="
         ls -la "$DTB_DIR"/rk3568-nanopi-*.dtb 2>/dev/null || true
 
         rm -rf /tmp/dtb-pack
         mkdir -p /tmp/dtb-pack
 
-        # 实测 compatible=friendlyelec,nanopi-r5s，主 DTB 就是 rk3568-nanopi-r5s.dtb
-        # 但保守起见仍允许 -lts / r5c 等变体兜底
         R5S_DTB=""
         for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5s-lts.dtb rk3568-nanopi-r5c.dtb; do
           if [ -f "$DTB_DIR/$cand" ]; then
@@ -306,37 +304,22 @@ jobs:
             break
           fi
         done
-
-        if [ -z "$R5S_DTB" ]; then
-          echo "::error::找不到 rk3568-nanopi-r5s*.dtb / r5c"
-          ls "$DTB_DIR"/*.dtb 2>/dev/null | head -20
-          exit 1
-        fi
+        [ -z "$R5S_DTB" ] && { echo "::error::找不到 rk3568-nanopi-r5s*.dtb"; ls "$DTB_DIR"/*.dtb 2>/dev/null | head -20; exit 1; }
 
         echo "[OK] 主 dtb: $R5S_DTB"
         cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
-
         for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5s-lts.dtb rk3568-nanopi-r5c.dtb; do
           [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
         done
 
         cd /tmp/dtb-pack
         DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
-
         [ -z "$DTB_LIST" ] && { echo "::error::no dtb files"; exit 1; }
+        echo "=== 待打包 dtb 列表 ==="; echo "$DTB_LIST"
 
-        echo "=== 待打包 dtb 列表 ==="
-        echo "$DTB_LIST"
-        echo "总数: $(echo "$DTB_LIST" | wc -l)"
-
-        "$SF/tools/resource_tool" --pack \
-          --root=. \
-          --image="$IMGFILE" \
-          $DTB_LIST
-
+        "$SF/tools/resource_tool" --pack --root=. --image="$IMGFILE" $DTB_LIST
         cd - > /dev/null
-
-        [ -f "$IMGFILE" ] || { echo "::error::resource.img 未生成: $IMGFILE"; exit 1; }
+        [ -f "$IMGFILE" ] || { echo "::error::resource.img 未生成"; exit 1; }
         ls -lh "$IMGFILE"
 
     - name: Stage U-Boot binaries
@@ -351,7 +334,6 @@ jobs:
       run: |
         cd project/sd-fuse
         TGT="$TARGET_OS"
-
         [ -d "$ROOTFS_SRC" ] || { echo "::error::Rootfs src not found: $ROOTFS_SRC"; exit 1; }
 
         rm -rf /tmp/rootfs-pack
@@ -369,7 +351,7 @@ jobs:
         ACTUAL_MB=$(du -sm "$ROOTFS_DIR" | awk '{print $1}')
         echo "=== rootfs 实际内容: ${ACTUAL_MB} MB / 目标分区: ${ROOTFS_PARTSIZE} MB ==="
         if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
-          echo "::error::rootfs 内容 (${ACTUAL_MB}MB) 超过 ROOTFS_PARTSIZE (${ROOTFS_PARTSIZE}MB)，请增大分区"
+          echo "::error::rootfs 内容 (${ACTUAL_MB}MB) 超过 ROOTFS_PARTSIZE (${ROOTFS_PARTSIZE}MB)"
           exit 1
         fi
 
@@ -377,7 +359,7 @@ jobs:
         IMG_BLK=$(( LOGICAL_SIZE / 4096 ))
         INODE_SIZE=$(( $(find "$ROOTFS_DIR" | wc -l) + 128 ))
 
-        echo "=== 逻辑分区容量: ${ROOTFS_PARTSIZE} MB (${LOGICAL_SIZE} bytes, ${IMG_BLK} blocks) ==="
+        echo "=== 逻辑分区容量: ${ROOTFS_PARTSIZE} MB (${IMG_BLK} blocks) ==="
 
         rm -f "$TGT/rootfs.img"
         MKE2FS_CONFIG="$MKFS_CONF" \
@@ -387,63 +369,46 @@ jobs:
 
         [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img 生成失败"; exit 1; }
         ls -lh "$TGT/rootfs.img"
-
-        SPARSE_SIZE=$(stat -c%s "$TGT/rootfs.img")
-        echo "[INFO] sparse 文件实际大小: $SPARSE_SIZE bytes"
-        echo "[INFO] 逻辑分区大小:        $LOGICAL_SIZE bytes"
-
         echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
 
     - name: Generate parameter.txt
       run: |
         cd project/sd-fuse
         [ -z "$ROOTFS_SIZE_BYTES" ] && { echo "::error::ROOTFS_SIZE_BYTES 未设置"; exit 1; }
-        echo "=== 传给 generate-partmap-txt.sh 的 size: $ROOTFS_SIZE_BYTES ==="
         PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
           ./tools/generate-partmap-txt.sh "$ROOTFS_SIZE_BYTES" "$TARGET_OS"
         echo "=== parameter.txt (原始) ==="
         cat "$TARGET_OS/parameter.txt"
 
-    # ★★★ 实测补丁：把 Docker 必需的 cgroup/swap 参数追加到 CMDLINE ★★★
     - name: Patch parameter.txt CMDLINE (cgroup + swap)
       run: |
         cd project/sd-fuse
         PARAM="$TARGET_OS/parameter.txt"
         [ -f "$PARAM" ] || { echo "::error::$PARAM not found"; exit 1; }
 
-        # 需要追加的关键字（来自实测主机 /proc/cmdline）
         REQUIRED_KW="cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory swapaccount=1"
         ADD=""
-
         for kw in $REQUIRED_KW; do
           if grep -q -- "$kw" "$PARAM"; then
             echo "[OK] 已存在: $kw"
           else
-            ADD="$ADD $kw"
-            echo "[MISS] 待追加: $kw"
+            ADD="$ADD $kw"; echo "[MISS] 待追加: $kw"
           fi
         done
-
         ADD=$(echo "$ADD" | sed 's/^ *//;s/ *$//')
 
         if [ -n "$ADD" ]; then
-          echo "[PATCH] 追加到 CMDLINE: $ADD"
-          # CMDLINE 行通常以 CMDLINE: 开头，也可能是 CMDLINE= 或 bootargs=
+          echo "[PATCH] 追加: $ADD"
           if grep -qE "^CMDLINE[:=]" "$PARAM"; then
             sed -i "/^CMDLINE[:=]/ s|$| $ADD|" "$PARAM"
           elif grep -qE "^bootargs[:=]" "$PARAM"; then
             sed -i "/^bootargs[:=]/ s|$| $ADD|" "$PARAM"
           else
-            echo "::error::parameter.txt 中找不到 CMDLINE/bootargs 行，无法追加"
-            cat "$PARAM"
-            exit 1
+            echo "::error::parameter.txt 中找不到 CMDLINE/bootargs 行"; cat "$PARAM"; exit 1
           fi
         fi
-
         echo "=== parameter.txt (打完补丁) ==="
         cat "$PARAM"
-
-        # 校验
         for kw in $REQUIRED_KW; do
           grep -q -- "$kw" "$PARAM" || { echo "::error::参数 $kw 未成功写入"; exit 1; }
         done
@@ -458,11 +423,9 @@ jobs:
           tail -120 /tmp/sd-image.log
         }
         ls -lh out/ 2>/dev/null || echo "(无 out/)"
-
         if grep -q "more than capacity" /tmp/sd-image.log; then
           echo "::error::mk-sd-image.sh 跳过了 rootfs 写入（分区容量不足）"
-          grep "more than capacity" /tmp/sd-image.log
-          exit 1
+          grep "more than capacity" /tmp/sd-image.log; exit 1
         fi
 
     - name: Build eMMC flasher image
@@ -490,18 +453,16 @@ jobs:
           SRC_SIZE_MB=$(( $(stat -c%s "$SRC_IMG") / 1024 / 1024 ))
           echo "[INFO] SD 镜像原始大小: ${SRC_SIZE_MB} MB"
           if [ "$SRC_SIZE_MB" -lt 400 ]; then
-            echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入（预期 ≥ 2048MB）"
+            echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入"
             exit 1
           fi
           DST_NAME="${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}.img"
           cp "$SRC_IMG" "/tmp/${DST_NAME}"
           gzip -f "/tmp/${DST_NAME}"
           cp "/tmp/${DST_NAME}.gz" ../../artifact/
-          echo "[OK] SD image: ${DST_NAME}.gz ($(du -h /tmp/${DST_NAME}.gz | awk '{print $1}'))"
+          echo "[OK] SD image: ${DST_NAME}.gz"
         else
-          echo "::error::未找到 sd-fuse 生成的 .img"
-          ls -la out/ 2>/dev/null || true
-          exit 1
+          echo "::error::未找到 sd-fuse 生成的 .img"; exit 1
         fi
 
         SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
@@ -547,7 +508,7 @@ jobs:
         --------
         1. ${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}.img.gz  → SD 卡镜像
         2. images-${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}.tgz → eMMC 刷机包
-        3. ${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}-sysupgrade.img.gz → 原生镜像（备用）
+        3. ${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}-sysupgrade.img.gz → 原生镜像
         4. SHA256SUMS
 
         刷机后验证：
