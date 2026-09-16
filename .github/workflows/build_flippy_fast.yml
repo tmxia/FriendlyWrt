@@ -1,4 +1,4 @@
-name: Build FriendlyWrt With Custom Kernel
+name: Build FriendlyWrt With Flippy
 
 on:
   workflow_dispatch:
@@ -204,7 +204,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 1
           retain_days: 0
-          delete_workflow_pattern: "Build FriendlyWrt With Custom Kernel"
+          delete_workflow_pattern: "Build FriendlyWrt With Flippy"
           repository: ${{ github.repository }}
 
       - name: Clean old artifacts
