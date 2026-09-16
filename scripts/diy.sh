@@ -4,7 +4,7 @@ set -e
 STAGE="$1"
 
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
-AMLOGIC_FEED="src-git kenzo https://github.com/kenzok8/openwrt-packages.git"
+AMLOGIC_REPO="https://github.com/ophub/luci-app-amlogic.git"
 
 pre_feeds() {
     [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
@@ -14,7 +14,6 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
-    grep -q "src-git kenzo" feeds.conf || echo "$AMLOGIC_FEED" >> feeds.conf
 }
 
 post_feeds() {
@@ -31,6 +30,11 @@ post_feeds() {
         sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
+
+    mkdir -p package/custom
+    rm -rf package/custom/luci-app-amlogic
+    git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
+    rm -rf package/custom/luci-app-amlogic/.git
 
     mkdir -p files/etc/uci-defaults
     cat > files/etc/uci-defaults/99-custom << 'EOF'
@@ -167,7 +171,7 @@ config_stage() {
         fi
     done
     if [ $MISSING -eq 1 ]; then
-        echo "ERROR: 关键包未启用，中止。"
+        echo "ERROR: required packages not enabled"
         exit 1
     fi
 }
