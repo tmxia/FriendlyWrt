@@ -5,6 +5,8 @@ STAGE="$1"
 
 # Clashoo feed
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
+# Amlogic feed（包含 luci-app-amlogic）
+AMLOGIC_FEED="src-git kenzo https://github.com/kenzok8/openwrt-packages.git"
 
 # ============================================================
 # 阶段一：feeds 更新前（diy-part1 逻辑）
@@ -18,8 +20,10 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
+    grep -q "src-git kenzo" feeds.conf || echo "$AMLOGIC_FEED" >> feeds.conf
+
     echo "feeds.conf 已更新："
-    grep clashoo feeds.conf
+    grep -E "clashoo|kenzo" feeds.conf
 }
 
 # ============================================================
@@ -106,7 +110,7 @@ config_stage() {
         grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
     done
 
-    # 需要禁用的第三方插件（如果被上游 feeds 默认勾选）
+    # 需要禁用的第三方插件
     DISABLE_PKGS="
     adblock luci-app-adblock
     aria2 luci-app-aria2
@@ -132,6 +136,8 @@ config_stage() {
     luci-theme-argon luci-theme-aurora luci-theme-kucat
     luci-theme-material luci-theme-material3 luci-theme-openwrt
     "
+    # 注意：luci-app-ttyd 已从禁用列表移除
+
     for pkg in $DISABLE_PKGS; do
         sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
         grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
@@ -142,6 +148,8 @@ config_stage() {
     ENABLE_PKGS="
     bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
     wireguard-tools python3-light
+    bash perl parted curl dosfstools e2fsprogs lsblk pv losetup uuidgen fdisk
+    block-mount blkid
     "
     for pkg in $ENABLE_PKGS; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -149,8 +157,26 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 确保 Clashoo 相关包启用（两遍以确保覆盖）
+    # 确保 Clashoo 相关包启用
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
+    # 确保 luci-app-amlogic 及依赖启用
+    AMLOGIC_PKGS="
+    luci-app-amlogic luci-lib-nixio block-mount blkid parted curl
+    dosfstools e2fsprogs lsblk pv losetup uuidgen bash perl fdisk
+    "
+    for pkg in $AMLOGIC_PKGS; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
+    # 确保终端工具启用
+    for pkg in luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
@@ -159,7 +185,7 @@ config_stage() {
     # 验证
     echo "=====> 验证关键包"
     MISSING=0
-    for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+    for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd; do
         if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
             echo "[OK] $pkg"
         else
@@ -168,7 +194,7 @@ config_stage() {
         fi
     done
     if [ $MISSING -eq 1 ]; then
-        echo "ERROR: Clashoo 相关包未启用，中止。"
+        echo "ERROR: 关键包未启用，中止。"
         exit 1
     fi
 }
