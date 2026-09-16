@@ -6,6 +6,8 @@ STAGE="$1"
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
 AMLOGIC_REPO="https://github.com/ophub/luci-app-amlogic.git"
 
+CACHE_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY:-local/unknown}" | tr '[:upper:]' '[:lower:]')/r5s-base-cache:openwrt-25.12"
+
 pre_feeds() {
     [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
 
@@ -14,21 +16,10 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
-
-    REAL_GIT=$(command -v git)
-    sudo mkdir -p /usr/local/bin
-    sudo tee /usr/local/bin/git > /dev/null << EOF
-#!/bin/bash
-if [ "\$1" = "submodule" ]; then
-    exit 0
-fi
-exec $REAL_GIT "\$@"
-EOF
-    sudo chmod +x /usr/local/bin/git
-    echo "git wrapper installed at /usr/local/bin/git (real git: $REAL_GIT)"
 }
 
 post_feeds() {
+    sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/bin/config_generate 2>/dev/null || \
     sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
     KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
@@ -105,6 +96,72 @@ EOF
   }
 }
 EOF
+}
+
+cache_restore() {
+    echo "Attempting to restore build cache from GHCR: $CACHE_IMAGE"
+    if docker pull "$CACHE_IMAGE" 2>/dev/null; then
+        echo "Cache found. Extracting..."
+        cd /workdir
+        docker create --name cache_container "$CACHE_IMAGE" /bin/true > /dev/null
+        docker export cache_container > cache_exported.tar
+        docker rm cache_container > /dev/null
+        docker rmi "$CACHE_IMAGE" -f > /dev/null 2>&1 || true
+
+        tar -xf cache_exported.tar --wildcards "op_cache_raw_*" 2>/dev/null || true
+
+        if ls op_cache_raw_* 1> /dev/null 2>&1; then
+            cat op_cache_raw_* | tar -I "zstd -T0" -xf - -C /workdir/openwrt/
+            rm -f cache_exported.tar op_cache_raw_*
+            echo "Cache restored."
+        else
+            rm -f cache_exported.tar
+            echo "No valid cache chunks found."
+        fi
+    else
+        echo "No cache found. Will do full build."
+    fi
+
+    df -hT
+}
+
+cache_save() {
+    echo "Saving build cache to GHCR: $CACHE_IMAGE"
+    cd /workdir/openwrt
+
+    echo "Pruning obsolete versions..."
+    for linux_dir in build_dir/target-*/linux-*/; do
+        [ -d "$linux_dir" ] && (cd "$linux_dir" && ls -dt linux-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+    done
+    [ -d "build_dir" ] && (cd build_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+    if [ -d "staging_dir" ]; then
+        (cd staging_dir && ls -dt target-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+        (cd staging_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+    fi
+
+    echo "Packing build_dir, staging_dir, dl..."
+    find dl -type f | xargs -r touch -t 200001010000
+    tar -I "zstd -T0 -10" -cf - build_dir staging_dir dl | split -a 3 -d -b 5000M - /workdir/op_cache_raw_
+
+    cd /workdir
+    echo "FROM scratch" > Dockerfile
+    count=1
+    for f in op_cache_raw_*; do
+        layer_dir="layer$count"
+        mkdir -p "$layer_dir"
+        mv "$f" "$layer_dir/"
+        echo "COPY $layer_dir /" >> Dockerfile
+        count=$((count + 1))
+    done
+
+    docker build -t "$CACHE_IMAGE" .
+    docker push "$CACHE_IMAGE"
+    echo "Cache pushed."
+
+    rm -rf layer* Dockerfile op_cache_raw_* cache_exported.tar
+    docker rmi "$CACHE_IMAGE" -f > /dev/null 2>&1 || true
+    docker builder prune -a -f > /dev/null 2>&1 || true
+    df -hT
 }
 
 config_stage() {
@@ -189,8 +246,10 @@ config_stage() {
 }
 
 case "$STAGE" in
-    pre)    pre_feeds ;;
-    post)   post_feeds ;;
-    config) config_stage ;;
-    *)      echo "Usage: $0 {pre|post|config}"; exit 1 ;;
+    pre)           pre_feeds ;;
+    post)          post_feeds ;;
+    config)        config_stage ;;
+    cache_restore) cache_restore ;;
+    cache_save)    cache_save ;;
+    *)             echo "Usage: $0 {pre|post|config|cache_restore|cache_save}"; exit 1 ;;
 esac
