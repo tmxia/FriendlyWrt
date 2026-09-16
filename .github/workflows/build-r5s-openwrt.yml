@@ -1,4 +1,4 @@
-name: Build R5S Custom Firmware
+name: Build OpenWrt for NanoPi R5S
 
 on:
   watch:
@@ -464,5 +464,5 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           keep_minimum_runs: 0
           retain_days: 0
-          delete_workflow_pattern: "Build R5S Custom Firmware"
+          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
           repository: ${{ github.repository }}
