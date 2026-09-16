@@ -3,9 +3,7 @@ set -e
 
 STAGE="$1"
 
-# Clashoo feed
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
-# Amlogic feed（包含 luci-app-amlogic）
 AMLOGIC_FEED="src-git kenzo https://github.com/kenzok8/openwrt-packages.git"
 
 # ============================================================
@@ -32,10 +30,8 @@ pre_feeds() {
 post_feeds() {
     echo "=====> DIY [post]: 应用定制"
 
-    # 修改默认 IP
     sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
-    # 内核 INET_DIAG（Clashoo 依赖）
     KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
     [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.12"
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
@@ -47,7 +43,15 @@ post_feeds() {
     done
     echo "内核 INET_DIAG 已启用: $KERNEL_CONFIG_FILE"
 
-    # UCI 默认设置（旁路由 + 密码 + 主题）
+    # Docker 需要的内核模块和特性
+    for opt in BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT; do
+        sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
+        sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
+        echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
+    done
+    echo "Docker 内核特性已启用"
+
+    # UCI 默认设置
     mkdir -p files/etc/uci-defaults
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -76,7 +80,7 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    # SSH 配置（Dropbear 2222，OpenSSH 22）
+    # SSH 配置
     cat > files/etc/uci-defaults/99-custom-ssh << 'EOF'
 #!/bin/sh
 /etc/init.d/dropbear stop
@@ -95,16 +99,28 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom-ssh
 
+    # Docker daemon.json 默认配置
+    mkdir -p files/etc/docker
+    cat > files/etc/docker/daemon.json << 'EOF'
+{
+  "data-root": "/opt/docker",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOF
+
     echo "UCI 默认设置已写入"
 }
 
 # ============================================================
-# 阶段三：.config 加载后，make defconfig 前
+# 阶段三：.config 加载后
 # ============================================================
 config_stage() {
     echo "=====> DIY [config]: 调整 .config"
 
-    # 禁用全局构建选项
     for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
         sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || true
         grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
@@ -142,7 +158,7 @@ config_stage() {
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
-    # 确保必需系统包启用
+    # 必需系统包
     ENABLE_PKGS="
     bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
     wireguard-tools python3-light
@@ -155,26 +171,50 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 确保 Clashoo 相关包启用
+    # Clashoo
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 确保 luci-app-amlogic 及依赖启用
-    AMLOGIC_PKGS="
-    luci-app-amlogic luci-lib-nixio block-mount blkid parted curl
-    dosfstools e2fsprogs lsblk pv losetup uuidgen bash perl fdisk
-    "
-    for pkg in $AMLOGIC_PKGS; do
+    # luci-app-amlogic
+    for pkg in luci-app-amlogic luci-lib-nixio; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 确保终端工具启用
+    # TTYD
     for pkg in luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
+    # Docker 核心包
+    DOCKER_PKGS="
+    docker dockerd docker-compose containerd runc tini libnetwork
+    luci-app-dockerman luci-lib-docker luci-i18n-dockerman-zh-cn
+    cgroupfs-mount
+    "
+    for pkg in $DOCKER_PKGS; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
+    # Docker 内核依赖
+    DOCKER_KMODS="
+    kmod-br-netfilter kmod-veth kmod-nf-ipvs kmod-ipt-physdev
+    kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra
+    kmod-nf-nathelper kmod-nf-nathelper-extra
+    kmod-fs-overlay kmod-fuse
+    iptables-nft iptables-zz-legacy
+    iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter
+    ip6tables-nft ip6tables-extra
+    "
+    for pkg in $DOCKER_KMODS; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
@@ -183,7 +223,7 @@ config_stage() {
     # 验证
     echo "=====> 验证关键包"
     MISSING=0
-    for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd; do
+    for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd docker dockerd luci-app-dockerman; do
         if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
             echo "[OK] $pkg"
         else
