@@ -22,6 +22,8 @@ env:
   AUTO_REPLACE_TAG: 'false'
   OPENWRT_VER: '25.12'
   MODEL_NAME: 'R5S'
+  ROOTFS_PARTSIZE: '1024'
+  OPENWRT_BRANCH: 'openwrt-25.12'
 
 jobs:
   init:
@@ -133,7 +135,8 @@ jobs:
             python3 python3-dev python3-pip python3-setuptools python3-pyelftools \
             unzip wget zip zlib1g-dev libelf-dev \
             subversion flex bison libtool autoconf automake cmake \
-            rsync quilt time jq swig
+            rsync quilt time jq swig \
+            device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools
 
       - name: Clone OpenWrt source
         run: |
@@ -175,21 +178,257 @@ jobs:
           cd openwrt
           make -j$(nproc) V=s || make -j1 V=s
 
-      - name: Rename artifacts
-        if: success()
+      # ============================================================
+      # 新增：使用 sd-fuse 打包完整 eMMC 镜像
+      # ============================================================
+      - name: Locate kernel artifacts
         run: |
-          cd openwrt/bin/targets/rockchip/armv8
+          cd openwrt
+
+          TRIPLE_DIR=$(find build_dir -maxdepth 1 -type d -name "target-*_musl" | head -1)
+          [ -z "$TRIPLE_DIR" ] && { echo "::error::target triple not found"; exit 1; }
+          TRIPLE_DIR=$(realpath "$TRIPLE_DIR")
+          echo "TRIPLE_DIR=$TRIPLE_DIR" >> $GITHUB_ENV
+
+          KDIR=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "linux-rockchip*" | head -1)
+          [ -z "$KDIR" ] && { echo "::error::linux-rockchip dir not found"; exit 1; }
+          KDIR=$(realpath "$KDIR")
+          echo "KDIR=$KDIR" >> $GITHUB_ENV
+
+          IMG=$(find "$KDIR" -path "*/arch/arm64/boot/Image" -type f 2>/dev/null | head -1)
+          [ -z "$IMG" ] && { echo "::error::Kernel Image not found"; exit 1; }
+          IMG=$(realpath "$IMG")
+          echo "IMAGE_PATH=$IMG" >> $GITHUB_ENV
+
+          DTB_DIR=$(find "$KDIR" -path "*/arch/arm64/boot/dts/rockchip" -type d 2>/dev/null | head -1)
+          [ -z "$DTB_DIR" ] && { echo "::error::DTB dir not found"; exit 1; }
+          DTB_DIR=$(realpath "$DTB_DIR")
+          echo "DTB_DIR=$DTB_DIR" >> $GITHUB_ENV
+
+          ROOTFS_SRC=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "root-*" | head -1)
+          [ -z "$ROOTFS_SRC" ] && { echo "::error::Rootfs dir not found"; exit 1; }
+          ROOTFS_SRC=$(realpath "$ROOTFS_SRC")
+          echo "ROOTFS_SRC=$ROOTFS_SRC" >> $GITHUB_ENV
+
+          KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
+          echo "KV=$KV" >> $GITHUB_ENV
+          [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules 不是 6.12"; exit 1; }
+
+      - name: Clone sd-fuse_rk3568
+        run: |
+          cd $GITHUB_WORKSPACE
+          rm -rf sd-fuse
+          git clone --depth 1 -b master https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse
+          cd sd-fuse
+          [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
+          echo "[OK] sd-fuse ready"
+
+      - name: Prepare eMMC workspace
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          TGT="friendlywrt25"
+          mkdir -p "$TGT"
+
+          # 下载 eflasher 基础包（提供 uboot、misc 等预编译文件）
+          wget -q http://112.124.9.243/dvdfiles/rk3568/images-for-eflasher/emmc-flasher-images.tgz -O /tmp/emmc-flasher-images.tgz
+          tar xzf /tmp/emmc-flasher-images.tgz
+
+          echo "[OK] eMMC workspace prepared"
+
+      - name: Package kernel.img
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          TGT="friendlywrt25"
+
+          [ -f "$IMAGE_PATH" ] || { echo "::error::Image not found: $IMAGE_PATH"; exit 1; }
+
+          ./tools/mkkrnlimg "$IMAGE_PATH" "$TGT/kernel.img"
+          [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img 未生成"; exit 1; }
+          ls -lh "$TGT/kernel.img"
+
+          cp "$TGT/kernel.img" "$TGT/boot.img"
+
+      - name: Package resource.img
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          TGT="friendlywrt25"
+          IMGFILE="$TGT/resource.img"
+
+          [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
+
+          rm -rf /tmp/dtb-pack
+          mkdir -p /tmp/dtb-pack
+
+          R5S_DTB=""
+          for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
+            if [ -f "$DTB_DIR/$cand" ]; then
+              R5S_DTB="$cand"
+              break
+            fi
+          done
+
+          [ -z "$R5S_DTB" ] && { echo "::error::找不到 rk3568-nanopi-r5s.dtb"; exit 1; }
+
+          cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
+
+          for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
+            [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
+          done
+
+          cd /tmp/dtb-pack
+          DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
+          [ -z "$DTB_LIST" ] && { echo "::error::no dtb files"; exit 1; }
+
+          "$OLDPWD/tools/resource_tool" --pack \
+            --root=. \
+            --image="$OLDPWD/$IMGFILE" \
+            $DTB_LIST
+
+          cd "$OLDPWD"
+          [ -f "$IMGFILE" ] || { echo "::error::resource.img 未生成"; exit 1; }
+          ls -lh "$IMGFILE"
+
+      - name: Stage U-Boot binaries
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          TGT="friendlywrt25"
+          for f in uboot.img idbloader.img MiniLoaderAll.bin misc.img dtbo.img; do
+            [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
+          done
+
+      - name: Build rootfs.img
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          TGT="friendlywrt25"
+
+          [ -d "$ROOTFS_SRC" ] || { echo "::error::Rootfs src not found"; exit 1; }
+
+          rm -rf /tmp/rootfs-pack
+          cp -a "$ROOTFS_SRC" /tmp/rootfs-pack
+          (cd /tmp/rootfs-pack/dev && find . ! -type d -exec rm -f {} \; ) 2>/dev/null || true
+
+          ACTUAL_MB=$(du -sm /tmp/rootfs-pack | awk '{print $1}')
+          echo "=== rootfs 实际内容: ${ACTUAL_MB} MB / 目标分区: ${ROOTFS_PARTSIZE} MB ==="
+          if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
+            echo "::error::rootfs 内容超出 ROOTFS_PARTSIZE"
+            exit 1
+          fi
+
+          LOGICAL_SIZE=$(( ROOTFS_PARTSIZE * 1024 * 1024 ))
+          IMG_BLK=$(( LOGICAL_SIZE / 4096 ))
+          INODE_SIZE=$(( $(find /tmp/rootfs-pack | wc -l) + 128 ))
+
+          MKFS="$PWD/tools/mke2fs"
+          MKFS_CONF="$PWD/tools/mke2fs.conf"
+
+          rm -f "$TGT/rootfs.img"
+          MKE2FS_CONFIG="$MKFS_CONF" \
+            "$MKFS" -N "$INODE_SIZE" \
+              -E android_sparse -t ext4 -L rootfs -M /root -b 4096 -0 \
+              -d /tmp/rootfs-pack "$TGT/rootfs.img" "$IMG_BLK"
+
+          [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img 生成失败"; exit 1; }
+          ls -lh "$TGT/rootfs.img"
+
+          echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
+
+      - name: Generate parameter.txt
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          [ -z "$ROOTFS_SIZE_BYTES" ] && { echo "::error::ROOTFS_SIZE_BYTES 未设置"; exit 1; }
+          PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
+            ./tools/generate-partmap-txt.sh "$ROOTFS_SIZE_BYTES" "friendlywrt25"
+          cat "friendlywrt25/parameter.txt"
+
+      - name: Build SD card image (gz)
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          export SDFUSE_NONINTERACTIVE=y
+          sudo -E ./mk-sd-image.sh friendlywrt25 2>&1 | tee /tmp/sd-image.log | tail -60 || {
+            tail -120 /tmp/sd-image.log
+            exit 1
+          }
+          ls -lh out/
+
+          if grep -q "more than capacity" /tmp/sd-image.log; then
+            echo "::error::mk-sd-image.sh 跳过了 rootfs 写入"
+            exit 1
+          fi
+
+      - name: Build eMMC flasher image (tgz)
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          export SDFUSE_NONINTERACTIVE=y
+          sudo -E ./mk-emmc-image.sh friendlywrt25 autostart=yes 2>&1 | tee /tmp/emmc-image.log | tail -40 || {
+            tail -80 /tmp/emmc-image.log
+            exit 1
+          }
+          ls -lh out/images-for-eflasher/
+
+      - name: Fix file ownership
+        run: |
+          cd $GITHUB_WORKSPACE/sd-fuse
+          sudo chown -R "$(id -u):$(id -g)" out/ friendlywrt25/ 2>/dev/null || true
+
+      - name: Rename and collect artifacts
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/artifact
+          cd $GITHUB_WORKSPACE/sd-fuse
+
           DATE=$(date +%Y.%m.%d)
           PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
-          for f in *friendlyarm_nanopi-r5s*sysupgrade.img.gz; do
-            [ -f "$f" ] && mv "$f" "${PREFIX}-sysupgrade.img.gz"
-          done
-          for f in *friendlyarm_nanopi-r5s*.manifest; do
-            [ -f "$f" ] && mv "$f" "${PREFIX}-manifest.txt"
-          done
+          # 1) SD 卡完整镜像 (gz)
+          SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
+          if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
+            SRC_SIZE_MB=$(( $(stat -c%s "$SRC_IMG") / 1024 / 1024 ))
+            echo "[INFO] SD 镜像大小: ${SRC_SIZE_MB} MB"
+            if [ "$SRC_SIZE_MB" -lt 200 ]; then
+              echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入"
+              exit 1
+            fi
 
-          echo "=== 重命名后的产物 ==="
+            DST_NAME="${PREFIX}-sdcard.img"
+            cp "$SRC_IMG" "/tmp/${DST_NAME}"
+            gzip -f "/tmp/${DST_NAME}"
+            cp "/tmp/${DST_NAME}.gz" $GITHUB_WORKSPACE/artifact/
+            echo "[OK] SD image: ${DST_NAME}.gz"
+          else
+            echo "::error::未找到 sd-fuse 生成的 .img"
+            exit 1
+          fi
+
+          # 2) eMMC 刷机包 (tgz)
+          SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
+          if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
+            DST_NAME="${PREFIX}-emmc-flasher.tgz"
+            cp "$SRC_TGZ" "$GITHUB_WORKSPACE/artifact/${DST_NAME}"
+            echo "[OK] eMMC pack: ${DST_NAME}"
+          else
+            echo "::warning::未找到 eMMC 刷机包"
+          fi
+
+          # 3) OpenWrt 原生 sysupgrade 镜像
+          OPENWRT_SYSUP=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
+            -name "*nanopi-r5s*sysupgrade.img.gz" -type f 2>/dev/null | head -1)
+          if [ -n "$OPENWRT_SYSUP" ]; then
+            DST_NAME="${PREFIX}-sysupgrade.img.gz"
+            cp "$OPENWRT_SYSUP" "$GITHUB_WORKSPACE/artifact/${DST_NAME}"
+            echo "[OK] OpenWrt sysupgrade: ${DST_NAME}"
+          fi
+
+          # 4) manifest
+          OPENWRT_MANIFEST=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
+            -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
+          [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd $GITHUB_WORKSPACE/artifact
+          rm -f SHA256SUMS
+          for f in *; do
+            [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
+          done
           ls -lh
 
       - name: Upload firmware artifact
@@ -197,7 +436,7 @@ jobs:
         if: success()
         with:
           name: r5s-firmware
-          path: openwrt/bin/targets/rockchip/armv8/*.gz
+          path: artifact/
           retention-days: 30
 
       - name: Upload to release
@@ -208,8 +447,10 @@ jobs:
         with:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: |
-            openwrt/bin/targets/rockchip/armv8/*.img.gz
-            openwrt/bin/targets/rockchip/armv8/*-manifest.txt
+            artifact/*.gz
+            artifact/*.tgz
+            artifact/*-manifest.txt
+            artifact/SHA256SUMS
           overwrite: true
 
   cleanup_self:
