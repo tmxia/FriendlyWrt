@@ -6,11 +6,7 @@ STAGE="$1"
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
 AMLOGIC_FEED="src-git kenzo https://github.com/kenzok8/openwrt-packages.git"
 
-# ============================================================
-# 阶段一：feeds 更新前
-# ============================================================
 pre_feeds() {
-    echo "=====> DIY [pre]: 配置 feeds"
     [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
 
     sed -i '/^#/d' feeds.conf
@@ -19,39 +15,23 @@ pre_feeds() {
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
     grep -q "src-git kenzo" feeds.conf || echo "$AMLOGIC_FEED" >> feeds.conf
-
-    echo "feeds.conf 已更新："
-    grep -E "clashoo|kenzo" feeds.conf
 }
 
-# ============================================================
-# 阶段二：feeds 更新后
-# ============================================================
 post_feeds() {
-    echo "=====> DIY [post]: 应用定制"
-
     sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
     KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
     [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.12"
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
-    for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG; do
+
+    for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
+               BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT; do
         sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
         sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
-    echo "内核 INET_DIAG 已启用: $KERNEL_CONFIG_FILE"
 
-    # Docker 需要的内核模块和特性
-    for opt in BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT; do
-        sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
-        sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
-        echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
-    done
-    echo "Docker 内核特性已启用"
-
-    # UCI 默认设置
     mkdir -p files/etc/uci-defaults
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
@@ -80,7 +60,6 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    # SSH 配置
     cat > files/etc/uci-defaults/99-custom-ssh << 'EOF'
 #!/bin/sh
 /etc/init.d/dropbear stop
@@ -99,7 +78,6 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom-ssh
 
-    # Docker daemon.json 默认配置
     mkdir -p files/etc/docker
     cat > files/etc/docker/daemon.json << 'EOF'
 {
@@ -111,22 +89,14 @@ EOF
   }
 }
 EOF
-
-    echo "UCI 默认设置已写入"
 }
 
-# ============================================================
-# 阶段三：.config 加载后
-# ============================================================
 config_stage() {
-    echo "=====> DIY [config]: 调整 .config"
-
     for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
         sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || true
         grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
     done
 
-    # 需要禁用的第三方插件
     DISABLE_PKGS="
     adblock luci-app-adblock
     aria2 luci-app-aria2
@@ -158,7 +128,6 @@ config_stage() {
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
-    # 必需系统包
     ENABLE_PKGS="
     bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
     wireguard-tools python3-light
@@ -171,57 +140,23 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # Clashoo
-    for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+    for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag \
+               luci-app-amlogic luci-lib-nixio \
+               luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
+               docker dockerd docker-compose containerd runc tini libnetwork \
+               luci-app-dockerman luci-lib-docker luci-i18n-dockerman-zh-cn cgroupfs-mount \
+               kmod-br-netfilter kmod-veth kmod-nf-ipvs kmod-ipt-physdev \
+               kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
+               kmod-nf-nathelper kmod-nf-nathelper-extra \
+               kmod-fs-overlay kmod-fuse \
+               iptables-nft iptables-zz-legacy \
+               iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
+               ip6tables-nft ip6tables-extra; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # luci-app-amlogic
-    for pkg in luci-app-amlogic luci-lib-nixio; do
-        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-    done
-
-    # TTYD
-    for pkg in luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn; do
-        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-    done
-
-    # Docker 核心包
-    DOCKER_PKGS="
-    docker dockerd docker-compose containerd runc tini libnetwork
-    luci-app-dockerman luci-lib-docker luci-i18n-dockerman-zh-cn
-    cgroupfs-mount
-    "
-    for pkg in $DOCKER_PKGS; do
-        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-    done
-
-    # Docker 内核依赖
-    DOCKER_KMODS="
-    kmod-br-netfilter kmod-veth kmod-nf-ipvs kmod-ipt-physdev
-    kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra
-    kmod-nf-nathelper kmod-nf-nathelper-extra
-    kmod-fs-overlay kmod-fuse
-    iptables-nft iptables-zz-legacy
-    iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter
-    ip6tables-nft ip6tables-extra
-    "
-    for pkg in $DOCKER_KMODS; do
-        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
-        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-    done
-
-    # 验证
-    echo "=====> 验证关键包"
     MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd docker dockerd luci-app-dockerman; do
         if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
