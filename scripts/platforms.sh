@@ -27,11 +27,7 @@ done
 
 matrix_json="${matrix_json%,}]"
 
-# 关键：压缩成单行 JSON 再输出
 COMPRESSED_MATRIX=$(echo "$matrix_json" | jq -c .)
 
-echo "=== Matrix JSON ==="
 echo "$COMPRESSED_MATRIX"
-echo "==================="
-
 echo "matrix=$COMPRESSED_MATRIX" >> "$GITHUB_OUTPUT"
