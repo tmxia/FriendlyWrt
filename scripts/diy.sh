@@ -1,347 +1,205 @@
-#
-# OpenWrt Configuration - R5S 精简版
-# OpenWrt 25.12 / Linux 6.12
-#
+#!/bin/bash
+set -e
 
-CONFIG_MODULES=y
-CONFIG_HAVE_DOT_CONFIG=y
-CONFIG_HOST_OS_LINUX=y
-# CONFIG_HOST_OS_MACOS is not set
+STAGE="$1"
 
-# ==================== 目标平台 ====================
-CONFIG_TARGET_rockchip=y
-CONFIG_TARGET_rockchip_armv8=y
-CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y
-CONFIG_TARGET_BOARD="rockchip"
-CONFIG_TARGET_SUBTARGET="armv8"
-CONFIG_TARGET_PROFILE="DEVICE_friendlyarm_nanopi-r5s"
-CONFIG_TARGET_ARCH_PACKAGES="aarch64_generic"
-CONFIG_DEFAULT_TARGET_OPTIMIZATION="-Os -pipe -mcpu=generic"
-CONFIG_CPU_TYPE="generic"
-CONFIG_LINUX_6_12=y
+# Clashoo feed
+CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
+# Amlogic feed（包含 luci-app-amlogic）
+AMLOGIC_FEED="src-git kenzo https://github.com/kenzok8/openwrt-packages.git"
 
-# ==================== 平台特性 ====================
-CONFIG_HAS_SUBTARGETS=y
-CONFIG_HAS_DEVICES=y
-CONFIG_HAS_FPU=y
-CONFIG_AUDIO_SUPPORT=y
-CONFIG_GPIO_SUPPORT=y
-CONFIG_PCI_SUPPORT=y
-CONFIG_PCIE_SUPPORT=y
-CONFIG_PINCTRL_SUPPORT=y
-CONFIG_PWM_SUPPORT=y
-CONFIG_USB_SUPPORT=y
-CONFIG_USB_GADGET_SUPPORT=y
-CONFIG_RTC_SUPPORT=y
-CONFIG_USES_PM=y
-CONFIG_USES_DEVICETREE=y
-CONFIG_USES_SQUASHFS=y
-CONFIG_USES_EXT4=y
-CONFIG_ARCH_64BIT=y
-CONFIG_USES_ROOTFS_PART=y
-CONFIG_USES_BOOT_PART=y
-CONFIG_aarch64=y
-CONFIG_ARCH="aarch64"
+# ============================================================
+# 阶段一：feeds 更新前
+# ============================================================
+pre_feeds() {
+    echo "=====> DIY [pre]: 配置 feeds"
+    [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
 
-# ==================== 默认包 ====================
-CONFIG_DEFAULT_base-files=y
-CONFIG_DEFAULT_ca-bundle=y
-CONFIG_DEFAULT_dnsmasq=y
-CONFIG_DEFAULT_dropbear=y
-CONFIG_DEFAULT_e2fsprogs=y
-CONFIG_DEFAULT_firewall4=y
-CONFIG_DEFAULT_fstools=y
-CONFIG_DEFAULT_kmod-gpio-button-hotplug=y
-CONFIG_DEFAULT_kmod-nft-offload=y
-CONFIG_DEFAULT_kmod-r8169=y
-CONFIG_DEFAULT_libc=y
-CONFIG_DEFAULT_libgcc=y
-CONFIG_DEFAULT_libustream-mbedtls=y
-CONFIG_DEFAULT_logd=y
-CONFIG_DEFAULT_mkf2fs=y
-CONFIG_DEFAULT_mtd=y
-CONFIG_DEFAULT_netifd=y
-CONFIG_DEFAULT_nftables=y
-CONFIG_DEFAULT_odhcp6c=y
-CONFIG_DEFAULT_odhcpd-ipv6only=y
-CONFIG_DEFAULT_partx-utils=y
-CONFIG_DEFAULT_ppp=y
-CONFIG_DEFAULT_ppp-mod-pppoe=y
-CONFIG_DEFAULT_procd-ujail=y
-CONFIG_DEFAULT_uboot-envtools=y
-CONFIG_DEFAULT_uci=y
-CONFIG_DEFAULT_uclient-fetch=y
-CONFIG_DEFAULT_urandom-seed=y
-CONFIG_DEFAULT_urngd=y
+    sed -i '/^#/d' feeds.conf
+    sed -i -e 's|git.openwrt.org/feed|github.com/openwrt|g' \
+           -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
-# ==================== 镜像配置 ====================
-CONFIG_TARGET_ROOTFS_EXT4FS=y
-CONFIG_TARGET_EXT4_RESERVED_PCT=0
-CONFIG_TARGET_EXT4_BLOCKSIZE_4K=y
-CONFIG_TARGET_EXT4_BLOCKSIZE=4096
-CONFIG_TARGET_EXT4_JOURNAL=y
-CONFIG_TARGET_ROOTFS_SQUASHFS=y
-CONFIG_TARGET_SQUASHFS_BLOCK_SIZE=256
-CONFIG_TARGET_SQUASHFS_BLOCK_READERS=4
-CONFIG_TARGET_IMAGES_GZIP=y
-CONFIG_TARGET_KERNEL_PARTSIZE=256
-CONFIG_TARGET_ROOTFS_PARTSIZE=1024
+    grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
+    grep -q "src-git kenzo" feeds.conf || echo "$AMLOGIC_FEED" >> feeds.conf
 
-# ==================== 全局构建 ====================
-CONFIG_JSON_OVERVIEW_IMAGE_INFO=y
-CONFIG_SIGNED_PACKAGES=y
-CONFIG_SIGNATURE_CHECK=y
-CONFIG_DOWNLOAD_CHECK_CERTIFICATE=y
-CONFIG_USE_APK=y
-CONFIG_SHADOW_PASSWORDS=y
-CONFIG_KERNEL_PRINTK=y
-CONFIG_KERNEL_KALLSYMS=y
-CONFIG_KERNEL_AIO=y
-CONFIG_KERNEL_IO_URING=y
-CONFIG_KERNEL_FHANDLE=y
-CONFIG_KERNEL_CGROUPS=y
-CONFIG_KERNEL_NAMESPACES=y
-CONFIG_KERNEL_SECCOMP_FILTER=y
-CONFIG_KERNEL_SECCOMP=y
-CONFIG_KERNEL_IPV6=y
-CONFIG_KERNEL_MPTCP=y
-CONFIG_KERNEL_MPTCP_IPV6=y
-CONFIG_IPV6=y
-CONFIG_USE_MUSL=y
-CONFIG_GCC_VERSION="14.3.0"
-CONFIG_LIBC="musl"
-CONFIG_TARGET_SUFFIX="musl"
-CONFIG_USE_SECCOMP=y
-CONFIG_USE_SSTRIP=y
-CONFIG_MOLD=y
+    echo "feeds.conf 已更新："
+    grep -E "clashoo|kenzo" feeds.conf
+}
 
-# ==================== 基础系统 ====================
-CONFIG_PACKAGE_apk-mbedtls=y
-CONFIG_PACKAGE_base-files=y
-CONFIG_PACKAGE_busybox=y
-CONFIG_PACKAGE_ca-bundle=y
-CONFIG_PACKAGE_ca-certificates=y
-CONFIG_PACKAGE_dnsmasq-full=y
-CONFIG_PACKAGE_dnsmasq_full_dhcp=y
-CONFIG_PACKAGE_dnsmasq_full_dhcpv6=y
-CONFIG_PACKAGE_dnsmasq_full_dnssec=y
-CONFIG_PACKAGE_dnsmasq_full_auth=y
-CONFIG_PACKAGE_dnsmasq_full_ipset=y
-CONFIG_PACKAGE_dnsmasq_full_nftset=y
-CONFIG_PACKAGE_dnsmasq_full_conntrack=y
-CONFIG_PACKAGE_dnsmasq_full_noid=y
-CONFIG_PACKAGE_dnsmasq_full_tftp=y
-CONFIG_PACKAGE_dropbear=y
-CONFIG_PACKAGE_firewall4=y
-CONFIG_PACKAGE_fstools=y
-CONFIG_PACKAGE_fwtool=y
-CONFIG_PACKAGE_getrandom=y
-CONFIG_PACKAGE_jsonfilter=y
-CONFIG_PACKAGE_libatomic=y
-CONFIG_PACKAGE_libc=y
-CONFIG_PACKAGE_libgcc=y
-CONFIG_PACKAGE_libpthread=y
-CONFIG_PACKAGE_librt=y
-CONFIG_PACKAGE_libstdcpp=y
-CONFIG_PACKAGE_logd=y
-CONFIG_PACKAGE_mtd=y
-CONFIG_PACKAGE_netifd=y
-CONFIG_PACKAGE_openwrt-keyring=y
-CONFIG_PACKAGE_procd=y
-CONFIG_PACKAGE_procd-seccomp=y
-CONFIG_PACKAGE_procd-ujail=y
-CONFIG_PACKAGE_resolveip=y
-CONFIG_PACKAGE_rpcd=y
-CONFIG_PACKAGE_rpcd-mod-file=y
-CONFIG_PACKAGE_rpcd-mod-iwinfo=y
-CONFIG_PACKAGE_rpcd-mod-rpcsys=y
-CONFIG_PACKAGE_rpcd-mod-ucode=y
-CONFIG_PACKAGE_ubox=y
-CONFIG_PACKAGE_ubus=y
-CONFIG_PACKAGE_ubusd=y
-CONFIG_PACKAGE_uci=y
-CONFIG_PACKAGE_urandom-seed=y
-CONFIG_PACKAGE_urngd=y
-CONFIG_PACKAGE_usign=y
+# ============================================================
+# 阶段二：feeds 更新后
+# ============================================================
+post_feeds() {
+    echo "=====> DIY [post]: 应用定制"
 
-# ==================== 基础 LuCI ====================
-CONFIG_PACKAGE_luci=y
-CONFIG_PACKAGE_luci-base=y
-CONFIG_PACKAGE_luci-compat=y
-CONFIG_PACKAGE_luci-lua-runtime=y
-CONFIG_PACKAGE_luci-mod-admin-full=y
-CONFIG_PACKAGE_luci-mod-network=y
-CONFIG_PACKAGE_luci-mod-status=y
-CONFIG_PACKAGE_luci-mod-system=y
-CONFIG_PACKAGE_luci-app-firewall=y
-CONFIG_PACKAGE_luci-app-opkg=y
-CONFIG_PACKAGE_luci-proto-ipv6=y
-CONFIG_PACKAGE_luci-proto-ppp=y
-CONFIG_PACKAGE_luci-theme-bootstrap=y
-CONFIG_PACKAGE_luci-light=y
-CONFIG_PACKAGE_luci-ssl=y
+    # 修改默认 IP
+    sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
-# ==================== LuCI 中文 ====================
-CONFIG_LUCI_LANG_zh_Hans=y
-CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-CONFIG_PACKAGE_luci-i18n-firewall-zh-cn=y
+    # 内核 INET_DIAG（Clashoo 依赖）
+    KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
+    [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.12"
+    KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
+    touch "$KERNEL_CONFIG_FILE"
+    for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG; do
+        sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
+        sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
+        echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
+    done
+    echo "内核 INET_DIAG 已启用: $KERNEL_CONFIG_FILE"
 
-# ==================== 用户定制：必需系统包 ====================
-CONFIG_PACKAGE_bc=y
-CONFIG_PACKAGE_vsftpd=y
-CONFIG_PACKAGE_sudo=y
-CONFIG_PACKAGE_unzip=y
-CONFIG_PACKAGE_file=y
-CONFIG_PACKAGE_logrotate=y
-CONFIG_PACKAGE_coreutils-stat=y
-CONFIG_PACKAGE_lsof=y
-CONFIG_PACKAGE_jq=y
-CONFIG_PACKAGE_wireguard-tools=y
-CONFIG_PACKAGE_kmod-wireguard=y
-CONFIG_PACKAGE_python3-light=y
-CONFIG_PACKAGE_python3-base=y
-CONFIG_PACKAGE_libpython3=y
+    # UCI 默认设置（旁路由 + 密码 + 主题）
+    mkdir -p files/etc/uci-defaults
+    cat > files/etc/uci-defaults/99-custom << 'EOF'
+#!/bin/sh
+uci set network.lan.ipaddr='192.168.3.3/24'
+uci set network.lan.gateway='192.168.3.1'
+uci set network.lan.dns='192.168.3.1'
+uci delete network.lan.netmask 2>/dev/null
+uci commit network
+uci set dhcp.lan.ignore='1'
+uci commit dhcp
+uci set firewall.@zone[0].network='lan'
+uci commit firewall
+uci set network.wan.clientid=''
+uci commit network
 
-# ==================== 用户定制：Clashoo 插件 ====================
-CONFIG_PACKAGE_clashoo=y
-CONFIG_PACKAGE_luci-app-clashoo=y
-CONFIG_PACKAGE_luci-i18n-clashoo-zh-cn=y
-CONFIG_PACKAGE_kmod-inet-diag=y
+printf "tony\ntony\n" | passwd root
 
-# ==================== 用户定制：luci-app-amlogic（晶晨宝盒）====================
-CONFIG_PACKAGE_luci-app-amlogic=y
-CONFIG_PACKAGE_luci-lib-nixio=y
-CONFIG_PACKAGE_block-mount=y
-CONFIG_PACKAGE_blkid=y
-CONFIG_PACKAGE_parted=y
-CONFIG_PACKAGE_curl=y
-CONFIG_PACKAGE_dosfstools=y
-CONFIG_PACKAGE_e2fsprogs=y
-CONFIG_PACKAGE_lsblk=y
-CONFIG_PACKAGE_pv=y
-CONFIG_PACKAGE_losetup=y
-CONFIG_PACKAGE_uuidgen=y
-CONFIG_PACKAGE_bash=y
-CONFIG_PACKAGE_perl=y
-CONFIG_PACKAGE_fdisk=y
+uci set luci.main.mediaurlbase='/luci-static/bootstrap'
+uci delete luci.themes.Argon 2>/dev/null || true
+uci commit luci
+rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null
+/etc/init.d/uhttpd restart
+/etc/init.d/network restart
+/etc/init.d/firewall restart
+exit 0
+EOF
+    chmod +x files/etc/uci-defaults/99-custom
 
-# ==================== 用户定制：终端工具（TTYD）====================
-CONFIG_PACKAGE_luci-app-ttyd=y
-CONFIG_PACKAGE_ttyd=y
-CONFIG_PACKAGE_luci-i18n-ttyd-zh-cn=y
+    # SSH 配置（Dropbear 2222，OpenSSH 22）
+    cat > files/etc/uci-defaults/99-custom-ssh << 'EOF'
+#!/bin/sh
+/etc/init.d/dropbear stop
+/etc/init.d/sshd stop 2>/dev/null
+uci set dropbear.@dropbear[0].Port='2222'
+uci commit dropbear
+SSHD_CONFIG="/etc/ssh/sshd_config"
+if [ -f "$SSHD_CONFIG" ]; then
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
+    sed -i 's/^#*Port.*/Port 22/' "$SSHD_CONFIG"
+fi
+/etc/init.d/dropbear start
+/etc/init.d/sshd enable 2>/dev/null
+/etc/init.d/sshd start 2>/dev/null
+exit 0
+EOF
+    chmod +x files/etc/uci-defaults/99-custom-ssh
 
-# ==================== 网络基础 ====================
-CONFIG_PACKAGE_ppp=y
-CONFIG_PACKAGE_ppp-mod-pppoe=y
-CONFIG_PACKAGE_odhcp6c=y
-CONFIG_PACKAGE_odhcpd-ipv6only=y
-CONFIG_PACKAGE_uboot-envtools=y
+    echo "UCI 默认设置已写入"
+}
 
-# ==================== 内核基础模块 ====================
-# Netfilter / nftables
-CONFIG_PACKAGE_kmod-nf-conntrack=y
-CONFIG_PACKAGE_kmod-nf-conntrack6=y
-CONFIG_PACKAGE_kmod-nf-conntrack-netlink=y
-CONFIG_PACKAGE_kmod-nf-flow=y
-CONFIG_PACKAGE_kmod-nf-nat=y
-CONFIG_PACKAGE_kmod-nf-reject=y
-CONFIG_PACKAGE_kmod-nf-reject6=y
-CONFIG_PACKAGE_kmod-nf-socket=y
-CONFIG_PACKAGE_kmod-nf-tproxy=y
-CONFIG_PACKAGE_kmod-nfnetlink=y
-CONFIG_PACKAGE_kmod-nft-core=y
-CONFIG_PACKAGE_kmod-nft-fib=y
-CONFIG_PACKAGE_kmod-nft-nat=y
-CONFIG_PACKAGE_kmod-nft-netdev=y
-CONFIG_PACKAGE_kmod-nft-offload=y
-CONFIG_PACKAGE_kmod-nft-socket=y
-CONFIG_PACKAGE_kmod-nft-tproxy=y
-CONFIG_PACKAGE_kmod-nft-compat=y
-CONFIG_PACKAGE_kmod-nft-bridge=y
+# ============================================================
+# 阶段三：.config 加载后，make defconfig 前
+# ============================================================
+config_stage() {
+    echo "=====> DIY [config]: 调整 .config"
 
-# iptables
-CONFIG_PACKAGE_kmod-ipt-core=y
-CONFIG_PACKAGE_kmod-ipt-conntrack=y
-CONFIG_PACKAGE_kmod-ipt-conntrack-extra=y
-CONFIG_PACKAGE_kmod-ipt-nat=y
-CONFIG_PACKAGE_kmod-ipt-tproxy=y
-CONFIG_PACKAGE_kmod-ipt-socket=y
-CONFIG_PACKAGE_kmod-ipt-ipset=y
-CONFIG_PACKAGE_kmod-ipt-ipopt=y
-CONFIG_PACKAGE_kmod-ipt-iprange=y
+    # 禁用全局构建选项
+    for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
+        sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || true
+        grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
+    done
 
-# 网络接口
-CONFIG_PACKAGE_kmod-tun=y
-CONFIG_PACKAGE_kmod-veth=y
-CONFIG_PACKAGE_kmod-dummy=y
-CONFIG_PACKAGE_kmod-ifb=y
-CONFIG_PACKAGE_kmod-macvlan=y
-CONFIG_PACKAGE_kmod-inet-diag=y
-CONFIG_PACKAGE_kmod-netlink-diag=y
+    # 需要禁用的第三方插件
+    DISABLE_PKGS="
+    adblock luci-app-adblock
+    aria2 luci-app-aria2
+    sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
+    ddns-scripts luci-app-ddns
+    miniupnpd-nftables luci-app-upnp
+    samba4-libs samba4-server luci-app-samba4
+    minidlna luci-app-minidlna
+    luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official
+    iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
+    luci-app-diskman collectd luci-app-statistics
+    luci-app-watchcat luci-theme-openwrt-2020
+    luci-app-cpufreq luci-i18n-cpufreq-zh-cn
+    luci-app-hd-idle hd-idle luci-i18n-hd-idle-zh-cn
+    luci-app-nlbwmon nlbwmon luci-i18n-nlbwmon-zh-cn
+    luci-app-smartdns smartdns luci-i18n-smartdns-zh-cn
+    luci-app-openclash luci-app-passwall luci-app-passwall2
+    luci-app-ssr-plus luci-app-homeproxy luci-app-mosdns
+    luci-app-adguardhome luci-app-ddns-go luci-app-netdata
+    luci-app-vlmcsd luci-app-vnstat2 luci-app-wechatpush
+    luci-app-keepalived luci-app-ramfree luci-app-rustdesk-server
+    luci-app-udpxy luci-app-wol
+    luci-theme-argon luci-theme-aurora luci-theme-kucat
+    luci-theme-material luci-theme-material3 luci-theme-openwrt
+    "
+    for pkg in $DISABLE_PKGS; do
+        sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+        grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+          echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+    done
 
-# 网络设备驱动
-CONFIG_PACKAGE_kmod-r8169=y
-CONFIG_PACKAGE_kmod-r8168-rss=y
-CONFIG_PACKAGE_kmod-r8125-rss=y
-CONFIG_PACKAGE_kmod-r8126-rss=y
-CONFIG_PACKAGE_kmod-r8127-rss=y
-CONFIG_PACKAGE_kmod-usb-net=y
-CONFIG_PACKAGE_kmod-usb-net-rtl8152=y
-CONFIG_PACKAGE_kmod-usb-net-asix=y
-CONFIG_PACKAGE_kmod-usb-net-asix-ax88179=y
+    # 确保必需系统包启用
+    ENABLE_PKGS="
+    bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
+    wireguard-tools python3-light
+    bash perl parted curl dosfstools e2fsprogs lsblk pv losetup uuidgen fdisk
+    block-mount blkid
+    "
+    for pkg in $ENABLE_PKGS; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
+        grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
 
-# 存储
-CONFIG_PACKAGE_kmod-usb-core=y
-CONFIG_PACKAGE_kmod-usb-storage=y
-CONFIG_PACKAGE_kmod-usb-storage-extras=y
-CONFIG_PACKAGE_kmod-usb-storage-uas=y
-CONFIG_PACKAGE_kmod-fs-ext4=y
-CONFIG_PACKAGE_kmod-fs-vfat=y
-CONFIG_PACKAGE_kmod-fs-exfat=y
-CONFIG_PACKAGE_kmod-fs-ntfs3=y
-CONFIG_PACKAGE_kmod-fs-btrfs=y
-CONFIG_PACKAGE_kmod-fs-cifs=y
+    # 确保 Clashoo 相关包启用
+    for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
 
-# 加密
-CONFIG_PACKAGE_kmod-crypto-aead=y
-CONFIG_PACKAGE_kmod-crypto-authenc=y
-CONFIG_PACKAGE_kmod-crypto-cbc=y
-CONFIG_PACKAGE_kmod-crypto-ccm=y
-CONFIG_PACKAGE_kmod-crypto-chacha20poly1305=y
-CONFIG_PACKAGE_kmod-crypto-cmac=y
-CONFIG_PACKAGE_kmod-crypto-crc32c=y
-CONFIG_PACKAGE_kmod-crypto-ctr=y
-CONFIG_PACKAGE_kmod-crypto-des=y
-CONFIG_PACKAGE_kmod-crypto-ecb=y
-CONFIG_PACKAGE_kmod-crypto-gcm=y
-CONFIG_PACKAGE_kmod-crypto-gf128=y
-CONFIG_PACKAGE_kmod-crypto-ghash=y
-CONFIG_PACKAGE_kmod-crypto-hash=y
-CONFIG_PACKAGE_kmod-crypto-hmac=y
-CONFIG_PACKAGE_kmod-crypto-md5=y
-CONFIG_PACKAGE_kmod-crypto-sha1=y
-CONFIG_PACKAGE_kmod-crypto-sha256=y
-CONFIG_PACKAGE_kmod-crypto-sha512=y
-CONFIG_PACKAGE_kmod-crypto-xts=y
+    # 确保 luci-app-amlogic 及依赖启用
+    AMLOGIC_PKGS="
+    luci-app-amlogic luci-lib-nixio block-mount blkid parted curl
+    dosfstools e2fsprogs lsblk pv losetup uuidgen bash perl fdisk
+    "
+    for pkg in $AMLOGIC_PKGS; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
 
-# 基础库
-CONFIG_PACKAGE_kmod-lib-crc-ccitt=y
-CONFIG_PACKAGE_kmod-lib-crc32c=y
-CONFIG_PACKAGE_kmod-lib-lzo=y
-CONFIG_PACKAGE_kmod-lib-zlib-deflate=y
-CONFIG_PACKAGE_kmod-lib-zlib-inflate=y
-CONFIG_PACKAGE_kmod-lib-zstd=y
+    # 确保终端工具启用
+    for pkg in luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
 
-# 基础工具
-CONFIG_PACKAGE_kmod-gpio-button-hotplug=y
-CONFIG_PACKAGE_kmod-hwmon-core=y
-CONFIG_PACKAGE_kmod-i2c-core=y
-CONFIG_PACKAGE_kmod-input-core=y
-CONFIG_PACKAGE_kmod-input-evdev=y
-CONFIG_PACKAGE_kmod-usb-hid=y
-CONFIG_PACKAGE_kmod-scsi-core=y
-CONFIG_PACKAGE_kmod-md-mod=y
-CONFIG_PACKAGE_kmod-md-raid0=y
-CONFIG_PACKAGE_kmod-md-raid1=y
-CONFIG_PACKAGE_kmod-md-raid10=y
-CONFIG_PACKAGE_kmod-md-raid456=y
+    # 验证
+    echo "=====> 验证关键包"
+    MISSING=0
+    for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd; do
+        if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
+            echo "[OK] $pkg"
+        else
+            echo "[FAIL] $pkg"
+            MISSING=1
+        fi
+    done
+    if [ $MISSING -eq 1 ]; then
+        echo "ERROR: 关键包未启用，中止。"
+        exit 1
+    fi
+}
+
+case "$STAGE" in
+    pre)    pre_feeds ;;
+    post)   post_feeds ;;
+    config) config_stage ;;
+    *)      echo "Usage: $0 {pre|post|config}"; exit 1 ;;
+esac
