@@ -18,18 +18,29 @@ pre_feeds() {
     if [ -f tools/libtool/Makefile ]; then
         python3 - << 'PYEOF'
 import re
+
 path = 'tools/libtool/Makefile'
 with open(path) as f:
     content = f.read()
-old = '(cd $(HOST_BUILD_DIR);'
-new = '(cd $(HOST_BUILD_DIR); rm -rf .git; git init -q . 2>/dev/null || true; git config user.email ci@local 2>/dev/null || true; git config user.name CI 2>/dev/null || true;'
-if old in content and 'rm -rf .git; git init' not in content:
-    content = content.replace(old, new, 1)
-    with open(path, 'w') as f:
-        f.write(content)
-    print('patched tools/libtool/Makefile')
+
+if 'rm -rf .git; git init' in content:
+    print('tools/libtool/Makefile: already patched')
 else:
-    print('tools/libtool/Makefile: no change needed')
+    pattern = r'(\(\s*cd \$\(HOST_BUILD_DIR\)\s*;)'
+    replacement = (
+        r'\1 '
+        r'rm -rf .git; '
+        r'git init -q . >/dev/null 2>&1 || true; '
+        r'git config user.email ci@local >/dev/null 2>&1 || true; '
+        r'git config user.name CI >/dev/null 2>&1 || true; '
+    )
+    new_content, n = re.subn(pattern, replacement, content, count=1)
+    if n > 0:
+        with open(path, 'w') as f:
+            f.write(new_content)
+        print('tools/libtool/Makefile: patched')
+    else:
+        print('tools/libtool/Makefile: pattern not found, skipping')
 PYEOF
     fi
 }
