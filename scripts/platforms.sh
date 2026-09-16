@@ -26,4 +26,12 @@ for source_platform in "${source_code_platforms[@]}"; do
 done
 
 matrix_json="${matrix_json%,}]"
-echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
+
+# 关键：压缩成单行 JSON 再输出
+COMPRESSED_MATRIX=$(echo "$matrix_json" | jq -c .)
+
+echo "=== Matrix JSON ==="
+echo "$COMPRESSED_MATRIX"
+echo "==================="
+
+echo "matrix=$COMPRESSED_MATRIX" >> "$GITHUB_OUTPUT"
