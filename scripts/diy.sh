@@ -14,6 +14,24 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
+
+    if [ -f tools/libtool/Makefile ]; then
+        python3 - << 'PYEOF'
+import re
+path = 'tools/libtool/Makefile'
+with open(path) as f:
+    content = f.read()
+old = '(cd $(HOST_BUILD_DIR);'
+new = '(cd $(HOST_BUILD_DIR); rm -rf .git; git init -q . 2>/dev/null || true; git config user.email ci@local 2>/dev/null || true; git config user.name CI 2>/dev/null || true;'
+if old in content and 'rm -rf .git; git init' not in content:
+    content = content.replace(old, new, 1)
+    with open(path, 'w') as f:
+        f.write(content)
+    print('patched tools/libtool/Makefile')
+else:
+    print('tools/libtool/Makefile: no change needed')
+PYEOF
+    fi
 }
 
 post_feeds() {
