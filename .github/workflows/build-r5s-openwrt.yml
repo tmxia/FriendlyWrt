@@ -88,7 +88,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.release_tag.outputs.tag }}
-          name: R5S OpenWrt ${{ env.OPENWRT_VER }} (${{ steps.release_tag.outputs.tag }})
+          name: ${{ steps.release_tag.outputs.tag }}
           draft: false
           prerelease: false
           allow_updates: true
@@ -178,9 +178,6 @@ jobs:
           cd openwrt
           make -j$(nproc) V=s || make -j1 V=s
 
-      # ============================================================
-      # 新增：使用 sd-fuse 打包完整 eMMC 镜像
-      # ============================================================
       - name: Locate kernel artifacts
         run: |
           cd openwrt
@@ -229,7 +226,6 @@ jobs:
           TGT="friendlywrt25"
           mkdir -p "$TGT"
 
-          # 下载 eflasher 基础包（提供 uboot、misc 等预编译文件）
           wget -q http://112.124.9.243/dvdfiles/rk3568/images-for-eflasher/emmc-flasher-images.tgz -O /tmp/emmc-flasher-images.tgz
           tar xzf /tmp/emmc-flasher-images.tgz
 
