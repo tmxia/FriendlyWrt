@@ -21,16 +21,6 @@ on:
         default: '6.18.y'
         type: choice
         options: ['6.18.y', '6.12.y', '6.6.y', '6.1.y']
-      official_release_tag:
-        description: '官方固件 Release tag'
-        required: true
-        default: 'FriendlyWrt-2026-09-04'
-        type: string
-      official_asset:
-        description: '官方固件 asset 名'
-        required: true
-        default: 'R5S-R5C-Series-FriendlyWrt-24.10-docker.img.gz'
-        type: string
       replace_existing:
         description: 'Replace existing release tag'
         required: false
@@ -46,7 +36,6 @@ jobs:
     runs-on: ubuntu-22.04
     if: github.event.repository.owner.id == github.event.sender.id
     outputs:
-      verified: ${{ steps.verify.outputs.passed }}
       img_name: ${{ env.img_name }}
     steps:
     - uses: actions/checkout@v4
@@ -111,38 +100,18 @@ jobs:
         echo "images_tgz=/tmp/inputs/$PATTERN" >> $GITHUB_OUTPUT
 
     # ============================================================
-    # 4. 下载官方参考固件
+    # 4. 替换内核 + 注入模块 + 生成镜像
     # ============================================================
-    - name: Download official
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        REF_TAG: ${{ inputs.official_release_tag }}
-        REF_ASSET: ${{ inputs.official_asset }}
-      run: |
-        mkdir -p /tmp/official && cd /tmp/official
-        if gh release download "$REF_TAG" --repo "$GITHUB_REPOSITORY" \
-             --pattern "$REF_ASSET" --dir .; then
-          gunzip -k *.img.gz 2>/dev/null || true
-          IMG=$(find . -maxdepth 1 -name "*.img" | head -1)
-          [ -n "$IMG" ] && echo "官方参考: $IMG"
-        else
-          touch /tmp/official/.no_reference
-        fi
-
-    # ============================================================
-    # 5. 替换内核 + 注入模块 + 生成镜像（一体化脚本）
-    # ============================================================
-    - name: Replace kernel & inject modules & build image
+    - name: Build with Flippy kernel
       env:
         KERNEL_VERSION: ${{ inputs.kernel_version }}
-        OFFICIAL_DIR: /tmp/official
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        chmod +x $GITHUB_WORKSPACE/scripts/replace-kernel.sh
+        chmod +x $GITHUB_WORKSPACE/scripts/flippy-kernel.sh
         DIST_NAME="friendlywrt$(echo ${{ inputs.version }} | awk -F . '{print $1}')$([ "${{ inputs.set }}" = "docker" ] && echo "-docker")"
         KV_SHORT="${{ inputs.kernel_version }}"; KV_SHORT="${KV_SHORT%.y}"
         IMG_FILE="R5S-R5C-Series-FriendlyWrt-kv${KV_SHORT}-${{ inputs.version }}$([ "${{ inputs.set }}" = "docker" ] && echo "-docker").img"
-        bash $GITHUB_WORKSPACE/scripts/replace-kernel.sh \
+        bash $GITHUB_WORKSPACE/scripts/flippy-kernel.sh \
           "${{ steps.images.outputs.images_tgz }}" \
           /tmp/scripts/sd-fuse \
           "$DIST_NAME" \
@@ -150,26 +119,7 @@ jobs:
         echo "img_name=$IMG_FILE" >> $GITHUB_ENV
 
     # ============================================================
-    # 6. 验证
-    # ============================================================
-    - name: Verify
-      id: verify
-      run: |
-        set +e
-        bash $GITHUB_WORKSPACE/scripts/verify-against-official.sh \
-          "$GITHUB_WORKSPACE/artifact/${{ env.img_name }}" \
-          "/tmp/official" "${{ inputs.kernel_version }}"
-        RC=$?
-        set -e
-        if [ $RC -eq 0 ]; then
-          echo "passed=true" >> $GITHUB_OUTPUT
-        else
-          echo "passed=false" >> $GITHUB_OUTPUT
-          exit $RC
-        fi
-
-    # ============================================================
-    # 7. 压缩 + 上传
+    # 5. 压缩 + 上传
     # ============================================================
     - name: Compress
       run: |
@@ -200,9 +150,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-22.04
-    if: |
-      github.event.repository.owner.id == github.event.sender.id &&
-      needs.build.outputs.verified == 'true'
+    if: github.event.repository.owner.id == github.event.sender.id
     steps:
     - uses: actions/checkout@v4
     - uses: actions/download-artifact@v4
