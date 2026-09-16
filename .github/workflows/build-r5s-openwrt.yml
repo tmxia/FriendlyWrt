@@ -41,10 +41,12 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
-            gettext git java-props libncurses5-dev libncursesw5-dev libssl-dev \
-            python3 python3-dev python3-pip unzip wget zip zlib1g-dev \
-            libelf-dev subversion flex bison libtool autoconf automake cmake \
+          sudo apt-get install -y \
+            build-essential ccache file g++ gawk \
+            gettext git libncurses-dev libssl-dev \
+            python3 python3-dev python3-pip python3-setuptools \
+            unzip wget zip zlib1g-dev libelf-dev \
+            subversion flex bison libtool autoconf automake cmake \
             rsync quilt time jq
 
       - name: Clone OpenWrt source
