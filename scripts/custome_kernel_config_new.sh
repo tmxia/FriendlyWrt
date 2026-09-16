@@ -70,28 +70,37 @@ step_patch_gpio() {
     local PATCH_DIR="target/linux/rockchip/patches-6.12"
     mkdir -p "$PATCH_DIR"
 
-    # 清理历史遗留的 DTS 补丁（上下文不稳定，易导致内核准备失败）
     rm -f "$PATCH_DIR/998-r5s-dts-led-aliases.patch"
+    rm -f "$PATCH_DIR/999-gpio-rockchip-fix-dynamic-base.patch"
 
     local GPIO_PATCH="$PATCH_DIR/999-gpio-rockchip-fix-dynamic-base.patch"
 
-    if [ -f "$GPIO_PATCH" ]; then
-        log "GPIO 修复补丁已存在，跳过"
-        return 0
-    fi
-
     cat > "$GPIO_PATCH" << 'PATCH_EOF'
+From: Jonas Karlman <jonas@kwiboo.se>
+Subject: [PATCH] gpio: rockchip: Fix GPIO after convert to dynamic base allocation
+
+The commit c8079f83e0bf ("gpio: rockchip: convert to dynamic GPIO base
+allocation") broke GPIO on devices using device trees which don't set
+the gpio-ranges property, something only Rockchip RK35xx SoC DTs do.
+
+Restore GPIO to a working state on devices using older Rockchip SoCs
+and/or DTs not having the gpio-ranges property set by restoring prior
+use of bank->pin_base as the pin_offset value.
+
+Fixes: c8079f83e0bf ("gpio: rockchip: convert to dynamic GPIO base allocation")
+Signed-off-by: Jonas Karlman <jonas@kwiboo.se>
+---
 --- a/drivers/gpio/gpio-rockchip.c
 +++ b/drivers/gpio/gpio-rockchip.c
-@@ -108,7 +108,7 @@ static int rockchip_gpio_probe(struct platform_device *pdev)
- 	bank->gpio_chip.parent = &pdev->dev;
- 	bank->gpio_chip.of_node = pdev->dev.of_node;
- 	bank->gpio_chip.ngpio = bank->nr_pins;
--	bank->gpio_chip.base = -1;
-+	bank->gpio_chip.base = bank->pin_base;
+@@ -617,7 +617,7 @@ static int rockchip_gpiolib_register(struct rockchip_pin_bank *bank)
+ 		return -ENODEV;
  
- 	gc = &bank->gpio_chip;
- 	ret = devm_gpiochip_add_data(&pdev->dev, gc, bank);
+ 	ret = gpiochip_add_pin_range(gc, dev_name(pctldev->dev), 0,
+-				     gc->base, gc->ngpio);
++				     bank->pin_base, bank->nr_pins);
+ 	if (ret) {
+ 		dev_err(bank->dev, "Failed to add pin range\n");
+ 		goto fail;
 PATCH_EOF
 
     log "[OK] GPIO 驱动修复补丁已写入: $GPIO_PATCH"
