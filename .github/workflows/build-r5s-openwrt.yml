@@ -32,7 +32,6 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Generate matrix
         id: set-matrix
         run: bash scripts/platforms.sh
@@ -106,24 +105,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Free disk space
+      - name: Prepare runner
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
                       /usr/share/swift /usr/local/.ghcup /opt/az || true
           sudo docker image prune --all --force || true
           sudo apt-get clean
-          df -hT
 
-      - name: Add swap
-        run: |
           sudo swapoff -a || true
           sudo rm -f /swapfile
           sudo fallocate -l 4G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile > /dev/null
           sudo swapon /swapfile
-          free -h
+          df -hT
 
       - name: Install dependencies
         env:
@@ -139,12 +135,12 @@ jobs:
             rsync quilt time jq swig \
             device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools
 
-      - name: Clone OpenWrt source
+      - name: Clone source
         run: |
           git clone -b ${{ matrix.value.REPO_BRANCH }} --single-branch \
             ${{ matrix.value.REPO_URL }} openwrt 2>&1 | tail -3
 
-      - name: DIY pre (feeds 更新前)
+      - name: DIY pre
         run: |
           cd openwrt
           bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} pre
@@ -154,7 +150,7 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a 2>&1 | tail -20
 
-      - name: DIY post (feeds 更新后)
+      - name: DIY post
         run: |
           cd openwrt
           bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} post
@@ -164,11 +160,11 @@ jobs:
           cd openwrt
           ./scripts/feeds install -a 2>&1 | tail -20
 
-      - name: Load R5S config
+      - name: Load config
         run: |
           cp $GITHUB_WORKSPACE/${{ matrix.value.CONFIG_FILE }} openwrt/.config
 
-      - name: DIY config (.config 调整)
+      - name: DIY config
         run: |
           cd openwrt
           bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} config
@@ -195,14 +191,6 @@ jobs:
 
           tail -10 /tmp/build.log
           ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || true
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: /tmp/build.log
-          retention-days: 7
 
       - name: Locate kernel artifacts
         run: |
@@ -237,7 +225,7 @@ jobs:
           echo "KV=$KV" >> $GITHUB_ENV
           [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules 不是 6.12"; exit 1; }
 
-      - name: Clone sd-fuse_rk3568
+      - name: Prepare sd-fuse workspace
         run: |
           cd $GITHUB_WORKSPACE
           rm -rf sd-fuse
@@ -245,51 +233,32 @@ jobs:
           cd sd-fuse
           [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
 
-      - name: Prepare eMMC workspace
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
           TGT="friendlywrt25"
           mkdir -p "$TGT"
-
           wget -q http://112.124.9.243/dvdfiles/rk3568/images-for-eflasher/emmc-flasher-images.tgz -O /tmp/emmc-flasher-images.tgz
           tar xzf /tmp/emmc-flasher-images.tgz
 
-      - name: Package kernel.img
+      - name: Package boot images
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           TGT="friendlywrt25"
 
           [ -f "$IMAGE_PATH" ] || { echo "::error::Image not found: $IMAGE_PATH"; exit 1; }
-
           ./tools/mkkrnlimg "$IMAGE_PATH" "$TGT/kernel.img"
           [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img 未生成"; exit 1; }
-          ls -lh "$TGT/kernel.img"
-
           cp "$TGT/kernel.img" "$TGT/boot.img"
 
-      - name: Package resource.img
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
-          TGT="friendlywrt25"
-          IMGFILE="$TGT/resource.img"
-
           [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
-
           rm -rf /tmp/dtb-pack
           mkdir -p /tmp/dtb-pack
 
           R5S_DTB=""
           for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
-            if [ -f "$DTB_DIR/$cand" ]; then
-              R5S_DTB="$cand"
-              break
-            fi
+            [ -f "$DTB_DIR/$cand" ] && { R5S_DTB="$cand"; break; }
           done
-
           [ -z "$R5S_DTB" ] && { echo "::error::找不到 rk3568-nanopi-r5s.dtb"; exit 1; }
 
           cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
-
           for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
             [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
           done
@@ -300,20 +269,17 @@ jobs:
 
           "$OLDPWD/tools/resource_tool" --pack \
             --root=. \
-            --image="$OLDPWD/$IMGFILE" \
+            --image="$OLDPWD/$TGT/resource.img" \
             $DTB_LIST
-
           cd "$OLDPWD"
-          [ -f "$IMGFILE" ] || { echo "::error::resource.img 未生成"; exit 1; }
-          ls -lh "$IMGFILE"
 
-      - name: Stage U-Boot binaries
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
-          TGT="friendlywrt25"
+          [ -f "$TGT/resource.img" ] || { echo "::error::resource.img 未生成"; exit 1; }
+
           for f in uboot.img idbloader.img MiniLoaderAll.bin misc.img dtbo.img; do
-            [ -f "prebuilt/$f" ] && cp -v "prebuilt/$f" "$TGT/$f"
+            [ -f "prebuilt/$f" ] && cp "prebuilt/$f" "$TGT/$f"
           done
+
+          ls -lh "$TGT"/kernel.img "$TGT"/resource.img
 
       - name: Build rootfs.img
         run: |
@@ -337,61 +303,47 @@ jobs:
           IMG_BLK=$(( LOGICAL_SIZE / 4096 ))
           INODE_SIZE=$(( $(find /tmp/rootfs-pack | wc -l) + 128 ))
 
-          MKFS="$PWD/tools/mke2fs"
-          MKFS_CONF="$PWD/tools/mke2fs.conf"
-
           rm -f "$TGT/rootfs.img"
-          MKE2FS_CONFIG="$MKFS_CONF" \
-            "$MKFS" -N "$INODE_SIZE" \
+          MKE2FS_CONFIG="$PWD/tools/mke2fs.conf" \
+            "$PWD/tools/mke2fs" -N "$INODE_SIZE" \
               -E android_sparse -t ext4 -L rootfs -M /root -b 4096 -0 \
               -d /tmp/rootfs-pack "$TGT/rootfs.img" "$IMG_BLK"
 
           [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img 生成失败"; exit 1; }
-          ls -lh "$TGT/rootfs.img"
+
+          PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
+            ./tools/generate-partmap-txt.sh "$LOGICAL_SIZE" "$TGT"
 
           echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
+          ls -lh "$TGT/rootfs.img"
+          cat "$TGT/parameter.txt"
 
-      - name: Generate parameter.txt
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
-          [ -z "$ROOTFS_SIZE_BYTES" ] && { echo "::error::ROOTFS_SIZE_BYTES 未设置"; exit 1; }
-          PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
-            ./tools/generate-partmap-txt.sh "$ROOTFS_SIZE_BYTES" "friendlywrt25"
-          cat "friendlywrt25/parameter.txt"
-
-      - name: Build SD card image (gz)
+      - name: Build SD and eMMC images
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           export SDFUSE_NONINTERACTIVE=y
+
           sudo -E ./mk-sd-image.sh friendlywrt25 > /tmp/sd-image.log 2>&1 || {
             tail -80 /tmp/sd-image.log
             exit 1
           }
           tail -20 /tmp/sd-image.log
-          ls -lh out/
 
           if grep -q "more than capacity" /tmp/sd-image.log; then
             echo "::error::mk-sd-image.sh 跳过了 rootfs 写入"
             exit 1
           fi
 
-      - name: Build eMMC flasher image (tgz)
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
-          export SDFUSE_NONINTERACTIVE=y
           sudo -E ./mk-emmc-image.sh friendlywrt25 autostart=yes > /tmp/emmc-image.log 2>&1 || {
             tail -80 /tmp/emmc-image.log
             exit 1
           }
           tail -20 /tmp/emmc-image.log
-          ls -lh out/images-for-eflasher/
 
-      - name: Fix file ownership
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
           sudo chown -R "$(id -u):$(id -g)" out/ friendlywrt25/ 2>/dev/null || true
+          ls -lh out/ out/images-for-eflasher/ 2>/dev/null || true
 
-      - name: Rename and collect artifacts
+      - name: Collect artifacts
         run: |
           mkdir -p $GITHUB_WORKSPACE/artifact
           cd $GITHUB_WORKSPACE/sd-fuse
@@ -406,12 +358,10 @@ jobs:
               echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入"
               exit 1
             fi
-
-            DST_NAME="${PREFIX}-sdcard.img"
-            cp "$SRC_IMG" "/tmp/${DST_NAME}"
-            gzip -f "/tmp/${DST_NAME}"
-            cp "/tmp/${DST_NAME}.gz" $GITHUB_WORKSPACE/artifact/
-            echo "SD image: ${DST_NAME}.gz"
+            cp "$SRC_IMG" "/tmp/${PREFIX}-sdcard.img"
+            gzip -f "/tmp/${PREFIX}-sdcard.img"
+            cp "/tmp/${PREFIX}-sdcard.img.gz" $GITHUB_WORKSPACE/artifact/
+            echo "SD image: ${PREFIX}-sdcard.img.gz"
           else
             echo "::error::未找到 sd-fuse 生成的 .img"
             exit 1
@@ -419,9 +369,8 @@ jobs:
 
           SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
           if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
-            DST_NAME="${PREFIX}-emmc-flasher.tgz"
-            cp "$SRC_TGZ" "$GITHUB_WORKSPACE/artifact/${DST_NAME}"
-            echo "eMMC pack: ${DST_NAME}"
+            cp "$SRC_TGZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-emmc-flasher.tgz"
+            echo "eMMC pack: ${PREFIX}-emmc-flasher.tgz"
           else
             echo "::warning::未找到 eMMC 刷机包"
           fi
@@ -429,17 +378,14 @@ jobs:
           OPENWRT_SYSUP=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
             -name "*nanopi-r5s*sysupgrade.img.gz" -type f 2>/dev/null | head -1)
           if [ -n "$OPENWRT_SYSUP" ]; then
-            DST_NAME="${PREFIX}-sysupgrade.img.gz"
-            cp "$OPENWRT_SYSUP" "$GITHUB_WORKSPACE/artifact/${DST_NAME}"
-            echo "OpenWrt sysupgrade: ${DST_NAME}"
+            cp "$OPENWRT_SYSUP" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sysupgrade.img.gz"
+            echo "sysupgrade: ${PREFIX}-sysupgrade.img.gz"
           fi
 
           OPENWRT_MANIFEST=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
             -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
           [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
 
-      - name: Generate SHA256SUMS
-        run: |
           cd $GITHUB_WORKSPACE/artifact
           rm -f SHA256SUMS
           for f in *; do
