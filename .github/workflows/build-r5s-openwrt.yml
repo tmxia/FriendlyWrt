@@ -173,24 +173,47 @@ jobs:
       - name: Compile OpenWrt firmware
         run: |
           cd openwrt
-          set -o pipefail
 
+          set +e
           make -j$(nproc) 2>&1 | tee /tmp/build.log | \
             grep --line-buffered -E \
-              "(^make\[[0-9]+\]: (Entering|Leaving)|^make: \*\*\*|error:|Error [0-9]|ERROR|failed|Failed|FAILED|undefined reference|collect2|Package/[^ ]+ is not available|^Configuring|^Compiling|^Building|^Installing)" \
+              "(^make\[[0-9]+\]: (Entering|Leaving)|^make: \*\*\*|^make\[[0-9]+\]: \*\*\*|error:|Error [0-9]|ERROR|failed|Failed|FAILED|undefined reference|collect2|No rule to make target|Package/[^ ]+ is not available)" \
             || true
-
           BUILD_RESULT=${PIPESTATUS[0]}
+          set -e
 
           if [ "$BUILD_RESULT" -ne 0 ]; then
-            grep -n -E "(error:|Error [0-9]|ERROR|failed|Failed|undefined reference|collect2)" /tmp/build.log | tail -30 || true
             echo ""
-            tail -150 /tmp/build.log
+            echo "=========================================="
+            echo "Build failed (exit code: $BUILD_RESULT)"
+            echo "=========================================="
+            echo ""
+            echo "----- Error lines -----"
+            grep -n -E "(^make\[[0-9]+\]: \*\*\*|^make: \*\*\*|Error [0-9]|error:|ERROR:|No rule to make target|undefined reference)" /tmp/build.log | head -40 || true
+
+            FIRST_ERR_LINE=$(grep -n -m 1 -E "(^make\[[0-9]+\]: \*\*\*|^make: \*\*\*|Error [0-9]|error:|No rule to make target)" /tmp/build.log | cut -d: -f1 || true)
+            if [ -n "$FIRST_ERR_LINE" ]; then
+              START=$((FIRST_ERR_LINE > 150 ? FIRST_ERR_LINE - 150 : 1))
+              END=$((FIRST_ERR_LINE + 80))
+              echo ""
+              echo "----- Error context (lines $START-$END) -----"
+              sed -n "${START},${END}p" /tmp/build.log
+            fi
+
             exit 1
           fi
 
+          echo "Build succeeded"
           tail -10 /tmp/build.log
           ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || true
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 7
 
       - name: Locate kernel build artifacts
         run: |
@@ -223,7 +246,7 @@ jobs:
 
           KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
           echo "KV=$KV" >> $GITHUB_ENV
-          [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules 不是 6.12"; exit 1; }
+          [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules not 6.12, got: $KV"; exit 1; }
 
       - name: Setup sd-fuse packaging tools
         run: |
@@ -245,7 +268,7 @@ jobs:
 
           [ -f "$IMAGE_PATH" ] || { echo "::error::Image not found: $IMAGE_PATH"; exit 1; }
           ./tools/mkkrnlimg "$IMAGE_PATH" "$TGT/kernel.img"
-          [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img 未生成"; exit 1; }
+          [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img not generated"; exit 1; }
           cp "$TGT/kernel.img" "$TGT/boot.img"
 
           [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
@@ -256,7 +279,7 @@ jobs:
           for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
             [ -f "$DTB_DIR/$cand" ] && { R5S_DTB="$cand"; break; }
           done
-          [ -z "$R5S_DTB" ] && { echo "::error::找不到 rk3568-nanopi-r5s.dtb"; exit 1; }
+          [ -z "$R5S_DTB" ] && { echo "::error::rk3568-nanopi-r5s.dtb not found"; exit 1; }
 
           cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
           for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
@@ -273,7 +296,7 @@ jobs:
             $DTB_LIST
           cd "$OLDPWD"
 
-          [ -f "$TGT/resource.img" ] || { echo "::error::resource.img 未生成"; exit 1; }
+          [ -f "$TGT/resource.img" ] || { echo "::error::resource.img not generated"; exit 1; }
 
           for f in uboot.img idbloader.img MiniLoaderAll.bin misc.img dtbo.img; do
             [ -f "prebuilt/$f" ] && cp "prebuilt/$f" "$TGT/$f"
@@ -295,7 +318,7 @@ jobs:
           ACTUAL_MB=$(du -sm /tmp/rootfs-pack | awk '{print $1}')
           echo "rootfs: ${ACTUAL_MB} MB / ${ROOTFS_PARTSIZE} MB"
           if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
-            echo "::error::rootfs 内容超出 ROOTFS_PARTSIZE"
+            echo "::error::rootfs content exceeds ROOTFS_PARTSIZE"
             exit 1
           fi
 
@@ -309,7 +332,7 @@ jobs:
               -E android_sparse -t ext4 -L rootfs -M /root -b 4096 -0 \
               -d /tmp/rootfs-pack "$TGT/rootfs.img" "$IMG_BLK"
 
-          [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img 生成失败"; exit 1; }
+          [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img generation failed"; exit 1; }
 
           PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
             ./tools/generate-partmap-txt.sh "$LOGICAL_SIZE" "$TGT"
@@ -330,7 +353,7 @@ jobs:
           tail -20 /tmp/sd-image.log
 
           if grep -q "more than capacity" /tmp/sd-image.log; then
-            echo "::error::mk-sd-image.sh 跳过了 rootfs 写入"
+            echo "::error::mk-sd-image.sh skipped rootfs write"
             exit 1
           fi
 
@@ -355,7 +378,7 @@ jobs:
           if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
             SRC_SIZE_MB=$(( $(stat -c%s "$SRC_IMG") / 1024 / 1024 ))
             if [ "$SRC_SIZE_MB" -lt 200 ]; then
-              echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入"
+              echo "::error::SD image only ${SRC_SIZE_MB} MB, rootfs may not be written"
               exit 1
             fi
             cp "$SRC_IMG" "/tmp/${PREFIX}-sdcard.img"
@@ -363,7 +386,7 @@ jobs:
             cp "/tmp/${PREFIX}-sdcard.img.gz" $GITHUB_WORKSPACE/artifact/
             echo "SD image: ${PREFIX}-sdcard.img.gz"
           else
-            echo "::error::未找到 sd-fuse 生成的 .img"
+            echo "::error::no .img found from sd-fuse"
             exit 1
           fi
 
@@ -372,7 +395,7 @@ jobs:
             cp "$SRC_TGZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-emmc-flasher.tgz"
             echo "eMMC pack: ${PREFIX}-emmc-flasher.tgz"
           else
-            echo "::warning::未找到 eMMC 刷机包"
+            echo "::warning::eMMC flasher pack not found"
           fi
 
           OPENWRT_SYSUP=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
