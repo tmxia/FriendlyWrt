@@ -24,21 +24,13 @@ env:
   MODEL_NAME: 'R5S'
   ROOTFS_PARTSIZE: '1024'
   OPENWRT_BRANCH: 'openwrt-25.12'
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  CONFIG_FILE: 'scripts/r5s.config'
+  DIY_SH: 'scripts/r5s_customize.sh'
 
 jobs:
-  init:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Generate build matrix
-        id: set-matrix
-        run: bash scripts/platforms.sh
-
   prepare_release:
     runs-on: ubuntu-latest
-    needs: init
     if: github.event.repository.owner.id == github.event.sender.id
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
@@ -94,14 +86,9 @@ jobs:
           overwrite: true
 
   build:
-    name: Build ${{ matrix.platform }}
-    needs: [init, prepare_release]
+    name: Build r5s
+    needs: prepare_release
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJson(needs.init.outputs.matrix) }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -137,13 +124,13 @@ jobs:
 
       - name: Clone OpenWrt source
         run: |
-          git clone -b ${{ matrix.value.REPO_BRANCH }} --single-branch \
-            ${{ matrix.value.REPO_URL }} openwrt 2>&1 | tail -3
+          git clone -b ${{ env.OPENWRT_BRANCH }} --single-branch \
+            ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
 
       - name: Configure custom feeds
         run: |
           cd openwrt
-          bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} pre
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
 
       - name: Update feeds
         run: |
@@ -153,7 +140,7 @@ jobs:
       - name: Apply custom modifications
         run: |
           cd openwrt
-          bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} post
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
 
       - name: Install feed packages
         run: |
@@ -162,12 +149,12 @@ jobs:
 
       - name: Load R5S configuration
         run: |
-          cp $GITHUB_WORKSPACE/${{ matrix.value.CONFIG_FILE }} openwrt/.config
+          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} openwrt/.config
 
       - name: Adjust package configuration
         run: |
           cd openwrt
-          bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} config
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
           make defconfig
 
       - name: Compile OpenWrt firmware
