@@ -63,47 +63,17 @@ step_bridge_kernel_config() {
     ls -la config-6.1
 }
 
-step_patch_gpio() {
-    log "===== 3.5 修复 Rockchip GPIO 动态基地址 ====="
+step_clean_legacy_patches() {
+    log "===== 3.5 清理历史遗留补丁 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    local PATCH_DIR="target/linux/rockchip/patches-6.12"
-    mkdir -p "$PATCH_DIR"
+    rm -f target/linux/rockchip/patches-6.12/999-gpio-rockchip-fix-dynamic-base.patch
+    rm -f target/linux/rockchip/patches-6.12/998-r5s-dts-led-aliases.patch
 
-    rm -f "$PATCH_DIR/998-r5s-dts-led-aliases.patch"
-    rm -f "$PATCH_DIR/999-gpio-rockchip-fix-dynamic-base.patch"
+    find build_dir -name "*.rej" -path "*gpio-rockchip*" -delete 2>/dev/null || true
+    find build_dir -name "*.orig" -path "*gpio-rockchip*" -delete 2>/dev/null || true
 
-    local GPIO_PATCH="$PATCH_DIR/999-gpio-rockchip-fix-dynamic-base.patch"
-
-    cat > "$GPIO_PATCH" << 'PATCH_EOF'
-From: Jonas Karlman <jonas@kwiboo.se>
-Subject: [PATCH] gpio: rockchip: Fix GPIO after convert to dynamic base allocation
-
-The commit c8079f83e0bf ("gpio: rockchip: convert to dynamic GPIO base
-allocation") broke GPIO on devices using device trees which don't set
-the gpio-ranges property, something only Rockchip RK35xx SoC DTs do.
-
-Restore GPIO to a working state on devices using older Rockchip SoCs
-and/or DTs not having the gpio-ranges property set by restoring prior
-use of bank->pin_base as the pin_offset value.
-
-Fixes: c8079f83e0bf ("gpio: rockchip: convert to dynamic GPIO base allocation")
-Signed-off-by: Jonas Karlman <jonas@kwiboo.se>
----
---- a/drivers/gpio/gpio-rockchip.c
-+++ b/drivers/gpio/gpio-rockchip.c
-@@ -617,7 +617,7 @@ static int rockchip_gpiolib_register(struct rockchip_pin_bank *bank)
- 		return -ENODEV;
- 
- 	ret = gpiochip_add_pin_range(gc, dev_name(pctldev->dev), 0,
--				     gc->base, gc->ngpio);
-+				     bank->pin_base, bank->nr_pins);
- 	if (ret) {
- 		dev_err(bank->dev, "Failed to add pin range\n");
- 		goto fail;
-PATCH_EOF
-
-    log "[OK] GPIO 驱动修复补丁已写入: $GPIO_PATCH"
+    log "[OK] 已清理遗留补丁与 .rej/.orig 文件"
 }
 
 step_add_fan_control() {
@@ -338,13 +308,69 @@ step_sync_config() {
     make defconfig > /dev/null 2>&1 || true
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
 
-    log "执行 make kernel_oldconfig（同步内核级别配置）..."
+    log "执行 make kernel_oldconfig（解压内核源码）..."
     if ! make kernel_oldconfig > /tmp/kernel_oldconfig.log 2>&1; then
         tail -80 /tmp/kernel_oldconfig.log
-        err "make kernel_oldconfig 失败，通常意味着某个内核补丁应用失败"
+        err "make kernel_oldconfig 失败"
     fi
 
-    log "[OK] 配置同步完成"
+    log "[OK] 内核配置同步完成"
+}
+
+step_apply_gpio_source_fix() {
+    log "===== 9.6 源码级修复 GPIO 驱动 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    local SRC
+    SRC=$(find build_dir -maxdepth 6 -name "gpio-rockchip.c" -path "*/drivers/gpio/*" -type f 2>/dev/null | head -1)
+
+    if [ -z "$SRC" ]; then
+        warn "未找到 gpio-rockchip.c，跳过源码修复"
+        return 0
+    fi
+
+    log "目标源码: $SRC"
+
+    log "--- 诊断：源码中 GPIO 相关代码 ---"
+    grep -n "gc->base\|pin_base\|gpiochip_add_pin_range\|gpio_chip.base\|\.base" "$SRC" | head -20 || true
+
+    python3 - "$SRC" << 'PY'
+import sys, pathlib, re
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
+orig = txt
+changed = False
+
+if 'gc->base = bank->pin_base;' in txt:
+    print("[OK] gc->base 已是 bank->pin_base")
+elif 'gc->base = -1;' in txt:
+    txt = txt.replace('gc->base = -1;', 'gc->base = bank->pin_base;')
+    print("[OK] 修复 gc->base = -1 -> bank->pin_base")
+    changed = True
+else:
+    print("[WARN] 未找到 gc->base = -1，尝试匹配其他模式")
+    m = re.search(r'gc->base\s*=\s*-1\s*;', txt)
+    if m:
+        txt = txt[:m.start()] + 'gc->base = bank->pin_base;' + txt[m.end():]
+        print("[OK] 通过正则修复 gc->base = -1")
+        changed = True
+
+pattern = re.compile(r'gc->base\s*,\s*gc->ngpio\s*\)')
+if pattern.search(txt):
+    txt = pattern.sub('bank->pin_base, bank->nr_pins)', txt)
+    print("[OK] 修复 gpiochip_add_pin_range 参数: gc->base,gc->ngpio -> bank->pin_base,bank->nr_pins")
+    changed = True
+elif 'bank->pin_base, bank->nr_pins)' in txt:
+    print("[OK] gpiochip_add_pin_range 已是 bank->pin_base, bank->nr_pins")
+
+if changed and txt != orig:
+    p.write_text(txt)
+    print("[OK] 源码已更新写入")
+else:
+    print("[INFO] 源码未变更")
+PY
+
+    log "[OK] GPIO 驱动源码修复流程完成"
 }
 
 step_compile() {
@@ -352,6 +378,7 @@ step_compile() {
     cd "$FRIENDLYWRT_DIR"
 
     step_sync_config
+    step_apply_gpio_source_fix
 
     local s
     for s in tools/compile toolchain/compile target/compile package/compile; do
@@ -375,7 +402,7 @@ main() {
     step_ccache_and_staging
     step_verify_kernel
     step_bridge_kernel_config
-    step_patch_gpio
+    step_clean_legacy_patches
     step_add_fan_control
     step_init_config
     step_apply_customizations
