@@ -175,47 +175,32 @@ jobs:
           cd openwrt
 
           set +e
-          make -j$(nproc) 2>&1 | tee /tmp/build.log | \
-            grep --line-buffered -E \
-              "(^make\[[0-9]+\]: (Entering|Leaving)|^make: \*\*\*|^make\[[0-9]+\]: \*\*\*|error:|Error [0-9]|ERROR|failed|Failed|FAILED|undefined reference|collect2|No rule to make target|Package/[^ ]+ is not available)" \
-            || true
-          BUILD_RESULT=${PIPESTATUS[0]}
+          make -j$(nproc) V=s > /tmp/build.log 2>&1
+          BUILD_RESULT=$?
           set -e
 
           if [ "$BUILD_RESULT" -ne 0 ]; then
-            echo ""
-            echo "=========================================="
             echo "Build failed (exit code: $BUILD_RESULT)"
-            echo "=========================================="
             echo ""
-            echo "----- Error lines -----"
-            grep -n -E "(^make\[[0-9]+\]: \*\*\*|^make: \*\*\*|Error [0-9]|error:|ERROR:|No rule to make target|undefined reference)" /tmp/build.log | head -40 || true
 
-            FIRST_ERR_LINE=$(grep -n -m 1 -E "(^make\[[0-9]+\]: \*\*\*|^make: \*\*\*|Error [0-9]|error:|No rule to make target)" /tmp/build.log | cut -d: -f1 || true)
-            if [ -n "$FIRST_ERR_LINE" ]; then
-              START=$((FIRST_ERR_LINE > 150 ? FIRST_ERR_LINE - 150 : 1))
-              END=$((FIRST_ERR_LINE + 80))
-              echo ""
+            FIRST_ERR=$(grep -n -m 1 -E "^make(\[[0-9]+\])?: \*\*\* .* Error [0-9]" /tmp/build.log | cut -d: -f1)
+            if [ -n "$FIRST_ERR" ]; then
+              START=$((FIRST_ERR > 150 ? FIRST_ERR - 150 : 1))
+              END=$((FIRST_ERR + 30))
               echo "----- Error context (lines $START-$END) -----"
               sed -n "${START},${END}p" /tmp/build.log
+            else
+              echo "----- Last 200 lines -----"
+              tail -200 /tmp/build.log
             fi
-
             exit 1
           fi
 
           echo "Build succeeded"
-          tail -10 /tmp/build.log
           ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || true
 
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: /tmp/build.log
-          retention-days: 7
-
       - name: Locate kernel build artifacts
+        if: success()
         run: |
           cd openwrt
 
@@ -249,6 +234,7 @@ jobs:
           [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules not 6.12, got: $KV"; exit 1; }
 
       - name: Setup sd-fuse packaging tools
+        if: success()
         run: |
           cd $GITHUB_WORKSPACE
           rm -rf sd-fuse
@@ -262,6 +248,7 @@ jobs:
           tar xzf /tmp/emmc-flasher-images.tgz
 
       - name: Package kernel and resource images
+        if: success()
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           TGT="friendlywrt25"
@@ -305,6 +292,7 @@ jobs:
           ls -lh "$TGT"/kernel.img "$TGT"/resource.img
 
       - name: Build rootfs image
+        if: success()
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           TGT="friendlywrt25"
@@ -342,6 +330,7 @@ jobs:
           cat "$TGT/parameter.txt"
 
       - name: Build SD card and eMMC images
+        if: success()
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           export SDFUSE_NONINTERACTIVE=y
@@ -367,6 +356,7 @@ jobs:
           ls -lh out/ out/images-for-eflasher/ 2>/dev/null || true
 
       - name: Collect and checksum artifacts
+        if: success()
         run: |
           mkdir -p $GITHUB_WORKSPACE/artifact
           cd $GITHUB_WORKSPACE/sd-fuse
