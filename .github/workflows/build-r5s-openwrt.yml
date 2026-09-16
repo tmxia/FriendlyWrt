@@ -95,6 +95,7 @@ jobs:
           overwrite: true
 
   build:
+    name: Build ${{ matrix.platform }}
     needs: [init, prepare_release]
     runs-on: ubuntu-latest
     strategy:
@@ -141,7 +142,7 @@ jobs:
       - name: Clone OpenWrt source
         run: |
           git clone -b ${{ matrix.value.REPO_BRANCH }} --single-branch \
-            ${{ matrix.value.REPO_URL }} openwrt
+            ${{ matrix.value.REPO_URL }} openwrt 2>&1 | tail -3
 
       - name: DIY pre (feeds 更新前)
         run: |
@@ -151,7 +152,7 @@ jobs:
       - name: Update feeds
         run: |
           cd openwrt
-          ./scripts/feeds update -a
+          ./scripts/feeds update -a 2>&1 | tail -20
 
       - name: DIY post (feeds 更新后)
         run: |
@@ -161,7 +162,7 @@ jobs:
       - name: Install feeds
         run: |
           cd openwrt
-          ./scripts/feeds install -a
+          ./scripts/feeds install -a 2>&1 | tail -20
 
       - name: Load R5S config
         run: |
@@ -176,7 +177,45 @@ jobs:
       - name: Compile firmware
         run: |
           cd openwrt
-          make -j$(nproc) V=s || make -j1 V=s
+          set -o pipefail
+
+          # 只显示核心进度和错误，完整日志保存到 /tmp/build.log
+          echo "=====> 开始编译（$(nproc) 线程）"
+          make -j$(nproc) 2>&1 | tee /tmp/build.log | \
+            grep --line-buffered -E \
+              "(^make\[[0-9]+\]: (Entering|Leaving)|^make: \*\*\*|error:|Error [0-9]|ERROR|failed|Failed|FAILED|undefined reference|collect2|Package/[^ ]+ is not available|^Configuring|^Compiling|^Building|^Installing)" \
+            || true
+
+          BUILD_RESULT=${PIPESTATUS[0]}
+
+          if [ "$BUILD_RESULT" -ne 0 ]; then
+            echo ""
+            echo "=========================================="
+            echo "❌ 编译失败（退出码：$BUILD_RESULT）"
+            echo "=========================================="
+            echo "----- 错误摘要 -----"
+            grep -n -E "(error:|Error [0-9]|ERROR|failed|Failed|undefined reference|collect2)" /tmp/build.log | tail -30 || true
+            echo ""
+            echo "----- 最后 150 行日志 -----"
+            tail -150 /tmp/build.log
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "✅ 编译成功"
+          echo "=========================================="
+          tail -10 /tmp/build.log
+          echo ""
+          ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || true
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 7
 
       - name: Locate kernel artifacts
         run: |
@@ -215,7 +254,7 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           rm -rf sd-fuse
-          git clone --depth 1 -b master https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse
+          git clone --depth 1 -b master https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse 2>&1 | tail -2
           cd sd-fuse
           [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
           echo "[OK] sd-fuse ready"
@@ -340,10 +379,12 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           export SDFUSE_NONINTERACTIVE=y
-          sudo -E ./mk-sd-image.sh friendlywrt25 2>&1 | tee /tmp/sd-image.log | tail -60 || {
-            tail -120 /tmp/sd-image.log
+          sudo -E ./mk-sd-image.sh friendlywrt25 > /tmp/sd-image.log 2>&1 || {
+            echo "::error::mk-sd-image.sh 失败"
+            tail -80 /tmp/sd-image.log
             exit 1
           }
+          tail -20 /tmp/sd-image.log
           ls -lh out/
 
           if grep -q "more than capacity" /tmp/sd-image.log; then
@@ -355,10 +396,12 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           export SDFUSE_NONINTERACTIVE=y
-          sudo -E ./mk-emmc-image.sh friendlywrt25 autostart=yes 2>&1 | tee /tmp/emmc-image.log | tail -40 || {
+          sudo -E ./mk-emmc-image.sh friendlywrt25 autostart=yes > /tmp/emmc-image.log 2>&1 || {
+            echo "::error::mk-emmc-image.sh 失败"
             tail -80 /tmp/emmc-image.log
             exit 1
           }
+          tail -20 /tmp/emmc-image.log
           ls -lh out/images-for-eflasher/
 
       - name: Fix file ownership
@@ -374,7 +417,7 @@ jobs:
           DATE=$(date +%Y.%m.%d)
           PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
-          # 1) SD 卡完整镜像 (gz)
+          # SD 卡完整镜像 (gz)
           SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
           if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
             SRC_SIZE_MB=$(( $(stat -c%s "$SRC_IMG") / 1024 / 1024 ))
@@ -394,7 +437,7 @@ jobs:
             exit 1
           fi
 
-          # 2) eMMC 刷机包 (tgz)
+          # eMMC 刷机包 (tgz)
           SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
           if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
             DST_NAME="${PREFIX}-emmc-flasher.tgz"
@@ -404,7 +447,7 @@ jobs:
             echo "::warning::未找到 eMMC 刷机包"
           fi
 
-          # 3) OpenWrt 原生 sysupgrade 镜像
+          # OpenWrt 原生 sysupgrade 镜像
           OPENWRT_SYSUP=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
             -name "*nanopi-r5s*sysupgrade.img.gz" -type f 2>/dev/null | head -1)
           if [ -n "$OPENWRT_SYSUP" ]; then
@@ -413,7 +456,7 @@ jobs:
             echo "[OK] OpenWrt sysupgrade: ${DST_NAME}"
           fi
 
-          # 4) manifest
+          # manifest
           OPENWRT_MANIFEST=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
             -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
           [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
