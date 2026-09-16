@@ -179,8 +179,6 @@ jobs:
           cd openwrt
           set -o pipefail
 
-          # 只显示核心进度和错误，完整日志保存到 /tmp/build.log
-          echo "=====> 开始编译（$(nproc) 线程）"
           make -j$(nproc) 2>&1 | tee /tmp/build.log | \
             grep --line-buffered -E \
               "(^make\[[0-9]+\]: (Entering|Leaving)|^make: \*\*\*|error:|Error [0-9]|ERROR|failed|Failed|FAILED|undefined reference|collect2|Package/[^ ]+ is not available|^Configuring|^Compiling|^Building|^Installing)" \
@@ -189,24 +187,13 @@ jobs:
           BUILD_RESULT=${PIPESTATUS[0]}
 
           if [ "$BUILD_RESULT" -ne 0 ]; then
-            echo ""
-            echo "=========================================="
-            echo "❌ 编译失败（退出码：$BUILD_RESULT）"
-            echo "=========================================="
-            echo "----- 错误摘要 -----"
             grep -n -E "(error:|Error [0-9]|ERROR|failed|Failed|undefined reference|collect2)" /tmp/build.log | tail -30 || true
             echo ""
-            echo "----- 最后 150 行日志 -----"
             tail -150 /tmp/build.log
             exit 1
           fi
 
-          echo ""
-          echo "=========================================="
-          echo "✅ 编译成功"
-          echo "=========================================="
           tail -10 /tmp/build.log
-          echo ""
           ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || true
 
       - name: Upload build log on failure
@@ -257,7 +244,6 @@ jobs:
           git clone --depth 1 -b master https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse 2>&1 | tail -2
           cd sd-fuse
           [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
-          echo "[OK] sd-fuse ready"
 
       - name: Prepare eMMC workspace
         run: |
@@ -267,8 +253,6 @@ jobs:
 
           wget -q http://112.124.9.243/dvdfiles/rk3568/images-for-eflasher/emmc-flasher-images.tgz -O /tmp/emmc-flasher-images.tgz
           tar xzf /tmp/emmc-flasher-images.tgz
-
-          echo "[OK] eMMC workspace prepared"
 
       - name: Package kernel.img
         run: |
@@ -343,7 +327,7 @@ jobs:
           (cd /tmp/rootfs-pack/dev && find . ! -type d -exec rm -f {} \; ) 2>/dev/null || true
 
           ACTUAL_MB=$(du -sm /tmp/rootfs-pack | awk '{print $1}')
-          echo "=== rootfs 实际内容: ${ACTUAL_MB} MB / 目标分区: ${ROOTFS_PARTSIZE} MB ==="
+          echo "rootfs: ${ACTUAL_MB} MB / ${ROOTFS_PARTSIZE} MB"
           if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
             echo "::error::rootfs 内容超出 ROOTFS_PARTSIZE"
             exit 1
@@ -380,7 +364,6 @@ jobs:
           cd $GITHUB_WORKSPACE/sd-fuse
           export SDFUSE_NONINTERACTIVE=y
           sudo -E ./mk-sd-image.sh friendlywrt25 > /tmp/sd-image.log 2>&1 || {
-            echo "::error::mk-sd-image.sh 失败"
             tail -80 /tmp/sd-image.log
             exit 1
           }
@@ -397,7 +380,6 @@ jobs:
           cd $GITHUB_WORKSPACE/sd-fuse
           export SDFUSE_NONINTERACTIVE=y
           sudo -E ./mk-emmc-image.sh friendlywrt25 autostart=yes > /tmp/emmc-image.log 2>&1 || {
-            echo "::error::mk-emmc-image.sh 失败"
             tail -80 /tmp/emmc-image.log
             exit 1
           }
@@ -417,11 +399,9 @@ jobs:
           DATE=$(date +%Y.%m.%d)
           PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
-          # SD 卡完整镜像 (gz)
           SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
           if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
             SRC_SIZE_MB=$(( $(stat -c%s "$SRC_IMG") / 1024 / 1024 ))
-            echo "[INFO] SD 镜像大小: ${SRC_SIZE_MB} MB"
             if [ "$SRC_SIZE_MB" -lt 200 ]; then
               echo "::error::SD 镜像只有 ${SRC_SIZE_MB} MB，可能 rootfs 未写入"
               exit 1
@@ -431,32 +411,29 @@ jobs:
             cp "$SRC_IMG" "/tmp/${DST_NAME}"
             gzip -f "/tmp/${DST_NAME}"
             cp "/tmp/${DST_NAME}.gz" $GITHUB_WORKSPACE/artifact/
-            echo "[OK] SD image: ${DST_NAME}.gz"
+            echo "SD image: ${DST_NAME}.gz"
           else
             echo "::error::未找到 sd-fuse 生成的 .img"
             exit 1
           fi
 
-          # eMMC 刷机包 (tgz)
           SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
           if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
             DST_NAME="${PREFIX}-emmc-flasher.tgz"
             cp "$SRC_TGZ" "$GITHUB_WORKSPACE/artifact/${DST_NAME}"
-            echo "[OK] eMMC pack: ${DST_NAME}"
+            echo "eMMC pack: ${DST_NAME}"
           else
             echo "::warning::未找到 eMMC 刷机包"
           fi
 
-          # OpenWrt 原生 sysupgrade 镜像
           OPENWRT_SYSUP=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
             -name "*nanopi-r5s*sysupgrade.img.gz" -type f 2>/dev/null | head -1)
           if [ -n "$OPENWRT_SYSUP" ]; then
             DST_NAME="${PREFIX}-sysupgrade.img.gz"
             cp "$OPENWRT_SYSUP" "$GITHUB_WORKSPACE/artifact/${DST_NAME}"
-            echo "[OK] OpenWrt sysupgrade: ${DST_NAME}"
+            echo "OpenWrt sysupgrade: ${DST_NAME}"
           fi
 
-          # manifest
           OPENWRT_MANIFEST=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
             -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
           [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
