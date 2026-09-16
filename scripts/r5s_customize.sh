@@ -15,34 +15,17 @@ pre_feeds() {
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
 
-    if [ -f tools/libtool/Makefile ]; then
-        python3 - << 'PYEOF'
-import re
-
-path = 'tools/libtool/Makefile'
-with open(path) as f:
-    content = f.read()
-
-if 'rm -rf .git; git init' in content:
-    print('tools/libtool/Makefile: already patched')
-else:
-    pattern = r'(\(\s*cd \$\(HOST_BUILD_DIR\)\s*;)'
-    replacement = (
-        r'\1 '
-        r'rm -rf .git; '
-        r'git init -q . >/dev/null 2>&1 || true; '
-        r'git config user.email ci@local >/dev/null 2>&1 || true; '
-        r'git config user.name CI >/dev/null 2>&1 || true; '
-    )
-    new_content, n = re.subn(pattern, replacement, content, count=1)
-    if n > 0:
-        with open(path, 'w') as f:
-            f.write(new_content)
-        print('tools/libtool/Makefile: patched')
-    else:
-        print('tools/libtool/Makefile: pattern not found, skipping')
-PYEOF
-    fi
+    REAL_GIT=$(command -v git)
+    sudo mkdir -p /usr/local/bin
+    sudo tee /usr/local/bin/git > /dev/null << EOF
+#!/bin/bash
+if [ "\$1" = "submodule" ]; then
+    exit 0
+fi
+exec $REAL_GIT "\$@"
+EOF
+    sudo chmod +x /usr/local/bin/git
+    echo "git wrapper installed at /usr/local/bin/git (real git: $REAL_GIT)"
 }
 
 post_feeds() {
