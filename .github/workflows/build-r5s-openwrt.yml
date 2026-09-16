@@ -32,7 +32,7 @@ jobs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-      - name: Generate matrix
+      - name: Generate build matrix
         id: set-matrix
         run: bash scripts/platforms.sh
 
@@ -105,7 +105,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare runner
+      - name: Prepare build environment
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
@@ -121,7 +121,7 @@ jobs:
           sudo swapon /swapfile
           df -hT
 
-      - name: Install dependencies
+      - name: Install build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -135,12 +135,12 @@ jobs:
             rsync quilt time jq swig \
             device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools
 
-      - name: Clone source
+      - name: Clone OpenWrt source
         run: |
           git clone -b ${{ matrix.value.REPO_BRANCH }} --single-branch \
             ${{ matrix.value.REPO_URL }} openwrt 2>&1 | tail -3
 
-      - name: DIY pre
+      - name: Configure custom feeds
         run: |
           cd openwrt
           bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} pre
@@ -150,27 +150,27 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a 2>&1 | tail -20
 
-      - name: DIY post
+      - name: Apply custom modifications
         run: |
           cd openwrt
           bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} post
 
-      - name: Install feeds
+      - name: Install feed packages
         run: |
           cd openwrt
           ./scripts/feeds install -a 2>&1 | tail -20
 
-      - name: Load config
+      - name: Load R5S configuration
         run: |
           cp $GITHUB_WORKSPACE/${{ matrix.value.CONFIG_FILE }} openwrt/.config
 
-      - name: DIY config
+      - name: Adjust package configuration
         run: |
           cd openwrt
           bash $GITHUB_WORKSPACE/${{ matrix.value.DIY_SH }} config
           make defconfig
 
-      - name: Compile firmware
+      - name: Compile OpenWrt firmware
         run: |
           cd openwrt
           set -o pipefail
@@ -192,7 +192,7 @@ jobs:
           tail -10 /tmp/build.log
           ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || true
 
-      - name: Locate kernel artifacts
+      - name: Locate kernel build artifacts
         run: |
           cd openwrt
 
@@ -225,7 +225,7 @@ jobs:
           echo "KV=$KV" >> $GITHUB_ENV
           [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules 不是 6.12"; exit 1; }
 
-      - name: Prepare sd-fuse workspace
+      - name: Setup sd-fuse packaging tools
         run: |
           cd $GITHUB_WORKSPACE
           rm -rf sd-fuse
@@ -238,7 +238,7 @@ jobs:
           wget -q http://112.124.9.243/dvdfiles/rk3568/images-for-eflasher/emmc-flasher-images.tgz -O /tmp/emmc-flasher-images.tgz
           tar xzf /tmp/emmc-flasher-images.tgz
 
-      - name: Package boot images
+      - name: Package kernel and resource images
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           TGT="friendlywrt25"
@@ -281,7 +281,7 @@ jobs:
 
           ls -lh "$TGT"/kernel.img "$TGT"/resource.img
 
-      - name: Build rootfs.img
+      - name: Build rootfs image
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           TGT="friendlywrt25"
@@ -318,7 +318,7 @@ jobs:
           ls -lh "$TGT/rootfs.img"
           cat "$TGT/parameter.txt"
 
-      - name: Build SD and eMMC images
+      - name: Build SD card and eMMC images
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
           export SDFUSE_NONINTERACTIVE=y
@@ -343,7 +343,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" out/ friendlywrt25/ 2>/dev/null || true
           ls -lh out/ out/images-for-eflasher/ 2>/dev/null || true
 
-      - name: Collect artifacts
+      - name: Collect and checksum artifacts
         run: |
           mkdir -p $GITHUB_WORKSPACE/artifact
           cd $GITHUB_WORKSPACE/sd-fuse
@@ -401,7 +401,7 @@ jobs:
           path: artifact/
           retention-days: 30
 
-      - name: Upload to release
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         if: success()
         env:
