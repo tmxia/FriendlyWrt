@@ -70,6 +70,9 @@ step_patch_gpio() {
     local PATCH_DIR="target/linux/rockchip/patches-6.12"
     mkdir -p "$PATCH_DIR"
 
+    # 清理历史遗留的 DTS 补丁（上下文不稳定，易导致内核准备失败）
+    rm -f "$PATCH_DIR/998-r5s-dts-led-aliases.patch"
+
     local GPIO_PATCH="$PATCH_DIR/999-gpio-rockchip-fix-dynamic-base.patch"
 
     if [ -f "$GPIO_PATCH" ]; then
@@ -92,42 +95,6 @@ step_patch_gpio() {
 PATCH_EOF
 
     log "[OK] GPIO 驱动修复补丁已写入: $GPIO_PATCH"
-}
-
-step_patch_dts_led() {
-    log "===== 3.6 通过内核补丁修改 R5S DTS LED ====="
-    cd "$FRIENDLYWRT_DIR"
-
-    local PATCH_DIR="target/linux/rockchip/patches-6.12"
-    mkdir -p "$PATCH_DIR"
-
-    local DTS_PATCH="$PATCH_DIR/998-r5s-dts-led-aliases.patch"
-
-    if [ -f "$DTS_PATCH" ]; then
-        log "DTS LED 补丁已存在，跳过"
-        return 0
-    fi
-
-    cat > "$DTS_PATCH" << 'PATCH_EOF'
---- a/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
-+++ b/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
-@@ -10,6 +10,13 @@
- 
- / {
- 	model = "FriendlyElec NanoPi R5S";
-+
-+	aliases {
-+		led-boot = &sys_led;
-+		led-failsafe = &sys_led;
-+		led-running = &sys_led;
-+		led-upgrade = &sys_led;
-+	};
- 
- 	chosen {
- 		stdout-path = "serial2:1500000n8";
-PATCH_EOF
-
-    log "[OK] DTS LED 补丁已写入: $DTS_PATCH（失败不影响 GPIO 核心修复）"
 }
 
 step_add_fan_control() {
@@ -213,7 +180,6 @@ CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
 
-# ==== 内核选项（通过 .config 控制，不直接修改 config-6.12） ====
 CONFIG_KERNEL_GPIO_ROCKCHIP=y
 CONFIG_KERNEL_PINCTRL_ROCKCHIP=y
 CONFIG_KERNEL_LEDS_GPIO=y
@@ -364,10 +330,10 @@ step_sync_config() {
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1 || true
 
     log "执行 make kernel_oldconfig（同步内核级别配置）..."
-    make kernel_oldconfig > /tmp/kernel_oldconfig.log 2>&1 || {
-        warn "make kernel_oldconfig 非零退出，检查日志"
-        tail -50 /tmp/kernel_oldconfig.log
-    }
+    if ! make kernel_oldconfig > /tmp/kernel_oldconfig.log 2>&1; then
+        tail -80 /tmp/kernel_oldconfig.log
+        err "make kernel_oldconfig 失败，通常意味着某个内核补丁应用失败"
+    fi
 
     log "[OK] 配置同步完成"
 }
@@ -401,7 +367,6 @@ main() {
     step_verify_kernel
     step_bridge_kernel_config
     step_patch_gpio
-    step_patch_dts_led
     step_add_fan_control
     step_init_config
     step_apply_customizations
