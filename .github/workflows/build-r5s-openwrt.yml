@@ -396,7 +396,7 @@ jobs:
           fi
 
       # ============================================================
-      # 修复：移除 emmc-flasher-images.tgz 下载，仅使用 sd-fuse 自带 prebuilt
+      # 移除 emmc-flasher-images.tgz 下载，仅使用 sd-fuse 自带 prebuilt
       # ============================================================
       - name: Setup sd-fuse packaging tools
         if: success()
@@ -500,20 +500,34 @@ jobs:
 
           [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img generation failed"; exit 1; }
 
-          # ---- 挂载校验 rootfs.img 内容 ----
+          # ---- 校验 rootfs.img 内容 ----
+          # rootfs.img 是 android sparse 格式，先转 raw ext4 再挂载
           echo "===== 校验 rootfs.img 内容 ====="
-          mkdir -p /tmp/verify-rootfs
-          sudo mount -o loop,ro "$TGT/rootfs.img" /tmp/verify-rootfs
+          SPARSE_IMG="$TGT/rootfs.img"
+          RAW_IMG="/tmp/rootfs-raw.img"
+          rm -f "$RAW_IMG"
 
-          [ -d /tmp/verify-rootfs/etc/config ] || { echo "::error::rootfs.img 不是 OpenWrt（缺 /etc/config/）"; sudo umount /tmp/verify-rootfs; exit 1; }
-          [ -f /tmp/verify-rootfs/etc/config/network ] || { echo "::error::缺 /etc/config/network"; sudo umount /tmp/verify-rootfs; exit 1; }
-          [ -f /tmp/verify-rootfs/etc/uci-defaults/99-custom ] || { echo "::error::缺 99-custom"; sudo umount /tmp/verify-rootfs; exit 1; }
+          if file "$SPARSE_IMG" | grep -qi 'Android sparse'; then
+            echo "  检测到 Android sparse 格式，转换为 raw ext4..."
+            simg2img "$SPARSE_IMG" "$RAW_IMG"
+            echo "  raw 大小: $(stat -c%s "$RAW_IMG") 字节"
+          else
+            echo "  非 sparse 格式，直接使用"
+            cp "$SPARSE_IMG" "$RAW_IMG"
+          fi
+
+          mkdir -p /tmp/verify-rootfs
+          sudo mount -o loop,ro "$RAW_IMG" /tmp/verify-rootfs
+
+          [ -d /tmp/verify-rootfs/etc/config ] || { echo "::error::rootfs.img 不是 OpenWrt（缺 /etc/config/）"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
+          [ -f /tmp/verify-rootfs/etc/config/network ] || { echo "::error::缺 /etc/config/network"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
+          [ -f /tmp/verify-rootfs/etc/uci-defaults/99-custom ] || { echo "::error::缺 99-custom"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
 
           KVER=$(ls /tmp/verify-rootfs/lib/modules/ | head -1)
           echo "kernel: $KVER"
           case "$KVER" in
             6.12*) echo "  [OK] kernel 6.12" ;;
-            *) echo "::error::kernel 不是 6.12"; sudo umount /tmp/verify-rootfs; exit 1 ;;
+            *) echo "::error::kernel 不是 6.12"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1 ;;
           esac
 
           R8125=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8125*.ko' 2>/dev/null | head -1)
@@ -524,17 +538,18 @@ jobs:
             echo "  [WARN] 只有 r8169，将作为 RTL8125 的驱动"
           else
             echo "::error::r8125 与 r8169 都缺失"
-            sudo umount /tmp/verify-rootfs; exit 1
+            sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
           fi
 
           if [ -f /tmp/verify-rootfs/etc/debian_version ]; then
             echo "::error::rootfs 是 Debian"
-            sudo umount /tmp/verify-rootfs; exit 1
+            sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
           fi
 
           echo "[OK] rootfs.img 校验通过"
           sudo umount /tmp/verify-rootfs
           sudo rmdir /tmp/verify-rootfs
+          rm -f "$RAW_IMG"
           # ---- 校验结束 ----
 
           PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
