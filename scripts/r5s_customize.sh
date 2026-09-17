@@ -19,7 +19,6 @@ pre_feeds() {
 }
 
 post_feeds() {
-    sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/bin/config_generate 2>/dev/null || \
     sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
     KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
@@ -222,12 +221,19 @@ config_stage() {
                kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
                kmod-nf-nathelper kmod-nf-nathelper-extra \
                kmod-fs-overlay kmod-fuse \
-               iptables-nft iptables-zz-legacy \
+               iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
+    # 显式禁用 legacy iptables（避免与 iptables-nft 冲突）
+    for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
+        sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+        grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+          echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
     MISSING=0
