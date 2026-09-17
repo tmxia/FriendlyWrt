@@ -247,6 +247,10 @@ CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
 
+CONFIG_KERNEL_GPIOLIB=y
+CONFIG_KERNEL_OF_GPIO=y
+CONFIG_KERNEL_GPIOD=y
+CONFIG_KERNEL_GPIOLIB_IRQCHIP=y
 CONFIG_KERNEL_GPIO_ROCKCHIP=y
 CONFIG_KERNEL_PINCTRL_ROCKCHIP=y
 CONFIG_KERNEL_NEW_LEDS=y
@@ -318,13 +322,6 @@ step_apply_customizations() {
     bash "$SCRIPTS_DIR/add_packages.sh"
     log "[OK] add_packages.sh 执行完成"
 
-    # ============================================================
-    # 关键修复：add_packages.sh 内部用 `sed -i` 破坏了
-    # config-6.1 -> armv8/config-6.12 的软链接，导致它对
-    # INET_DIAG 系列的写入落入一个孤儿普通文件而不是真正的
-    # 内核 config。此处强制把 4 项 INET_DIAG 写入 armv8/config-6.12，
-    # 并清理孤儿文件、恢复软链接，保证下次运行环境干净。
-    # ============================================================
     log "---- 合并 INET_DIAG 到 armv8/config-6.12 ----"
     local ROCKCHIP_DIR="$FRIENDLYWRT_DIR/target/linux/rockchip"
     local KCONFIG="$ROCKCHIP_DIR/armv8/config-6.12"
@@ -340,17 +337,14 @@ step_apply_customizations() {
         log "  [OK] $opt=y 已写入 armv8/config-6.12"
     done
 
-    # 清理孤儿 config-6.1（add_packages.sh 的 sed -i 已把它从软链接变成普通文件）
     if [ -e "$CONFIG61" ] && [ ! -L "$CONFIG61" ]; then
         log "  清理 add_packages.sh 遗留的孤儿文件 config-6.1"
         rm -f "$CONFIG61"
     fi
 
-    # 重建软链接
     [ -e "$CONFIG61" ] || ln -s armv8/config-6.12 "$CONFIG61"
     log "[OK] config-6.1 软链接已恢复: $(readlink "$CONFIG61")"
 
-    log "---- 校验 INET_DIAG 最终状态 ----"
     grep -E "^CONFIG_INET_(TCP_|UDP_|RAW_)?DIAG=y" "$KCONFIG" || warn "INET_DIAG 系列未全部写入"
 }
 
@@ -421,15 +415,24 @@ step_force_config() {
 
     local kopt
     for kopt in \
+        CONFIG_KERNEL_GPIOLIB \
+        CONFIG_KERNEL_OF_GPIO \
+        CONFIG_KERNEL_GPIOD \
+        CONFIG_KERNEL_GPIOLIB_IRQCHIP \
+        CONFIG_KERNEL_NEW_LEDS \
+        CONFIG_KERNEL_LEDS_CLASS \
         CONFIG_KERNEL_LEDS_GPIO \
         CONFIG_KERNEL_LEDS_TRIGGERS \
         CONFIG_KERNEL_LEDS_TRIGGER_HEARTBEAT \
         CONFIG_KERNEL_LEDS_TRIGGER_NETDEV \
         CONFIG_KERNEL_LEDS_TRIGGER_TIMER \
         CONFIG_KERNEL_LEDS_TRIGGER_DEFAULT_ON \
+        CONFIG_KERNEL_GPIO_ROCKCHIP \
+        CONFIG_KERNEL_PINCTRL_ROCKCHIP \
         CONFIG_KERNEL_R8169 \
         CONFIG_KERNEL_STMMAC_ETH \
-        CONFIG_KERNEL_DWMAC_ROCKCHIP; do
+        CONFIG_KERNEL_DWMAC_ROCKCHIP \
+        CONFIG_KERNEL_REALTEK_PHY; do
         sed -i "/^${kopt}=/d" .config
         echo "${kopt}=y" >> .config
     done
@@ -468,7 +471,7 @@ step_sync_config() {
 }
 
 step_verify_kernel_options() {
-    log "===== 9.6 校验关键内核选项 ====="
+    log "===== 9.6 校验关键内核选项（硬断言） ====="
     cd "$FRIENDLYWRT_DIR"
 
     local KSRC
@@ -480,31 +483,36 @@ step_verify_kernel_options() {
     fi
 
     log "内核源码路径: $KSRC"
-    log "--- LED / 网络驱动关键配置 ---"
+    log "内核 .config: $KSRC/.config"
 
-    local failed=0
+    # 关键选项：缺失立即终止（不浪费 90 分钟）
     local opt
     for opt in \
         CONFIG_LEDS_GPIO \
         CONFIG_LEDS_TRIGGER_NETDEV \
         CONFIG_LEDS_TRIGGER_HEARTBEAT \
-        CONFIG_LEDS_TRIGGER_TIMER \
-        CONFIG_LEDS_TRIGGER_DEFAULT_ON \
+        CONFIG_GPIO_ROCKCHIP \
+        CONFIG_PINCTRL_ROCKCHIP \
         CONFIG_R8169 \
-        CONFIG_STMMAC_ETH \
-        CONFIG_DWMAC_ROCKCHIP; do
+        CONFIG_STMMAC_ETH; do
         if grep -q "^${opt}=y" "$KSRC/.config"; then
             log "  [OK]   $opt"
         elif grep -q "^${opt}=m" "$KSRC/.config"; then
             log "  [MOD]  $opt"
         else
-            warn "  [MISS] $opt"
-            failed=$((failed + 1))
+            tail -80 /tmp/kernel_oldconfig.log 2>/dev/null || true
+            err "  [FATAL] $opt 未生效！内核配置映射失败，立即终止。"
         fi
     done
 
-    log "--- INET_DIAG 系列（Clashoo 依赖） ---"
+    # 次要选项：仅警告
     for opt in \
+        CONFIG_LEDS_TRIGGER_TIMER \
+        CONFIG_LEDS_TRIGGER_DEFAULT_ON \
+        CONFIG_DWMAC_ROCKCHIP \
+        CONFIG_REALTEK_PHY \
+        CONFIG_GPIOLIB \
+        CONFIG_OF_GPIO \
         CONFIG_INET_DIAG \
         CONFIG_INET_TCP_DIAG \
         CONFIG_INET_UDP_DIAG \
@@ -517,12 +525,61 @@ step_verify_kernel_options() {
             warn "  [MISS] $opt"
         fi
     done
+}
 
-    if [ "$failed" -gt 0 ]; then
-        warn "有 $failed 个关键 LED/网络选项未启用，LED 可能不工作"
-    else
-        log "[OK] 所有关键 LED/网络内核选项均已启用"
+step_export_debug_artifacts() {
+    log "===== 9.7 导出内核调试产物（决定性证据） ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    local DEBUG_DIR="$FRIENDLYWRT_DIR/.debug-artifacts"
+    rm -rf "$DEBUG_DIR"
+    mkdir -p "$DEBUG_DIR"
+
+    local KSRC
+    KSRC=$(find build_dir -maxdepth 5 -type d -name "linux-6.12*" 2>/dev/null | head -1)
+
+    if [ -z "$KSRC" ]; then
+        warn "找不到内核源码目录，跳过导出"
+        return 0
     fi
+
+    log "内核源码目录: $KSRC"
+
+    # 1. 内核最终 .config（这才是真实生效的配置）
+    if [ -f "$KSRC/.config" ]; then
+        cp "$KSRC/.config" "$DEBUG_DIR/kernel.config.full"
+        grep -E "^CONFIG_(LEDS|GPIO|PINCTRL|R8169|RTL|STMMAC|DWMAC|PHY_|PCI|NEW_LEDS|OF_GPIO|GPIOD|GPIOLIB|INET_DIAG|INET_TCP_DIAG|INET_UDP_DIAG|INET_RAW_DIAG)" \
+            "$KSRC/.config" > "$DEBUG_DIR/kernel.config.filtered" 2>/dev/null || true
+        log "  [OK] kernel.config.full ($(wc -l < "$KSRC/.config") 行)"
+        log "  [OK] kernel.config.filtered"
+    fi
+
+    # 2. System.map：符号名决定性证据
+    if [ -f "$KSRC/System.map" ]; then
+        cp "$KSRC/System.map" "$DEBUG_DIR/System.map"
+        grep -E " (T|t) _?(leds_gpio_probe|leds_gpio_remove|led_gpio_set|led_classdev_register|ledtrig_netdev_activate|ledtrig_heartbeat_activate|ledtrig_timer_activate|rockchip_gpio_probe|rockchip_gpio_irq_handler|rockchip_pinctrl_probe|r8169_probe|stmmac_dvr_probe|dwmac_rk_probe)$" \
+            "$KSRC/System.map" > "$DEBUG_DIR/System.map.leds-net" 2>/dev/null || true
+        log "  [OK] System.map"
+    fi
+
+    # 3. vmlinux（含完整符号表）
+    if [ -f "$KSRC/vmlinux" ]; then
+        cp "$KSRC/vmlinux" "$DEBUG_DIR/vmlinux"
+        log "  [OK] vmlinux ($(du -h "$KSRC/vmlinux" | awk '{print $1}'))"
+    fi
+
+    # 4. DTB 反编译
+    local DTB_FILE="$KSRC/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dtb"
+    if [ -f "$DTB_FILE" ]; then
+        cp "$DTB_FILE" "$DEBUG_DIR/rk3568-nanopi-r5s.dtb"
+        if command -v dtc >/dev/null 2>&1; then
+            dtc -I dtb -O dts "$DTB_FILE" > "$DEBUG_DIR/rk3568-nanopi-r5s.dtb.dts" 2>/dev/null || true
+            log "  [OK] DTB 反编译为 DTS"
+        fi
+    fi
+
+    log "[OK] 调试产物导出到 $DEBUG_DIR"
+    ls -lh "$DEBUG_DIR" | tail -n +2
 }
 
 step_compile() {
@@ -546,6 +603,9 @@ step_compile() {
     log "[DONE] final make"
 
     ls -lh bin/targets/rockchip/armv8/*.img.gz
+
+    # 编译完成后导出调试产物（此时内核 .config 已最终确定）
+    step_export_debug_artifacts
 }
 
 main() {
