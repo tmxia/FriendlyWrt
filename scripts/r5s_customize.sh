@@ -229,7 +229,6 @@ config_stage() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 显式禁用 legacy iptables（避免与 iptables-nft 冲突）
     for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
         sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
         grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
