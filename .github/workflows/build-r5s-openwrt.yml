@@ -145,9 +145,64 @@ jobs:
             subversion flex bison libtool autoconf automake cmake \
             rsync quilt time jq swig zstd \
             device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
-            exfatprogs exfat-fuse
+            exfatprogs exfat-fuse fuse \
+            android-sdk-libsparse-utils btrfs-progs
 
-          sudo modprobe exfat 2>/dev/null || echo "kernel exfat module not available, using FUSE"
+      - name: Fix exfat mount helper
+        run: |
+          echo "===== exfat 环境诊断 ====="
+          uname -r
+          echo "--- 内核 exfat 支持 ---"
+          grep exfat /proc/filesystems || echo "  内核无 exfat（将用 FUSE）"
+          sudo modprobe exfat 2>/dev/null || true
+          sudo modprobe fuse 2>/dev/null || true
+          grep exfat /proc/filesystems || echo "  modprobe 后仍无 exfat"
+
+          echo "--- exfat-fuse 包内容 ---"
+          dpkg -L exfat-fuse 2>/dev/null | grep -E "mount" || echo "  (无 mount 相关文件)"
+
+          echo "--- 查找 mount.exfat-fuse 二进制 ---"
+          HELPER=""
+          for f in /usr/sbin/mount.exfat-fuse /sbin/mount.exfat-fuse /usr/bin/mount.exfat-fuse /bin/mount.exfat-fuse; do
+              if [ -x "$f" ]; then
+                  HELPER="$f"
+                  echo "  找到: $f"
+                  break
+              fi
+          done
+
+          if [ -z "$HELPER" ]; then
+              echo "  dpkg 未找到，尝试 find"
+              HELPER=$(find /usr /sbin /bin -name 'mount.exfat-fuse' -type f -executable 2>/dev/null | head -1)
+          fi
+
+          if [ -n "$HELPER" ]; then
+              echo "使用 helper: $HELPER"
+              for target in /sbin/mount.exfat /usr/sbin/mount.exfat /bin/mount.exfat /usr/bin/mount.exfat; do
+                  sudo ln -sf "$HELPER" "$target"
+              done
+              echo "  已创建所有符号链接"
+          else
+              echo "::error::未找到 mount.exfat-fuse，无法建立 helper"
+              exit 1
+          fi
+
+          echo "--- 最终 helper ---"
+          ls -la /sbin/mount.exfat /usr/sbin/mount.exfat 2>/dev/null || true
+
+          echo "--- 挂载测试 ---"
+          dd if=/dev/zero of=/tmp/test.img bs=1M count=10 2>/dev/null
+          mkfs.exfat /tmp/test.img > /dev/null 2>&1
+          sudo mkdir -p /tmp/test-mnt
+          if sudo mount -t exfat /tmp/test.img /tmp/test-mnt; then
+              echo "  [OK] mount -t exfat 成功"
+              sudo umount /tmp/test-mnt
+          else
+              echo "::error::mount -t exfat 依然失败"
+              exit 1
+          fi
+          sudo rmdir /tmp/test-mnt
+          rm -f /tmp/test.img
 
       - name: Clone OpenWrt source
         working-directory: /workdir
