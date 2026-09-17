@@ -144,7 +144,10 @@ jobs:
             unzip wget zip zlib1g-dev libelf-dev \
             subversion flex bison libtool autoconf automake cmake \
             rsync quilt time jq swig zstd \
-            device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools
+            device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
+            exfatprogs exfat-fuse
+
+          sudo modprobe exfat 2>/dev/null || echo "kernel exfat module not available, using FUSE"
 
       - name: Clone OpenWrt source
         working-directory: /workdir
@@ -183,7 +186,6 @@ jobs:
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
           make defconfig
 
-          # defconfig 之后再次禁用 legacy iptables（防止 defconfig 根据依赖重新拉回）
           for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
             sed -i "s/^CONFIG_PACKAGE_${pkg}=y/# CONFIG_PACKAGE_${pkg} is not set/" .config
             sed -i "s/^CONFIG_PACKAGE_${pkg}=m/# CONFIG_PACKAGE_${pkg} is not set/" .config
