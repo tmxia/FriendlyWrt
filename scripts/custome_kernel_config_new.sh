@@ -54,34 +54,19 @@ step_verify_kernel() {
     find target/linux/rockchip -maxdepth 3 \( -type d -name "patches-*" -o -type f -name "config-*" \) 2>/dev/null
 }
 
-# 关键：通过软链接把 add_packages.sh 里硬编码的 config-6.1 路径
-# 指向真实的 config-6.12。这样无需修改用户的原始脚本，
-# add_packages.sh 里的 INET_DIAG 追加就会自动落到 6.12 上。
 step_bridge_kernel_config() {
-    log "===== 3. 桥接 config-6.1 -> config-6.12（不改 add_packages.sh） ====="
+    log "===== 3. 创建 config-6.1 -> armv8/config-6.12 软链接 ====="
     cd "$FRIENDLYWRT_DIR/target/linux/rockchip" || return 0
 
     [ -f armv8/config-6.12 ] || err "找不到 armv8/config-6.12"
 
-    if [ -L config-6.1 ]; then
-        local target
-        target=$(readlink config-6.1)
-        if [ "$target" = "armv8/config-6.12" ]; then
-            log "[OK] config-6.1 软链接已就位: config-6.1 -> armv8/config-6.12"
-        else
-            warn "config-6.1 是软链接但指向 $target，重建"
-            rm -f config-6.1
-            ln -s armv8/config-6.12 config-6.1
-        fi
-    elif [ -f config-6.1 ]; then
-        warn "config-6.1 是真实文件（非软链接），备份为 config-6.1.bak 后重建软链接"
-        mv config-6.1 config-6.1.bak
-        ln -s armv8/config-6.12 config-6.1
-    else
-        ln -s armv8/config-6.12 config-6.1
-        log "[OK] 已创建软链接 config-6.1 -> armv8/config-6.12"
+    if [ -e config-6.1 ] && [ ! -L config-6.1 ]; then
+        warn "config-6.1 是普通文件，删除以重建软链接"
+        rm -f config-6.1
     fi
-
+    [ -L config-6.1 ] && rm -f config-6.1
+    ln -s armv8/config-6.12 config-6.1
+    log "[OK] 已创建软链接: config-6.1 -> armv8/config-6.12"
     ls -la config-6.1
 }
 
@@ -151,12 +136,6 @@ step_add_led_and_network_fallback() {
 
     mkdir -p files/etc/init.d files/etc/uci-defaults
 
-    # ------------------------------------------------------------------
-    # LED 兜底：START=97 晚于 /etc/init.d/led（START=96）。
-    # 无论 board.d/01_leds 是否成功、netdev 触发器是否存在，
-    # 都用 sysfs 直接绑定 LED；netdev 加载失败时自动降级。
-    # 只设置 gpio-leds 里的四个 LED，不碰网卡自身的 LED。
-    # ------------------------------------------------------------------
     cat > files/etc/init.d/led-force << 'EOF'
 #!/bin/sh /etc/rc.common
 
@@ -191,30 +170,19 @@ start() {
 		sleep 1
 	done
 
-	# 电源 LED 用 heartbeat，DTS 里没有 default-trigger
 	setup_led "red:power"  heartbeat ""
 
-	# 网络 LED 用 netdev；DTS 中的名称由 color+function[-enumerator] 决定
 	setup_led "green:wan"   netdev eth0
 	setup_led "green:lan-1" netdev eth1
 	setup_led "green:lan-2" netdev eth2
 
-	# 兼容可能的不同内核命名
 	[ -e /sys/class/leds/green:lan/trigger ] && setup_led "green:lan" netdev eth1
-	[ -e /sys/class/leds/red:power/trigger ] && setup_led "red:power" heartbeat ""
 }
 
 boot() { start; }
 EOF
     chmod +x files/etc/init.d/led-force
 
-    # ------------------------------------------------------------------
-    # 网络兜底：命名 50-fix-network，字典序早于 99-custom 执行。
-    # 只补 ifname / proto，不设置 IP / gateway / dns / netmask，
-    # 那些参数由 add_packages.sh 的 99-custom 负责。
-    # 判断条件检查 ifname 是否为空（而不是 section 是否存在），
-    # 避免被 99-custom 中先执行的 `uci set network.lan.ipaddr` 骗过。
-    # ------------------------------------------------------------------
     cat > files/etc/uci-defaults/50-fix-network << 'EOF'
 #!/bin/sh
 
@@ -240,7 +208,7 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/50-fix-network
 
-    log "[OK] LED 与网络兜底脚本已写入（50-fix-network 兼容 99-custom）"
+    log "[OK] LED 与网络兜底脚本已写入"
 }
 
 step_init_config() {
@@ -279,7 +247,6 @@ CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
 
-# ==== 内核 GPIO / LED ====
 CONFIG_KERNEL_GPIO_ROCKCHIP=y
 CONFIG_KERNEL_PINCTRL_ROCKCHIP=y
 CONFIG_KERNEL_NEW_LEDS=y
@@ -292,7 +259,6 @@ CONFIG_KERNEL_LEDS_TRIGGER_TIMER=y
 CONFIG_KERNEL_LEDS_TRIGGER_DEFAULT_ON=y
 CONFIG_KERNEL_LEDS_TRIGGER_TRANSIENT=y
 
-# ==== 网络驱动（RTL8125 走 PCIe，RGMII PHY 走 stmmac） ====
 CONFIG_KERNEL_R8169=y
 CONFIG_KERNEL_STMMAC_ETH=y
 CONFIG_KERNEL_DWMAC_ROCKCHIP=y
@@ -301,12 +267,10 @@ CONFIG_KERNEL_PHY_ROCKCHIP_SNPS_PCIE3=y
 CONFIG_KERNEL_PCIE_ROCKCHIP_HOST=y
 CONFIG_KERNEL_REALTEK_PHY=y
 
-# ==== 热管理与 PWM 风扇 ====
 CONFIG_KERNEL_ROCKCHIP_THERMAL=y
 CONFIG_KERNEL_PWM_ROCKCHIP=y
 CONFIG_KERNEL_PWM_FAN=y
 
-# ==== USB ====
 CONFIG_KERNEL_USB_EHCI_HCD=y
 CONFIG_KERNEL_USB_EHCI_PCI=y
 CONFIG_KERNEL_USB_OHCI_HCD=y
@@ -314,7 +278,6 @@ CONFIG_KERNEL_USB_UHCI_HCD=y
 CONFIG_KERNEL_USB_XHCI_HCD=y
 CONFIG_KERNEL_USB_XHCI_PCI=y
 
-# ==== Docker / 容器支持 ====
 CONFIG_KERNEL_CGROUPS=y
 CONFIG_KERNEL_CGROUP_FREEZER=y
 CONFIG_KERNEL_CGROUP_PIDS=y
@@ -353,7 +316,42 @@ step_apply_customizations() {
 
     cd "$PROJECT_DIR"
     bash "$SCRIPTS_DIR/add_packages.sh"
-    log "[OK] add_packages.sh 执行完成（未修改原脚本）"
+    log "[OK] add_packages.sh 执行完成"
+
+    # ============================================================
+    # 关键修复：add_packages.sh 内部用 `sed -i` 破坏了
+    # config-6.1 -> armv8/config-6.12 的软链接，导致它对
+    # INET_DIAG 系列的写入落入一个孤儿普通文件而不是真正的
+    # 内核 config。此处强制把 4 项 INET_DIAG 写入 armv8/config-6.12，
+    # 并清理孤儿文件、恢复软链接，保证下次运行环境干净。
+    # ============================================================
+    log "---- 合并 INET_DIAG 到 armv8/config-6.12 ----"
+    local ROCKCHIP_DIR="$FRIENDLYWRT_DIR/target/linux/rockchip"
+    local KCONFIG="$ROCKCHIP_DIR/armv8/config-6.12"
+    local CONFIG61="$ROCKCHIP_DIR/config-6.1"
+
+    [ -f "$KCONFIG" ] || err "找不到 $KCONFIG"
+
+    local opt
+    for opt in CONFIG_INET_DIAG CONFIG_INET_TCP_DIAG CONFIG_INET_UDP_DIAG CONFIG_INET_RAW_DIAG; do
+        sed -i "/^# ${opt} is not set/d" "$KCONFIG"
+        sed -i "/^${opt}=/d" "$KCONFIG"
+        echo "${opt}=y" >> "$KCONFIG"
+        log "  [OK] $opt=y 已写入 armv8/config-6.12"
+    done
+
+    # 清理孤儿 config-6.1（add_packages.sh 的 sed -i 已把它从软链接变成普通文件）
+    if [ -e "$CONFIG61" ] && [ ! -L "$CONFIG61" ]; then
+        log "  清理 add_packages.sh 遗留的孤儿文件 config-6.1"
+        rm -f "$CONFIG61"
+    fi
+
+    # 重建软链接
+    [ -e "$CONFIG61" ] || ln -s armv8/config-6.12 "$CONFIG61"
+    log "[OK] config-6.1 软链接已恢复: $(readlink "$CONFIG61")"
+
+    log "---- 校验 INET_DIAG 最终状态 ----"
+    grep -E "^CONFIG_INET_(TCP_|UDP_|RAW_)?DIAG=y" "$KCONFIG" || warn "INET_DIAG 系列未全部写入"
 }
 
 step_dedupe_config() {
@@ -421,7 +419,6 @@ step_force_config() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 强制重新声明 LED / 网络驱动内核选项，防止被 add_packages.sh 覆盖
     local kopt
     for kopt in \
         CONFIG_KERNEL_LEDS_GPIO \
@@ -506,7 +503,7 @@ step_verify_kernel_options() {
         fi
     done
 
-    log "--- INET_DIAG 系列（add_packages.sh 追加） ---"
+    log "--- INET_DIAG 系列（Clashoo 依赖） ---"
     for opt in \
         CONFIG_INET_DIAG \
         CONFIG_INET_TCP_DIAG \
