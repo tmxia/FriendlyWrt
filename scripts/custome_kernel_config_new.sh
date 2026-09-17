@@ -131,7 +131,7 @@ EOF
 }
 
 step_add_led_and_network_fallback() {
-    log "===== 3.7 添加 LED 与网络兜底脚本（与 99-custom 兼容） ====="
+    log "===== 3.7 添加 LED 与网络兜底脚本（动态识别，不依赖硬编码 LED 名） ====="
     cd "$FRIENDLYWRT_DIR"
 
     mkdir -p files/etc/init.d files/etc/uci-defaults
@@ -142,14 +142,19 @@ step_add_led_and_network_fallback() {
 START=97
 STOP=01
 
-setup_led() {
+# 通用 LED 触发器设置
+# $1 = LED 名称（如 red:power）
+# $2 = 触发器（如 heartbeat / netdev）
+# $3 = netdev 设备名（可选）
+set_led() {
 	local name="$1"
-	local trigger="$2"
+	local trig="$2"
 	local dev="$3"
 
 	[ -e "/sys/class/leds/$name/trigger" ] || return 0
 
-	if ! echo "$trigger" > "/sys/class/leds/$name/trigger" 2>/dev/null; then
+	if ! echo "$trig" > "/sys/class/leds/$name/trigger" 2>/dev/null; then
+		# 触发器不可用时降级
 		echo heartbeat > "/sys/class/leds/$name/trigger" 2>/dev/null || \
 		echo default-on > "/sys/class/leds/$name/trigger" 2>/dev/null
 		return 0
@@ -165,18 +170,37 @@ setup_led() {
 
 start() {
 	local i
-	for i in $(seq 1 60); do
-		[ -e /sys/class/net/eth0 ] && break
+	for i in $(seq 1 30); do
+		[ -e /sys/class/leds ] && [ "$(ls /sys/class/leds/ 2>/dev/null | wc -l)" -gt 0 ] && break
 		sleep 1
 	done
 
-	setup_led "red:power"  heartbeat ""
+	# 遍历所有 LED 节点，根据名字动态分配触发器
+	for led in /sys/class/leds/*/; do
+		[ -d "$led" ] || continue
+		name=$(basename "$led")
 
-	setup_led "green:wan"   netdev eth0
-	setup_led "green:lan-1" netdev eth1
-	setup_led "green:lan-2" netdev eth2
-
-	[ -e /sys/class/leds/green:lan/trigger ] && setup_led "green:lan" netdev eth1
+		case "$name" in
+			*:power*|*power:red*|*red:power*)
+				set_led "$name" heartbeat ""
+				;;
+			*:wan*|*wan:green*)
+				set_led "$name" netdev eth0
+				;;
+			*lan-1*|*lan1*|*lan_1*)
+				set_led "$name" netdev eth1
+				;;
+			*lan-2*|*lan2*|*lan_2*)
+				set_led "$name" netdev eth2
+				;;
+			*:lan*|*lan:green*)
+				set_led "$name" netdev eth1
+				;;
+			*:wlan*|*wlan:green*)
+				set_led "$name" netdev phy0-ap0
+				;;
+		esac
+	done
 }
 
 boot() { start; }
@@ -208,7 +232,7 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/50-fix-network
 
-    log "[OK] LED 与网络兜底脚本已写入"
+    log "[OK] LED 与网络兜底脚本已写入（动态识别 LED 名）"
 }
 
 step_init_config() {
@@ -247,6 +271,11 @@ CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
 
+# ==== 网络驱动走 OpenWrt kmod 包（不用 KERNEL_*=y 强推） ====
+CONFIG_PACKAGE_kmod-r8169=y
+CONFIG_PACKAGE_kmod-stmmac=y
+
+# ==== LED 驱动（DTS 直接引用，必须 built-in） ====
 CONFIG_KERNEL_GPIOLIB=y
 CONFIG_KERNEL_OF_GPIO=y
 CONFIG_KERNEL_GPIOD=y
@@ -263,14 +292,7 @@ CONFIG_KERNEL_LEDS_TRIGGER_TIMER=y
 CONFIG_KERNEL_LEDS_TRIGGER_DEFAULT_ON=y
 CONFIG_KERNEL_LEDS_TRIGGER_TRANSIENT=y
 
-CONFIG_KERNEL_R8169=y
-CONFIG_KERNEL_STMMAC_ETH=y
-CONFIG_KERNEL_DWMAC_ROCKCHIP=y
-CONFIG_KERNEL_PHY_ROCKCHIP_NANENG_COMBO_PHY=y
-CONFIG_KERNEL_PHY_ROCKCHIP_SNPS_PCIE3=y
-CONFIG_KERNEL_PCIE_ROCKCHIP_HOST=y
-CONFIG_KERNEL_REALTEK_PHY=y
-
+# ==== 其他外设 ====
 CONFIG_KERNEL_ROCKCHIP_THERMAL=y
 CONFIG_KERNEL_PWM_ROCKCHIP=y
 CONFIG_KERNEL_PWM_FAN=y
@@ -413,6 +435,13 @@ step_force_config() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    # 网络驱动走 kmod 包
+    for pkg in kmod-r8169 kmod-stmmac; do
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
+    # 只强制 LED 内核驱动（DTS 直接引用，必须 built-in）
     local kopt
     for kopt in \
         CONFIG_KERNEL_GPIOLIB \
@@ -428,11 +457,7 @@ step_force_config() {
         CONFIG_KERNEL_LEDS_TRIGGER_TIMER \
         CONFIG_KERNEL_LEDS_TRIGGER_DEFAULT_ON \
         CONFIG_KERNEL_GPIO_ROCKCHIP \
-        CONFIG_KERNEL_PINCTRL_ROCKCHIP \
-        CONFIG_KERNEL_R8169 \
-        CONFIG_KERNEL_STMMAC_ETH \
-        CONFIG_KERNEL_DWMAC_ROCKCHIP \
-        CONFIG_KERNEL_REALTEK_PHY; do
+        CONFIG_KERNEL_PINCTRL_ROCKCHIP; do
         sed -i "/^${kopt}=/d" .config
         echo "${kopt}=y" >> .config
     done
@@ -471,7 +496,7 @@ step_sync_config() {
 }
 
 step_verify_kernel_options() {
-    log "===== 9.6 校验关键内核选项（硬断言） ====="
+    log "===== 9.6 校验关键内核选项 ====="
     cd "$FRIENDLYWRT_DIR"
 
     local KSRC
@@ -485,32 +510,28 @@ step_verify_kernel_options() {
     log "内核源码路径: $KSRC"
     log "内核 .config: $KSRC/.config"
 
-    # 关键选项：缺失立即终止（不浪费 90 分钟）
+    # 硬断言：只对 LED/GPIO 相关（DTS 直接依赖，缺失一定不工作）
     local opt
     for opt in \
         CONFIG_LEDS_GPIO \
         CONFIG_LEDS_TRIGGER_NETDEV \
         CONFIG_LEDS_TRIGGER_HEARTBEAT \
         CONFIG_GPIO_ROCKCHIP \
-        CONFIG_PINCTRL_ROCKCHIP \
-        CONFIG_R8169 \
-        CONFIG_STMMAC_ETH; do
+        CONFIG_PINCTRL_ROCKCHIP; do
         if grep -q "^${opt}=y" "$KSRC/.config"; then
             log "  [OK]   $opt"
         elif grep -q "^${opt}=m" "$KSRC/.config"; then
             log "  [MOD]  $opt"
         else
             tail -80 /tmp/kernel_oldconfig.log 2>/dev/null || true
-            err "  [FATAL] $opt 未生效！内核配置映射失败，立即终止。"
+            err "  [FATAL] $opt 未生效！LED/GPIO 依赖缺失，立即终止。"
         fi
     done
 
-    # 次要选项：仅警告
+    # 软警告：网络驱动、可选触发器、INET_DIAG
     for opt in \
         CONFIG_LEDS_TRIGGER_TIMER \
         CONFIG_LEDS_TRIGGER_DEFAULT_ON \
-        CONFIG_DWMAC_ROCKCHIP \
-        CONFIG_REALTEK_PHY \
         CONFIG_GPIOLIB \
         CONFIG_OF_GPIO \
         CONFIG_INET_DIAG \
@@ -525,6 +546,8 @@ step_verify_kernel_options() {
             warn "  [MISS] $opt"
         fi
     done
+
+    log "[OK] LED/GPIO 硬断言全部通过"
 }
 
 step_export_debug_artifacts() {
@@ -545,16 +568,13 @@ step_export_debug_artifacts() {
 
     log "内核源码目录: $KSRC"
 
-    # 1. 内核最终 .config（这才是真实生效的配置）
     if [ -f "$KSRC/.config" ]; then
         cp "$KSRC/.config" "$DEBUG_DIR/kernel.config.full"
         grep -E "^CONFIG_(LEDS|GPIO|PINCTRL|R8169|RTL|STMMAC|DWMAC|PHY_|PCI|NEW_LEDS|OF_GPIO|GPIOD|GPIOLIB|INET_DIAG|INET_TCP_DIAG|INET_UDP_DIAG|INET_RAW_DIAG)" \
             "$KSRC/.config" > "$DEBUG_DIR/kernel.config.filtered" 2>/dev/null || true
         log "  [OK] kernel.config.full ($(wc -l < "$KSRC/.config") 行)"
-        log "  [OK] kernel.config.filtered"
     fi
 
-    # 2. System.map：符号名决定性证据
     if [ -f "$KSRC/System.map" ]; then
         cp "$KSRC/System.map" "$DEBUG_DIR/System.map"
         grep -E " (T|t) _?(leds_gpio_probe|leds_gpio_remove|led_gpio_set|led_classdev_register|ledtrig_netdev_activate|ledtrig_heartbeat_activate|ledtrig_timer_activate|rockchip_gpio_probe|rockchip_gpio_irq_handler|rockchip_pinctrl_probe|r8169_probe|stmmac_dvr_probe|dwmac_rk_probe)$" \
@@ -562,19 +582,16 @@ step_export_debug_artifacts() {
         log "  [OK] System.map"
     fi
 
-    # 3. vmlinux（含完整符号表）
     if [ -f "$KSRC/vmlinux" ]; then
         cp "$KSRC/vmlinux" "$DEBUG_DIR/vmlinux"
         log "  [OK] vmlinux ($(du -h "$KSRC/vmlinux" | awk '{print $1}'))"
     fi
 
-    # 4. DTB 反编译
     local DTB_FILE="$KSRC/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dtb"
     if [ -f "$DTB_FILE" ]; then
         cp "$DTB_FILE" "$DEBUG_DIR/rk3568-nanopi-r5s.dtb"
         if command -v dtc >/dev/null 2>&1; then
             dtc -I dtb -O dts "$DTB_FILE" > "$DEBUG_DIR/rk3568-nanopi-r5s.dtb.dts" 2>/dev/null || true
-            log "  [OK] DTB 反编译为 DTS"
         fi
     fi
 
@@ -604,7 +621,6 @@ step_compile() {
 
     ls -lh bin/targets/rockchip/armv8/*.img.gz
 
-    # 编译完成后导出调试产物（此时内核 .config 已最终确定）
     step_export_debug_artifacts
 }
 
