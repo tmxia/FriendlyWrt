@@ -495,6 +495,7 @@ jobs:
         rootfs 分区: ${ROOTFS_PARTSIZE} MB
         Docker: 已集成
         晶晨宝盒: 已集成 (luci-app-amlogic)
+        LED: DTS 层已注入 default-trigger（电源心跳，网络 netdev）
         CMDLINE 追加: ${DOCKER_BOOTARGS}
 
         产物:
@@ -502,10 +503,11 @@ jobs:
         2. images-${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}.tgz → eMMC 刷机包
         3. ${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}-sysupgrade.img.gz → 原生镜像
         4. SHA256SUMS
-        5. diagnostics.tgz → 编译期诊断信息（含 System.map、内核 .config）
+        5. diagnostics.tgz → 编译期诊断信息（含 System.map、kernel.config）
 
         刷机后验证:
         - uname -r → 6.12.x
+        - 上电后 3-5 秒电源灯应呼吸闪烁
         - /proc/cmdline 含 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory
         - docker info 正常
         - LuCI 有「系统 → 晶晨宝盒」
@@ -519,10 +521,6 @@ jobs:
         mkdir -p artifact/diagnostics
         DIAG=artifact/diagnostics
 
-        # =========================================================
-        # 优先：从 custome_kernel_config_new.sh 导出的调试产物
-        # 这是决定性证据（System.map / vmlinux / kernel.config.full）
-        # =========================================================
         if [ -d "project/friendlywrt/.debug-artifacts" ]; then
           echo "[OK] 拷贝 .debug-artifacts 里的所有文件"
           cp -r project/friendlywrt/.debug-artifacts/* "$DIAG/" 2>/dev/null || true
@@ -531,43 +529,33 @@ jobs:
           echo "::warning::.debug-artifacts 不存在，用兜底逻辑"
         fi
 
-        # =========================================================
-        # 兜底：直接从内核源码目录采集（修正路径）
-        # =========================================================
         if [ -n "$KDIR" ] && [ -d "$KDIR" ]; then
           KSRC_REAL=$(find "$KDIR" -maxdepth 1 -type d -name "linux-6.12*" | head -1)
 
           if [ -n "$KSRC_REAL" ] && [ -d "$KSRC_REAL" ]; then
             echo "[OK] 找到内核源码目录: $KSRC_REAL"
 
-            # DTS 源文件
             find "$KSRC_REAL" -name "rk3568-nanopi-r5s*.dts*" -type f \
               -exec cp {} "$DIAG/" \; 2>/dev/null || true
 
-            # 最终内核 .config
             if [ -f "$KSRC_REAL/.config" ]; then
               cp "$KSRC_REAL/.config" "$DIAG/kernel.config.full" 2>/dev/null || true
               grep -E "^CONFIG_(LEDS|GPIO_ROCKCHIP|PINCTRL_ROCKCHIP|R8169|RTL8|STMMAC|NET_DSA|NET_VENDOR|PCI|PHY_|NEW_LEDS|LEDS_TRIGGER|LEDS_CLASS|LEDS_GPIO|GPIOLIB|OF_GPIO|GPIOD|INET_DIAG)" \
                 "$KSRC_REAL/.config" > "$DIAG/kernel-config-led-net.txt" 2>/dev/null || true
             fi
 
-            # System.map（决定性证据）
             if [ -f "$KSRC_REAL/System.map" ]; then
               cp "$KSRC_REAL/System.map" "$DIAG/System.map" 2>/dev/null || true
               grep -E " (T|t) _?(leds_gpio_probe|led_gpio_set|led_classdev_register|ledtrig_netdev_activate|ledtrig_heartbeat_activate|rockchip_gpio_probe|r8169_probe|stmmac_dvr_probe|dwmac_rk_probe)$" \
                 "$KSRC_REAL/System.map" > "$DIAG/System.map.leds-net" 2>/dev/null || true
             fi
 
-            # vmlinux（完整符号表，可能几十 MB）
             if [ -f "$KSRC_REAL/vmlinux" ]; then
               cp "$KSRC_REAL/vmlinux" "$DIAG/vmlinux" 2>/dev/null || true
             fi
           fi
         fi
 
-        # =========================================================
-        # 用户空间诊断
-        # =========================================================
         if [ -n "$ROOTFS_SRC" ] && [ -d "$ROOTFS_SRC" ]; then
           [ -f "$ROOTFS_SRC/etc/config/network" ] && cp "$ROOTFS_SRC/etc/config/network" "$DIAG/network-config.txt" || true
           [ -f "$ROOTFS_SRC/etc/config/system" ] && cp "$ROOTFS_SRC/etc/config/system" "$DIAG/system-config.txt" || true
@@ -592,7 +580,6 @@ jobs:
           fi
         fi
 
-        # 环境变量记录
         {
           echo "IMMORTALWRT_BRANCH=$IMMORTALWRT_BRANCH"
           echo "FRIENDLY_VER=$FRIENDLY_VER"
