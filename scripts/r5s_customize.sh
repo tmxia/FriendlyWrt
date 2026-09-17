@@ -4,6 +4,7 @@ set -e
 STAGE="$1"
 
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
+SMALL_PACKAGE_FEED="src-git small https://github.com/kenzok8/small-package.git;main"
 AMLOGIC_REPO="https://github.com/ophub/luci-app-amlogic.git"
 
 CACHE_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY:-local/unknown}" | tr '[:upper:]' '[:lower:]')/r5s-base-cache:openwrt-25.12"
@@ -16,6 +17,7 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
+    grep -q "src-git small" feeds.conf || echo "$SMALL_PACKAGE_FEED" >> feeds.conf
 }
 
 post_feeds() {
@@ -239,7 +241,7 @@ config_stage() {
                kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
                kmod-nf-nathelper kmod-nf-nathelper-extra \
                kmod-fs-overlay kmod-fuse \
-               kmod-r8125 kmod-r8125-rss kmod-r8169 \
+               kmod-r8125-rss kmod-r8169 \
                iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra; do
@@ -267,6 +269,10 @@ config_stage() {
         echo "ERROR: required packages not enabled"
         exit 1
     fi
+
+    echo "===== 网卡驱动 config 检查 ====="
+    grep -E "^CONFIG_PACKAGE_kmod-(r8125|r8169|r8168)" .config || echo "  (无)"
+    echo "==============================="
 }
 
 case "$STAGE" in
