@@ -252,6 +252,9 @@ jobs:
           echo "===== iptables related config ====="
           grep -E "^CONFIG_PACKAGE_(i|ip6)tables" .config || true
 
+          echo "===== r8125 / r8169 相关 config ====="
+          grep -E "CONFIG_PACKAGE_kmod-r81(25|68|69)" .config || true
+
       - name: Restore base build cache
         id: restore_cache
         run: |
@@ -365,6 +368,19 @@ jobs:
           echo "KV=$KV" >> $GITHUB_ENV
           [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules not 6.12, got: $KV"; exit 1; }
 
+          echo "===== r8125 in rootfs-src ====="
+          ls "$ROOTFS_SRC/lib/modules/$KV/kernel/drivers/net/ethernet/realtek/" 2>/dev/null || \
+              echo "  (realtek 目录不存在)"
+          if ls "$ROOTFS_SRC/lib/modules/$KV/kernel/drivers/net/ethernet/realtek/" 2>/dev/null | grep -q r8125; then
+              echo "  [OK] r8125 found in compiled rootfs"
+          else
+              echo "::error::r8125 未编译进 OpenWrt rootfs（2.5G 网口无法工作）"
+              exit 1
+          fi
+
+      # ============================================================
+      # 修复：移除 emmc-flasher-images.tgz 下载，仅使用 sd-fuse 自带 prebuilt
+      # ============================================================
       - name: Setup sd-fuse packaging tools
         if: success()
         run: |
@@ -372,12 +388,29 @@ jobs:
           rm -rf sd-fuse
           git clone --depth 1 -b master https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse 2>&1 | tail -2
           cd sd-fuse
+          [ -f mk-sd-image.sh ] || { echo "::error::mk-sd-image.sh missing"; exit 1; }
           [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
+          [ -d prebuilt ] || { echo "::error::prebuilt missing"; exit 1; }
 
           TGT="friendlywrt25"
+          rm -rf "$TGT"
           mkdir -p "$TGT"
-          wget -q http://112.124.9.243/dvdfiles/rk3568/images-for-eflasher/emmc-flasher-images.tgz -O /tmp/emmc-flasher-images.tgz
-          tar xzf /tmp/emmc-flasher-images.tgz
+
+          echo "===== prebuilt/ 内容 ====="
+          ls -la prebuilt/ | head -30
+
+          echo "===== parameter.template ====="
+          cat prebuilt/parameter.template 2>/dev/null || echo "  (缺失)"
+
+          echo "===== 拷贝启动二进制到 $TGT/ ====="
+          for f in uboot.img idbloader.img MiniLoaderAll.bin misc.img dtbo.img; do
+            if [ -f "prebuilt/$f" ]; then
+              cp "prebuilt/$f" "$TGT/$f"
+              echo "  copied $f"
+            else
+              echo "  [WARN] prebuilt/$f 不存在，跳过"
+            fi
+          done
 
       - name: Package kernel and resource images
         if: success()
@@ -417,10 +450,6 @@ jobs:
 
           [ -f "$TGT/resource.img" ] || { echo "::error::resource.img not generated"; exit 1; }
 
-          for f in uboot.img idbloader.img MiniLoaderAll.bin misc.img dtbo.img; do
-            [ -f "prebuilt/$f" ] && cp "prebuilt/$f" "$TGT/$f"
-          done
-
           ls -lh "$TGT"/kernel.img "$TGT"/resource.img
 
       - name: Build rootfs image
@@ -454,20 +483,64 @@ jobs:
 
           [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img generation failed"; exit 1; }
 
+          # ---- 直接挂载校验 rootfs.img 内容 ----
+          echo "===== 校验 rootfs.img 内容 ====="
+          mkdir -p /tmp/verify-rootfs
+          sudo mount -o loop,ro "$TGT/rootfs.img" /tmp/verify-rootfs
+
+          [ -d /tmp/verify-rootfs/etc/config ] || { echo "::error::rootfs.img 不是 OpenWrt（缺 /etc/config/）"; sudo umount /tmp/verify-rootfs; exit 1; }
+          [ -f /tmp/verify-rootfs/etc/config/network ] || { echo "::error::缺 /etc/config/network"; sudo umount /tmp/verify-rootfs; exit 1; }
+          [ -f /tmp/verify-rootfs/etc/uci-defaults/99-custom ] || { echo "::error::缺 99-custom"; sudo umount /tmp/verify-rootfs; exit 1; }
+
+          KVER=$(ls /tmp/verify-rootfs/lib/modules/ | head -1)
+          echo "kernel: $KVER"
+          case "$KVER" in
+            6.12*) echo "  [OK] kernel 6.12" ;;
+            *) echo "::error::kernel 不是 6.12"; sudo umount /tmp/verify-rootfs; exit 1 ;;
+          esac
+
+          if ls /tmp/verify-rootfs/lib/modules/$KVER/kernel/drivers/net/ethernet/realtek/ 2>/dev/null | grep -q r8125; then
+            echo "  [OK] r8125 found"
+          else
+            echo "::error::r8125 缺失（2.5G 网口无法工作）"
+            sudo umount /tmp/verify-rootfs; exit 1
+          fi
+
+          if [ -f /tmp/verify-rootfs/etc/debian_version ]; then
+            echo "::error::rootfs 是 Debian"
+            sudo umount /tmp/verify-rootfs; exit 1
+          fi
+
+          echo "[OK] rootfs.img 校验通过"
+          sudo umount /tmp/verify-rootfs
+          sudo rmdir /tmp/verify-rootfs
+          # ---- 校验结束 ----
+
           PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
             ./tools/generate-partmap-txt.sh "$LOGICAL_SIZE" "$TGT"
 
           echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
-          ls -lh "$TGT/rootfs.img"
+
+          echo "===== $TGT/ 内容 ====="
+          ls -lh "$TGT/"
+
+          echo "===== parameter.txt ====="
           cat "$TGT/parameter.txt"
 
       - name: Build SD card and eMMC images
         if: success()
         run: |
           cd $GITHUB_WORKSPACE/sd-fuse
+          TGT="friendlywrt25"
+
+          [ -f "$TGT/kernel.img" ]    || { echo "::error::kernel.img missing"; exit 1; }
+          [ -f "$TGT/rootfs.img" ]    || { echo "::error::rootfs.img missing"; exit 1; }
+          [ -f "$TGT/resource.img" ]  || { echo "::error::resource.img missing"; exit 1; }
+          [ -f "$TGT/parameter.txt" ] || { echo "::error::parameter.txt missing"; exit 1; }
+
           export SDFUSE_NONINTERACTIVE=y
 
-          sudo -E ./mk-sd-image.sh friendlywrt25 > /tmp/sd-image.log 2>&1 || {
+          sudo -E ./mk-sd-image.sh "$TGT" > /tmp/sd-image.log 2>&1 || {
             tail -80 /tmp/sd-image.log
             exit 1
           }
@@ -478,7 +551,7 @@ jobs:
             exit 1
           fi
 
-          sudo -E ./mk-emmc-image.sh friendlywrt25 autostart=yes > /tmp/emmc-image.log 2>&1 || {
+          sudo -E ./mk-emmc-image.sh "$TGT" autostart=yes > /tmp/emmc-image.log 2>&1 || {
             tail -80 /tmp/emmc-image.log
             exit 1
           }
@@ -486,6 +559,90 @@ jobs:
 
           sudo chown -R "$(id -u):$(id -g)" out/ friendlywrt25/ 2>/dev/null || true
           ls -lh out/ out/images-for-eflasher/ 2>/dev/null || true
+
+      # ============================================================
+      # 新增：校验最终生成的 SD 镜像，防止打包污染
+      # ============================================================
+      - name: Verify generated SD image contains OpenWrt
+        if: success()
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/sd-fuse
+
+          IMG=$(find out -maxdepth 1 -name "*.img" -type f | head -1)
+          [ -n "$IMG" ] || { echo "::error::no SD image produced"; exit 1; }
+          echo "SD image: $IMG ($(stat -c%s "$IMG") bytes)"
+
+          LOOP=$(sudo losetup -Pf --show "$IMG")
+          echo "loop: $LOOP"
+          sleep 2
+
+          ROOT_PART=""
+          for p in ${LOOP}p*; do
+              FS=$(sudo file -s "$p" | sed 's/.*: //')
+              echo "  $p: $FS"
+              if echo "$FS" | grep -qi 'ext4'; then
+                  ROOT_PART="$p"
+              fi
+          done
+
+          [ -n "$ROOT_PART" ] || { echo "::error::no ext4 partition in SD image"; sudo losetup -d "$LOOP"; exit 1; }
+
+          mkdir -p /tmp/verify-sd
+          sudo mount -o ro "$ROOT_PART" /tmp/verify-sd
+
+          echo "===== 校验 1: OpenWrt 布局 ====="
+          if [ ! -d /tmp/verify-sd/etc/config ]; then
+              echo "::error::rootfs 不是 OpenWrt（缺 /etc/config/）"
+              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
+          fi
+          [ -f /tmp/verify-sd/etc/config/network ] || { echo "::error::no /etc/config/network"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
+          [ -f /tmp/verify-sd/etc/uci-defaults/99-custom ] || { echo "::error::99-custom missing"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
+
+          echo "===== 校验 2: 内核版本 ====="
+          KVER=$(ls /tmp/verify-sd/lib/modules/ | head -1)
+          echo "kernel modules: $KVER"
+          case "$KVER" in
+            6.12*) echo "  [OK] 6.12" ;;
+            *) echo "::error::kernel is NOT 6.12 (got $KVER)"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1 ;;
+          esac
+
+          echo "===== 校验 3: r8125 驱动 ====="
+          if ls /tmp/verify-sd/lib/modules/$KVER/kernel/drivers/net/ethernet/realtek/ 2>/dev/null | grep -q r8125; then
+              echo "  [OK] r8125 found"
+          else
+              echo "::error::r8125 missing (R5S 2.5G 网口将无法工作)"
+              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
+          fi
+
+          echo "===== 校验 4: 确认不是 FriendlyElec Debian ====="
+          if [ -f /tmp/verify-sd/etc/debian_version ]; then
+              echo "::error::rootfs is Debian, not OpenWrt"
+              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
+          fi
+          if [ -f /tmp/verify-sd/etc/init.d/friendlyelec_firstuse.sh ]; then
+              echo "::error::FriendlyElec firstuse 脚本存在"
+              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
+          fi
+
+          echo "===== 校验 5: 分区大小 ====="
+          ROOT_MB=$(( $(sudo blockdev --getsize64 "$ROOT_PART") / 1024 / 1024 ))
+          echo "rootfs partition: ${ROOT_MB} MB (expect 1024)"
+          if [ "$ROOT_MB" -lt 900 ] || [ "$ROOT_MB" -gt 1200 ]; then
+              echo "::warning::rootfs partition ${ROOT_MB}MB 与 1024MB 不匹配"
+          fi
+
+          echo "===== 校验 6: 网络接口映射 ====="
+          if [ -f /tmp/verify-sd/etc/board.d/02_network ]; then
+              grep -n -A3 'nanopi-r5s' /tmp/verify-sd/etc/board.d/02_network || true
+          fi
+          echo "--- /etc/config/network 前 40 行 ---"
+          head -40 /tmp/verify-sd/etc/config/network || true
+
+          sudo umount /tmp/verify-sd
+          sudo losetup -d "$LOOP"
+          sudo rmdir /tmp/verify-sd
+          echo "===== SD image verification passed ====="
 
       - name: Collect and checksum artifacts
         if: success()
