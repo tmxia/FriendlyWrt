@@ -54,12 +54,34 @@ step_verify_kernel() {
     find target/linux/rockchip -maxdepth 3 \( -type d -name "patches-*" -o -type f -name "config-*" \) 2>/dev/null
 }
 
+# 关键：通过软链接把 add_packages.sh 里硬编码的 config-6.1 路径
+# 指向真实的 config-6.12。这样无需修改用户的原始脚本，
+# add_packages.sh 里的 INET_DIAG 追加就会自动落到 6.12 上。
 step_bridge_kernel_config() {
-    log "===== 3. 桥接 config-6.1 -> config-6.12 ====="
+    log "===== 3. 桥接 config-6.1 -> config-6.12（不改 add_packages.sh） ====="
     cd "$FRIENDLYWRT_DIR/target/linux/rockchip" || return 0
 
     [ -f armv8/config-6.12 ] || err "找不到 armv8/config-6.12"
-    [ -e config-6.1 ] || ln -s armv8/config-6.12 config-6.1
+
+    if [ -L config-6.1 ]; then
+        local target
+        target=$(readlink config-6.1)
+        if [ "$target" = "armv8/config-6.12" ]; then
+            log "[OK] config-6.1 软链接已就位: config-6.1 -> armv8/config-6.12"
+        else
+            warn "config-6.1 是软链接但指向 $target，重建"
+            rm -f config-6.1
+            ln -s armv8/config-6.12 config-6.1
+        fi
+    elif [ -f config-6.1 ]; then
+        warn "config-6.1 是真实文件（非软链接），备份为 config-6.1.bak 后重建软链接"
+        mv config-6.1 config-6.1.bak
+        ln -s armv8/config-6.12 config-6.1
+    else
+        ln -s armv8/config-6.12 config-6.1
+        log "[OK] 已创建软链接 config-6.1 -> armv8/config-6.12"
+    fi
+
     ls -la config-6.1
 }
 
@@ -77,7 +99,7 @@ step_clean_legacy_patches() {
 }
 
 step_add_fan_control() {
-    log "===== 3.8 添加 PWM 风扇控制 ====="
+    log "===== 3.6 添加 PWM 风扇控制 ====="
     cd "$FRIENDLYWRT_DIR"
 
     mkdir -p files/etc/init.d
@@ -123,6 +145,104 @@ EOF
     log "[OK] 风扇控制脚本已写入"
 }
 
+step_add_led_and_network_fallback() {
+    log "===== 3.7 添加 LED 与网络兜底脚本（与 99-custom 兼容） ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    mkdir -p files/etc/init.d files/etc/uci-defaults
+
+    # ------------------------------------------------------------------
+    # LED 兜底：START=97 晚于 /etc/init.d/led（START=96）。
+    # 无论 board.d/01_leds 是否成功、netdev 触发器是否存在，
+    # 都用 sysfs 直接绑定 LED；netdev 加载失败时自动降级。
+    # 只设置 gpio-leds 里的四个 LED，不碰网卡自身的 LED。
+    # ------------------------------------------------------------------
+    cat > files/etc/init.d/led-force << 'EOF'
+#!/bin/sh /etc/rc.common
+
+START=97
+STOP=01
+
+setup_led() {
+	local name="$1"
+	local trigger="$2"
+	local dev="$3"
+
+	[ -e "/sys/class/leds/$name/trigger" ] || return 0
+
+	if ! echo "$trigger" > "/sys/class/leds/$name/trigger" 2>/dev/null; then
+		echo heartbeat > "/sys/class/leds/$name/trigger" 2>/dev/null || \
+		echo default-on > "/sys/class/leds/$name/trigger" 2>/dev/null
+		return 0
+	fi
+
+	[ -n "$dev" ] && [ -e "/sys/class/leds/$name/device_name" ] && {
+		echo "$dev" > "/sys/class/leds/$name/device_name" 2>/dev/null
+		[ -e "/sys/class/leds/$name/link" ] && echo 1 > "/sys/class/leds/$name/link" 2>/dev/null
+		[ -e "/sys/class/leds/$name/tx" ]   && echo 1 > "/sys/class/leds/$name/tx"   2>/dev/null
+		[ -e "/sys/class/leds/$name/rx" ]   && echo 1 > "/sys/class/leds/$name/rx"   2>/dev/null
+	}
+}
+
+start() {
+	local i
+	for i in $(seq 1 60); do
+		[ -e /sys/class/net/eth0 ] && break
+		sleep 1
+	done
+
+	# 电源 LED 用 heartbeat，DTS 里没有 default-trigger
+	setup_led "red:power"  heartbeat ""
+
+	# 网络 LED 用 netdev；DTS 中的名称由 color+function[-enumerator] 决定
+	setup_led "green:wan"   netdev eth0
+	setup_led "green:lan-1" netdev eth1
+	setup_led "green:lan-2" netdev eth2
+
+	# 兼容可能的不同内核命名
+	[ -e /sys/class/leds/green:lan/trigger ] && setup_led "green:lan" netdev eth1
+	[ -e /sys/class/leds/red:power/trigger ] && setup_led "red:power" heartbeat ""
+}
+
+boot() { start; }
+EOF
+    chmod +x files/etc/init.d/led-force
+
+    # ------------------------------------------------------------------
+    # 网络兜底：命名 50-fix-network，字典序早于 99-custom 执行。
+    # 只补 ifname / proto，不设置 IP / gateway / dns / netmask，
+    # 那些参数由 add_packages.sh 的 99-custom 负责。
+    # 判断条件检查 ifname 是否为空（而不是 section 是否存在），
+    # 避免被 99-custom 中先执行的 `uci set network.lan.ipaddr` 骗过。
+    # ------------------------------------------------------------------
+    cat > files/etc/uci-defaults/50-fix-network << 'EOF'
+#!/bin/sh
+
+if [ -z "$(uci -q get network.lan.ifname)" ] && \
+   [ "$(uci -q get network.lan.type)" != "bridge" ]; then
+	uci -q set network.lan=interface
+	uci -q set network.lan.type='bridge'
+	uci -q set network.lan.ifname='eth1 eth2'
+	uci -q set network.lan.proto='static'
+	uci -q set network.lan.ipaddr='192.168.3.3'
+	uci -q set network.lan.netmask='255.255.255.0'
+	uci commit network
+fi
+
+if [ -z "$(uci -q get network.wan.ifname)" ]; then
+	uci -q set network.wan=interface
+	uci -q set network.wan.ifname='eth0'
+	uci -q set network.wan.proto='dhcp'
+	uci commit network
+fi
+
+exit 0
+EOF
+    chmod +x files/etc/uci-defaults/50-fix-network
+
+    log "[OK] LED 与网络兜底脚本已写入（50-fix-network 兼容 99-custom）"
+}
+
 step_init_config() {
     log "===== 4. 初始化 .config ====="
     cd "$FRIENDLYWRT_DIR"
@@ -159,22 +279,42 @@ CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
 
+# ==== 内核 GPIO / LED ====
 CONFIG_KERNEL_GPIO_ROCKCHIP=y
 CONFIG_KERNEL_PINCTRL_ROCKCHIP=y
+CONFIG_KERNEL_NEW_LEDS=y
+CONFIG_KERNEL_LEDS_CLASS=y
 CONFIG_KERNEL_LEDS_GPIO=y
+CONFIG_KERNEL_LEDS_TRIGGERS=y
 CONFIG_KERNEL_LEDS_TRIGGER_HEARTBEAT=y
+CONFIG_KERNEL_LEDS_TRIGGER_NETDEV=y
+CONFIG_KERNEL_LEDS_TRIGGER_TIMER=y
+CONFIG_KERNEL_LEDS_TRIGGER_DEFAULT_ON=y
+CONFIG_KERNEL_LEDS_TRIGGER_TRANSIENT=y
+
+# ==== 网络驱动（RTL8125 走 PCIe，RGMII PHY 走 stmmac） ====
+CONFIG_KERNEL_R8169=y
+CONFIG_KERNEL_STMMAC_ETH=y
+CONFIG_KERNEL_DWMAC_ROCKCHIP=y
 CONFIG_KERNEL_PHY_ROCKCHIP_NANENG_COMBO_PHY=y
 CONFIG_KERNEL_PHY_ROCKCHIP_SNPS_PCIE3=y
 CONFIG_KERNEL_PCIE_ROCKCHIP_HOST=y
+CONFIG_KERNEL_REALTEK_PHY=y
+
+# ==== 热管理与 PWM 风扇 ====
 CONFIG_KERNEL_ROCKCHIP_THERMAL=y
 CONFIG_KERNEL_PWM_ROCKCHIP=y
 CONFIG_KERNEL_PWM_FAN=y
+
+# ==== USB ====
 CONFIG_KERNEL_USB_EHCI_HCD=y
 CONFIG_KERNEL_USB_EHCI_PCI=y
 CONFIG_KERNEL_USB_OHCI_HCD=y
 CONFIG_KERNEL_USB_UHCI_HCD=y
 CONFIG_KERNEL_USB_XHCI_HCD=y
 CONFIG_KERNEL_USB_XHCI_PCI=y
+
+# ==== Docker / 容器支持 ====
 CONFIG_KERNEL_CGROUPS=y
 CONFIG_KERNEL_CGROUP_FREEZER=y
 CONFIG_KERNEL_CGROUP_PIDS=y
@@ -196,7 +336,7 @@ EOF
 }
 
 step_apply_customizations() {
-    log "===== 5. 应用自定义配置 ====="
+    log "===== 5. 应用自定义配置（调用 add_packages.sh，不修改脚本本身） ====="
 
     log "克隆 luci-app-amlogic..."
     rm -rf "$FRIENDLYWRT_DIR/package/luci-app-amlogic"
@@ -211,12 +351,9 @@ step_apply_customizations() {
     echo "CONFIG_PACKAGE_luci-app-amlogic=y" >> .config
     yes "" 2>/dev/null | make oldconfig > /dev/null 2>&1
 
-    sed -i 's|target/linux/rockchip/config-\${KERNEL_VERSION}|target/linux/rockchip/armv8/config-\${KERNEL_VERSION}|' \
-        "$SCRIPTS_DIR/add_packages.sh"
-
     cd "$PROJECT_DIR"
     bash "$SCRIPTS_DIR/add_packages.sh"
-    log "[OK] add_packages.sh 执行完成"
+    log "[OK] add_packages.sh 执行完成（未修改原脚本）"
 }
 
 step_dedupe_config() {
@@ -284,6 +421,22 @@ step_force_config() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    # 强制重新声明 LED / 网络驱动内核选项，防止被 add_packages.sh 覆盖
+    local kopt
+    for kopt in \
+        CONFIG_KERNEL_LEDS_GPIO \
+        CONFIG_KERNEL_LEDS_TRIGGERS \
+        CONFIG_KERNEL_LEDS_TRIGGER_HEARTBEAT \
+        CONFIG_KERNEL_LEDS_TRIGGER_NETDEV \
+        CONFIG_KERNEL_LEDS_TRIGGER_TIMER \
+        CONFIG_KERNEL_LEDS_TRIGGER_DEFAULT_ON \
+        CONFIG_KERNEL_R8169 \
+        CONFIG_KERNEL_STMMAC_ETH \
+        CONFIG_KERNEL_DWMAC_ROCKCHIP; do
+        sed -i "/^${kopt}=/d" .config
+        echo "${kopt}=y" >> .config
+    done
+
     log "[OK] 关键配置已强制修正"
 }
 
@@ -317,60 +470,62 @@ step_sync_config() {
     log "[OK] 内核配置同步完成"
 }
 
-step_apply_gpio_source_fix() {
-    log "===== 9.6 源码级修复 GPIO 驱动 ====="
+step_verify_kernel_options() {
+    log "===== 9.6 校验关键内核选项 ====="
     cd "$FRIENDLYWRT_DIR"
 
-    local SRC
-    SRC=$(find build_dir -maxdepth 6 -name "gpio-rockchip.c" -path "*/drivers/gpio/*" -type f 2>/dev/null | head -1)
+    local KSRC
+    KSRC=$(find build_dir -maxdepth 5 -type d -name "linux-6.12*" 2>/dev/null | head -1)
 
-    if [ -z "$SRC" ]; then
-        warn "未找到 gpio-rockchip.c，跳过源码修复"
+    if [ -z "$KSRC" ] || [ ! -f "$KSRC/.config" ]; then
+        warn "未找到已解压的内核源码 .config，跳过校验"
         return 0
     fi
 
-    log "目标源码: $SRC"
+    log "内核源码路径: $KSRC"
+    log "--- LED / 网络驱动关键配置 ---"
 
-    log "--- 诊断：源码中 GPIO 相关代码 ---"
-    grep -n "gc->base\|pin_base\|gpiochip_add_pin_range\|gpio_chip.base\|\.base" "$SRC" | head -20 || true
+    local failed=0
+    local opt
+    for opt in \
+        CONFIG_LEDS_GPIO \
+        CONFIG_LEDS_TRIGGER_NETDEV \
+        CONFIG_LEDS_TRIGGER_HEARTBEAT \
+        CONFIG_LEDS_TRIGGER_TIMER \
+        CONFIG_LEDS_TRIGGER_DEFAULT_ON \
+        CONFIG_R8169 \
+        CONFIG_STMMAC_ETH \
+        CONFIG_DWMAC_ROCKCHIP; do
+        if grep -q "^${opt}=y" "$KSRC/.config"; then
+            log "  [OK]   $opt"
+        elif grep -q "^${opt}=m" "$KSRC/.config"; then
+            log "  [MOD]  $opt"
+        else
+            warn "  [MISS] $opt"
+            failed=$((failed + 1))
+        fi
+    done
 
-    python3 - "$SRC" << 'PY'
-import sys, pathlib, re
-p = pathlib.Path(sys.argv[1])
-txt = p.read_text()
-orig = txt
-changed = False
+    log "--- INET_DIAG 系列（add_packages.sh 追加） ---"
+    for opt in \
+        CONFIG_INET_DIAG \
+        CONFIG_INET_TCP_DIAG \
+        CONFIG_INET_UDP_DIAG \
+        CONFIG_INET_RAW_DIAG; do
+        if grep -q "^${opt}=y" "$KSRC/.config"; then
+            log "  [OK]   $opt"
+        elif grep -q "^${opt}=m" "$KSRC/.config"; then
+            log "  [MOD]  $opt"
+        else
+            warn "  [MISS] $opt"
+        fi
+    done
 
-if 'gc->base = bank->pin_base;' in txt:
-    print("[OK] gc->base 已是 bank->pin_base")
-elif 'gc->base = -1;' in txt:
-    txt = txt.replace('gc->base = -1;', 'gc->base = bank->pin_base;')
-    print("[OK] 修复 gc->base = -1 -> bank->pin_base")
-    changed = True
-else:
-    print("[WARN] 未找到 gc->base = -1，尝试匹配其他模式")
-    m = re.search(r'gc->base\s*=\s*-1\s*;', txt)
-    if m:
-        txt = txt[:m.start()] + 'gc->base = bank->pin_base;' + txt[m.end():]
-        print("[OK] 通过正则修复 gc->base = -1")
-        changed = True
-
-pattern = re.compile(r'gc->base\s*,\s*gc->ngpio\s*\)')
-if pattern.search(txt):
-    txt = pattern.sub('bank->pin_base, bank->nr_pins)', txt)
-    print("[OK] 修复 gpiochip_add_pin_range 参数: gc->base,gc->ngpio -> bank->pin_base,bank->nr_pins")
-    changed = True
-elif 'bank->pin_base, bank->nr_pins)' in txt:
-    print("[OK] gpiochip_add_pin_range 已是 bank->pin_base, bank->nr_pins")
-
-if changed and txt != orig:
-    p.write_text(txt)
-    print("[OK] 源码已更新写入")
-else:
-    print("[INFO] 源码未变更")
-PY
-
-    log "[OK] GPIO 驱动源码修复流程完成"
+    if [ "$failed" -gt 0 ]; then
+        warn "有 $failed 个关键 LED/网络选项未启用，LED 可能不工作"
+    else
+        log "[OK] 所有关键 LED/网络内核选项均已启用"
+    fi
 }
 
 step_compile() {
@@ -378,7 +533,7 @@ step_compile() {
     cd "$FRIENDLYWRT_DIR"
 
     step_sync_config
-    step_apply_gpio_source_fix
+    step_verify_kernel_options
 
     local s
     for s in tools/compile toolchain/compile target/compile package/compile; do
@@ -404,6 +559,7 @@ main() {
     step_bridge_kernel_config
     step_clean_legacy_patches
     step_add_fan_control
+    step_add_led_and_network_fallback
     step_init_config
     step_apply_customizations
     step_dedupe_config
