@@ -23,7 +23,6 @@ env:
   AUTO_REPLACE_TAG: 'false'
   OPENWRT_VER: '25.12'
   MODEL_NAME: 'R5S'
-  ROOTFS_PARTSIZE: '1024'
   OPENWRT_BRANCH: 'openwrt-25.12'
   OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
   CONFIG_FILE: 'scripts/r5s.config'
@@ -145,64 +144,7 @@ jobs:
             subversion flex bison libtool autoconf automake cmake \
             rsync quilt time jq swig zstd \
             device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
-            exfatprogs exfat-fuse fuse \
             android-sdk-libsparse-utils btrfs-progs
-
-      - name: Fix exfat mount helper
-        run: |
-          echo "===== exfat 环境诊断 ====="
-          uname -r
-          echo "--- 内核 exfat 支持 ---"
-          grep exfat /proc/filesystems || echo "  内核无 exfat（将用 FUSE）"
-          sudo modprobe exfat 2>/dev/null || true
-          sudo modprobe fuse 2>/dev/null || true
-          grep exfat /proc/filesystems || echo "  modprobe 后仍无 exfat"
-
-          echo "--- exfat-fuse 包内容 ---"
-          dpkg -L exfat-fuse 2>/dev/null | grep -E "mount" || echo "  (无 mount 相关文件)"
-
-          echo "--- 查找 mount.exfat-fuse 二进制 ---"
-          HELPER=""
-          for f in /usr/sbin/mount.exfat-fuse /sbin/mount.exfat-fuse /usr/bin/mount.exfat-fuse /bin/mount.exfat-fuse; do
-              if [ -x "$f" ]; then
-                  HELPER="$f"
-                  echo "  找到: $f"
-                  break
-              fi
-          done
-
-          if [ -z "$HELPER" ]; then
-              echo "  dpkg 未找到，尝试 find"
-              HELPER=$(find /usr /sbin /bin -name 'mount.exfat-fuse' -type f -executable 2>/dev/null | head -1)
-          fi
-
-          if [ -n "$HELPER" ]; then
-              echo "使用 helper: $HELPER"
-              for target in /sbin/mount.exfat /usr/sbin/mount.exfat /bin/mount.exfat /usr/bin/mount.exfat; do
-                  sudo ln -sf "$HELPER" "$target"
-              done
-              echo "  已创建所有符号链接"
-          else
-              echo "::error::未找到 mount.exfat-fuse，无法建立 helper"
-              exit 1
-          fi
-
-          echo "--- 最终 helper ---"
-          ls -la /sbin/mount.exfat /usr/sbin/mount.exfat 2>/dev/null || true
-
-          echo "--- 挂载测试 ---"
-          dd if=/dev/zero of=/tmp/test.img bs=1M count=10 2>/dev/null
-          mkfs.exfat /tmp/test.img > /dev/null 2>&1
-          sudo mkdir -p /tmp/test-mnt
-          if sudo mount -t exfat /tmp/test.img /tmp/test-mnt; then
-              echo "  [OK] mount -t exfat 成功"
-              sudo umount /tmp/test-mnt
-          else
-              echo "::error::mount -t exfat 依然失败"
-              exit 1
-          fi
-          sudo rmdir /tmp/test-mnt
-          rm -f /tmp/test.img
 
       - name: Clone OpenWrt source
         working-directory: /workdir
@@ -221,12 +163,6 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a 2>&1 | tail -30
 
-          echo "===== 检查 kmod-r8125-rss 是否存在于 small feed ====="
-          if [ -d feeds/small ]; then
-            find feeds/small -maxdepth 3 -type d -name 'r8125*' 2>/dev/null | head -10 || true
-          fi
-          grep -R "kmod-r8125" feeds/ 2>/dev/null | head -5 || echo "  (feeds 中暂未找到 r8125 关键字)"
-
       - name: Apply custom modifications
         run: |
           cd openwrt
@@ -236,9 +172,6 @@ jobs:
         run: |
           cd openwrt
           ./scripts/feeds install -a 2>&1 | tail -30
-
-          echo "===== 检查 r8125 包是否已安装到 package/feeds/small ====="
-          find package/feeds -maxdepth 3 -type d -name 'r8125*' 2>/dev/null | head -10 || true
 
       - name: Load R5S configuration
         run: |
@@ -262,7 +195,7 @@ jobs:
           grep -E "^CONFIG_PACKAGE_(i|ip6)tables" .config || true
 
           echo "===== 网卡驱动 config ====="
-          grep -E "CONFIG_PACKAGE_kmod-(r8125|r8169|r8168)" .config || echo "  (无)"
+          grep -E "CONFIG_PACKAGE_kmod-(r8169|r8125|r8168)" .config || echo "  (无)"
 
       - name: Restore base build cache
         id: restore_cache
@@ -341,443 +274,75 @@ jobs:
           fi
 
           echo "Build succeeded"
-          ls -lh bin/targets/rockchip/armv8/*.img.gz 2>/dev/null || true
 
-      - name: Locate kernel build artifacts
+      - name: Verify OpenWrt official outputs
         if: success()
         run: |
           cd /workdir/openwrt
-
-          TRIPLE_DIR=$(find build_dir -maxdepth 1 -type d -name "target-*_musl" | head -1)
-          [ -z "$TRIPLE_DIR" ] && { echo "::error::target triple not found"; exit 1; }
-          TRIPLE_DIR=$(realpath "$TRIPLE_DIR")
-          echo "TRIPLE_DIR=$TRIPLE_DIR" >> $GITHUB_ENV
-
-          KDIR=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "linux-rockchip*" | head -1)
-          [ -z "$KDIR" ] && { echo "::error::linux-rockchip dir not found"; exit 1; }
-          KDIR=$(realpath "$KDIR")
-          echo "KDIR=$KDIR" >> $GITHUB_ENV
-
-          IMG=$(find "$KDIR" -path "*/arch/arm64/boot/Image" -type f 2>/dev/null | head -1)
-          [ -z "$IMG" ] && { echo "::error::Kernel Image not found"; exit 1; }
-          IMG=$(realpath "$IMG")
-          echo "IMAGE_PATH=$IMG" >> $GITHUB_ENV
-
-          DTB_DIR=$(find "$KDIR" -path "*/arch/arm64/boot/dts/rockchip" -type d 2>/dev/null | head -1)
-          [ -z "$DTB_DIR" ] && { echo "::error::DTB dir not found"; exit 1; }
-          DTB_DIR=$(realpath "$DTB_DIR")
-          echo "DTB_DIR=$DTB_DIR" >> $GITHUB_ENV
-
-          ROOTFS_SRC=$(find "$TRIPLE_DIR" -maxdepth 1 -type d -name "root-*" | head -1)
-          [ -z "$ROOTFS_SRC" ] && { echo "::error::Rootfs dir not found"; exit 1; }
-          ROOTFS_SRC=$(realpath "$ROOTFS_SRC")
-          echo "ROOTFS_SRC=$ROOTFS_SRC" >> $GITHUB_ENV
-
-          KV=$(ls "$ROOTFS_SRC/lib/modules/" 2>/dev/null | head -1)
-          echo "KV=$KV" >> $GITHUB_ENV
-          [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules not 6.12, got: $KV"; exit 1; }
-
-          echo "===== 检查网卡驱动 ====="
-          R8125_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8125*.ko*' 2>/dev/null)
-          R8169_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8169*.ko*' 2>/dev/null)
-
-          echo "--- r8125 ---"
-          echo "${R8125_LIST:-  (无)}"
-          echo "--- r8169 ---"
-          echo "${R8169_LIST:-  (无)}"
-
-          if [ -n "$R8125_LIST" ]; then
-              echo "  [OK] r8125 存在（Realtek 官方驱动）"
-          elif [ -n "$R8169_LIST" ]; then
-              echo "  [WARN] 只有 r8169（内核 5.4+ 的 r8169 可驱动 RTL8125）"
-          else
-              echo "::error::r8125 与 r8169 都不存在，2.5G 网口无法工作"
-              exit 1
-          fi
-
-      # ============================================================
-      # 移除 emmc-flasher-images.tgz 下载，仅使用 sd-fuse 自带 prebuilt
-      # ============================================================
-      - name: Setup sd-fuse packaging tools
-        if: success()
-        run: |
-          cd $GITHUB_WORKSPACE
-          rm -rf sd-fuse
-          git clone --depth 1 -b master https://github.com/friendlyarm/sd-fuse_rk3568.git sd-fuse 2>&1 | tail -2
-          cd sd-fuse
-          [ -f mk-sd-image.sh ] || { echo "::error::mk-sd-image.sh missing"; exit 1; }
-          [ -f mk-emmc-image.sh ] || { echo "::error::mk-emmc-image.sh missing"; exit 1; }
-          [ -d prebuilt ] || { echo "::error::prebuilt missing"; exit 1; }
-
-          TGT="friendlywrt25"
-          rm -rf "$TGT"
-          mkdir -p "$TGT"
-
-          echo "===== prebuilt/ 内容 ====="
-          ls -la prebuilt/ | head -30
-
-          echo "===== parameter.template ====="
-          cat prebuilt/parameter.template 2>/dev/null || echo "  (缺失)"
-
-          echo "===== 拷贝启动二进制到 $TGT/ ====="
-          for f in uboot.img idbloader.img MiniLoaderAll.bin misc.img dtbo.img; do
-            if [ -f "prebuilt/$f" ]; then
-              cp "prebuilt/$f" "$TGT/$f"
-              echo "  copied $f"
-            else
-              echo "  [WARN] prebuilt/$f 不存在，跳过"
-            fi
-          done
-
-      - name: Package kernel and resource images
-        if: success()
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
-          TGT="friendlywrt25"
-
-          [ -f "$IMAGE_PATH" ] || { echo "::error::Image not found: $IMAGE_PATH"; exit 1; }
-          ./tools/mkkrnlimg "$IMAGE_PATH" "$TGT/kernel.img"
-          [ -f "$TGT/kernel.img" ] || { echo "::error::kernel.img not generated"; exit 1; }
-          cp "$TGT/kernel.img" "$TGT/boot.img"
-
-          [ -d "$DTB_DIR" ] || { echo "::error::DTB dir not found: $DTB_DIR"; exit 1; }
-          rm -rf /tmp/dtb-pack
-          mkdir -p /tmp/dtb-pack
-
-          R5S_DTB=""
-          for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
-            [ -f "$DTB_DIR/$cand" ] && { R5S_DTB="$cand"; break; }
-          done
-          [ -z "$R5S_DTB" ] && { echo "::error::rk3568-nanopi-r5s.dtb not found"; exit 1; }
-
-          cp "$DTB_DIR/$R5S_DTB" /tmp/dtb-pack/rk-kernel.dtb
-          for cand in rk3568-nanopi-r5s.dtb rk3568-nanopi-r5c.dtb; do
-            [ -f "$DTB_DIR/$cand" ] && cp "$DTB_DIR/$cand" /tmp/dtb-pack/
-          done
-
-          cd /tmp/dtb-pack
-          DTB_LIST=$(find . -maxdepth 1 -type f -name "*.dtb" -printf "%f\n" | sort)
-          [ -z "$DTB_LIST" ] && { echo "::error::no dtb files"; exit 1; }
-
-          "$OLDPWD/tools/resource_tool" --pack \
-            --root=. \
-            --image="$OLDPWD/$TGT/resource.img" \
-            $DTB_LIST
-          cd "$OLDPWD"
-
-          [ -f "$TGT/resource.img" ] || { echo "::error::resource.img not generated"; exit 1; }
-
-          ls -lh "$TGT"/kernel.img "$TGT"/resource.img
-
-      - name: Build rootfs image
-        if: success()
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
-          TGT="friendlywrt25"
-
-          [ -d "$ROOTFS_SRC" ] || { echo "::error::Rootfs src not found"; exit 1; }
-
-          rm -rf /tmp/rootfs-pack
-          cp -a "$ROOTFS_SRC" /tmp/rootfs-pack
-          (cd /tmp/rootfs-pack/dev && find . ! -type d -exec rm -f {} \; ) 2>/dev/null || true
-
-          ACTUAL_MB=$(du -sm /tmp/rootfs-pack | awk '{print $1}')
-          echo "rootfs: ${ACTUAL_MB} MB / ${ROOTFS_PARTSIZE} MB"
-          if [ "$ACTUAL_MB" -gt "$ROOTFS_PARTSIZE" ]; then
-            echo "::error::rootfs content exceeds ROOTFS_PARTSIZE"
-            exit 1
-          fi
-
-          LOGICAL_SIZE=$(( ROOTFS_PARTSIZE * 1024 * 1024 ))
-          IMG_BLK=$(( LOGICAL_SIZE / 4096 ))
-          INODE_SIZE=$(( $(find /tmp/rootfs-pack | wc -l) + 128 ))
-
-          rm -f "$TGT/rootfs.img"
-          MKE2FS_CONFIG="$PWD/tools/mke2fs.conf" \
-            "$PWD/tools/mke2fs" -N "$INODE_SIZE" \
-              -E android_sparse -t ext4 -L rootfs -M /root -b 4096 -0 \
-              -d /tmp/rootfs-pack "$TGT/rootfs.img" "$IMG_BLK"
-
-          [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img generation failed"; exit 1; }
-
-          # ---- 校验 rootfs.img 内容 ----
-          # rootfs.img 是 android sparse 格式，先转 raw ext4 再挂载
-          echo "===== 校验 rootfs.img 内容 ====="
-          SPARSE_IMG="$TGT/rootfs.img"
-          RAW_IMG="/tmp/rootfs-raw.img"
-          rm -f "$RAW_IMG"
-
-          if file "$SPARSE_IMG" | grep -qi 'Android sparse'; then
-            echo "  检测到 Android sparse 格式，转换为 raw ext4..."
-            simg2img "$SPARSE_IMG" "$RAW_IMG"
-            echo "  raw 大小: $(stat -c%s "$RAW_IMG") 字节"
-          else
-            echo "  非 sparse 格式，直接使用"
-            cp "$SPARSE_IMG" "$RAW_IMG"
-          fi
-
-          mkdir -p /tmp/verify-rootfs
-          sudo mount -o loop,ro "$RAW_IMG" /tmp/verify-rootfs
-
-          echo "--- /etc/ 前 40 项 ---"
-          ls /tmp/verify-rootfs/etc/ 2>/dev/null | head -40 || echo "  (无)"
-
-          echo "--- /etc/config/ 全部内容 ---"
-          ls -la /tmp/verify-rootfs/etc/config/ 2>/dev/null || echo "  (无 /etc/config/ 目录)"
-
-          echo "--- /etc/uci-defaults/ 全部内容 ---"
-          ls -la /tmp/verify-rootfs/etc/uci-defaults/ 2>/dev/null || echo "  (无 /etc/uci-defaults/ 目录)"
-
-          echo "--- /etc/board.d/ 全部内容 ---"
-          ls -la /tmp/verify-rootfs/etc/board.d/ 2>/dev/null || echo "  (无 /etc/board.d/ 目录)"
-
-          # 检查 1: OpenWrt 核心标记（必需）
-          if [ -f /tmp/verify-rootfs/etc/openwrt_release ] || [ -f /tmp/verify-rootfs/etc/openwrt_version ]; then
-            echo "  [OK] OpenWrt 标记文件存在"
-            [ -f /tmp/verify-rootfs/etc/openwrt_release ] && cat /tmp/verify-rootfs/etc/openwrt_release || true
-          else
-            echo "::error::rootfs.img 不是 OpenWrt（缺 /etc/openwrt_release 和 /etc/openwrt_version）"
-            sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
-          fi
-
-          # 检查 2: /etc/config/ 目录（结构必需）
-          [ -d /tmp/verify-rootfs/etc/config ] || { echo "::error::缺 /etc/config/ 目录"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
-
-          # 检查 3: 我们注入的 99-custom（必需）
-          [ -f /tmp/verify-rootfs/etc/uci-defaults/99-custom ] || { echo "::error::缺 /etc/uci-defaults/99-custom（customize.sh 的 files/ 未生效）"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
-
-          # 检查 4: /etc/config/network（可选，首次启动由 config_generate 生成）
-          if [ -f /tmp/verify-rootfs/etc/config/network ]; then
-            echo "  [OK] /etc/config/network 已预置"
-          else
-            echo "  [INFO] /etc/config/network 未预置（首次启动会由 config_generate 生成，正常）"
-          fi
-
-          # 检查 5: /etc/board.d/（可选，首次启动用于生成 board.json）
-          if [ -d /tmp/verify-rootfs/etc/board.d ]; then
-            echo "  [OK] /etc/board.d/ 存在"
-          else
-            echo "  [WARN] /etc/board.d/ 不存在，首次启动可能无法生成 board.json"
-          fi
-
-          # 检查 6: 内核版本
-          KVER=$(ls /tmp/verify-rootfs/lib/modules/ | head -1)
-          echo "kernel: $KVER"
-          case "$KVER" in
-            6.12*) echo "  [OK] kernel 6.12" ;;
-            *) echo "::error::kernel 不是 6.12"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1 ;;
-          esac
-
-          # 检查 7: 网卡驱动
-          R8125=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8125*.ko*' 2>/dev/null | head -1)
-          R8169=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8169*.ko*' 2>/dev/null | head -1)
-          if [ -n "$R8125" ]; then
-            echo "  [OK] r8125 found: $R8125"
-          elif [ -n "$R8169" ]; then
-            echo "  [WARN] 只有 r8169，将作为 RTL8125 的驱动"
-          else
-            echo "::error::r8125 与 r8169 都缺失"
-            sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
-          fi
-
-          # 检查 8: 确认为非 Debian
-          if [ -f /tmp/verify-rootfs/etc/debian_version ]; then
-            echo "::error::rootfs 是 Debian"
-            sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
-          fi
-
-          echo "[OK] rootfs.img 校验通过"
-          sudo umount /tmp/verify-rootfs
-          sudo rmdir /tmp/verify-rootfs
-          rm -f "$RAW_IMG"
-          # ---- 校验结束 ----
-
-          PARAMETER_TPL="$PWD/prebuilt/parameter.template" \
-            ./tools/generate-partmap-txt.sh "$LOGICAL_SIZE" "$TGT"
-
-          echo "ROOTFS_SIZE_BYTES=$LOGICAL_SIZE" >> $GITHUB_ENV
-
-          echo "===== $TGT/ 内容 ====="
-          ls -lh "$TGT/"
-
-          echo "===== parameter.txt ====="
-          cat "$TGT/parameter.txt"
-
-      - name: Build SD card and eMMC images
-        if: success()
-        run: |
-          cd $GITHUB_WORKSPACE/sd-fuse
-          TGT="friendlywrt25"
-
-          [ -f "$TGT/kernel.img" ]    || { echo "::error::kernel.img missing"; exit 1; }
-          [ -f "$TGT/rootfs.img" ]    || { echo "::error::rootfs.img missing"; exit 1; }
-          [ -f "$TGT/resource.img" ]  || { echo "::error::resource.img missing"; exit 1; }
-          [ -f "$TGT/parameter.txt" ] || { echo "::error::parameter.txt missing"; exit 1; }
-
-          export SDFUSE_NONINTERACTIVE=y
-
-          sudo -E ./mk-sd-image.sh "$TGT" > /tmp/sd-image.log 2>&1 || {
-            tail -80 /tmp/sd-image.log
-            exit 1
-          }
-          tail -20 /tmp/sd-image.log
-
-          if grep -q "more than capacity" /tmp/sd-image.log; then
-            echo "::error::mk-sd-image.sh skipped rootfs write"
-            exit 1
-          fi
-
-          sudo -E ./mk-emmc-image.sh "$TGT" autostart=yes > /tmp/emmc-image.log 2>&1 || {
-            tail -80 /tmp/emmc-image.log
-            exit 1
-          }
-          tail -20 /tmp/emmc-image.log
-
-          sudo chown -R "$(id -u):$(id -g)" out/ friendlywrt25/ 2>/dev/null || true
-          ls -lh out/ out/images-for-eflasher/ 2>/dev/null || true
-
-      # ============================================================
-      # 校验最终生成的 SD 镜像，防止打包污染
-      # ============================================================
-      - name: Verify generated SD image contains OpenWrt
-        if: success()
-        run: |
-          set -e
-          cd $GITHUB_WORKSPACE/sd-fuse
-
-          IMG=$(find out -maxdepth 1 -name "*.img" -type f | head -1)
-          [ -n "$IMG" ] || { echo "::error::no SD image produced"; exit 1; }
-          echo "SD image: $IMG ($(stat -c%s "$IMG") bytes)"
-
-          LOOP=$(sudo losetup -Pf --show "$IMG")
-          echo "loop: $LOOP"
-          sleep 2
-
-          ROOT_PART=""
-          for p in ${LOOP}p*; do
-              FS=$(sudo file -s "$p" | sed 's/.*: //')
-              echo "  $p: $FS"
-              if echo "$FS" | grep -qi 'ext4'; then
-                  ROOT_PART="$p"
-              fi
-          done
-
-          [ -n "$ROOT_PART" ] || { echo "::error::no ext4 partition in SD image"; sudo losetup -d "$LOOP"; exit 1; }
-
-          mkdir -p /tmp/verify-sd
-          sudo mount -o ro "$ROOT_PART" /tmp/verify-sd
-
-          echo "===== 校验 1: OpenWrt 标记 ====="
-          if [ -f /tmp/verify-sd/etc/openwrt_release ] || [ -f /tmp/verify-sd/etc/openwrt_version ]; then
-              echo "  [OK] OpenWrt 标记文件存在"
-              [ -f /tmp/verify-sd/etc/openwrt_release ] && cat /tmp/verify-sd/etc/openwrt_release || true
-          else
-              echo "::error::rootfs 不是 OpenWrt（缺 /etc/openwrt_release）"
-              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
-          fi
-
-          echo "===== 校验 2: /etc/config/ 结构 ====="
-          [ -d /tmp/verify-sd/etc/config ] || { echo "::error::缺 /etc/config/"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
-          ls -la /tmp/verify-sd/etc/config/ 2>/dev/null || true
-
-          echo "===== 校验 3: 99-custom ====="
-          [ -f /tmp/verify-sd/etc/uci-defaults/99-custom ] || { echo "::error::99-custom missing"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
-          echo "  [OK] 99-custom 存在"
-
-          if [ ! -f /tmp/verify-sd/etc/config/network ]; then
-              echo "  [INFO] /etc/config/network 未预置，首次启动由 config_generate 生成"
-          fi
-
-          echo "===== 校验 4: 内核版本 ====="
-          KVER=$(ls /tmp/verify-sd/lib/modules/ | head -1)
-          echo "kernel modules: $KVER"
-          case "$KVER" in
-            6.12*) echo "  [OK] 6.12" ;;
-            *) echo "::error::kernel is NOT 6.12 (got $KVER)"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1 ;;
-          esac
-
-          echo "===== 校验 5: 网卡驱动 ====="
-          R8125=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8125*.ko*' 2>/dev/null | head -1)
-          R8169=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8169*.ko*' 2>/dev/null | head -1)
-          if [ -n "$R8125" ]; then
-              echo "  [OK] r8125 found: $R8125"
-          elif [ -n "$R8169" ]; then
-              echo "  [WARN] 只有 r8169（RTL8125 由它驱动）"
-          else
-              echo "::error::r8125 与 r8169 都缺失"
-              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
-          fi
-
-          echo "===== 校验 6: 确认不是 FriendlyElec Debian ====="
-          if [ -f /tmp/verify-sd/etc/debian_version ]; then
-              echo "::error::rootfs is Debian, not OpenWrt"
-              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
-          fi
-          if [ -f /tmp/verify-sd/etc/init.d/friendlyelec_firstuse.sh ]; then
-              echo "::error::FriendlyElec firstuse 脚本存在"
-              sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
-          fi
-
-          echo "===== 校验 7: 分区大小 ====="
-          ROOT_MB=$(( $(sudo blockdev --getsize64 "$ROOT_PART") / 1024 / 1024 ))
-          echo "rootfs partition: ${ROOT_MB} MB (expect 1024)"
-          if [ "$ROOT_MB" -lt 900 ] || [ "$ROOT_MB" -gt 1200 ]; then
-              echo "::warning::rootfs partition ${ROOT_MB}MB 与 1024MB 不匹配"
-          fi
-
-          echo "===== 校验 8: 网络接口映射 ====="
-          if [ -f /tmp/verify-sd/etc/board.d/02_network ]; then
-              grep -n -A3 'nanopi-r5s' /tmp/verify-sd/etc/board.d/02_network || true
-          fi
-
-          sudo umount /tmp/verify-sd
-          sudo losetup -d "$LOOP"
-          sudo rmdir /tmp/verify-sd
-          echo "===== SD image verification passed ====="
+          OUT="bin/targets/rockchip/armv8"
+
+          echo "===== $OUT/ 目录内容 ====="
+          ls -lh "$OUT"/*nanopi-r5s* 2>/dev/null || true
+
+          # 1. SD 卡首次刷写镜像（完整磁盘镜像）
+          SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4.img.gz" -type f | head -1)
+          [ -n "$SDIMG" ] || { echo "::error::未找到 *nanopi-r5s-ext4.img.gz（SD 卡镜像）"; exit 1; }
+          echo "[OK] SD 卡镜像: $SDIMG ($(stat -c%s "$SDIMG") 字节)"
+
+          # 2. sysupgrade 镜像（用于后续升级）
+          SYSUP=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s*ext4-sysupgrade.img.gz" -type f | head -1)
+          [ -n "$SYSUP" ] || { echo "::error::未找到 *nanopi-r5s-ext4-sysupgrade.img.gz"; exit 1; }
+          echo "[OK] sysupgrade 镜像: $SYSUP ($(stat -c%s "$SYSUP") 字节)"
+
+          # 3. manifest
+          MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
+          [ -n "$MANIFEST" ] || { echo "::error::未找到 *nanopi-r5s.manifest"; exit 1; }
+          echo "[OK] manifest: $MANIFEST"
+
+          echo "===== manifest 中的关键包 ====="
+          grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|luci-app-dockerman|ttyd)\b" "$MANIFEST" || true
 
       - name: Collect and checksum artifacts
         if: success()
         run: |
           mkdir -p $GITHUB_WORKSPACE/artifact
-          cd $GITHUB_WORKSPACE/sd-fuse
+          cd /workdir/openwrt
+          OUT="bin/targets/rockchip/armv8"
 
           DATE=$(date +%Y.%m.%d)
           PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
-          SRC_IMG=$(find out -maxdepth 1 -name "*.img" -type f 2>/dev/null | head -1)
-          if [ -n "$SRC_IMG" ] && [ -s "$SRC_IMG" ]; then
-            SRC_SIZE_MB=$(( $(stat -c%s "$SRC_IMG") / 1024 / 1024 ))
-            if [ "$SRC_SIZE_MB" -lt 200 ]; then
-              echo "::error::SD image only ${SRC_SIZE_MB} MB, rootfs may not be written"
-              exit 1
-            fi
-            cp "$SRC_IMG" "/tmp/${PREFIX}-sdcard.img"
-            gzip -f "/tmp/${PREFIX}-sdcard.img"
-            cp "/tmp/${PREFIX}-sdcard.img.gz" $GITHUB_WORKSPACE/artifact/
+          # SD 卡首次刷写镜像
+          SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4.img.gz" -type f | head -1)
+          if [ -n "$SDIMG" ] && [ -s "$SDIMG" ]; then
+            cp "$SDIMG" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
             echo "SD image: ${PREFIX}-sdcard.img.gz"
           else
-            echo "::error::no .img found from sd-fuse"
+            echo "::error::SD image not found"
             exit 1
           fi
 
-          SRC_TGZ=$(find out -maxdepth 3 -name "*-images.tgz" -type f 2>/dev/null | head -1)
-          if [ -n "$SRC_TGZ" ] && [ -s "$SRC_TGZ" ]; then
-            cp "$SRC_TGZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-emmc-flasher.tgz"
-            echo "eMMC pack: ${PREFIX}-emmc-flasher.tgz"
-          else
-            echo "::warning::eMMC flasher pack not found"
-          fi
-
-          OPENWRT_SYSUP=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
-            -name "*nanopi-r5s*sysupgrade.img.gz" -type f 2>/dev/null | head -1)
-          if [ -n "$OPENWRT_SYSUP" ]; then
-            cp "$OPENWRT_SYSUP" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sysupgrade.img.gz"
+          # sysupgrade
+          SYSUP=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s*ext4-sysupgrade.img.gz" -type f | head -1)
+          if [ -n "$SYSUP" ] && [ -s "$SYSUP" ]; then
+            cp "$SYSUP" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sysupgrade.img.gz"
             echo "sysupgrade: ${PREFIX}-sysupgrade.img.gz"
           fi
 
-          OPENWRT_MANIFEST=$(find openwrt/bin/targets/rockchip/armv8 -maxdepth 1 \
-            -name "*nanopi-r5s*.manifest" -type f 2>/dev/null | head -1)
-          [ -n "$OPENWRT_MANIFEST" ] && cp "$OPENWRT_MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
+          # squashfs sysupgrade（如果 config 里有）
+          SYSUP_SQ=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s*squashfs-sysupgrade.img.gz" -type f | head -1)
+          if [ -n "$SYSUP_SQ" ] && [ -s "$SYSUP_SQ" ]; then
+            cp "$SYSUP_SQ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
+            echo "squashfs sysupgrade: ${PREFIX}-squashfs-sysupgrade.img.gz"
+          fi
+
+          # manifest
+          MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
+          [ -n "$MANIFEST" ] && cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
+
+          # sha256sums（OpenWrt 官方生成的）
+          SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
+          [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
 
           cd $GITHUB_WORKSPACE/artifact
           rm -f SHA256SUMS
@@ -803,8 +368,8 @@ jobs:
           tag_name: ${{ needs.prepare_release.outputs.release_tag }}
           files: |
             artifact/*.gz
-            artifact/*.tgz
             artifact/*-manifest.txt
+            artifact/*-sha256sums.txt
             artifact/SHA256SUMS
           overwrite: true
 
