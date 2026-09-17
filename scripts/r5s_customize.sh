@@ -4,7 +4,7 @@ set -e
 STAGE="$1"
 
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
-SMALL_PACKAGE_FEED="src-git small https://github.com/kenzok8/small-package.git;main"
+DOCKER_FEED="src-git dockerfeed https://github.com/kenzok8/openwrt-packages.git;main"
 AMLOGIC_REPO="https://github.com/ophub/luci-app-amlogic.git"
 
 CACHE_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY:-local/unknown}" | tr '[:upper:]' '[:lower:]')/r5s-base-cache:openwrt-25.12"
@@ -17,7 +17,11 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
-    grep -q "src-git small" feeds.conf || echo "$SMALL_PACKAGE_FEED" >> feeds.conf
+    grep -q "src-git dockerfeed" feeds.conf || echo "$DOCKER_FEED" >> feeds.conf
+
+    echo "===== feeds.conf 最终内容 ====="
+    cat feeds.conf
+    echo "================================"
 }
 
 post_feeds() {
@@ -29,18 +33,22 @@ post_feeds() {
     touch "$KERNEL_CONFIG_FILE"
 
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
-               BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT; do
+               BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
+               CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
+               CGROUP_PIDS CGROUP_RDMA CGROUP_HUGETLB CGROUP_NET_CLASSID \
+               MEMCG BLK_CGROUP CFS_BANDWIDTH FAIR_GROUP_SCHED RT_GROUP_SCHED \
+               CGROUP_PERF CGROUP_NET_PRIO; do
         sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
         sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ---- 打印 R5S 网络接口映射，便于 CI 日志核对 ----
+    # 只读检查官方 board.d/02_network，确认 R5S 网络映射
     NET_FILE="target/linux/rockchip/armv8/base-files/etc/board.d/02_network"
     if [ -f "$NET_FILE" ]; then
-        echo "===== 02_network: nanopi-r5s 条目 ====="
+        echo "===== 02_network: nanopi-r5s 条目（官方原样，只读） ====="
         grep -n -A5 'nanopi-r5s' "$NET_FILE" || echo "  (未找到)"
-        echo "======================================="
+        echo "======================================================"
     fi
 
     mkdir -p package/custom
@@ -51,6 +59,8 @@ post_feeds() {
     mkdir -p files/etc/uci-defaults
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
+
+# ---- 网络 ----
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -72,11 +82,18 @@ uci set network.wan.clientid=''
 uci set network.wan.peerdns='1'
 uci commit network
 
+# ---- 密码 ----
 printf "tony\ntony\n" | passwd root
 
+# ---- LuCI 主题 ----
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
+
+# ---- Docker 数据目录 ----
+# OpenWrt ext4 镜像没有独立 opt 分区，data-root=/opt/docker 需要先建目录
+mkdir -p /opt/docker
+chmod 0700 /opt/docker
 
 rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null
 /etc/init.d/uhttpd restart
@@ -232,16 +249,17 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    # ---- 必备软件包（含 Docker 生态） ----
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag \
                luci-app-amlogic luci-lib-nixio \
                luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
                docker dockerd docker-compose containerd runc tini libnetwork \
-               luci-app-dockerman luci-lib-docker luci-i18n-dockerman-zh-cn cgroupfs-mount \
+               luci-app-dockerman luci-lib-docker luci-i18n-dockerman-zh-cn \
                kmod-br-netfilter kmod-veth kmod-nf-ipvs kmod-ipt-physdev \
                kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
                kmod-nf-nathelper kmod-nf-nathelper-extra \
                kmod-fs-overlay kmod-fuse \
-               kmod-r8125-rss kmod-r8169 \
+               kmod-r8169 \
                iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra; do
@@ -257,7 +275,8 @@ config_stage() {
     done
 
     MISSING=0
-    for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd docker dockerd luci-app-dockerman; do
+    for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
+               docker dockerd containerd runc luci-app-dockerman; do
         if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
             echo "[OK] $pkg"
         else
@@ -271,8 +290,12 @@ config_stage() {
     fi
 
     echo "===== 网卡驱动 config 检查 ====="
-    grep -E "^CONFIG_PACKAGE_kmod-(r8125|r8169|r8168)" .config || echo "  (无)"
+    grep -E "^CONFIG_PACKAGE_kmod-(r8169|r8125|r8168)" .config || echo "  (无)"
     echo "==============================="
+
+    echo "===== Docker 相关 config 检查 ====="
+    grep -E "^CONFIG_PACKAGE_(docker|dockerd|containerd|runc|luci-app-dockerman|luci-lib-docker)" .config || echo "  (无)"
+    echo "================================="
 }
 
 case "$STAGE" in
