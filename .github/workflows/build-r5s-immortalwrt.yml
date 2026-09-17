@@ -502,7 +502,7 @@ jobs:
         2. images-${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}.tgz → eMMC 刷机包
         3. ${MODEL_NAME}-ImmortalWrt-${FRIENDLY_VER}-sysupgrade.img.gz → 原生镜像
         4. SHA256SUMS
-        5. diagnostics.tgz → 编译期诊断信息（DTS/DTB/内核配置/rootfs 网络配置）
+        5. diagnostics.tgz → 编译期诊断信息（含 System.map、内核 .config）
 
         刷机后验证:
         - uname -r → 6.12.x
@@ -513,43 +513,61 @@ jobs:
         EOF
         ls -lh
 
-    # ============================================================
-    # 新增：收集诊断信息
-    # 目的：即使设备无法通过串口/网络提供日志，也能从编译产物中
-    #      反推 LED、网络、DTS、内核配置的真实状态。
-    # ============================================================
     - name: Collect diagnostics
       if: always()
       run: |
         mkdir -p artifact/diagnostics
         DIAG=artifact/diagnostics
 
-        # 1) 内核源码中的 R5S DTS
-        if [ -n "$KDIR" ] && [ -d "$KDIR" ]; then
-          find "$KDIR" -name "rk3568-nanopi-r5s*.dts*" -type f -exec cp {} "$DIAG/" \; 2>/dev/null || true
-          find "$KDIR" -name "rk3568.dtsi" -o -name "rk356x.dtsi" -o -name "rk3568-base.dtsi" 2>/dev/null | while read -r f; do
-            cp "$f" "$DIAG/$(basename "$f")" 2>/dev/null || true
-          done
-
-          # 2) 内核 .config 中 LED / GPIO / 网络 / PCIe 相关项
-          if [ -f "$KDIR/.config" ]; then
-            grep -E "^CONFIG_(LEDS|GPIO_ROCKCHIP|PINCTRL_ROCKCHIP|R8169|RTL8|STMMAC|NET_DSA|NET_VENDOR|PCI|PHY_|NEW_LEDS|LEDS_TRIGGER|LEDS_CLASS|LEDS_GPIO)" "$KDIR/.config" \
-              > "$DIAG/kernel-config-led-net.txt" 2>/dev/null || true
-          fi
+        # =========================================================
+        # 优先：从 custome_kernel_config_new.sh 导出的调试产物
+        # 这是决定性证据（System.map / vmlinux / kernel.config.full）
+        # =========================================================
+        if [ -d "project/friendlywrt/.debug-artifacts" ]; then
+          echo "[OK] 拷贝 .debug-artifacts 里的所有文件"
+          cp -r project/friendlywrt/.debug-artifacts/* "$DIAG/" 2>/dev/null || true
+          ls -lh "$DIAG/"
+        else
+          echo "::warning::.debug-artifacts 不存在，用兜底逻辑"
         fi
 
-        # 3) 内核编译产物中的 DTB（反编译回文本形式）
-        if [ -n "$DTB_DIR" ] && [ -d "$DTB_DIR" ]; then
-          DTB_SRC="$DTB_DIR/rk3568-nanopi-r5s.dtb"
-          if [ -f "$DTB_SRC" ]; then
-            cp "$DTB_SRC" "$DIAG/" 2>/dev/null || true
-            if command -v dtc >/dev/null 2>&1; then
-              dtc -I dtb -O dts "$DTB_SRC" > "$DIAG/rk3568-nanopi-r5s.dtb.dts" 2>/dev/null || true
+        # =========================================================
+        # 兜底：直接从内核源码目录采集（修正路径）
+        # =========================================================
+        if [ -n "$KDIR" ] && [ -d "$KDIR" ]; then
+          KSRC_REAL=$(find "$KDIR" -maxdepth 1 -type d -name "linux-6.12*" | head -1)
+
+          if [ -n "$KSRC_REAL" ] && [ -d "$KSRC_REAL" ]; then
+            echo "[OK] 找到内核源码目录: $KSRC_REAL"
+
+            # DTS 源文件
+            find "$KSRC_REAL" -name "rk3568-nanopi-r5s*.dts*" -type f \
+              -exec cp {} "$DIAG/" \; 2>/dev/null || true
+
+            # 最终内核 .config
+            if [ -f "$KSRC_REAL/.config" ]; then
+              cp "$KSRC_REAL/.config" "$DIAG/kernel.config.full" 2>/dev/null || true
+              grep -E "^CONFIG_(LEDS|GPIO_ROCKCHIP|PINCTRL_ROCKCHIP|R8169|RTL8|STMMAC|NET_DSA|NET_VENDOR|PCI|PHY_|NEW_LEDS|LEDS_TRIGGER|LEDS_CLASS|LEDS_GPIO|GPIOLIB|OF_GPIO|GPIOD|INET_DIAG)" \
+                "$KSRC_REAL/.config" > "$DIAG/kernel-config-led-net.txt" 2>/dev/null || true
+            fi
+
+            # System.map（决定性证据）
+            if [ -f "$KSRC_REAL/System.map" ]; then
+              cp "$KSRC_REAL/System.map" "$DIAG/System.map" 2>/dev/null || true
+              grep -E " (T|t) _?(leds_gpio_probe|led_gpio_set|led_classdev_register|ledtrig_netdev_activate|ledtrig_heartbeat_activate|rockchip_gpio_probe|r8169_probe|stmmac_dvr_probe|dwmac_rk_probe)$" \
+                "$KSRC_REAL/System.map" > "$DIAG/System.map.leds-net" 2>/dev/null || true
+            fi
+
+            # vmlinux（完整符号表，可能几十 MB）
+            if [ -f "$KSRC_REAL/vmlinux" ]; then
+              cp "$KSRC_REAL/vmlinux" "$DIAG/vmlinux" 2>/dev/null || true
             fi
           fi
         fi
 
-        # 4) rootfs 里的网络配置、LED 配置、board.d 初始化脚本
+        # =========================================================
+        # 用户空间诊断
+        # =========================================================
         if [ -n "$ROOTFS_SRC" ] && [ -d "$ROOTFS_SRC" ]; then
           [ -f "$ROOTFS_SRC/etc/config/network" ] && cp "$ROOTFS_SRC/etc/config/network" "$DIAG/network-config.txt" || true
           [ -f "$ROOTFS_SRC/etc/config/system" ] && cp "$ROOTFS_SRC/etc/config/system" "$DIAG/system-config.txt" || true
@@ -561,40 +579,20 @@ jobs:
             done
           fi
 
-          # 5) LED 相关的用户空间脚本
           for f in \
             "$ROOTFS_SRC/etc/init.d/led" \
-            "$ROOTFS_SRC/etc/rc.d/S*led" \
-            "$ROOTFS_SRC/lib/functions/leds.sh"; do
-            [ -f "$f" ] && cp "$f" "$DIAG/leds-$(basename "$f").txt" || true
+            "$ROOTFS_SRC/etc/init.d/led-force" \
+            "$ROOTFS_SRC/etc/uci-defaults/50-fix-network" \
+            "$ROOTFS_SRC/etc/uci-defaults/99-custom"; do
+            [ -f "$f" ] && cp "$f" "$DIAG/$(basename "$f").txt" || true
           done
 
-          # 6) 内核模块清单与 LED/网络相关模块
           if [ -n "$KV" ] && [ -d "$ROOTFS_SRC/lib/modules/$KV" ]; then
             ls -1 "$ROOTFS_SRC/lib/modules/$KV/" > "$DIAG/modules-top.txt" 2>/dev/null || true
-            find "$ROOTFS_SRC/lib/modules/$KV" -type f \( \
-                -name "*led*" -o -name "*gpio*" -o -name "*r8169*" -o \
-                -name "*r8125*" -o -name "*stmmac*" -o -name "*realtek*" -o \
-                -name "*dwmac*" -o -name "*phy*" \) \
-              > "$DIAG/modules-led-net.txt" 2>/dev/null || true
           fi
-
-          # 7) 用户空间看到的 LED 名称（通过 sysfs，runtime 才有）
-          # 这里只收集 board.d 里 LED 相关行，反映作者意图
-          grep -RInE "sys_led|wan_led|lan_led|led" "$ROOTFS_SRC/etc/board.d" \
-            > "$DIAG/board.d-leds.txt" 2>/dev/null || true
         fi
 
-        # 8) 本次编译是否应用了我们写的补丁（记录最终状态）
-        for p in \
-          "project/friendlywrt/target/linux/rockchip/patches-6.12/999-gpio-rockchip-fix-dynamic-base.patch" \
-          "project/friendlywrt/target/linux/rockchip/patches-6.12/998-r5s-dts-led-aliases.patch"; do
-          if [ -f "$p" ]; then
-            cp "$p" "$DIAG/" 2>/dev/null || true
-          fi
-        done
-
-        # 9) 记录编译时的关键环境变量
+        # 环境变量记录
         {
           echo "IMMORTALWRT_BRANCH=$IMMORTALWRT_BRANCH"
           echo "FRIENDLY_VER=$FRIENDLY_VER"
@@ -606,20 +604,10 @@ jobs:
           echo "KV=$KV"
         } > "$DIAG/env.txt"
 
-        # 打包为一个 tgz，方便随 release 一起上传
         cd artifact
         tar czf diagnostics.tgz diagnostics/
         rm -rf diagnostics/
         ls -lh diagnostics.tgz
-
-    - name: Verify kernel & CMDLINE in final firmware
-      run: |
-        cd project/sd-fuse
-        strings "$TARGET_OS/kernel.img" 2>/dev/null | grep -oE "Linux version [0-9]+\.[0-9]+\.[0-9]+" | head -1
-        ls /tmp/rootfs-pack/lib/modules/ 2>/dev/null
-        grep -E "^CMDLINE" "$TARGET_OS/parameter.txt" || true
-        ls /tmp/rootfs-pack/usr/lib/lua/luci/controller/amlogic.lua 2>/dev/null && echo "[OK] amlogic (Lua)"
-        ls /tmp/rootfs-pack/www/luci-static/resources/view/amlogic/ 2>/dev/null && echo "[OK] amlogic (JS)"
 
     - name: Upload all artifacts to release
       uses: svenstaro/upload-release-action@v2
