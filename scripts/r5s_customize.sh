@@ -33,6 +33,14 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
+    # ---- 打印 R5S 网络接口映射，便于 CI 日志核对 ----
+    NET_FILE="target/linux/rockchip/armv8/base-files/etc/board.d/02_network"
+    if [ -f "$NET_FILE" ]; then
+        echo "===== 02_network: nanopi-r5s 条目 ====="
+        grep -n -A5 'nanopi-r5s' "$NET_FILE" || echo "  (未找到)"
+        echo "======================================="
+    fi
+
     mkdir -p package/custom
     rm -rf package/custom/luci-app-amlogic
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
@@ -45,12 +53,21 @@ uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
 uci delete network.lan.netmask 2>/dev/null
+uci set network.lan.delegate='0'
 uci commit network
+
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
+
+uci set firewall.@zone[0].name='lan'
+uci set firewall.@zone[0].input='ACCEPT'
+uci set firewall.@zone[0].output='ACCEPT'
+uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
 uci commit firewall
+
 uci set network.wan.clientid=''
+uci set network.wan.peerdns='1'
 uci commit network
 
 printf "tony\ntony\n" | passwd root
@@ -58,6 +75,7 @@ printf "tony\ntony\n" | passwd root
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
+
 rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null
 /etc/init.d/uhttpd restart
 /etc/init.d/network restart
@@ -221,6 +239,7 @@ config_stage() {
                kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
                kmod-nf-nathelper kmod-nf-nathelper-extra \
                kmod-fs-overlay kmod-fuse \
+               kmod-r8125 kmod-r8125-rss kmod-r8169 \
                iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra; do
