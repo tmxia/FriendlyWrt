@@ -6,6 +6,8 @@ STAGE="$1"
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
 AMLOGIC_REPO="https://github.com/ophub/luci-app-amlogic.git"
 
+CACHE_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY:-local/unknown}" | tr '[:upper:]' '[:lower:]')/r5s-base-cache:openwrt-25.12"
+
 pre_feeds() {
     [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
 
@@ -14,24 +16,6 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
-
-    if [ -f tools/libtool/Makefile ]; then
-        python3 - << 'PYEOF'
-import re
-path = 'tools/libtool/Makefile'
-with open(path) as f:
-    content = f.read()
-old = '(cd $(HOST_BUILD_DIR);'
-new = '(cd $(HOST_BUILD_DIR); rm -rf .git; git init -q . 2>/dev/null || true; git config user.email ci@local 2>/dev/null || true; git config user.name CI 2>/dev/null || true;'
-if old in content and 'rm -rf .git; git init' not in content:
-    content = content.replace(old, new, 1)
-    with open(path, 'w') as f:
-        f.write(content)
-    print('patched tools/libtool/Makefile')
-else:
-    print('tools/libtool/Makefile: no change needed')
-PYEOF
-    fi
 }
 
 post_feeds() {
@@ -113,6 +97,72 @@ EOF
 EOF
 }
 
+cache_restore() {
+    echo "Attempting to restore build cache from GHCR: $CACHE_IMAGE"
+    if docker pull "$CACHE_IMAGE" 2>/dev/null; then
+        echo "Cache found. Extracting..."
+        cd /workdir
+        docker create --name cache_container "$CACHE_IMAGE" /bin/true > /dev/null
+        docker export cache_container > cache_exported.tar
+        docker rm cache_container > /dev/null
+        docker rmi "$CACHE_IMAGE" -f > /dev/null 2>&1 || true
+
+        tar -xf cache_exported.tar --wildcards "op_cache_raw_*" 2>/dev/null || true
+
+        if ls op_cache_raw_* 1> /dev/null 2>&1; then
+            cat op_cache_raw_* | tar -I "zstd -T0" -xf - -C /workdir/openwrt/
+            rm -f cache_exported.tar op_cache_raw_*
+            echo "Cache restored."
+        else
+            rm -f cache_exported.tar
+            echo "No valid cache chunks found."
+        fi
+    else
+        echo "No cache found. Will do full build."
+    fi
+
+    df -hT
+}
+
+cache_save() {
+    echo "Saving build cache to GHCR: $CACHE_IMAGE"
+    cd /workdir/openwrt
+
+    echo "Pruning obsolete versions..."
+    for linux_dir in build_dir/target-*/linux-*/; do
+        [ -d "$linux_dir" ] && (cd "$linux_dir" && ls -dt linux-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+    done
+    [ -d "build_dir" ] && (cd build_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+    if [ -d "staging_dir" ]; then
+        (cd staging_dir && ls -dt target-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+        (cd staging_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+    fi
+
+    echo "Packing build_dir, staging_dir, dl..."
+    find dl -type f | xargs -r touch -t 200001010000
+    tar -I "zstd -T0 -10" -cf - build_dir staging_dir dl | split -a 3 -d -b 5000M - /workdir/op_cache_raw_
+
+    cd /workdir
+    echo "FROM scratch" > Dockerfile
+    count=1
+    for f in op_cache_raw_*; do
+        layer_dir="layer$count"
+        mkdir -p "$layer_dir"
+        mv "$f" "$layer_dir/"
+        echo "COPY $layer_dir /" >> Dockerfile
+        count=$((count + 1))
+    done
+
+    docker build -t "$CACHE_IMAGE" .
+    docker push "$CACHE_IMAGE"
+    echo "Cache pushed."
+
+    rm -rf layer* Dockerfile op_cache_raw_* cache_exported.tar
+    docker rmi "$CACHE_IMAGE" -f > /dev/null 2>&1 || true
+    docker builder prune -a -f > /dev/null 2>&1 || true
+    df -hT
+}
+
 config_stage() {
     for opt in CONFIG_ALL_KMODS CONFIG_ALL_NONSHARED CONFIG_DEVEL CONFIG_BUILDBOT; do
         sed -i "s/^${opt}=.*/# ${opt} is not set/" .config || true
@@ -171,12 +221,19 @@ config_stage() {
                kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
                kmod-nf-nathelper kmod-nf-nathelper-extra \
                kmod-fs-overlay kmod-fuse \
-               iptables-nft iptables-zz-legacy \
+               iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
+    # 显式禁用冲突的 legacy iptables
+    for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
+        sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+        grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+          echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
     MISSING=0
@@ -195,8 +252,10 @@ config_stage() {
 }
 
 case "$STAGE" in
-    pre)    pre_feeds ;;
-    post)   post_feeds ;;
-    config) config_stage ;;
-    *)      echo "Usage: $0 {pre|post|config}"; exit 1 ;;
+    pre)           pre_feeds ;;
+    post)          post_feeds ;;
+    config)        config_stage ;;
+    cache_restore) cache_restore ;;
+    cache_save)    cache_save ;;
+    *)             echo "Usage: $0 {pre|post|config|cache_restore|cache_save}"; exit 1 ;;
 esac
