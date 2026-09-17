@@ -378,8 +378,8 @@ jobs:
           [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules not 6.12, got: $KV"; exit 1; }
 
           echo "===== 检查网卡驱动 ====="
-          R8125_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8125*.ko' 2>/dev/null)
-          R8169_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8169*.ko' 2>/dev/null)
+          R8125_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8125*.ko*' 2>/dev/null)
+          R8169_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8169*.ko*' 2>/dev/null)
 
           echo "--- r8125 ---"
           echo "${R8125_LIST:-  (无)}"
@@ -519,10 +519,48 @@ jobs:
           mkdir -p /tmp/verify-rootfs
           sudo mount -o loop,ro "$RAW_IMG" /tmp/verify-rootfs
 
-          [ -d /tmp/verify-rootfs/etc/config ] || { echo "::error::rootfs.img 不是 OpenWrt（缺 /etc/config/）"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
-          [ -f /tmp/verify-rootfs/etc/config/network ] || { echo "::error::缺 /etc/config/network"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
-          [ -f /tmp/verify-rootfs/etc/uci-defaults/99-custom ] || { echo "::error::缺 99-custom"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
+          echo "--- /etc/ 前 40 项 ---"
+          ls /tmp/verify-rootfs/etc/ 2>/dev/null | head -40 || echo "  (无)"
 
+          echo "--- /etc/config/ 全部内容 ---"
+          ls -la /tmp/verify-rootfs/etc/config/ 2>/dev/null || echo "  (无 /etc/config/ 目录)"
+
+          echo "--- /etc/uci-defaults/ 全部内容 ---"
+          ls -la /tmp/verify-rootfs/etc/uci-defaults/ 2>/dev/null || echo "  (无 /etc/uci-defaults/ 目录)"
+
+          echo "--- /etc/board.d/ 全部内容 ---"
+          ls -la /tmp/verify-rootfs/etc/board.d/ 2>/dev/null || echo "  (无 /etc/board.d/ 目录)"
+
+          # 检查 1: OpenWrt 核心标记（必需）
+          if [ -f /tmp/verify-rootfs/etc/openwrt_release ] || [ -f /tmp/verify-rootfs/etc/openwrt_version ]; then
+            echo "  [OK] OpenWrt 标记文件存在"
+            [ -f /tmp/verify-rootfs/etc/openwrt_release ] && cat /tmp/verify-rootfs/etc/openwrt_release || true
+          else
+            echo "::error::rootfs.img 不是 OpenWrt（缺 /etc/openwrt_release 和 /etc/openwrt_version）"
+            sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
+          fi
+
+          # 检查 2: /etc/config/ 目录（结构必需）
+          [ -d /tmp/verify-rootfs/etc/config ] || { echo "::error::缺 /etc/config/ 目录"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
+
+          # 检查 3: 我们注入的 99-custom（必需）
+          [ -f /tmp/verify-rootfs/etc/uci-defaults/99-custom ] || { echo "::error::缺 /etc/uci-defaults/99-custom（customize.sh 的 files/ 未生效）"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1; }
+
+          # 检查 4: /etc/config/network（可选，首次启动由 config_generate 生成）
+          if [ -f /tmp/verify-rootfs/etc/config/network ]; then
+            echo "  [OK] /etc/config/network 已预置"
+          else
+            echo "  [INFO] /etc/config/network 未预置（首次启动会由 config_generate 生成，正常）"
+          fi
+
+          # 检查 5: /etc/board.d/（可选，首次启动用于生成 board.json）
+          if [ -d /tmp/verify-rootfs/etc/board.d ]; then
+            echo "  [OK] /etc/board.d/ 存在"
+          else
+            echo "  [WARN] /etc/board.d/ 不存在，首次启动可能无法生成 board.json"
+          fi
+
+          # 检查 6: 内核版本
           KVER=$(ls /tmp/verify-rootfs/lib/modules/ | head -1)
           echo "kernel: $KVER"
           case "$KVER" in
@@ -530,8 +568,9 @@ jobs:
             *) echo "::error::kernel 不是 6.12"; sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1 ;;
           esac
 
-          R8125=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8125*.ko' 2>/dev/null | head -1)
-          R8169=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8169*.ko' 2>/dev/null | head -1)
+          # 检查 7: 网卡驱动
+          R8125=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8125*.ko*' 2>/dev/null | head -1)
+          R8169=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8169*.ko*' 2>/dev/null | head -1)
           if [ -n "$R8125" ]; then
             echo "  [OK] r8125 found: $R8125"
           elif [ -n "$R8169" ]; then
@@ -541,6 +580,7 @@ jobs:
             sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
           fi
 
+          # 检查 8: 确认为非 Debian
           if [ -f /tmp/verify-rootfs/etc/debian_version ]; then
             echo "::error::rootfs 是 Debian"
             sudo umount /tmp/verify-rootfs; rm -f "$RAW_IMG"; exit 1
@@ -627,15 +667,28 @@ jobs:
           mkdir -p /tmp/verify-sd
           sudo mount -o ro "$ROOT_PART" /tmp/verify-sd
 
-          echo "===== 校验 1: OpenWrt 布局 ====="
-          if [ ! -d /tmp/verify-sd/etc/config ]; then
-              echo "::error::rootfs 不是 OpenWrt（缺 /etc/config/）"
+          echo "===== 校验 1: OpenWrt 标记 ====="
+          if [ -f /tmp/verify-sd/etc/openwrt_release ] || [ -f /tmp/verify-sd/etc/openwrt_version ]; then
+              echo "  [OK] OpenWrt 标记文件存在"
+              [ -f /tmp/verify-sd/etc/openwrt_release ] && cat /tmp/verify-sd/etc/openwrt_release || true
+          else
+              echo "::error::rootfs 不是 OpenWrt（缺 /etc/openwrt_release）"
               sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
           fi
-          [ -f /tmp/verify-sd/etc/config/network ] || { echo "::error::no /etc/config/network"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
-          [ -f /tmp/verify-sd/etc/uci-defaults/99-custom ] || { echo "::error::99-custom missing"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
 
-          echo "===== 校验 2: 内核版本 ====="
+          echo "===== 校验 2: /etc/config/ 结构 ====="
+          [ -d /tmp/verify-sd/etc/config ] || { echo "::error::缺 /etc/config/"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
+          ls -la /tmp/verify-sd/etc/config/ 2>/dev/null || true
+
+          echo "===== 校验 3: 99-custom ====="
+          [ -f /tmp/verify-sd/etc/uci-defaults/99-custom ] || { echo "::error::99-custom missing"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1; }
+          echo "  [OK] 99-custom 存在"
+
+          if [ ! -f /tmp/verify-sd/etc/config/network ]; then
+              echo "  [INFO] /etc/config/network 未预置，首次启动由 config_generate 生成"
+          fi
+
+          echo "===== 校验 4: 内核版本 ====="
           KVER=$(ls /tmp/verify-sd/lib/modules/ | head -1)
           echo "kernel modules: $KVER"
           case "$KVER" in
@@ -643,9 +696,9 @@ jobs:
             *) echo "::error::kernel is NOT 6.12 (got $KVER)"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1 ;;
           esac
 
-          echo "===== 校验 3: 网卡驱动 ====="
-          R8125=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8125*.ko' 2>/dev/null | head -1)
-          R8169=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8169*.ko' 2>/dev/null | head -1)
+          echo "===== 校验 5: 网卡驱动 ====="
+          R8125=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8125*.ko*' 2>/dev/null | head -1)
+          R8169=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8169*.ko*' 2>/dev/null | head -1)
           if [ -n "$R8125" ]; then
               echo "  [OK] r8125 found: $R8125"
           elif [ -n "$R8169" ]; then
@@ -655,7 +708,7 @@ jobs:
               sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
           fi
 
-          echo "===== 校验 4: 确认不是 FriendlyElec Debian ====="
+          echo "===== 校验 6: 确认不是 FriendlyElec Debian ====="
           if [ -f /tmp/verify-sd/etc/debian_version ]; then
               echo "::error::rootfs is Debian, not OpenWrt"
               sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
@@ -665,19 +718,17 @@ jobs:
               sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
           fi
 
-          echo "===== 校验 5: 分区大小 ====="
+          echo "===== 校验 7: 分区大小 ====="
           ROOT_MB=$(( $(sudo blockdev --getsize64 "$ROOT_PART") / 1024 / 1024 ))
           echo "rootfs partition: ${ROOT_MB} MB (expect 1024)"
           if [ "$ROOT_MB" -lt 900 ] || [ "$ROOT_MB" -gt 1200 ]; then
               echo "::warning::rootfs partition ${ROOT_MB}MB 与 1024MB 不匹配"
           fi
 
-          echo "===== 校验 6: 网络接口映射 ====="
+          echo "===== 校验 8: 网络接口映射 ====="
           if [ -f /tmp/verify-sd/etc/board.d/02_network ]; then
               grep -n -A3 'nanopi-r5s' /tmp/verify-sd/etc/board.d/02_network || true
           fi
-          echo "--- /etc/config/network 前 40 行 ---"
-          head -40 /tmp/verify-sd/etc/config/network || true
 
           sudo umount /tmp/verify-sd
           sudo losetup -d "$LOOP"
