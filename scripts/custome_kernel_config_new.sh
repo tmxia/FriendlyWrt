@@ -130,8 +130,62 @@ EOF
     log "[OK] 风扇控制脚本已写入"
 }
 
+step_patch_led_default_trigger() {
+    log "===== 3.7 通过 DTS 补丁给 LED 加默认触发器 ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    local PATCH_DIR="target/linux/rockchip/patches-6.12"
+    mkdir -p "$PATCH_DIR"
+
+    rm -f "$PATCH_DIR/997-r5s-led-default-trigger.patch"
+
+    local PATCH="$PATCH_DIR/997-r5s-led-default-trigger.patch"
+
+    cat > "$PATCH" << 'PATCH_EOF'
+--- a/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
++++ b/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
+@@ -30,6 +30,7 @@
+ 		led-lan1 {
+ 			color = <LED_COLOR_ID_GREEN>;
+ 			function = LED_FUNCTION_LAN;
+ 			function-enumerator = <1>;
++			linux,default-trigger = "netdev";
+ 			gpios = <&gpio3 RK_PD6 GPIO_ACTIVE_HIGH>;
+ 		};
+ 
+@@ -38,6 +39,7 @@
+ 		led-lan2 {
+ 			color = <LED_COLOR_ID_GREEN>;
+ 			function = LED_FUNCTION_LAN;
+ 			function-enumerator = <2>;
++			linux,default-trigger = "netdev";
+ 			gpios = <&gpio3 RK_PD7 GPIO_ACTIVE_HIGH>;
+ 		};
+ 
+@@ -46,12 +48,14 @@
+ 		power_led: led-power {
+ 			color = <LED_COLOR_ID_RED>;
+ 			function = LED_FUNCTION_POWER;
++			linux,default-trigger = "heartbeat";
+ 			gpios = <&gpio4 RK_PD2 GPIO_ACTIVE_HIGH>;
+ 		};
+ 
+ 		led-wan {
+ 			color = <LED_COLOR_ID_GREEN>;
+ 			function = LED_FUNCTION_WAN;
++			linux,default-trigger = "netdev";
+ 			gpios = <&gpio2 RK_PC1 GPIO_ACTIVE_HIGH>;
+ 		};
+ 	};
+PATCH_EOF
+
+    log "[OK] LED default-trigger 补丁已写入: $PATCH"
+    log "     电源灯 -> heartbeat（呼吸闪烁）"
+    log "     网络灯 -> netdev（随网口活动闪烁）"
+}
+
 step_add_led_and_network_fallback() {
-    log "===== 3.7 添加 LED 与网络兜底脚本（动态识别，不依赖硬编码 LED 名） ====="
+    log "===== 3.8 添加 LED 与网络兜底脚本（动态识别，不硬编码 LED 名） ====="
     cd "$FRIENDLYWRT_DIR"
 
     mkdir -p files/etc/init.d files/etc/uci-defaults
@@ -142,10 +196,6 @@ step_add_led_and_network_fallback() {
 START=97
 STOP=01
 
-# 通用 LED 触发器设置
-# $1 = LED 名称（如 red:power）
-# $2 = 触发器（如 heartbeat / netdev）
-# $3 = netdev 设备名（可选）
 set_led() {
 	local name="$1"
 	local trig="$2"
@@ -154,7 +204,6 @@ set_led() {
 	[ -e "/sys/class/leds/$name/trigger" ] || return 0
 
 	if ! echo "$trig" > "/sys/class/leds/$name/trigger" 2>/dev/null; then
-		# 触发器不可用时降级
 		echo heartbeat > "/sys/class/leds/$name/trigger" 2>/dev/null || \
 		echo default-on > "/sys/class/leds/$name/trigger" 2>/dev/null
 		return 0
@@ -175,7 +224,6 @@ start() {
 		sleep 1
 	done
 
-	# 遍历所有 LED 节点，根据名字动态分配触发器
 	for led in /sys/class/leds/*/; do
 		[ -d "$led" ] || continue
 		name=$(basename "$led")
@@ -528,7 +576,7 @@ step_verify_kernel_options() {
         fi
     done
 
-    # 软警告：网络驱动、可选触发器、INET_DIAG
+    # 软警告：可选触发器、GPIOLIB、INET_DIAG
     for opt in \
         CONFIG_LEDS_TRIGGER_TIMER \
         CONFIG_LEDS_TRIGGER_DEFAULT_ON \
@@ -632,6 +680,7 @@ main() {
     step_bridge_kernel_config
     step_clean_legacy_patches
     step_add_fan_control
+    step_patch_led_default_trigger
     step_add_led_and_network_fallback
     step_init_config
     step_apply_customizations
