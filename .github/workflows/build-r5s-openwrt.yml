@@ -219,7 +219,13 @@ jobs:
       - name: Update feeds
         run: |
           cd openwrt
-          ./scripts/feeds update -a 2>&1 | tail -20
+          ./scripts/feeds update -a 2>&1 | tail -30
+
+          echo "===== 检查 kmod-r8125-rss 是否存在于 small feed ====="
+          if [ -d feeds/small ]; then
+            find feeds/small -maxdepth 3 -type d -name 'r8125*' 2>/dev/null | head -10 || true
+          fi
+          grep -R "kmod-r8125" feeds/ 2>/dev/null | head -5 || echo "  (feeds 中暂未找到 r8125 关键字)"
 
       - name: Apply custom modifications
         run: |
@@ -229,7 +235,10 @@ jobs:
       - name: Install feed packages
         run: |
           cd openwrt
-          ./scripts/feeds install -a 2>&1 | tail -20
+          ./scripts/feeds install -a 2>&1 | tail -30
+
+          echo "===== 检查 r8125 包是否已安装到 package/feeds/small ====="
+          find package/feeds -maxdepth 3 -type d -name 'r8125*' 2>/dev/null | head -10 || true
 
       - name: Load R5S configuration
         run: |
@@ -252,8 +261,8 @@ jobs:
           echo "===== iptables related config ====="
           grep -E "^CONFIG_PACKAGE_(i|ip6)tables" .config || true
 
-          echo "===== r8125 / r8169 相关 config ====="
-          grep -E "CONFIG_PACKAGE_kmod-r81(25|68|69)" .config || true
+          echo "===== 网卡驱动 config ====="
+          grep -E "CONFIG_PACKAGE_kmod-(r8125|r8169|r8168)" .config || echo "  (无)"
 
       - name: Restore base build cache
         id: restore_cache
@@ -368,13 +377,21 @@ jobs:
           echo "KV=$KV" >> $GITHUB_ENV
           [[ "$KV" == 6.12* ]] || { echo "::error::kernel modules not 6.12, got: $KV"; exit 1; }
 
-          echo "===== r8125 in rootfs-src ====="
-          ls "$ROOTFS_SRC/lib/modules/$KV/kernel/drivers/net/ethernet/realtek/" 2>/dev/null || \
-              echo "  (realtek 目录不存在)"
-          if ls "$ROOTFS_SRC/lib/modules/$KV/kernel/drivers/net/ethernet/realtek/" 2>/dev/null | grep -q r8125; then
-              echo "  [OK] r8125 found in compiled rootfs"
+          echo "===== 检查网卡驱动 ====="
+          R8125_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8125*.ko' 2>/dev/null)
+          R8169_LIST=$(find "$ROOTFS_SRC/lib/modules/$KV" -name 'r8169*.ko' 2>/dev/null)
+
+          echo "--- r8125 ---"
+          echo "${R8125_LIST:-  (无)}"
+          echo "--- r8169 ---"
+          echo "${R8169_LIST:-  (无)}"
+
+          if [ -n "$R8125_LIST" ]; then
+              echo "  [OK] r8125 存在（Realtek 官方驱动）"
+          elif [ -n "$R8169_LIST" ]; then
+              echo "  [WARN] 只有 r8169（内核 5.4+ 的 r8169 可驱动 RTL8125）"
           else
-              echo "::error::r8125 未编译进 OpenWrt rootfs（2.5G 网口无法工作）"
+              echo "::error::r8125 与 r8169 都不存在，2.5G 网口无法工作"
               exit 1
           fi
 
@@ -483,7 +500,7 @@ jobs:
 
           [ -f "$TGT/rootfs.img" ] || { echo "::error::rootfs.img generation failed"; exit 1; }
 
-          # ---- 直接挂载校验 rootfs.img 内容 ----
+          # ---- 挂载校验 rootfs.img 内容 ----
           echo "===== 校验 rootfs.img 内容 ====="
           mkdir -p /tmp/verify-rootfs
           sudo mount -o loop,ro "$TGT/rootfs.img" /tmp/verify-rootfs
@@ -499,10 +516,14 @@ jobs:
             *) echo "::error::kernel 不是 6.12"; sudo umount /tmp/verify-rootfs; exit 1 ;;
           esac
 
-          if ls /tmp/verify-rootfs/lib/modules/$KVER/kernel/drivers/net/ethernet/realtek/ 2>/dev/null | grep -q r8125; then
-            echo "  [OK] r8125 found"
+          R8125=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8125*.ko' 2>/dev/null | head -1)
+          R8169=$(find /tmp/verify-rootfs/lib/modules/$KVER -name 'r8169*.ko' 2>/dev/null | head -1)
+          if [ -n "$R8125" ]; then
+            echo "  [OK] r8125 found: $R8125"
+          elif [ -n "$R8169" ]; then
+            echo "  [WARN] 只有 r8169，将作为 RTL8125 的驱动"
           else
-            echo "::error::r8125 缺失（2.5G 网口无法工作）"
+            echo "::error::r8125 与 r8169 都缺失"
             sudo umount /tmp/verify-rootfs; exit 1
           fi
 
@@ -561,7 +582,7 @@ jobs:
           ls -lh out/ out/images-for-eflasher/ 2>/dev/null || true
 
       # ============================================================
-      # 新增：校验最终生成的 SD 镜像，防止打包污染
+      # 校验最终生成的 SD 镜像，防止打包污染
       # ============================================================
       - name: Verify generated SD image contains OpenWrt
         if: success()
@@ -607,11 +628,15 @@ jobs:
             *) echo "::error::kernel is NOT 6.12 (got $KVER)"; sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1 ;;
           esac
 
-          echo "===== 校验 3: r8125 驱动 ====="
-          if ls /tmp/verify-sd/lib/modules/$KVER/kernel/drivers/net/ethernet/realtek/ 2>/dev/null | grep -q r8125; then
-              echo "  [OK] r8125 found"
+          echo "===== 校验 3: 网卡驱动 ====="
+          R8125=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8125*.ko' 2>/dev/null | head -1)
+          R8169=$(find /tmp/verify-sd/lib/modules/$KVER -name 'r8169*.ko' 2>/dev/null | head -1)
+          if [ -n "$R8125" ]; then
+              echo "  [OK] r8125 found: $R8125"
+          elif [ -n "$R8169" ]; then
+              echo "  [WARN] 只有 r8169（RTL8125 由它驱动）"
           else
-              echo "::error::r8125 missing (R5S 2.5G 网口将无法工作)"
+              echo "::error::r8125 与 r8169 都缺失"
               sudo umount /tmp/verify-sd; sudo losetup -d "$LOOP"; exit 1
           fi
 
