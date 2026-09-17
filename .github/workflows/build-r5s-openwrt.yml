@@ -183,6 +183,18 @@ jobs:
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
           make defconfig
 
+          # defconfig 之后再次禁用 legacy iptables（防止 defconfig 根据依赖重新拉回）
+          for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=y/# CONFIG_PACKAGE_${pkg} is not set/" .config
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=m/# CONFIG_PACKAGE_${pkg} is not set/" .config
+            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+              echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+          done
+          make defconfig
+
+          echo "===== iptables related config ====="
+          grep -E "^CONFIG_PACKAGE_(i|ip6)tables" .config || true
+
       - name: Restore base build cache
         id: restore_cache
         run: |
