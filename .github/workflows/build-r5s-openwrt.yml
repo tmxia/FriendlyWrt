@@ -163,6 +163,16 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a 2>&1 | tail -30
 
+          echo "===== 检查 dockerfeed 是否含 docker 包 ====="
+          if [ -d feeds/dockerfeed ]; then
+            find feeds/dockerfeed -maxdepth 3 -type d \( -name 'docker' -o -name 'dockerd' -o -name 'containerd' -o -name 'runc' -o -name 'luci-app-dockerman' \) 2>/dev/null | head -20 || true
+          fi
+
+          echo "===== 检查 dockerfeed 是否含 clashoo ====="
+          if [ -d feeds/dockerfeed ]; then
+            find feeds/dockerfeed -maxdepth 3 -type d -name 'clashoo' 2>/dev/null | head -5 || true
+          fi
+
       - name: Apply custom modifications
         run: |
           cd openwrt
@@ -171,7 +181,10 @@ jobs:
       - name: Install feed packages
         run: |
           cd openwrt
-          ./scripts/feeds install -a 2>&1 | tail -30
+          ./scripts/feeds install -a 2>&1 | tail -40
+
+          echo "===== 已安装的 docker / clashoo 包 ====="
+          find package/feeds -maxdepth 3 -type d \( -name 'docker' -o -name 'dockerd' -o -name 'containerd' -o -name 'runc' -o -name 'luci-app-dockerman' -o -name 'clashoo' \) 2>/dev/null | head -20 || true
 
       - name: Load R5S configuration
         run: |
@@ -191,8 +204,9 @@ jobs:
           done
           make defconfig
 
-          echo "===== iptables related config ====="
-          grep -E "^CONFIG_PACKAGE_(i|ip6)tables" .config || true
+          echo "===== Docker 相关 config ====="
+          grep -E "^CONFIG_PACKAGE_(docker|dockerd|docker-compose|containerd|runc|tini|libnetwork|luci-app-dockerman|luci-lib-docker)" .config || echo "  (无)"
+          echo "=============================="
 
           echo "===== 网卡驱动 config ====="
           grep -E "CONFIG_PACKAGE_kmod-(r8169|r8125|r8168)" .config || echo "  (无)"
@@ -300,7 +314,7 @@ jobs:
           echo "[OK] manifest: $MANIFEST"
 
           echo "===== manifest 中的关键包 ====="
-          grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|luci-app-dockerman|ttyd)\b" "$MANIFEST" || true
+          grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd) " "$MANIFEST" || true
 
       - name: Collect and checksum artifacts
         if: success()
@@ -340,7 +354,7 @@ jobs:
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] && cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
 
-          # sha256sums（OpenWrt 官方生成的）
+          # OpenWrt 官方 sha256sums
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
 
