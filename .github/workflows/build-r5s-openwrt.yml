@@ -298,17 +298,17 @@ jobs:
           echo "===== $OUT/ 目录内容 ====="
           ls -lh "$OUT"/*nanopi-r5s* 2>/dev/null || true
 
-          # 1. SD 卡首次刷写镜像（完整磁盘镜像）
-          SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4.img.gz" -type f | head -1)
-          [ -n "$SDIMG" ] || { echo "::error::未找到 *nanopi-r5s-ext4.img.gz（SD 卡镜像）"; exit 1; }
+          # SD 卡镜像（rockchip 目标完整盘镜像）
+          SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4-sysupgrade.img.gz" -type f | head -1)
+          [ -n "$SDIMG" ] || { echo "::error::未找到 *nanopi-r5s-ext4-sysupgrade.img.gz（SD 卡镜像）"; exit 1; }
           echo "[OK] SD 卡镜像: $SDIMG ($(stat -c%s "$SDIMG") 字节)"
 
-          # 2. sysupgrade 镜像（用于后续升级）
-          SYSUP=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s*ext4-sysupgrade.img.gz" -type f | head -1)
-          [ -n "$SYSUP" ] || { echo "::error::未找到 *nanopi-r5s-ext4-sysupgrade.img.gz"; exit 1; }
-          echo "[OK] sysupgrade 镜像: $SYSUP ($(stat -c%s "$SYSUP") 字节)"
+          # squashfs sysupgrade
+          SYSUP_SQ=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" -type f | head -1)
+          [ -n "$SYSUP_SQ" ] || { echo "::error::未找到 *nanopi-r5s-squashfs-sysupgrade.img.gz"; exit 1; }
+          echo "[OK] squashfs sysupgrade: $SYSUP_SQ ($(stat -c%s "$SYSUP_SQ") 字节)"
 
-          # 3. manifest
+          # manifest
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "::error::未找到 *nanopi-r5s.manifest"; exit 1; }
           echo "[OK] manifest: $MANIFEST"
@@ -326,8 +326,8 @@ jobs:
           DATE=$(date +%Y.%m.%d)
           PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
-          # SD 卡首次刷写镜像
-          SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4.img.gz" -type f | head -1)
+          # SD 卡完整盘镜像
+          SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4-sysupgrade.img.gz" -type f | head -1)
           if [ -n "$SDIMG" ] && [ -s "$SDIMG" ]; then
             cp "$SDIMG" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
             echo "SD image: ${PREFIX}-sdcard.img.gz"
@@ -336,15 +336,8 @@ jobs:
             exit 1
           fi
 
-          # sysupgrade
-          SYSUP=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s*ext4-sysupgrade.img.gz" -type f | head -1)
-          if [ -n "$SYSUP" ] && [ -s "$SYSUP" ]; then
-            cp "$SYSUP" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sysupgrade.img.gz"
-            echo "sysupgrade: ${PREFIX}-sysupgrade.img.gz"
-          fi
-
-          # squashfs sysupgrade（如果 config 里有）
-          SYSUP_SQ=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s*squashfs-sysupgrade.img.gz" -type f | head -1)
+          # squashfs sysupgrade
+          SYSUP_SQ=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" -type f | head -1)
           if [ -n "$SYSUP_SQ" ] && [ -s "$SYSUP_SQ" ]; then
             cp "$SYSUP_SQ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
             echo "squashfs sysupgrade: ${PREFIX}-squashfs-sysupgrade.img.gz"
@@ -354,7 +347,7 @@ jobs:
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] && cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
 
-          # OpenWrt 官方 sha256sums
+          # 官方 sha256sums
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
 
