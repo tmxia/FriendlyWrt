@@ -10,11 +10,9 @@ CACHE_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY:-local/unknown}" | tr '[:upper:
 
 pre_feeds() {
     [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
-
     sed -i '/^#/d' feeds.conf
     sed -i -e 's|git.openwrt.org/feed|github.com/openwrt|g' \
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
-
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
 
     echo "===== feeds.conf 最终内容 ====="
@@ -30,12 +28,15 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
+    # 内核关键选项：容器、网络、PWM、风扇、LED netdev trigger
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
                CGROUP_PIDS CGROUP_RDMA CGROUP_HUGETLB CGROUP_NET_CLASSID \
                MEMCG BLK_CGROUP CFS_BANDWIDTH FAIR_GROUP_SCHED RT_GROUP_SCHED \
-               CGROUP_PERF CGROUP_NET_PRIO; do
+               CGROUP_PERF CGROUP_NET_PRIO \
+               PWM PWM_SYSFS PWM_ROCKCHIP SENSORS_PWM_FAN \
+               LEDS_TRIGGER_NETDEV; do
         sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
         sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
@@ -54,10 +55,14 @@ post_feeds() {
     rm -rf package/custom/luci-app-amlogic/.git
 
     mkdir -p files/etc/uci-defaults
+    mkdir -p files/etc/docker
+
+    # ============================================================
+    # 99-custom：网络 / 密码 / 主题 / Docker 目录 / 清理失效 feed
+    # ============================================================
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
-# ---- 网络 ----
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -79,45 +84,119 @@ uci set network.wan.clientid=''
 uci set network.wan.peerdns='1'
 uci commit network
 
-# ---- 密码 ----
 printf "tony\ntony\n" | passwd root
 
-# ---- LuCI 主题 ----
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
 
-# ---- Docker 数据目录 ----
 mkdir -p /opt/docker
 chmod 0700 /opt/docker
 
-rm -rf /tmp/luci-* /tmp/luci-modulecache/* 2>/dev/null
-/etc/init.d/uhttpd restart
-/etc/init.d/network restart
-/etc/init.d/firewall restart
+for f in /etc/apk/repositories.d/*.list; do
+    [ -f "$f" ] && sed -i '/clashoo/d; /dockerfeed/d' "$f"
+done
+
 exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
+    # ============================================================
+    # 99-custom-ssh：如果装了 openssh-server 才动它
+    # ============================================================
     cat > files/etc/uci-defaults/99-custom-ssh << 'EOF'
 #!/bin/sh
-/etc/init.d/dropbear stop
-/etc/init.d/sshd stop 2>/dev/null
-uci set dropbear.@dropbear[0].Port='2222'
-uci commit dropbear
 SSHD_CONFIG="/etc/ssh/sshd_config"
-if [ -f "$SSHD_CONFIG" ]; then
+if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
-    sed -i 's/^#*Port.*/Port 22/' "$SSHD_CONFIG"
+    sed -i 's/^#*Port .*/Port 2222/' "$SSHD_CONFIG"
+    sed -i '/^Port 22$/d' "$SSHD_CONFIG"
+    /etc/init.d/sshd enable
+    /etc/init.d/sshd restart
 fi
-/etc/init.d/dropbear start
-/etc/init.d/sshd enable 2>/dev/null
-/etc/init.d/sshd start 2>/dev/null
 exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom-ssh
 
-    mkdir -p files/etc/docker
+    # ============================================================
+    # 90-led-setup：官方 netdev trigger 配置网口 LED
+    # ============================================================
+    cat > files/etc/uci-defaults/90-led-setup << 'EOF'
+#!/bin/sh
+# WAN
+uci -q delete system.wan_led
+uci set system.wan_led=led
+uci set system.wan_led.name='wan'
+uci set system.wan_led.sysfs='green:wan'
+uci set system.wan_led.trigger='netdev'
+uci set system.wan_led.dev='eth0'
+uci set system.wan_led.mode='link'
+
+# LAN1
+uci -q delete system.lan1_led
+uci set system.lan1_led=led
+uci set system.lan1_led.name='lan1'
+uci set system.lan1_led.sysfs='green:lan-1'
+uci set system.lan1_led.trigger='netdev'
+uci set system.lan1_led.dev='eth1'
+uci set system.lan1_led.mode='link'
+
+# LAN2
+uci -q delete system.lan2_led
+uci set system.lan2_led=led
+uci set system.lan2_led.name='lan2'
+uci set system.lan2_led.sysfs='green:lan-2'
+uci set system.lan2_led.trigger='netdev'
+uci set system.lan2_led.dev='eth2'
+uci set system.lan2_led.mode='link'
+
+uci commit system
+/etc/init.d/led restart
+exit 0
+EOF
+    chmod +x files/etc/uci-defaults/90-led-setup
+
+    # ============================================================
+    # 85-grow-rootfs：首次启动把 root 分区扩到整卡
+    # ============================================================
+    cat > files/etc/uci-defaults/85-grow-rootfs << 'EOF'
+#!/bin/sh
+[ -f /etc/.rootfs_resized ] && exit 0
+
+ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
+[ -z "$ROOT_DEV" ] && ROOT_DEV=$(mount | awk '$3=="/"{print $1; exit}')
+[ -z "$ROOT_DEV" ] && { touch /etc/.rootfs_resized; exit 0; }
+
+case "$ROOT_DEV" in
+    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')" ;;
+    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')" ;;
+    *)                  touch /etc/.rootfs_resized; exit 0 ;;
+esac
+PART=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$')
+
+[ ! -b "$DISK" ] && { touch /etc/.rootfs_resized; exit 0; }
+DISK_SECTORS=$(cat "/sys/block/$(basename "$DISK")/size" 2>/dev/null)
+[ -z "$DISK_SECTORS" ] && { touch /etc/.rootfs_resized; exit 0; }
+
+PART_END=$(parted -s "$DISK" unit s print 2>/dev/null | awk -v p="$PART" '$1==p {print $3}' | tr -d 's')
+[ -z "$PART_END" ] && { touch /etc/.rootfs_resized; exit 0; }
+
+if [ "$PART_END" -lt "$((DISK_SECTORS - 204800))" ]; then
+    logger -t grow-rootfs "Resizing $DISK partition $PART to full disk"
+    parted -s "$DISK" resizepart "$PART" 100% 2>/dev/null || true
+    blockdev --rereadpt "$DISK" 2>/dev/null || partprobe "$DISK" 2>/dev/null || true
+    sleep 1
+    resize2fs "$ROOT_DEV" 2>/dev/null || true
+fi
+
+touch /etc/.rootfs_resized
+exit 0
+EOF
+    chmod +x files/etc/uci-defaults/85-grow-rootfs
+
+    # ============================================================
+    # Docker daemon.json
+    # ============================================================
     cat > files/etc/docker/daemon.json << 'EOF'
 {
   "data-root": "/opt/docker",
@@ -128,6 +207,79 @@ EOF
   }
 }
 EOF
+}
+
+# ================================================================
+# pre_build：内核源码解压后注入 R5S 风扇 dts 节点
+# ================================================================
+pre_build() {
+    echo "===== Pre-build: 注入 R5S 风扇 dts 节点 ====="
+
+    make target/linux/prepare V=s > /dev/null 2>&1 || true
+
+    local DTS=""
+    DTS=$(find build_dir -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
+    if [ -z "$DTS" ]; then
+        DTS=$(find . -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
+    fi
+    if [ -z "$DTS" ]; then
+        echo "⚠️ 未找到 rk3568-nanopi-r5s.dts，跳过"
+        return 0
+    fi
+    echo "找到 dts: $DTS"
+
+    if grep -q "pwm-fan" "$DTS"; then
+        echo "✅ dts 已存在 pwm-fan 节点，跳过"
+        return 0
+    fi
+
+    cp "$DTS" "${DTS}.orig"
+
+    cat >> "$DTS" << 'DTS_EOF'
+
+&pwm4 {
+    status = "okay";
+    pinctrl-0 = <&pwm4m0_pins>;
+    pinctrl-names = "default";
+};
+
+/ {
+    fan: pwm-fan {
+        compatible = "pwm-fan";
+        cooling-levels = <0 80 160 255>;
+        pwms = <&pwm4 0 40000 0>;
+        #cooling-cells = <2>;
+        status = "okay";
+    };
+};
+
+&cpu_thermal {
+    trips {
+        cpu_warm: cpu_warm {
+            temperature = <45000>;
+            hysteresis = <2000>;
+            type = "active";
+        };
+        cpu_hot: cpu_hot {
+            temperature = <55000>;
+            hysteresis = <2000>;
+            type = "active";
+        };
+    };
+    cooling-maps {
+        map_warm {
+            trip = <&cpu_warm>;
+            cooling-device = <&fan 1 1>;
+        };
+        map_hot {
+            trip = <&cpu_hot>;
+            cooling-device = <&fan 2 3>;
+        };
+    };
+};
+DTS_EOF
+
+    echo "✅ 已注入 pwm-fan 节点（45℃→1档，55℃→2档，更热→3档）"
 }
 
 cache_restore() {
@@ -238,6 +390,7 @@ config_stage() {
     wireguard-tools python3-light
     bash perl parted curl dosfstools e2fsprogs lsblk pv losetup uuidgen fdisk
     block-mount blkid
+    e2fsprogs-extra
     "
     for pkg in $ENABLE_PKGS; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -250,6 +403,7 @@ config_stage() {
                luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
                docker dockerd docker-compose containerd runc tini libnetwork \
                luci-app-dockerman luci-lib-docker luci-i18n-dockerman-zh-cn \
+               openssh-sftp-server \
                kmod-br-netfilter kmod-veth kmod-nf-ipvs kmod-ipt-physdev \
                kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
                kmod-nf-nathelper kmod-nf-nathelper-extra \
@@ -271,7 +425,7 @@ config_stage() {
 
     MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
-               docker dockerd containerd runc luci-app-dockerman; do
+               docker dockerd containerd runc luci-app-dockerman openssh-sftp-server parted; do
         if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
             echo "[OK] $pkg"
         else
@@ -291,13 +445,18 @@ config_stage() {
     echo "===== Docker 相关 config 检查 ====="
     grep -E "^CONFIG_PACKAGE_(docker|dockerd|containerd|runc|luci-app-dockerman|luci-lib-docker)" .config || echo "  (无)"
     echo "================================="
+
+    echo "===== SFTP 相关 config 检查 ====="
+    grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || echo "  (无)"
+    echo "================================="
 }
 
 case "$STAGE" in
     pre)           pre_feeds ;;
     post)          post_feeds ;;
     config)        config_stage ;;
+    pre_build)     pre_build ;;
     cache_restore) cache_restore ;;
     cache_save)    cache_save ;;
-    *)             echo "Usage: $0 {pre|post|config|cache_restore|cache_save}"; exit 1 ;;
+    *)             echo "Usage: $0 {pre|post|config|pre_build|cache_restore|cache_save}"; exit 1 ;;
 esac
