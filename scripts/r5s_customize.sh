@@ -311,74 +311,32 @@ DTS_EOF
     echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，40℃→1档，45℃→2档）"
 }
 
-# 编译完成后：给 sdcard.img 的 GPT 加上 p3=/opt（last_lba=max，内核自动截断到实际盘大小）
-# 用 zlib.decompressobj(wbits=31) 只解第一个 gzip member，静默忽略 trailing 垃圾
+# 编译完成后：
+#   1) 直接修改 .img 的 GPT 加 p3=/opt（无 gzip 解压，不可能碰 trailing garbage）
+#   2) gzip -9n 生成纯净 .img.gz（无时间戳，可复现）
 add_opt_partition() {
-    echo "===== Post-build: 给 image 添加 p3=/opt 分区 ====="
+    echo "===== Post-build: 修改 .img GPT 加 p3=/opt，然后压缩 ====="
 
     local OUT="bin/targets/rockchip/armv8"
-    local IMG
-    IMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4-sysupgrade.img.gz" -type f 2>/dev/null | head -1)
-    [ -z "$IMG" ] && { echo "❌ 未找到 *nanopi-r5s-ext4-sysupgrade.img.gz"; return 1; }
-    echo "目标: $IMG"
 
-    # 前置 gzip 魔数校验
-    local MAGIC
-    MAGIC=$(head -c 2 "$IMG" | od -An -tx1 | tr -d ' \n')
-    if [ "$MAGIC" != "1f8b" ]; then
-        echo "❌ 文件不是 gzip（魔数: $MAGIC）"
-        echo "   前 16 字节:"
-        head -c 16 "$IMG" | od -An -tx1 -c | sed 's/^/     /'
-        echo "   文件大小: $(stat -c%s "$IMG") 字节"
-        return 1
-    fi
-    echo "✅ gzip 魔数校验通过"
+    # ---------- ext4 sysupgrade ----------
+    local IMG_EXT4
+    IMG_EXT4=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
+    if [ -n "$IMG_EXT4" ]; then
+        echo "▶ 处理 ext4: $IMG_EXT4"
 
-    python3 - "$IMG" << 'PYEOF'
-import gzip, shutil, struct, zlib, sys, os, tempfile
+        python3 - "$IMG_EXT4" << 'PYEOF'
+import struct, zlib, sys, os
 
-img_gz = sys.argv[1]
-tmp_img = tempfile.mktemp(suffix='.img')
+img = sys.argv[1]
+size = os.path.getsize(img)
+print(f"img 大小: {size} 字节")
 
-# ---- 1) 用 zlib.decompressobj(wbits=31) 只解第一个 gzip member ----
-#      trailing 垃圾静默忽略，不触发 BadGzipFile
-try:
-    with open(img_gz, 'rb') as f_in:
-        raw = f_in.read()
-except Exception as e:
-    print(f"ERROR: 读取失败: {e}")
-    sys.exit(1)
-
-try:
-    d = zlib.decompressobj(wbits=31)
-    img_data = d.decompress(raw)
-    if not d.eof:
-        img_data += d.flush()
-except zlib.error as e:
-    print(f"ERROR: 解压失败: {e}")
-    sys.exit(1)
-
-if not img_data:
-    print("ERROR: 解压为空")
-    sys.exit(1)
-
-trailing = len(d.unused_data)
-if trailing:
-    print(f"解压完成: {len(img_data)} 字节（忽略 trailing {trailing} 字节）")
-else:
-    print(f"解压完成: {len(img_data)} 字节")
-
-with open(tmp_img, 'wb') as f_out:
-    f_out.write(img_data)
-
-# ---- 2) 修改 GPT ----
-with open(tmp_img, 'r+b') as f:
+with open(img, 'r+b') as f:
     f.seek(512)
     header = bytearray(f.read(92))
     if header[:8] != b'EFI PART':
-        print("ERROR: not a GPT image")
-        f.close()
-        os.unlink(tmp_img)
+        print(f"ERROR: 不是 GPT 镜像（前 8 字节: {bytes(header[:8])!r}）")
         sys.exit(1)
 
     f.seek(1024)
@@ -388,8 +346,6 @@ with open(tmp_img, 'r+b') as f:
     p3_off = 2 * 128
     if entries[p3_off:p3_off+16] != b'\x00' * 16:
         print("p3 已存在，跳过")
-        f.close()
-        os.unlink(tmp_img)
         sys.exit(0)
 
     p2_off = 1 * 128
@@ -423,25 +379,35 @@ with open(tmp_img, 'r+b') as f:
 
     f.seek(512); f.write(header)
     f.seek(1024); f.write(entries)
-    print("GPT p3 added")
-
-# ---- 3) 用 gzip.open 重新压缩（输出纯净 gzip，无 trailing） ----
-try:
-    with open(tmp_img, 'rb') as f_in:
-        with gzip.open(img_gz, 'wb', compresslevel=9) as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    print("✅ 压缩完成")
-except Exception as e:
-    print(f"ERROR: 压缩失败: {e}")
-    try: os.unlink(tmp_img)
-    except: pass
-    sys.exit(1)
-
-os.unlink(tmp_img)
+    print("✅ GPT p3 added")
 PYEOF
 
-    echo "✅ p3=/opt 已加入 GPT"
-    ls -lh "$IMG"
+        echo "▶ 压缩: $IMG_EXT4.gz"
+        gzip -9n -c "$IMG_EXT4" > "${IMG_EXT4}.gz"
+        ls -lh "${IMG_EXT4}.gz"
+    else
+        echo "⚠️ 未找到 *-ext4-sysupgrade.img（未压缩）"
+    fi
+
+    # ---------- squashfs sysupgrade ----------
+    local IMG_SQ
+    IMG_SQ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-squashfs-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
+    if [ -n "$IMG_SQ" ]; then
+        echo "▶ 处理 squashfs: $IMG_SQ"
+        echo "▶ 压缩: $IMG_SQ.gz"
+        gzip -9n -c "$IMG_SQ" > "${IMG_SQ}.gz"
+        ls -lh "${IMG_SQ}.gz"
+    else
+        echo "⚠️ 未找到 *-squashfs-sysupgrade.img（未压缩）"
+    fi
+
+    # ---------- 清理未压缩 .img（节省空间） ----------
+    [ -n "$IMG_EXT4" ] && rm -f "$IMG_EXT4"
+    [ -n "$IMG_SQ" ] && rm -f "$IMG_SQ"
+
+    echo "===== $OUT/ 最终内容 ====="
+    ls -lh "$OUT"/*nanopi-r5s* 2>/dev/null || true
+    echo "============================"
 }
 
 cache_restore() {
@@ -595,6 +561,9 @@ config_stage() {
 
     echo "===== resize2fs ====="
     grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || echo "  (无)"
+
+    echo "===== IMAGES_GZIP ====="
+    grep -E "^CONFIG_TARGET_IMAGES_GZIP" .config || echo "  (无)"
 }
 
 case "$STAGE" in
