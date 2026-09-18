@@ -312,6 +312,7 @@ DTS_EOF
 }
 
 # 编译完成后：给 sdcard.img 的 GPT 加上 p3=/opt（last_lba=max，内核自动截断到实际盘大小）
+# 全流程使用 Python gzip，彻底避开 shell gzip 对 trailing garbage 的 exit code 2
 add_opt_partition() {
     echo "===== Post-build: 给 image 添加 p3=/opt 分区 ====="
 
@@ -321,17 +322,40 @@ add_opt_partition() {
     [ -z "$IMG" ] && { echo "⚠️ 未找到 sdcard img，跳过"; return 0; }
     echo "目标: $IMG"
 
-    gzip -dc "$IMG" > /tmp/sd.img
+    python3 - "$IMG" << 'PYEOF'
+import gzip, shutil, struct, zlib, sys, os, tempfile
 
-    python3 - /tmp/sd.img << 'PYEOF'
-import struct, zlib, sys
+img_gz = sys.argv[1]
+tmp_img = tempfile.mktemp(suffix='.img')
 
-img = sys.argv[1]
-with open(img, 'r+b') as f:
+# ---- 1) Python gzip 解压（忽略 trailing garbage） ----
+try:
+    with gzip.open(img_gz, 'rb') as f_in:
+        with open(tmp_img, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+except Exception as e:
+    print(f"ERROR: 解压失败: {e}")
+    try: os.unlink(tmp_img)
+    except: pass
+    sys.exit(0)
+
+if not os.path.exists(tmp_img) or os.path.getsize(tmp_img) == 0:
+    print("ERROR: 解压为空")
+    try: os.unlink(tmp_img)
+    except: pass
+    sys.exit(0)
+
+print(f"解压完成: {os.path.getsize(tmp_img)} 字节")
+
+# ---- 2) 修改 GPT ----
+with open(tmp_img, 'r+b') as f:
     f.seek(512)
     header = bytearray(f.read(92))
     if header[:8] != b'EFI PART':
-        print("ERROR: not a GPT image"); sys.exit(1)
+        print("ERROR: not a GPT image")
+        f.close()
+        os.unlink(tmp_img)
+        sys.exit(0)
 
     f.seek(1024)
     entries = bytearray(f.read(128 * 128))
@@ -339,7 +363,10 @@ with open(img, 'r+b') as f:
     # p3 = index 2
     p3_off = 2 * 128
     if entries[p3_off:p3_off+16] != b'\x00' * 16:
-        print("p3 already exists, skip"); sys.exit(0)
+        print("p3 已存在，跳过")
+        f.close()
+        os.unlink(tmp_img)
+        sys.exit(0)
 
     p2_off = 1 * 128
     p2_last = struct.unpack('<Q', entries[p2_off+40:p2_off+48])[0]
@@ -373,11 +400,22 @@ with open(img, 'r+b') as f:
     f.seek(512); f.write(header)
     f.seek(1024); f.write(entries)
     print("GPT p3 added")
+
+# ---- 3) Python gzip 重新压缩，覆盖原文件 ----
+try:
+    with open(tmp_img, 'rb') as f_in:
+        with gzip.open(img_gz, 'wb', compresslevel=9) as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    print("✅ 压缩完成")
+except Exception as e:
+    print(f"ERROR: 压缩失败: {e}")
+    try: os.unlink(tmp_img)
+    except: pass
+    sys.exit(0)
+
+os.unlink(tmp_img)
 PYEOF
 
-    gzip -9 -c /tmp/sd.img > "${IMG}.new"
-    mv "${IMG}.new" "$IMG"
-    rm -f /tmp/sd.img
     echo "✅ p3=/opt 已加入 GPT（刷盘后内核按实际容量截断）"
     ls -lh "$IMG"
 }
