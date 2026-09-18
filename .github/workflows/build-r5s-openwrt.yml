@@ -242,6 +242,12 @@ jobs:
           echo "Base cache changed, saving..."
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
 
+      # >>> NEW: 注入 R5S 风扇 dts 节点（内核源码在 target/linux/prepare 时已解压）
+      - name: Inject kernel dts patches
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
+
       - name: Compile OpenWrt firmware
         run: |
           cd /workdir/openwrt
@@ -300,7 +306,7 @@ jobs:
           echo "[OK] manifest: $MANIFEST"
 
           echo "===== manifest 中的关键包 ====="
-          grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd) " "$MANIFEST" || true
+          grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
 
       - name: Collect and checksum artifacts
         if: success()
