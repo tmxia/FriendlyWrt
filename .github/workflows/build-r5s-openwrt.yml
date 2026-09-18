@@ -309,34 +309,14 @@ jobs:
           [ -n "$IMG_EXT4_GZ" ] || { echo "::error::未找到 ext4-sysupgrade.img.gz"; exit 1; }
           echo "验证: $IMG_EXT4_GZ"
           file "$IMG_EXT4_GZ" | grep -q "gzip compressed data" || { echo "::error::ext4 不是有效 gzip"; exit 1; }
-          python3 -c "
-import zlib, sys
-with open('$IMG_EXT4_GZ', 'rb') as f:
-    raw = f.read()
-d = zlib.decompressobj(wbits=31)
-d.decompress(raw)
-if not d.eof:
-    print('ERROR: gzip member incomplete', file=sys.stderr)
-    sys.exit(1)
-print('OK')
-" || { echo "::error::ext4 gzip 完整性失败"; exit 1; }
+          python3 -c "import zlib,sys;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_EXT4_GZ','rb').read());sys.exit(0 if d.eof else 1)" || { echo "::error::ext4 gzip 完整性失败"; exit 1; }
           echo "✅ ext4 gzip OK"
 
           IMG_SQ_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" | head -1)
           if [ -n "$IMG_SQ_GZ" ]; then
             echo "验证: $IMG_SQ_GZ"
             file "$IMG_SQ_GZ" | grep -q "gzip compressed data" || { echo "::error::squashfs 不是有效 gzip"; exit 1; }
-            python3 -c "
-import zlib, sys
-with open('$IMG_SQ_GZ', 'rb') as f:
-    raw = f.read()
-d = zlib.decompressobj(wbits=31)
-d.decompress(raw)
-if not d.eof:
-    print('ERROR: gzip member incomplete', file=sys.stderr)
-    sys.exit(1)
-print('OK')
-" || { echo "::error::squashfs gzip 完整性失败"; exit 1; }
+            python3 -c "import zlib,sys;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_SQ_GZ','rb').read());sys.exit(0 if d.eof else 1)" || { echo "::error::squashfs gzip 完整性失败"; exit 1; }
             echo "✅ squashfs gzip OK"
           fi
 
