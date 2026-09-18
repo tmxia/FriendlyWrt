@@ -28,7 +28,7 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # 内核选项：容器/网络/PWM/风扇/LED netdev + LED_TRIGGER_PHY（配合 CVE-2026-23368）
+    # 内核选项：容器/网络/PWM/风扇/LED netdev + LED_TRIGGER_PHY
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
@@ -308,13 +308,18 @@ DTS_EOF
 
     # ---------- 2) CVE-2026-23368 内核补丁 ----------
     local PATCH01="$GITHUB_WORKSPACE/scripts/patch01.sh"
-    if [ -f "$PATCH01" ]; then
-        echo "▶ 调用 patch01.sh（CVE-2026-23368）..."
-        bash "$PATCH01" || { echo "❌ patch01.sh 执行失败"; exit 1; }
-    else
-        echo "❌ 未找到 $PATCH01"
-        exit 1
-    fi
+    [ -f "$PATCH01" ] || { echo "❌ 未找到 $PATCH01"; exit 1; }
+
+    echo "▶ 调用 patch01.sh（CVE-2026-23368）..."
+
+    # 内核源码目录（与 patch01.sh 内一致）
+    local KERNEL_SRC
+    KERNEL_SRC=$(find build_dir -maxdepth 4 -type d -path "*/linux-rockchip_armv8/linux-*" 2>/dev/null | head -1)
+    [ -z "$KERNEL_SRC" ] && KERNEL_SRC=$(find . -maxdepth 6 -type d -path "*/linux-rockchip_armv8/linux-*" 2>/dev/null | head -1)
+    [ -z "$KERNEL_SRC" ] && { echo "❌ 未找到内核源码目录"; exit 1; }
+
+    # 用绝对路径调用，避免 cwd 变化
+    bash "$PATCH01" "$(realpath "$KERNEL_SRC")" || { echo "❌ patch01.sh 执行失败"; exit 1; }
 
     echo "===== Pre-build 完成 ====="
 }
