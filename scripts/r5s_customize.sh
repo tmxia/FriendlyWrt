@@ -552,11 +552,18 @@ config_stage() {
     echo "===== SFTP ====="
     grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || echo "  (无)"
 
+    # 在 config_stage 中重新计算内核 config 路径（KERNEL_CONFIG_FILE 是 post_feeds 的局部变量）
+    local KV
+    KV=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile 2>/dev/null | cut -d= -f2 | tr -d ' ')
+    [ -z "$KV" ] && KV="6.12"
     echo "===== 风扇/PWM 内核 ====="
-    grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "$KERNEL_CONFIG_FILE" 2>/dev/null || echo "  (无)"
+    grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || echo "  (无)"
 
     echo "===== mountpoint ====="
     [ -f files/sbin/mountpoint ] && echo "[OK] shell 版已打包" || echo "[FAIL] 未找到 files/sbin/mountpoint"
+
+    echo "===== resize2fs ====="
+    grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || echo "  (无)"
 }
 
 case "$STAGE" in
