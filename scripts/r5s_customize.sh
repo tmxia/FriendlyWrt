@@ -319,8 +319,21 @@ add_opt_partition() {
     local OUT="bin/targets/rockchip/armv8"
     local IMG
     IMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4-sysupgrade.img.gz" -type f 2>/dev/null | head -1)
-    [ -z "$IMG" ] && { echo "⚠️ 未找到 sdcard img，跳过"; return 0; }
+    [ -z "$IMG" ] && { echo "❌ 未找到 *nanopi-r5s-ext4-sysupgrade.img.gz"; return 1; }
     echo "目标: $IMG"
+
+    # ---- 前置 gzip 魔数校验 ----
+    local MAGIC
+    MAGIC=$(head -c 2 "$IMG" | od -An -tx1 | tr -d ' \n')
+    if [ "$MAGIC" != "1f8b" ]; then
+        echo "❌ 文件不是 gzip（魔数: $MAGIC）"
+        echo "   前 16 字节:"
+        head -c 16 "$IMG" | od -An -tx1 -c | sed 's/^/     /'
+        echo "   文件大小: $(stat -c%s "$IMG") 字节"
+        echo "   这是脏文件（可能来自中断的构建）。请重新触发 workflow。"
+        return 1
+    fi
+    echo "✅ gzip 魔数校验通过"
 
     python3 - "$IMG" << 'PYEOF'
 import gzip, shutil, struct, zlib, sys, os, tempfile
@@ -328,7 +341,7 @@ import gzip, shutil, struct, zlib, sys, os, tempfile
 img_gz = sys.argv[1]
 tmp_img = tempfile.mktemp(suffix='.img')
 
-# ---- 1) Python gzip 解压（忽略 trailing garbage） ----
+# ---- 1) Python gzip 解压 ----
 try:
     with gzip.open(img_gz, 'rb') as f_in:
         with open(tmp_img, 'wb') as f_out:
@@ -337,13 +350,13 @@ except Exception as e:
     print(f"ERROR: 解压失败: {e}")
     try: os.unlink(tmp_img)
     except: pass
-    sys.exit(0)
+    sys.exit(1)
 
 if not os.path.exists(tmp_img) or os.path.getsize(tmp_img) == 0:
     print("ERROR: 解压为空")
     try: os.unlink(tmp_img)
     except: pass
-    sys.exit(0)
+    sys.exit(1)
 
 print(f"解压完成: {os.path.getsize(tmp_img)} 字节")
 
@@ -355,7 +368,7 @@ with open(tmp_img, 'r+b') as f:
         print("ERROR: not a GPT image")
         f.close()
         os.unlink(tmp_img)
-        sys.exit(0)
+        sys.exit(1)
 
     f.seek(1024)
     entries = bytearray(f.read(128 * 128))
@@ -411,12 +424,12 @@ except Exception as e:
     print(f"ERROR: 压缩失败: {e}")
     try: os.unlink(tmp_img)
     except: pass
-    sys.exit(0)
+    sys.exit(1)
 
 os.unlink(tmp_img)
 PYEOF
 
-    echo "✅ p3=/opt 已加入 GPT（刷盘后内核按实际容量截断）"
+    echo "✅ p3=/opt 已加入 GPT"
     ls -lh "$IMG"
 }
 
@@ -492,7 +505,6 @@ config_stage() {
         grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
     done
 
-    # 确保必需包被启用（r5s.config 里未必全列全）
     ENABLE_PKGS="
     bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
     wireguard-tools python3-light
@@ -505,7 +517,6 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 关键功能包（含 Docker 生态、SFTP、内核模块）
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag \
                luci-app-amlogic luci-lib-nixio \
                luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
@@ -531,7 +542,6 @@ config_stage() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 屏蔽 legacy iptables（可能被 dnsmasq-full / firewall4 依赖间接拉入）
     for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
         sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
         grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
