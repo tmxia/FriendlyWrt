@@ -175,65 +175,98 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/90-led-setup
 
-    # 首启在 root 分区后创建 /opt 分区（ext4, LABEL=opt）
-    cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
+    # 首启自动把 root 分区（p2）扩到整盘：
+    #   1) parted resizepart 扩分区表
+    #   2) losetup + resize2fs -f 绕过内核的 online resize 限制
+    #   3) 写 pending 标记，由 zz-reboot-if-needed 触发一次自动重启让 fs 视图生效
+    cat > files/etc/uci-defaults/90-extend-root << 'EOF'
 #!/bin/sh
-[ -f /etc/.opt_partition_done ] && exit 0
+[ -f /etc/.root_extend_done ] && exit 0
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
 [ -z "$ROOT_DEV" ] && ROOT_DEV=$(mount | awk '$3=="/"{print $1; exit}')
-[ -z "$ROOT_DEV" ] && { touch /etc/.opt_partition_done; exit 0; }
+[ -z "$ROOT_DEV" ] && { touch /etc/.root_extend_done; exit 0; }
+
+REAL_DEV=$(readlink -f "$ROOT_DEV" 2>/dev/null)
+[ -b "$REAL_DEV" ] && ROOT_DEV="$REAL_DEV"
 
 case "$ROOT_DEV" in
-    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; P="p" ;;
-    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; P="" ;;
-    *) touch /etc/.opt_partition_done; exit 0 ;;
+    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; PART=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$') ;;
+    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; PART=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$') ;;
+    *) touch /etc/.root_extend_done; exit 0 ;;
 esac
 
-OPT_DEV="${DISK}${P}3"
-UUID=""
+[ ! -b "$DISK" ] && { touch /etc/.root_extend_done; exit 0; }
 
-if [ -b "$OPT_DEV" ]; then
-    FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
-    [ "$FSTYPE" != "ext4" ] && mkfs.ext4 -L opt -F "$OPT_DEV" 2>/dev/null || true
-    UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
-else
-    DISK_BASE=$(basename "$DISK")
-    DISK_SECTORS=$(cat "/sys/block/$DISK_BASE/size" 2>/dev/null)
-    if [ -n "$DISK_SECTORS" ]; then
-        LAST_END=$(parted -s "$DISK" unit s print 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {e=$3} END {print e}' | tr -d s)
-        if [ -n "$LAST_END" ] && [ "$LAST_END" -lt "$((DISK_SECTORS - 4194304))" ]; then
-            logger -t opt-init "Creating /opt partition on $DISK"
-            parted -s "$DISK" unit s mkpart opt ext4 "$((LAST_END + 1))s" 100% 2>/dev/null || true
-            blockdev --rereadpt "$DISK" 2>/dev/null || true
-            sleep 2
-            if [ -b "$OPT_DEV" ]; then
-                mkfs.ext4 -L opt -F "$OPT_DEV" 2>/dev/null || true
-                UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
-            fi
-        fi
+DISK_SECTORS=$(cat "/sys/block/$(basename "$DISK")/size" 2>/dev/null)
+[ -z "$DISK_SECTORS" ] && { touch /etc/.root_extend_done; exit 0; }
+
+PART_END=$(parted -s "$DISK" unit s print 2>/dev/null | awk -v p="$PART" '$1==p {print $3}' | tr -d s)
+[ -z "$PART_END" ] && { touch /etc/.root_extend_done; exit 0; }
+
+FREE=$((DISK_SECTORS - PART_END))
+# 剩余 < 5GB 就不折腾
+[ "$FREE" -lt 10485760 ] && { touch /etc/.root_extend_done; exit 0; }
+
+logger -t extend-root "Growing $DISK partition $PART (free=$((FREE * 512 / 1024 / 1024))MB)"
+
+# 1) 扩分区表
+if ! parted -s "$DISK" unit s resizepart "$PART" 100% 2>/dev/null; then
+    logger -t extend-root "parted resizepart failed, abort"
+    exit 0
+fi
+
+# 2) losetup + resize2fs -f（绕过内核 online resize 限制）
+LOOP=$(losetup -f 2>/dev/null)
+if [ -n "$LOOP" ] && losetup "$LOOP" "$ROOT_DEV" 2>/dev/null; then
+    if resize2fs -f "$LOOP" 2>/dev/null; then
+        logger -t extend-root "resize2fs via $LOOP OK"
+        losetup -d "$LOOP" 2>/dev/null
+        # fs 已扩，但内核挂载视图还是旧大小 → 重启后刷新
+        touch /etc/.root_extend_done
+        touch /var/run/root_extend_pending
+        exit 0
+    else
+        logger -t extend-root "resize2fs via $LOOP failed"
+        losetup -d "$LOOP" 2>/dev/null
     fi
+else
+    logger -t extend-root "losetup attach failed"
 fi
 
-if [ -n "$UUID" ]; then
-    uci -q delete fstab.opt
-    uci set fstab.opt=mount
-    uci set fstab.opt.target='/opt'
-    uci set fstab.opt.uuid="$UUID"
-    uci set fstab.opt.fstype='ext4'
-    uci set fstab.opt.options='rw,relatime'
-    uci set fstab.opt.enabled='1'
-    uci commit fstab
-
-    mkdir -p /opt
-    mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt 2>/dev/null || true
-    logger -t opt-init "/opt 已挂载 UUID=$UUID"
+# 3) losetup 也失败：保留分区表扩展结果，下次开机靠 rc.local 尝试
+grep -q '# extend-root-fs' /etc/rc.local 2>/dev/null || {
+    sed -i '/^exit 0/d' /etc/rc.local 2>/dev/null
+    cat >> /etc/rc.local << RC
+# extend-root-fs
+if [ ! -f /etc/.root_fs_extended ]; then
+    ROOT_DEV=\$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
+    [ -z "\$ROOT_DEV" ] && ROOT_DEV=\$(mount | awk '\$3=="/"{print \$1; exit}')
+    [ -n "\$ROOT_DEV" ] && resize2fs -f "\$ROOT_DEV" 2>/dev/null && \\
+        touch /etc/.root_fs_extended && touch /etc/.root_extend_done && \\
+        logger -t extend-root "Filesystem resized post-boot"
 fi
-
-touch /etc/.opt_partition_done
+exit 0
+RC
+    chmod +x /etc/rc.local
+}
+touch /var/run/root_extend_pending
 exit 0
 EOF
-    chmod +x files/etc/uci-defaults/90-opt-partition
+    chmod +x files/etc/uci-defaults/90-extend-root
+
+    # 所有 uci-defaults 跑完后：若 root 扩容待生效则自动重启
+    cat > files/etc/uci-defaults/zz-reboot-if-needed << 'EOF'
+#!/bin/sh
+if [ -f /var/run/root_extend_pending ]; then
+    rm -f /var/run/root_extend_pending
+    logger -t extend-root "Auto reboot to apply rootfs resize"
+    sleep 1
+    reboot
+fi
+exit 0
+EOF
+    chmod +x files/etc/uci-defaults/zz-reboot-if-needed
 
     cat > files/etc/docker/daemon.json << 'EOF'
 {
@@ -431,7 +464,7 @@ config_stage() {
     ENABLE_PKGS="
     bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
     wireguard-tools python3-light
-    bash perl parted curl dosfstools e2fsprogs lsblk pv losetup uuidgen fdisk
+    bash perl parted curl dosfstools e2fsprogs resize2fs lsblk pv losetup uuidgen fdisk
     block-mount blkid
     "
     for pkg in $ENABLE_PKGS; do
@@ -500,6 +533,9 @@ config_stage() {
 
     echo "===== mountpoint ====="
     [ -f files/sbin/mountpoint ] && echo "[OK] shell 版已打包" || echo "[FAIL] 未找到 files/sbin/mountpoint"
+
+    echo "===== resize2fs ====="
+    grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || echo "  (无)"
 }
 
 case "$STAGE" in
