@@ -119,9 +119,6 @@ uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
 
-mkdir -p /opt/docker
-chmod 0700 /opt/docker
-
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/clashoo/d; /dockerfeed/d' "$f"
 done
@@ -175,34 +172,54 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/90-led-setup
 
-    # 首启直接把 rootfs 在线扩到分区最大（分区表已在编译阶段改为 GPT 最大）
-    cat > files/etc/uci-defaults/90-extend-root << 'EOF'
+    # 首启挂载 p3 为 /opt（编译时已加好 p3 分区，这里只做 mkfs + mount + fstab）
+    cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
 #!/bin/sh
-[ -f /etc/.root_extend_done ] && exit 0
-touch /etc/.root_extend_done
+[ -f /etc/.opt_partition_done ] && exit 0
+touch /etc/.opt_partition_done
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
-[ -z "$ROOT_DEV" ] && ROOT_DEV=$(mount | awk '$3=="/"{print $1; exit}')
 [ -z "$ROOT_DEV" ] && exit 0
-
 REAL_DEV=$(readlink -f "$ROOT_DEV" 2>/dev/null)
 [ -b "$REAL_DEV" ] && ROOT_DEV="$REAL_DEV"
 
-# 分区表已是 GPT 最大，内核按磁盘实际容量截断，直接在线扩展 fs 即可
-if resize2fs "$ROOT_DEV" >/dev/null 2>&1; then
-    logger -t extend-root "Extended $ROOT_DEV to $(df -h / | awk 'NR==2{print $2}')"
-else
-    # 兜底：losetup 方式
-    LOOP=$(losetup -f 2>/dev/null)
-    if [ -n "$LOOP" ] && losetup "$LOOP" "$ROOT_DEV" 2>/dev/null; then
-        resize2fs -f "$LOOP" >/dev/null 2>&1 && \
-            logger -t extend-root "Extended via $LOOP (losetup)"
-        losetup -d "$LOOP" 2>/dev/null
-    fi
+case "$ROOT_DEV" in
+    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; P="p" ;;
+    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; P="" ;;
+    *) exit 0 ;;
+esac
+
+OPT_DEV="${DISK}${P}3"
+[ ! -b "$OPT_DEV" ] && { logger -t opt-init "p3 not found, skip"; exit 0; }
+
+# 格式化（若是空盘或非 ext4）
+FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
+if [ "$FSTYPE" != "ext4" ]; then
+    logger -t opt-init "mkfs.ext4 on $OPT_DEV"
+    mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1 || exit 0
 fi
+
+UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
+[ -z "$UUID" ] && exit 0
+
+uci -q delete fstab.opt
+uci set fstab.opt=mount
+uci set fstab.opt.target='/opt'
+uci set fstab.opt.uuid="$UUID"
+uci set fstab.opt.fstype='ext4'
+uci set fstab.opt.options='rw,relatime'
+uci set fstab.opt.enabled='1'
+uci commit fstab
+
+mkdir -p /opt
+mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt 2>/dev/null
+mkdir -p /opt/docker
+chmod 0700 /opt/docker
+
+logger -t opt-init "/opt mounted on $OPT_DEV UUID=$UUID"
 exit 0
 EOF
-    chmod +x files/etc/uci-defaults/90-extend-root
+    chmod +x files/etc/uci-defaults/90-opt-partition
 
     cat > files/etc/docker/daemon.json << 'EOF'
 {
@@ -216,7 +233,7 @@ EOF
 EOF
 }
 
-# 注入 R5S 风扇 dts（自建 pinctrl 避开上游 /omit-if-no-ref/）
+# 注入 R5S 风扇 dts（温控点 40/45℃，与原脚本一致）
 pre_build() {
     echo "===== Pre-build: 注入 R5S 风扇 dts 节点 ====="
 
@@ -268,12 +285,12 @@ pre_build() {
 &cpu_thermal {
     trips {
         cpu_warm: cpu_warm {
-            temperature = <45000>;
+            temperature = <40000>;
             hysteresis = <2000>;
             type = "active";
         };
         cpu_hot: cpu_hot {
-            temperature = <55000>;
+            temperature = <45000>;
             hysteresis = <2000>;
             type = "active";
         };
@@ -291,12 +308,12 @@ pre_build() {
 };
 DTS_EOF
 
-    echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，45℃→1档，55℃→2档）"
+    echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，40℃→1档，45℃→2档）"
 }
 
-# 编译完成后：把 sdcard image 的 GPT p2 分区扩展到最大（last_lba = max）
-extend_image_gpt() {
-    echo "===== Post-build: 扩展 image GPT p2 分区到最大值 ====="
+# 编译完成后：给 sdcard.img 的 GPT 加上 p3=/opt（last_lba=max，内核自动截断到实际盘大小）
+add_opt_partition() {
+    echo "===== Post-build: 给 image 添加 p3=/opt 分区 ====="
 
     local OUT="bin/targets/rockchip/armv8"
     local IMG
@@ -304,66 +321,64 @@ extend_image_gpt() {
     [ -z "$IMG" ] && { echo "⚠️ 未找到 sdcard img，跳过"; return 0; }
     echo "目标: $IMG"
 
-    # 解压
-    gzip -dc "$IMG" > /tmp/sdcard_extend.img
+    gzip -dc "$IMG" > /tmp/sd.img
 
-    # 用 Python 修改 GPT 表
-    python3 - /tmp/sdcard_extend.img << 'PYEOF'
+    python3 - /tmp/sd.img << 'PYEOF'
 import struct, zlib, sys
 
 img = sys.argv[1]
 with open(img, 'r+b') as f:
-    # 读 GPT header (LBA 1)
     f.seek(512)
     header = bytearray(f.read(92))
     if header[:8] != b'EFI PART':
-        print("ERROR: not a GPT image")
-        sys.exit(1)
-    print(f"GPT header signature OK")
+        print("ERROR: not a GPT image"); sys.exit(1)
 
-    # 分区条目数组 (LBA 2)
     f.seek(1024)
     entries = bytearray(f.read(128 * 128))
 
-    # p2 = 第 2 个条目 (index 1)
-    p2_off = 128
-    p2_first = struct.unpack('<Q', entries[p2_off+32:p2_off+40])[0]
-    p2_last  = struct.unpack('<Q', entries[p2_off+40:p2_off+48])[0]
-    print(f"p2 before: first_lba={p2_first}, last_lba={p2_last}")
+    # p3 = index 2
+    p3_off = 2 * 128
+    if entries[p3_off:p3_off+16] != b'\x00' * 16:
+        print("p3 already exists, skip"); sys.exit(0)
 
-    # 设 last_lba = max (0xFFFFFFFFFFFFFFFF)
-    entries[p2_off+40:p2_off+48] = struct.pack('<Q', 0xFFFFFFFFFFFFFFFF)
-    print(f"p2 last_lba -> 0xFFFFFFFFFFFFFFFF")
+    p2_off = 1 * 128
+    p2_last = struct.unpack('<Q', entries[p2_off+40:p2_off+48])[0]
+    print(f"p2 last_lba = {p2_last}")
 
-    # header 里的 last_usable_lba (offset 48)
+    p3_first = ((p2_last + 1 + 2047) // 2048) * 2048
+    p3_last = 0xFFFFFFFFFFFFFFFF
+    print(f"p3 first={p3_first}, last=max (内核自动截断)")
+
+    # Linux filesystem GUID（小端序）
+    p3_type = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
+    p3_uuid = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
+
+    entries[p3_off:p3_off+16] = p3_type
+    entries[p3_off+16:p3_off+32] = p3_uuid
+    entries[p3_off+32:p3_off+40] = struct.pack('<Q', p3_first)
+    entries[p3_off+40:p3_off+48] = struct.pack('<Q', p3_last)
+    name = "opt".encode('utf-16-le')
+    entries[p3_off+56:p3_off+56+len(name)] = name
+
+    # header last_usable_lba 设为 max-33
     header[48:56] = struct.pack('<Q', 0xFFFFFFFFFFFFFFFF - 33)
-    print(f"header last_usable_lba -> max-33")
 
-    # 重算分区条目数组 CRC (header offset 88)
     entries_crc = zlib.crc32(entries) & 0xFFFFFFFF
     header[88:92] = struct.pack('<I', entries_crc)
-    print(f"entries CRC -> {entries_crc:#010x}")
 
-    # 重算 header CRC (header offset 16)
     header[16:20] = b'\x00\x00\x00\x00'
     header_crc = zlib.crc32(header) & 0xFFFFFFFF
     header[16:20] = struct.pack('<I', header_crc)
-    print(f"header CRC -> {header_crc:#010x}")
 
-    # 写回
-    f.seek(512)
-    f.write(header)
-    f.seek(1024)
-    f.write(entries)
-    print("GPT modified successfully")
+    f.seek(512); f.write(header)
+    f.seek(1024); f.write(entries)
+    print("GPT p3 added")
 PYEOF
 
-    # 重新压缩
-    gzip -9 -c /tmp/sdcard_extend.img > "${IMG}.new"
+    gzip -9 -c /tmp/sd.img > "${IMG}.new"
     mv "${IMG}.new" "$IMG"
-    rm -f /tmp/sdcard_extend.img
-
-    echo "✅ GPT p2 分区已扩展为最大（刷入磁盘后内核自动截断到实际容量）"
+    rm -f /tmp/sd.img
+    echo "✅ p3=/opt 已加入 GPT（刷盘后内核按实际容量截断）"
     ls -lh "$IMG"
 }
 
@@ -542,18 +557,15 @@ config_stage() {
 
     echo "===== mountpoint ====="
     [ -f files/sbin/mountpoint ] && echo "[OK] shell 版已打包" || echo "[FAIL] 未找到 files/sbin/mountpoint"
-
-    echo "===== resize2fs ====="
-    grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || echo "  (无)"
 }
 
 case "$STAGE" in
-    pre)           pre_feeds ;;
-    post)          post_feeds ;;
-    config)        config_stage ;;
-    pre_build)     pre_build ;;
-    extend_image)  extend_image_gpt ;;
-    cache_restore) cache_restore ;;
-    cache_save)    cache_save ;;
-    *)             echo "Usage: $0 {pre|post|config|pre_build|extend_image|cache_restore|cache_save}"; exit 1 ;;
+    pre)            pre_feeds ;;
+    post)           post_feeds ;;
+    config)         config_stage ;;
+    pre_build)      pre_build ;;
+    add_opt_part)   add_opt_partition ;;
+    cache_restore)  cache_restore ;;
+    cache_save)     cache_save ;;
+    *)              echo "Usage: $0 {pre|post|config|pre_build|add_opt_part|cache_restore|cache_save}"; exit 1 ;;
 esac
