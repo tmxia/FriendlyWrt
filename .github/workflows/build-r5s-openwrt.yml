@@ -242,11 +242,22 @@ jobs:
           echo "Base cache changed, saving..."
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
 
-      # >>> 注入 R5S 风扇 dts 节点（内核源码在 target/linux/prepare 时已解压）
+      # 注入 R5S 风扇 dts 节点
       - name: Inject kernel dts patches
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
+
+      # 清理 bin/targets/，确保 make image 重新生成（避免脏文件被跳过）
+      - name: Clean stale build outputs
+        run: |
+          cd /workdir/openwrt
+          echo "===== 清理 bin/targets/rockchip/armv8/ ====="
+          if [ -d bin/targets/rockchip/armv8 ]; then
+            ls -lh bin/targets/rockchip/armv8/ 2>/dev/null || true
+            rm -rf bin/targets/rockchip/armv8
+          fi
+          echo "✅ 已清理"
 
       - name: Compile OpenWrt firmware
         run: |
@@ -284,7 +295,6 @@ jobs:
 
           echo "Build succeeded"
 
-      # >>> 给 image 加 p3=/opt 分区（FriendlyWrt 风格，独立存储）
       - name: Add p3=/opt partition to image
         if: success()
         run: |
