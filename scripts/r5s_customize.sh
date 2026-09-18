@@ -288,36 +288,51 @@ DTS_EOF
     echo "pwm-fan node injected"
 }
 
+# 在镜像 GPT 中加入 p3=/opt（2GB），然后 gzip -9n 压缩
 add_opt_partition() {
     local OUT="bin/targets/rockchip/armv8"
 
-    local IMG_EXT4
-    IMG_EXT4=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
-    if [ -n "$IMG_EXT4" ]; then
-        python3 - "$IMG_EXT4" << 'PYEOF'
+    process_img() {
+        local IMG="$1"
+
+        if [ ! -f "$IMG" ] && [ -f "${IMG}.gz" ]; then
+            gzip -d "${IMG}.gz"
+        fi
+        [ -f "$IMG" ] || return 0
+
+        python3 - "$IMG" << 'PYEOF'
 import struct, zlib, sys, os
 
 img = sys.argv[1]
+P3_SIZE = 2 * 1024 * 1024 * 1024
+SECTOR  = 512
+ALIGN   = 2048
 
 with open(img, 'r+b') as f:
     f.seek(512)
     header = bytearray(f.read(92))
     if header[:8] != b'EFI PART':
-        print("not a GPT image")
-        sys.exit(1)
+        print("ERROR: not a GPT image"); sys.exit(1)
 
     f.seek(1024)
     entries = bytearray(f.read(128 * 128))
 
     p3_off = 2 * 128
     if entries[p3_off:p3_off+16] != b'\x00' * 16:
-        print("p3 exists, skip")
-        sys.exit(0)
+        print("p3 exists, skip"); sys.exit(0)
 
-    p2_off = 1 * 128
-    p2_last = struct.unpack('<Q', entries[p2_off+40:p2_off+48])[0]
-    p3_first = ((p2_last + 1 + 2047) // 2048) * 2048
-    p3_last = 0xFFFFFFFFFFFFFFFF
+    p2_last = struct.unpack('<Q', entries[128+40:128+48])[0]
+
+    p3_first = ((p2_last + 1 + ALIGN - 1) // ALIGN) * ALIGN
+    p3_last  = p3_first + (P3_SIZE // SECTOR) - 1
+
+    new_size = (p3_last + 1 + 33) * SECTOR
+    if os.path.getsize(img) < new_size:
+        f.truncate(new_size)
+
+    new_last_lba = (new_size // SECTOR) - 1
+    header[32:40] = struct.pack('<Q', new_last_lba)
+    header[48:56] = struct.pack('<Q', new_last_lba - 33)
 
     entries[p3_off:p3_off+16] = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
     entries[p3_off+16:p3_off+32] = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
@@ -326,26 +341,40 @@ with open(img, 'r+b') as f:
     name = "opt".encode('utf-16-le')
     entries[p3_off+56:p3_off+56+len(name)] = name
 
-    header[48:56] = struct.pack('<Q', 0xFFFFFFFFFFFFFFFF - 33)
     header[88:92] = struct.pack('<I', zlib.crc32(entries) & 0xFFFFFFFF)
+
     header[16:20] = b'\x00\x00\x00\x00'
     header[16:20] = struct.pack('<I', zlib.crc32(header) & 0xFFFFFFFF)
 
-    f.seek(512); f.write(header)
+    f.seek(512);  f.write(header)
     f.seek(1024); f.write(entries)
-    print("p3 added")
+
+    backup_header = bytearray(header)
+    backup_header[24:32] = struct.pack('<Q', new_last_lba)
+    backup_header[32:40] = struct.pack('<Q', 1)
+    backup_header[16:20] = b'\x00\x00\x00\x00'
+    backup_header[16:20] = struct.pack('<I', zlib.crc32(backup_header) & 0xFFFFFFFF)
+
+    f.seek((new_last_lba - 32) * SECTOR); f.write(entries)
+    f.seek(new_last_lba * SECTOR);        f.write(backup_header)
+
+    print(f"p3 added: LBA {p3_first}..{p3_last} ({P3_SIZE//1024//1024}MB), img={new_size//1024//1024}MB")
 PYEOF
 
-        gzip -9n -c "$IMG_EXT4" > "${IMG_EXT4}.gz"
-        rm -f "$IMG_EXT4"
-    fi
+        gzip -9n -c "$IMG" > "${IMG}.gz"
+        rm -f "$IMG"
+    }
 
-    local IMG_SQ
-    IMG_SQ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-squashfs-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
-    if [ -n "$IMG_SQ" ]; then
-        gzip -9n -c "$IMG_SQ" > "${IMG_SQ}.gz"
-        rm -f "$IMG_SQ"
-    fi
+    local IMG_EXT4 IMG_SQ
+    IMG_EXT4=$(find "$OUT" -maxdepth 1 -type f \
+        \( -name "*nanopi-r5s-ext4-sysupgrade.img" -o -name "*nanopi-r5s-ext4-sysupgrade.img.gz" \) \
+        2>/dev/null | head -1)
+    [ -n "$IMG_EXT4" ] && process_img "${IMG_EXT4%.gz}"
+
+    IMG_SQ=$(find "$OUT" -maxdepth 1 -type f \
+        \( -name "*nanopi-r5s-squashfs-sysupgrade.img" -o -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" \) \
+        2>/dev/null | head -1)
+    [ -n "$IMG_SQ" ] && process_img "${IMG_SQ%.gz}"
 
     ls -lh "$OUT"/*nanopi-r5s* 2>/dev/null || true
 }
