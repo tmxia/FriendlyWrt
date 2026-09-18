@@ -312,7 +312,7 @@ DTS_EOF
 }
 
 # 编译完成后：给 sdcard.img 的 GPT 加上 p3=/opt（last_lba=max，内核自动截断到实际盘大小）
-# 全流程使用 Python gzip，彻底避开 shell gzip 对 trailing garbage 的 exit code 2
+# 用 zlib.decompressobj(wbits=31) 只解第一个 gzip member，静默忽略 trailing 垃圾
 add_opt_partition() {
     echo "===== Post-build: 给 image 添加 p3=/opt 分区 ====="
 
@@ -322,7 +322,7 @@ add_opt_partition() {
     [ -z "$IMG" ] && { echo "❌ 未找到 *nanopi-r5s-ext4-sysupgrade.img.gz"; return 1; }
     echo "目标: $IMG"
 
-    # ---- 前置 gzip 魔数校验 ----
+    # 前置 gzip 魔数校验
     local MAGIC
     MAGIC=$(head -c 2 "$IMG" | od -An -tx1 | tr -d ' \n')
     if [ "$MAGIC" != "1f8b" ]; then
@@ -330,7 +330,6 @@ add_opt_partition() {
         echo "   前 16 字节:"
         head -c 16 "$IMG" | od -An -tx1 -c | sed 's/^/     /'
         echo "   文件大小: $(stat -c%s "$IMG") 字节"
-        echo "   这是脏文件（可能来自中断的构建）。请重新触发 workflow。"
         return 1
     fi
     echo "✅ gzip 魔数校验通过"
@@ -341,24 +340,36 @@ import gzip, shutil, struct, zlib, sys, os, tempfile
 img_gz = sys.argv[1]
 tmp_img = tempfile.mktemp(suffix='.img')
 
-# ---- 1) Python gzip 解压 ----
+# ---- 1) 用 zlib.decompressobj(wbits=31) 只解第一个 gzip member ----
+#      trailing 垃圾静默忽略，不触发 BadGzipFile
 try:
-    with gzip.open(img_gz, 'rb') as f_in:
-        with open(tmp_img, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
+    with open(img_gz, 'rb') as f_in:
+        raw = f_in.read()
 except Exception as e:
+    print(f"ERROR: 读取失败: {e}")
+    sys.exit(1)
+
+try:
+    d = zlib.decompressobj(wbits=31)
+    img_data = d.decompress(raw)
+    if not d.eof:
+        img_data += d.flush()
+except zlib.error as e:
     print(f"ERROR: 解压失败: {e}")
-    try: os.unlink(tmp_img)
-    except: pass
     sys.exit(1)
 
-if not os.path.exists(tmp_img) or os.path.getsize(tmp_img) == 0:
+if not img_data:
     print("ERROR: 解压为空")
-    try: os.unlink(tmp_img)
-    except: pass
     sys.exit(1)
 
-print(f"解压完成: {os.path.getsize(tmp_img)} 字节")
+trailing = len(d.unused_data)
+if trailing:
+    print(f"解压完成: {len(img_data)} 字节（忽略 trailing {trailing} 字节）")
+else:
+    print(f"解压完成: {len(img_data)} 字节")
+
+with open(tmp_img, 'wb') as f_out:
+    f_out.write(img_data)
 
 # ---- 2) 修改 GPT ----
 with open(tmp_img, 'r+b') as f:
@@ -414,7 +425,7 @@ with open(tmp_img, 'r+b') as f:
     f.seek(1024); f.write(entries)
     print("GPT p3 added")
 
-# ---- 3) Python gzip 重新压缩，覆盖原文件 ----
+# ---- 3) 用 gzip.open 重新压缩（输出纯净 gzip，无 trailing） ----
 try:
     with open(tmp_img, 'rb') as f_in:
         with gzip.open(img_gz, 'wb', compresslevel=9) as f_out:
