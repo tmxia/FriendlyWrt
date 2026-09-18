@@ -14,10 +14,7 @@ pre_feeds() {
     sed -i -e 's|git.openwrt.org/feed|github.com/openwrt|g' \
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
-
-    echo "===== feeds.conf 最终内容 ====="
     cat feeds.conf
-    echo "================================"
 }
 
 post_feeds() {
@@ -40,13 +37,6 @@ post_feeds() {
         sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
-
-    NET_FILE="target/linux/rockchip/armv8/base-files/etc/board.d/02_network"
-    if [ -f "$NET_FILE" ]; then
-        echo "===== 02_network: nanopi-r5s 条目 ====="
-        grep -n -A5 'nanopi-r5s' "$NET_FILE" || echo "  (未找到)"
-        echo "======================================"
-    fi
 
     mkdir -p package/custom
     rm -rf package/custom/luci-app-amlogic
@@ -229,31 +219,26 @@ EOF
 EOF
 }
 
-# 注入 R5S 风扇 dts + 调用 patch01.sh 应用 CVE-2026-23368
 pre_build() {
-    echo "===== Pre-build: 注入内核补丁 ====="
-
     make target/linux/prepare V=s > /dev/null 2>&1 || true
 
-    # ---------- 1) 风扇 PWM 节点 ----------
     local DTS=""
     DTS=$(find build_dir -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
     [ -z "$DTS" ] && DTS=$(find . -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
 
-    if [ -z "$DTS" ]; then
-        echo "⚠️ 未找到 rk3568-nanopi-r5s.dts，跳过风扇节点注入"
-    else
-        echo "找到 dts: $DTS"
-        if grep -q "pwm-fan" "$DTS"; then
-            echo "✅ dts 已存在 pwm-fan 节点，跳过"
-        else
-            cp "$DTS" "${DTS}.orig"
-            cat >> "$DTS" << 'DTS_EOF'
+    [ -z "$DTS" ] && { echo "r5s dts not found, skip"; return 0; }
+
+    if grep -q "pwm-fan" "$DTS"; then
+        echo "dts already patched"
+        return 0
+    fi
+
+    cp "$DTS" "${DTS}.orig"
+    cat >> "$DTS" << 'DTS_EOF'
 
 &pinctrl {
     pwm4_fan {
         pwm4_fan_pins: pwm4-fan-pins {
-            /* PWM4_M1 = GPIO0_C3, mux 1 */
             rockchip,pins = <0 RK_PC3 1 &pcfg_pull_none>;
         };
     };
@@ -300,49 +285,25 @@ pre_build() {
     };
 };
 DTS_EOF
-            echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，40℃→1档，45℃→2档）"
-        fi
-    fi
-
-    # ---------- 2) CVE-2026-23368 内核补丁 ----------
-    local PATCH01="$GITHUB_WORKSPACE/scripts/patch01.sh"
-    [ -f "$PATCH01" ] || { echo "❌ 未找到 $PATCH01"; exit 1; }
-
-    echo "▶ 调用 patch01.sh（CVE-2026-23368）..."
-
-    local KERNEL_SRC
-    KERNEL_SRC=$(find build_dir -maxdepth 4 -type d -path "*/linux-rockchip_armv8/linux-*" 2>/dev/null | head -1)
-    [ -z "$KERNEL_SRC" ] && KERNEL_SRC=$(find . -maxdepth 6 -type d -path "*/linux-rockchip_armv8/linux-*" 2>/dev/null | head -1)
-    [ -z "$KERNEL_SRC" ] && { echo "❌ 未找到内核源码目录"; exit 1; }
-
-    bash "$PATCH01" "$(realpath "$KERNEL_SRC")" || { echo "❌ patch01.sh 执行失败"; exit 1; }
-
-    echo "===== Pre-build 完成 ====="
+    echo "pwm-fan node injected"
 }
 
-# 编译完成后：修改 .img 的 GPT 加 p3=/opt，gzip -9n 压缩
 add_opt_partition() {
-    echo "===== Post-build: 修改 .img GPT 加 p3=/opt，然后压缩 ====="
-
     local OUT="bin/targets/rockchip/armv8"
 
     local IMG_EXT4
     IMG_EXT4=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
     if [ -n "$IMG_EXT4" ]; then
-        echo "▶ 处理 ext4: $IMG_EXT4"
-
         python3 - "$IMG_EXT4" << 'PYEOF'
 import struct, zlib, sys, os
 
 img = sys.argv[1]
-size = os.path.getsize(img)
-print(f"img 大小: {size} 字节")
 
 with open(img, 'r+b') as f:
     f.seek(512)
     header = bytearray(f.read(92))
     if header[:8] != b'EFI PART':
-        print(f"ERROR: 不是 GPT 镜像（前 8 字节: {bytes(header[:8])!r}）")
+        print("not a GPT image")
         sys.exit(1)
 
     f.seek(1024)
@@ -350,71 +311,47 @@ with open(img, 'r+b') as f:
 
     p3_off = 2 * 128
     if entries[p3_off:p3_off+16] != b'\x00' * 16:
-        print("p3 已存在，跳过")
+        print("p3 exists, skip")
         sys.exit(0)
 
     p2_off = 1 * 128
     p2_last = struct.unpack('<Q', entries[p2_off+40:p2_off+48])[0]
-    print(f"p2 last_lba = {p2_last}")
-
     p3_first = ((p2_last + 1 + 2047) // 2048) * 2048
     p3_last = 0xFFFFFFFFFFFFFFFF
-    print(f"p3 first={p3_first}, last=max (内核自动截断)")
 
-    p3_type = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
-    p3_uuid = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
-
-    entries[p3_off:p3_off+16] = p3_type
-    entries[p3_off+16:p3_off+32] = p3_uuid
+    entries[p3_off:p3_off+16] = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
+    entries[p3_off+16:p3_off+32] = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
     entries[p3_off+32:p3_off+40] = struct.pack('<Q', p3_first)
     entries[p3_off+40:p3_off+48] = struct.pack('<Q', p3_last)
     name = "opt".encode('utf-16-le')
     entries[p3_off+56:p3_off+56+len(name)] = name
 
     header[48:56] = struct.pack('<Q', 0xFFFFFFFFFFFFFFFF - 33)
-
-    entries_crc = zlib.crc32(entries) & 0xFFFFFFFF
-    header[88:92] = struct.pack('<I', entries_crc)
-
+    header[88:92] = struct.pack('<I', zlib.crc32(entries) & 0xFFFFFFFF)
     header[16:20] = b'\x00\x00\x00\x00'
-    header_crc = zlib.crc32(header) & 0xFFFFFFFF
-    header[16:20] = struct.pack('<I', header_crc)
+    header[16:20] = struct.pack('<I', zlib.crc32(header) & 0xFFFFFFFF)
 
     f.seek(512); f.write(header)
     f.seek(1024); f.write(entries)
-    print("✅ GPT p3 added")
+    print("p3 added")
 PYEOF
 
-        echo "▶ 压缩: $IMG_EXT4.gz"
         gzip -9n -c "$IMG_EXT4" > "${IMG_EXT4}.gz"
-        ls -lh "${IMG_EXT4}.gz"
-    else
-        echo "⚠️ 未找到 *-ext4-sysupgrade.img（未压缩）"
+        rm -f "$IMG_EXT4"
     fi
 
     local IMG_SQ
     IMG_SQ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-squashfs-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
     if [ -n "$IMG_SQ" ]; then
-        echo "▶ 处理 squashfs: $IMG_SQ"
-        echo "▶ 压缩: $IMG_SQ.gz"
         gzip -9n -c "$IMG_SQ" > "${IMG_SQ}.gz"
-        ls -lh "${IMG_SQ}.gz"
-    else
-        echo "⚠️ 未找到 *-squashfs-sysupgrade.img（未压缩）"
+        rm -f "$IMG_SQ"
     fi
 
-    [ -n "$IMG_EXT4" ] && rm -f "$IMG_EXT4"
-    [ -n "$IMG_SQ" ] && rm -f "$IMG_SQ"
-
-    echo "===== $OUT/ 最终内容 ====="
     ls -lh "$OUT"/*nanopi-r5s* 2>/dev/null || true
-    echo "============================"
 }
 
 cache_restore() {
-    echo "Attempting to restore build cache from GHCR: $CACHE_IMAGE"
     if docker pull "$CACHE_IMAGE" 2>/dev/null; then
-        echo "Cache found. Extracting..."
         cd /workdir
         docker create --name cache_container "$CACHE_IMAGE" /bin/true > /dev/null
         docker export cache_container > cache_exported.tar
@@ -425,24 +362,19 @@ cache_restore() {
 
         if ls op_cache_raw_* 1> /dev/null 2>&1; then
             cat op_cache_raw_* | tar -I "zstd -T0" -xf - -C /workdir/openwrt/
-            rm -f cache_exported.tar op_cache_raw_*
-            echo "Cache restored."
-        else
-            rm -f cache_exported.tar
-            echo "No valid cache chunks found."
+            echo "cache restored"
         fi
+        rm -f cache_exported.tar op_cache_raw_*
     else
-        echo "No cache found. Will do full build."
+        echo "no cache"
     fi
 
     df -hT
 }
 
 cache_save() {
-    echo "Saving build cache to GHCR: $CACHE_IMAGE"
     cd /workdir/openwrt
 
-    echo "Pruning obsolete versions..."
     for linux_dir in build_dir/target-*/linux-*/; do
         [ -d "$linux_dir" ] && (cd "$linux_dir" && ls -dt linux-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
     done
@@ -452,7 +384,6 @@ cache_save() {
         (cd staging_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
     fi
 
-    echo "Packing build_dir, staging_dir, dl..."
     find dl -type f | xargs -r touch -t 200001010000
     tar -I "zstd -T0 -10" -cf - build_dir staging_dir dl | split -a 3 -d -b 5000M - /workdir/op_cache_raw_
 
@@ -469,7 +400,6 @@ cache_save() {
 
     docker build -t "$CACHE_IMAGE" .
     docker push "$CACHE_IMAGE"
-    echo "Cache pushed."
 
     rm -rf layer* Dockerfile op_cache_raw_* cache_exported.tar
     docker rmi "$CACHE_IMAGE" -f > /dev/null 2>&1 || true
@@ -526,47 +456,26 @@ config_stage() {
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
-    MISSING=0
+    local MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
                docker dockerd containerd runc luci-app-dockerman openssh-sftp-server parted; do
-        if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-            echo "[OK] $pkg"
-        else
-            echo "[FAIL] $pkg"
-            MISSING=1
-        fi
+        grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || { echo "missing: $pkg"; MISSING=1; }
     done
-    if [ $MISSING -eq 1 ]; then
-        echo "ERROR: required packages not enabled"
-        exit 1
-    fi
+    [ $MISSING -eq 1 ] && exit 1
 
-    echo "===== 网卡驱动 ====="
-    grep -E "^CONFIG_PACKAGE_kmod-(r8169|r8125|r8168)" .config || echo "  (无)"
-
-    echo "===== Docker ====="
-    grep -E "^CONFIG_PACKAGE_(docker|dockerd|containerd|runc|luci-app-dockerman|luci-lib-docker)" .config || echo "  (无)"
-
-    echo "===== SFTP ====="
-    grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || echo "  (无)"
+    grep -E "^CONFIG_PACKAGE_kmod-(r8169|r8125|r8168)" .config || true
+    grep -E "^CONFIG_PACKAGE_(docker|dockerd|containerd|runc|luci-app-dockerman|luci-lib-docker)" .config || true
+    grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || true
+    grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || true
+    grep -E "^CONFIG_TARGET_IMAGES_GZIP" .config || true
 
     local KV
     KV=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile 2>/dev/null | cut -d= -f2 | tr -d ' ')
     [ -z "$KV" ] && KV="6.12"
-    echo "===== 风扇/PWM 内核 ====="
-    grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || echo "  (无)"
+    grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
+    grep -E "^CONFIG_(LEDS_TRIGGER_NETDEV|LED_TRIGGER_PHY)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
 
-    echo "===== LED trigger 内核 ====="
-    grep -E "^CONFIG_(LEDS_TRIGGER_NETDEV|LED_TRIGGER_PHY)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || echo "  (无)"
-
-    echo "===== mountpoint ====="
-    [ -f files/sbin/mountpoint ] && echo "[OK] shell 版已打包" || echo "[FAIL] 未找到 files/sbin/mountpoint"
-
-    echo "===== resize2fs ====="
-    grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || echo "  (无)"
-
-    echo "===== IMAGES_GZIP ====="
-    grep -E "^CONFIG_TARGET_IMAGES_GZIP" .config || echo "  (无)"
+    [ -f files/sbin/mountpoint ] || { echo "missing files/sbin/mountpoint"; exit 1; }
 }
 
 case "$STAGE" in
