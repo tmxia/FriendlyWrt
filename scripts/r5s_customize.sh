@@ -28,7 +28,7 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # 内核关键选项：容器、网络、PWM、风扇、LED netdev trigger
+    # 内核选项：容器/网络/PWM/风扇/LED netdev
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
@@ -44,9 +44,9 @@ post_feeds() {
 
     NET_FILE="target/linux/rockchip/armv8/base-files/etc/board.d/02_network"
     if [ -f "$NET_FILE" ]; then
-        echo "===== 02_network: nanopi-r5s 条目（官方原样，只读） ====="
+        echo "===== 02_network: nanopi-r5s 条目 ====="
         grep -n -A5 'nanopi-r5s' "$NET_FILE" || echo "  (未找到)"
-        echo "======================================================"
+        echo "======================================"
     fi
 
     mkdir -p package/custom
@@ -54,15 +54,44 @@ post_feeds() {
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
     rm -rf package/custom/luci-app-amlogic/.git
 
-    mkdir -p files/etc/uci-defaults
-    mkdir -p files/etc/docker
+    mkdir -p files/etc/uci-defaults files/etc/docker files/sbin
 
-    # ============================================================
-    # 99-custom：网络 / 密码 / 主题 / Docker 目录 / 清理失效 feed
-    # ============================================================
+    # shell 版 mountpoint（无需 util-linux，直接从 /proc/mounts 判断）
+    cat > files/sbin/mountpoint << 'MP_EOF'
+#!/bin/sh
+QUIET=0; DEV=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -q) QUIET=1; shift ;;
+        -d) DEV=1; shift ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+[ -z "$1" ] && { [ $QUIET -eq 0 ] && echo "usage: mountpoint [-q] [-d] path" >&2; exit 1; }
+RAW="$1"
+[ ! -d "$RAW" ] && [ ! -f "$RAW" ] && { [ $QUIET -eq 0 ] && echo "$RAW is not a mountpoint" >&2; exit 1; }
+TARGET=$(readlink -f "$RAW" 2>/dev/null || echo "$RAW")
+FOUND=0; DEVNAME=""
+if [ -r /proc/mounts ]; then
+    while read -r d m _rest; do
+        m_clean=$(printf '%b' "$(echo "$m" | sed 's/\\040/ /g; s/\\011/\t/g; s/\\012/\n/g; s/\\134/\\/g')")
+        [ "$m_clean" = "$TARGET" ] && { FOUND=1; DEVNAME="$d"; break; }
+    done < /proc/mounts
+fi
+if [ $FOUND -eq 1 ]; then
+    [ $QUIET -eq 1 ] && exit 0
+    [ $DEV -eq 1 ] && echo "$DEVNAME" || echo "$TARGET is a mountpoint"
+    exit 0
+fi
+[ $QUIET -eq 0 ] && echo "$TARGET is not a mountpoint" >&2
+exit 1
+MP_EOF
+    chmod +x files/sbin/mountpoint
+
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
-
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -96,14 +125,10 @@ chmod 0700 /opt/docker
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/clashoo/d; /dockerfeed/d' "$f"
 done
-
 exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    # ============================================================
-    # 99-custom-ssh：如果装了 openssh-server 才动它
-    # ============================================================
     cat > files/etc/uci-defaults/99-custom-ssh << 'EOF'
 #!/bin/sh
 SSHD_CONFIG="/etc/ssh/sshd_config"
@@ -118,12 +143,8 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom-ssh
 
-    # ============================================================
-    # 90-led-setup：官方 netdev trigger 配置网口 LED
-    # ============================================================
     cat > files/etc/uci-defaults/90-led-setup << 'EOF'
 #!/bin/sh
-# WAN
 uci -q delete system.wan_led
 uci set system.wan_led=led
 uci set system.wan_led.name='wan'
@@ -132,7 +153,6 @@ uci set system.wan_led.trigger='netdev'
 uci set system.wan_led.dev='eth0'
 uci set system.wan_led.mode='link'
 
-# LAN1
 uci -q delete system.lan1_led
 uci set system.lan1_led=led
 uci set system.lan1_led.name='lan1'
@@ -141,7 +161,6 @@ uci set system.lan1_led.trigger='netdev'
 uci set system.lan1_led.dev='eth1'
 uci set system.lan1_led.mode='link'
 
-# LAN2
 uci -q delete system.lan2_led
 uci set system.lan2_led=led
 uci set system.lan2_led.name='lan2'
@@ -156,47 +175,66 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/90-led-setup
 
-    # ============================================================
-    # 85-grow-rootfs：首次启动把 root 分区扩到整卡
-    # ============================================================
-    cat > files/etc/uci-defaults/85-grow-rootfs << 'EOF'
+    # 首启在 root 分区后创建 /opt 分区（ext4, LABEL=opt）
+    cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
 #!/bin/sh
-[ -f /etc/.rootfs_resized ] && exit 0
+[ -f /etc/.opt_partition_done ] && exit 0
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
 [ -z "$ROOT_DEV" ] && ROOT_DEV=$(mount | awk '$3=="/"{print $1; exit}')
-[ -z "$ROOT_DEV" ] && { touch /etc/.rootfs_resized; exit 0; }
+[ -z "$ROOT_DEV" ] && { touch /etc/.opt_partition_done; exit 0; }
 
 case "$ROOT_DEV" in
-    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')" ;;
-    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')" ;;
-    *)                  touch /etc/.rootfs_resized; exit 0 ;;
+    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; P="p" ;;
+    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; P="" ;;
+    *) touch /etc/.opt_partition_done; exit 0 ;;
 esac
-PART=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$')
 
-[ ! -b "$DISK" ] && { touch /etc/.rootfs_resized; exit 0; }
-DISK_SECTORS=$(cat "/sys/block/$(basename "$DISK")/size" 2>/dev/null)
-[ -z "$DISK_SECTORS" ] && { touch /etc/.rootfs_resized; exit 0; }
+OPT_DEV="${DISK}${P}3"
+UUID=""
 
-PART_END=$(parted -s "$DISK" unit s print 2>/dev/null | awk -v p="$PART" '$1==p {print $3}' | tr -d 's')
-[ -z "$PART_END" ] && { touch /etc/.rootfs_resized; exit 0; }
-
-if [ "$PART_END" -lt "$((DISK_SECTORS - 204800))" ]; then
-    logger -t grow-rootfs "Resizing $DISK partition $PART to full disk"
-    parted -s "$DISK" resizepart "$PART" 100% 2>/dev/null || true
-    blockdev --rereadpt "$DISK" 2>/dev/null || partprobe "$DISK" 2>/dev/null || true
-    sleep 1
-    resize2fs "$ROOT_DEV" 2>/dev/null || true
+if [ -b "$OPT_DEV" ]; then
+    FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
+    [ "$FSTYPE" != "ext4" ] && mkfs.ext4 -L opt -F "$OPT_DEV" 2>/dev/null || true
+    UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
+else
+    DISK_BASE=$(basename "$DISK")
+    DISK_SECTORS=$(cat "/sys/block/$DISK_BASE/size" 2>/dev/null)
+    if [ -n "$DISK_SECTORS" ]; then
+        LAST_END=$(parted -s "$DISK" unit s print 2>/dev/null | awk '$1 ~ /^[0-9]+$/ {e=$3} END {print e}' | tr -d s)
+        if [ -n "$LAST_END" ] && [ "$LAST_END" -lt "$((DISK_SECTORS - 4194304))" ]; then
+            logger -t opt-init "Creating /opt partition on $DISK"
+            parted -s "$DISK" unit s mkpart opt ext4 "$((LAST_END + 1))s" 100% 2>/dev/null || true
+            blockdev --rereadpt "$DISK" 2>/dev/null || true
+            sleep 2
+            if [ -b "$OPT_DEV" ]; then
+                mkfs.ext4 -L opt -F "$OPT_DEV" 2>/dev/null || true
+                UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
+            fi
+        fi
+    fi
 fi
 
-touch /etc/.rootfs_resized
+if [ -n "$UUID" ]; then
+    uci -q delete fstab.opt
+    uci set fstab.opt=mount
+    uci set fstab.opt.target='/opt'
+    uci set fstab.opt.uuid="$UUID"
+    uci set fstab.opt.fstype='ext4'
+    uci set fstab.opt.options='rw,relatime'
+    uci set fstab.opt.enabled='1'
+    uci commit fstab
+
+    mkdir -p /opt
+    mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt 2>/dev/null || true
+    logger -t opt-init "/opt 已挂载 UUID=$UUID"
+fi
+
+touch /etc/.opt_partition_done
 exit 0
 EOF
-    chmod +x files/etc/uci-defaults/85-grow-rootfs
+    chmod +x files/etc/uci-defaults/90-opt-partition
 
-    # ============================================================
-    # Docker daemon.json
-    # ============================================================
     cat > files/etc/docker/daemon.json << 'EOF'
 {
   "data-root": "/opt/docker",
@@ -209,9 +247,7 @@ EOF
 EOF
 }
 
-# ================================================================
-# pre_build：内核源码解压后注入 R5S 风扇 dts 节点
-# ================================================================
+# 注入 R5S 风扇 dts（自建 pinctrl 避开上游 /omit-if-no-ref/）
 pre_build() {
     echo "===== Pre-build: 注入 R5S 风扇 dts 节点 ====="
 
@@ -219,9 +255,7 @@ pre_build() {
 
     local DTS=""
     DTS=$(find build_dir -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
-    if [ -z "$DTS" ]; then
-        DTS=$(find . -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
-    fi
+    [ -z "$DTS" ] && DTS=$(find . -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
     if [ -z "$DTS" ]; then
         echo "⚠️ 未找到 rk3568-nanopi-r5s.dts，跳过"
         return 0
@@ -237,10 +271,19 @@ pre_build() {
 
     cat >> "$DTS" << 'DTS_EOF'
 
+&pinctrl {
+    pwm4_fan {
+        pwm4_fan_pins: pwm4-fan-pins {
+            /* PWM4_M1 = GPIO0_C3, mux 1 */
+            rockchip,pins = <0 RK_PC3 1 &pcfg_pull_none>;
+        };
+    };
+};
+
 &pwm4 {
     status = "okay";
-    pinctrl-0 = <&pwm4m0_pins>;
     pinctrl-names = "default";
+    pinctrl-0 = <&pwm4_fan_pins>;
 };
 
 / {
@@ -279,7 +322,7 @@ pre_build() {
 };
 DTS_EOF
 
-    echo "✅ 已注入 pwm-fan 节点（45℃→1档，55℃→2档，更热→3档）"
+    echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，45℃→1档，55℃→2档）"
 }
 
 cache_restore() {
@@ -390,7 +433,6 @@ config_stage() {
     wireguard-tools python3-light
     bash perl parted curl dosfstools e2fsprogs lsblk pv losetup uuidgen fdisk
     block-mount blkid
-    e2fsprogs-extra
     "
     for pkg in $ENABLE_PKGS; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
@@ -417,6 +459,12 @@ config_stage() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    for pkg in mount-utils util-linux-mountpoint; do
+        sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
+        sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
+        echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+    done
+
     for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
         sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
         grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
@@ -438,17 +486,20 @@ config_stage() {
         exit 1
     fi
 
-    echo "===== 网卡驱动 config 检查 ====="
+    echo "===== 网卡驱动 ====="
     grep -E "^CONFIG_PACKAGE_kmod-(r8169|r8125|r8168)" .config || echo "  (无)"
-    echo "==============================="
 
-    echo "===== Docker 相关 config 检查 ====="
+    echo "===== Docker ====="
     grep -E "^CONFIG_PACKAGE_(docker|dockerd|containerd|runc|luci-app-dockerman|luci-lib-docker)" .config || echo "  (无)"
-    echo "================================="
 
-    echo "===== SFTP 相关 config 检查 ====="
+    echo "===== SFTP ====="
     grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || echo "  (无)"
-    echo "================================="
+
+    echo "===== 风扇/PWM 内核 ====="
+    grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "$KERNEL_CONFIG_FILE" 2>/dev/null || echo "  (无)"
+
+    echo "===== mountpoint ====="
+    [ -f files/sbin/mountpoint ] && echo "[OK] shell 版已打包" || echo "[FAIL] 未找到 files/sbin/mountpoint"
 }
 
 case "$STAGE" in
