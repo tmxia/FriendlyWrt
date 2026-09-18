@@ -492,37 +492,7 @@ config_stage() {
         grep -q "^# ${opt} is not set" .config || echo "# ${opt} is not set" >> .config
     done
 
-    DISABLE_PKGS="
-    adblock luci-app-adblock
-    aria2 luci-app-aria2
-    sqm-scripts nft-qos luci-app-nft-qos luci-app-sqm
-    ddns-scripts luci-app-ddns
-    miniupnpd-nftables luci-app-upnp
-    samba4-libs samba4-server luci-app-samba4
-    minidlna luci-app-minidlna
-    luci-proto-3g luci-proto-qmi qmi-utils uqmi umbim usb-modeswitch-official
-    iwlwifi-firmware-ax200 iwlwifi-firmware-ax210 mt76x2-firmware mt792x-firmware
-    luci-app-diskman collectd luci-app-statistics
-    luci-app-watchcat luci-theme-openwrt-2020
-    luci-app-cpufreq luci-i18n-cpufreq-zh-cn
-    luci-app-hd-idle hd-idle luci-i18n-hd-idle-zh-cn
-    luci-app-nlbwmon nlbwmon luci-i18n-nlbwmon-zh-cn
-    luci-app-smartdns smartdns luci-i18n-smartdns-zh-cn
-    luci-app-openclash luci-app-passwall luci-app-passwall2
-    luci-app-ssr-plus luci-app-homeproxy luci-app-mosdns
-    luci-app-adguardhome luci-app-ddns-go luci-app-netdata
-    luci-app-vlmcsd luci-app-vnstat2 luci-app-wechatpush
-    luci-app-keepalived luci-app-ramfree luci-app-rustdesk-server
-    luci-app-udpxy luci-app-wol
-    luci-theme-argon luci-theme-aurora luci-theme-kucat
-    luci-theme-material luci-theme-material3 luci-theme-openwrt
-    "
-    for pkg in $DISABLE_PKGS; do
-        sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
-        grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
-          echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
-    done
-
+    # 确保必需包被启用（r5s.config 里未必全列全）
     ENABLE_PKGS="
     bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
     wireguard-tools python3-light
@@ -535,6 +505,7 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    # 关键功能包（含 Docker 生态、SFTP、内核模块）
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag \
                luci-app-amlogic luci-lib-nixio \
                luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
@@ -560,6 +531,7 @@ config_stage() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    # 屏蔽 legacy iptables（可能被 dnsmasq-full / firewall4 依赖间接拉入）
     for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
         sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
         grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
