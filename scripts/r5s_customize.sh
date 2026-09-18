@@ -175,98 +175,34 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/90-led-setup
 
-    # 首启自动把 root 分区（p2）扩到整盘：
-    #   1) parted resizepart 扩分区表
-    #   2) losetup + resize2fs -f 绕过内核的 online resize 限制
-    #   3) 写 pending 标记，由 zz-reboot-if-needed 触发一次自动重启让 fs 视图生效
+    # 首启直接把 rootfs 在线扩到分区最大（分区表已在编译阶段改为 GPT 最大）
     cat > files/etc/uci-defaults/90-extend-root << 'EOF'
 #!/bin/sh
 [ -f /etc/.root_extend_done ] && exit 0
+touch /etc/.root_extend_done
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
 [ -z "$ROOT_DEV" ] && ROOT_DEV=$(mount | awk '$3=="/"{print $1; exit}')
-[ -z "$ROOT_DEV" ] && { touch /etc/.root_extend_done; exit 0; }
+[ -z "$ROOT_DEV" ] && exit 0
 
 REAL_DEV=$(readlink -f "$ROOT_DEV" 2>/dev/null)
 [ -b "$REAL_DEV" ] && ROOT_DEV="$REAL_DEV"
 
-case "$ROOT_DEV" in
-    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; PART=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$') ;;
-    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; PART=$(echo "$ROOT_DEV" | grep -oE '[0-9]+$') ;;
-    *) touch /etc/.root_extend_done; exit 0 ;;
-esac
-
-[ ! -b "$DISK" ] && { touch /etc/.root_extend_done; exit 0; }
-
-DISK_SECTORS=$(cat "/sys/block/$(basename "$DISK")/size" 2>/dev/null)
-[ -z "$DISK_SECTORS" ] && { touch /etc/.root_extend_done; exit 0; }
-
-PART_END=$(parted -s "$DISK" unit s print 2>/dev/null | awk -v p="$PART" '$1==p {print $3}' | tr -d s)
-[ -z "$PART_END" ] && { touch /etc/.root_extend_done; exit 0; }
-
-FREE=$((DISK_SECTORS - PART_END))
-# 剩余 < 5GB 就不折腾
-[ "$FREE" -lt 10485760 ] && { touch /etc/.root_extend_done; exit 0; }
-
-logger -t extend-root "Growing $DISK partition $PART (free=$((FREE * 512 / 1024 / 1024))MB)"
-
-# 1) 扩分区表
-if ! parted -s "$DISK" unit s resizepart "$PART" 100% 2>/dev/null; then
-    logger -t extend-root "parted resizepart failed, abort"
-    exit 0
-fi
-
-# 2) losetup + resize2fs -f（绕过内核 online resize 限制）
-LOOP=$(losetup -f 2>/dev/null)
-if [ -n "$LOOP" ] && losetup "$LOOP" "$ROOT_DEV" 2>/dev/null; then
-    if resize2fs -f "$LOOP" 2>/dev/null; then
-        logger -t extend-root "resize2fs via $LOOP OK"
-        losetup -d "$LOOP" 2>/dev/null
-        # fs 已扩，但内核挂载视图还是旧大小 → 重启后刷新
-        touch /etc/.root_extend_done
-        touch /var/run/root_extend_pending
-        exit 0
-    else
-        logger -t extend-root "resize2fs via $LOOP failed"
+# 分区表已是 GPT 最大，内核按磁盘实际容量截断，直接在线扩展 fs 即可
+if resize2fs "$ROOT_DEV" >/dev/null 2>&1; then
+    logger -t extend-root "Extended $ROOT_DEV to $(df -h / | awk 'NR==2{print $2}')"
+else
+    # 兜底：losetup 方式
+    LOOP=$(losetup -f 2>/dev/null)
+    if [ -n "$LOOP" ] && losetup "$LOOP" "$ROOT_DEV" 2>/dev/null; then
+        resize2fs -f "$LOOP" >/dev/null 2>&1 && \
+            logger -t extend-root "Extended via $LOOP (losetup)"
         losetup -d "$LOOP" 2>/dev/null
     fi
-else
-    logger -t extend-root "losetup attach failed"
 fi
-
-# 3) losetup 也失败：保留分区表扩展结果，下次开机靠 rc.local 尝试
-grep -q '# extend-root-fs' /etc/rc.local 2>/dev/null || {
-    sed -i '/^exit 0/d' /etc/rc.local 2>/dev/null
-    cat >> /etc/rc.local << RC
-# extend-root-fs
-if [ ! -f /etc/.root_fs_extended ]; then
-    ROOT_DEV=\$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
-    [ -z "\$ROOT_DEV" ] && ROOT_DEV=\$(mount | awk '\$3=="/"{print \$1; exit}')
-    [ -n "\$ROOT_DEV" ] && resize2fs -f "\$ROOT_DEV" 2>/dev/null && \\
-        touch /etc/.root_fs_extended && touch /etc/.root_extend_done && \\
-        logger -t extend-root "Filesystem resized post-boot"
-fi
-exit 0
-RC
-    chmod +x /etc/rc.local
-}
-touch /var/run/root_extend_pending
 exit 0
 EOF
     chmod +x files/etc/uci-defaults/90-extend-root
-
-    # 所有 uci-defaults 跑完后：若 root 扩容待生效则自动重启
-    cat > files/etc/uci-defaults/zz-reboot-if-needed << 'EOF'
-#!/bin/sh
-if [ -f /var/run/root_extend_pending ]; then
-    rm -f /var/run/root_extend_pending
-    logger -t extend-root "Auto reboot to apply rootfs resize"
-    sleep 1
-    reboot
-fi
-exit 0
-EOF
-    chmod +x files/etc/uci-defaults/zz-reboot-if-needed
 
     cat > files/etc/docker/daemon.json << 'EOF'
 {
@@ -356,6 +292,79 @@ pre_build() {
 DTS_EOF
 
     echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，45℃→1档，55℃→2档）"
+}
+
+# 编译完成后：把 sdcard image 的 GPT p2 分区扩展到最大（last_lba = max）
+extend_image_gpt() {
+    echo "===== Post-build: 扩展 image GPT p2 分区到最大值 ====="
+
+    local OUT="bin/targets/rockchip/armv8"
+    local IMG
+    IMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4-sysupgrade.img.gz" -type f 2>/dev/null | head -1)
+    [ -z "$IMG" ] && { echo "⚠️ 未找到 sdcard img，跳过"; return 0; }
+    echo "目标: $IMG"
+
+    # 解压
+    gzip -dc "$IMG" > /tmp/sdcard_extend.img
+
+    # 用 Python 修改 GPT 表
+    python3 - /tmp/sdcard_extend.img << 'PYEOF'
+import struct, zlib, sys
+
+img = sys.argv[1]
+with open(img, 'r+b') as f:
+    # 读 GPT header (LBA 1)
+    f.seek(512)
+    header = bytearray(f.read(92))
+    if header[:8] != b'EFI PART':
+        print("ERROR: not a GPT image")
+        sys.exit(1)
+    print(f"GPT header signature OK")
+
+    # 分区条目数组 (LBA 2)
+    f.seek(1024)
+    entries = bytearray(f.read(128 * 128))
+
+    # p2 = 第 2 个条目 (index 1)
+    p2_off = 128
+    p2_first = struct.unpack('<Q', entries[p2_off+32:p2_off+40])[0]
+    p2_last  = struct.unpack('<Q', entries[p2_off+40:p2_off+48])[0]
+    print(f"p2 before: first_lba={p2_first}, last_lba={p2_last}")
+
+    # 设 last_lba = max (0xFFFFFFFFFFFFFFFF)
+    entries[p2_off+40:p2_off+48] = struct.pack('<Q', 0xFFFFFFFFFFFFFFFF)
+    print(f"p2 last_lba -> 0xFFFFFFFFFFFFFFFF")
+
+    # header 里的 last_usable_lba (offset 48)
+    header[48:56] = struct.pack('<Q', 0xFFFFFFFFFFFFFFFF - 33)
+    print(f"header last_usable_lba -> max-33")
+
+    # 重算分区条目数组 CRC (header offset 88)
+    entries_crc = zlib.crc32(entries) & 0xFFFFFFFF
+    header[88:92] = struct.pack('<I', entries_crc)
+    print(f"entries CRC -> {entries_crc:#010x}")
+
+    # 重算 header CRC (header offset 16)
+    header[16:20] = b'\x00\x00\x00\x00'
+    header_crc = zlib.crc32(header) & 0xFFFFFFFF
+    header[16:20] = struct.pack('<I', header_crc)
+    print(f"header CRC -> {header_crc:#010x}")
+
+    # 写回
+    f.seek(512)
+    f.write(header)
+    f.seek(1024)
+    f.write(entries)
+    print("GPT modified successfully")
+PYEOF
+
+    # 重新压缩
+    gzip -9 -c /tmp/sdcard_extend.img > "${IMG}.new"
+    mv "${IMG}.new" "$IMG"
+    rm -f /tmp/sdcard_extend.img
+
+    echo "✅ GPT p2 分区已扩展为最大（刷入磁盘后内核自动截断到实际容量）"
+    ls -lh "$IMG"
 }
 
 cache_restore() {
@@ -543,7 +552,8 @@ case "$STAGE" in
     post)          post_feeds ;;
     config)        config_stage ;;
     pre_build)     pre_build ;;
+    extend_image)  extend_image_gpt ;;
     cache_restore) cache_restore ;;
     cache_save)    cache_save ;;
-    *)             echo "Usage: $0 {pre|post|config|pre_build|cache_restore|cache_save}"; exit 1 ;;
+    *)             echo "Usage: $0 {pre|post|config|pre_build|extend_image|cache_restore|cache_save}"; exit 1 ;;
 esac
