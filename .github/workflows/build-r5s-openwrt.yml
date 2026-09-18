@@ -242,7 +242,7 @@ jobs:
           echo "Base cache changed, saving..."
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
 
-      # >>> NEW: 注入 R5S 风扇 dts 节点（内核源码在 target/linux/prepare 时已解压）
+      # >>> 注入 R5S 风扇 dts 节点（内核源码在 target/linux/prepare 时已解压）
       - name: Inject kernel dts patches
         run: |
           cd /workdir/openwrt
@@ -283,6 +283,13 @@ jobs:
           fi
 
           echo "Build succeeded"
+
+      # >>> 给 image 加 p3=/opt 分区（FriendlyWrt 风格，独立存储）
+      - name: Add p3=/opt partition to image
+        if: success()
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} add_opt_part
 
       - name: Verify OpenWrt official outputs
         if: success()
