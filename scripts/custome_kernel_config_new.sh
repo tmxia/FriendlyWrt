@@ -76,6 +76,7 @@ step_clean_legacy_patches() {
 
     rm -f target/linux/rockchip/patches-6.12/999-gpio-rockchip-fix-dynamic-base.patch
     rm -f target/linux/rockchip/patches-6.12/998-r5s-dts-led-aliases.patch
+    rm -f target/linux/rockchip/patches-6.12/997-r5s-led-default-trigger.patch
 
     find build_dir -name "*.rej" -path "*gpio-rockchip*" -delete 2>/dev/null || true
     find build_dir -name "*.orig" -path "*gpio-rockchip*" -delete 2>/dev/null || true
@@ -130,62 +131,8 @@ EOF
     log "[OK] 风扇控制脚本已写入"
 }
 
-step_patch_led_default_trigger() {
-    log "===== 3.7 通过 DTS 补丁给 LED 加默认触发器 ====="
-    cd "$FRIENDLYWRT_DIR"
-
-    local PATCH_DIR="target/linux/rockchip/patches-6.12"
-    mkdir -p "$PATCH_DIR"
-
-    rm -f "$PATCH_DIR/997-r5s-led-default-trigger.patch"
-
-    local PATCH="$PATCH_DIR/997-r5s-led-default-trigger.patch"
-
-    cat > "$PATCH" << 'PATCH_EOF'
---- a/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
-+++ b/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts
-@@ -30,6 +30,7 @@
- 		led-lan1 {
- 			color = <LED_COLOR_ID_GREEN>;
- 			function = LED_FUNCTION_LAN;
- 			function-enumerator = <1>;
-+			linux,default-trigger = "netdev";
- 			gpios = <&gpio3 RK_PD6 GPIO_ACTIVE_HIGH>;
- 		};
- 
-@@ -38,6 +39,7 @@
- 		led-lan2 {
- 			color = <LED_COLOR_ID_GREEN>;
- 			function = LED_FUNCTION_LAN;
- 			function-enumerator = <2>;
-+			linux,default-trigger = "netdev";
- 			gpios = <&gpio3 RK_PD7 GPIO_ACTIVE_HIGH>;
- 		};
- 
-@@ -46,12 +48,14 @@
- 		power_led: led-power {
- 			color = <LED_COLOR_ID_RED>;
- 			function = LED_FUNCTION_POWER;
-+			linux,default-trigger = "heartbeat";
- 			gpios = <&gpio4 RK_PD2 GPIO_ACTIVE_HIGH>;
- 		};
- 
- 		led-wan {
- 			color = <LED_COLOR_ID_GREEN>;
- 			function = LED_FUNCTION_WAN;
-+			linux,default-trigger = "netdev";
- 			gpios = <&gpio2 RK_PC1 GPIO_ACTIVE_HIGH>;
- 		};
- 	};
-PATCH_EOF
-
-    log "[OK] LED default-trigger 补丁已写入: $PATCH"
-    log "     电源灯 -> heartbeat（呼吸闪烁）"
-    log "     网络灯 -> netdev（随网口活动闪烁）"
-}
-
 step_add_led_and_network_fallback() {
-    log "===== 3.8 添加 LED 与网络兜底脚本（动态识别，不硬编码 LED 名） ====="
+    log "===== 3.7 添加 LED 与网络兜底脚本（动态识别） ====="
     cd "$FRIENDLYWRT_DIR"
 
     mkdir -p files/etc/init.d files/etc/uci-defaults
@@ -280,7 +227,7 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/50-fix-network
 
-    log "[OK] LED 与网络兜底脚本已写入（动态识别 LED 名）"
+    log "[OK] LED 与网络兜底脚本已写入"
 }
 
 step_init_config() {
@@ -319,11 +266,9 @@ CONFIG_PACKAGE_bash=y
 CONFIG_PACKAGE_perl=y
 CONFIG_PACKAGE_fdisk=y
 
-# ==== 网络驱动走 OpenWrt kmod 包（不用 KERNEL_*=y 强推） ====
 CONFIG_PACKAGE_kmod-r8169=y
 CONFIG_PACKAGE_kmod-stmmac=y
 
-# ==== LED 驱动（DTS 直接引用，必须 built-in） ====
 CONFIG_KERNEL_GPIOLIB=y
 CONFIG_KERNEL_OF_GPIO=y
 CONFIG_KERNEL_GPIOD=y
@@ -340,7 +285,6 @@ CONFIG_KERNEL_LEDS_TRIGGER_TIMER=y
 CONFIG_KERNEL_LEDS_TRIGGER_DEFAULT_ON=y
 CONFIG_KERNEL_LEDS_TRIGGER_TRANSIENT=y
 
-# ==== 其他外设 ====
 CONFIG_KERNEL_ROCKCHIP_THERMAL=y
 CONFIG_KERNEL_PWM_ROCKCHIP=y
 CONFIG_KERNEL_PWM_FAN=y
@@ -483,13 +427,11 @@ step_force_config() {
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 网络驱动走 kmod 包
     for pkg in kmod-r8169 kmod-stmmac; do
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # 只强制 LED 内核驱动（DTS 直接引用，必须 built-in）
     local kopt
     for kopt in \
         CONFIG_KERNEL_GPIOLIB \
@@ -543,8 +485,167 @@ step_sync_config() {
     log "[OK] 内核配置同步完成"
 }
 
+step_patch_led_dts_smart() {
+    log "===== 9.6 智能修改 DTS：给 LED 加 label 和 default-trigger ====="
+    cd "$FRIENDLYWRT_DIR"
+
+    local KSRC
+    KSRC=$(find build_dir -maxdepth 5 -type d -name "linux-6.12*" 2>/dev/null | head -1)
+
+    if [ -z "$KSRC" ]; then
+        warn "未找到已解压的内核源码，跳过 DTS 修改"
+        return 0
+    fi
+
+    local DTS="$KSRC/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts"
+
+    if [ ! -f "$DTS" ]; then
+        warn "找不到 $DTS，跳过"
+        return 0
+    fi
+
+    log "目标 DTS: $DTS"
+
+    # 备份原始
+    cp "$DTS" "${DTS}.orig"
+
+    log "--- 修改前的 gpio-leds 块 ---"
+    sed -n '/gpio-leds {/,/^};/p' "$DTS" | head -60 || true
+
+    # 用 Python 智能修改：
+    #   1. 遍历 gpio-leds 里的每个 LED 子节点
+    #   2. 根据节点名 / function 属性推断 LED 角色
+    #   3. 添加 label 和 linux,default-trigger
+    python3 - "$DTS" << 'PYEOF'
+import re, sys, pathlib
+
+p = pathlib.Path(sys.argv[1])
+txt = p.read_text()
+
+# 定位 gpio-leds 块
+m = re.search(r'(gpio-leds\s*\{)(.*?)(\n\t\};|\n\};)', txt, flags=re.S)
+if not m:
+    print("[WARN] 未找到 gpio-leds 块")
+    sys.exit(0)
+
+block_start = m.start(2)
+block_end = m.end(2)
+block = txt[block_start:block_end]
+
+# 记录已处理
+processed = 0
+
+def add_property(node_text, prop_name, prop_value):
+    """在节点里添加属性（如果不存在）"""
+    if re.search(rf'\b{prop_name}\b', node_text):
+        return node_text, False
+    # 在最后一个属性后面添加
+    return node_text, None  # 实际添加在外部做
+
+# 用正则匹配每个 LED 子节点
+# LED 节点格式：\t\tled-xxx { ... };
+led_pattern = re.compile(
+    r'(\n\t\t(\w[\w-]*)\s*:\s*(\w[\w-]*)\s*\{|'  # 有 label 的节点
+    r'\n\t\t(led-[\w-]*)\s*\{)'                  # 无 label 的节点
+    r'((?:[^{}]|\{[^{}]*\})*?)'                  # 节点内容
+    r'\n\t\t\};',
+    re.S
+)
+
+new_block = block
+offset = 0
+
+for match in led_pattern.finditer(block):
+    node_start = match.start()
+    node_end = match.end()
+    node_text = block[node_start:node_end]
+
+    # 提取节点名
+    if match.group(2):
+        node_name = match.group(2)
+    else:
+        node_name = match.group(4)
+
+    # 分析节点角色
+    # 优先看 label / color / function / function-enumerator
+    label_m = re.search(r'label\s*=\s*"([^"]+)"', node_text)
+    color_m = re.search(r'color\s*=\s*<([^>]+)>', node_text)
+    func_m = re.search(r'function\s*=\s*<([^>]+)>', node_text)
+    enum_m = re.search(r'function-enumerator\s*=\s*<(\d+)>', node_text)
+
+    # 目标 LED 名和触发器
+    target_label = None
+    target_trigger = None
+
+    if 'lan1' in node_name.lower() or 'lan-1' in node_name.lower():
+        target_label = "green:lan-1"
+        target_trigger = "netdev"
+    elif 'lan2' in node_name.lower() or 'lan-2' in node_name.lower():
+        target_label = "green:lan-2"
+        target_trigger = "netdev"
+    elif 'wan' in node_name.lower():
+        target_label = "green:wan"
+        target_trigger = "netdev"
+    elif 'power' in node_name.lower():
+        target_label = "red:power"
+        target_trigger = "heartbeat"
+    elif 'sys' in node_name.lower():
+        target_label = "green:sys"
+        target_trigger = "heartbeat"
+
+    if not target_label:
+        continue
+
+    print(f"  [INFO] 处理节点 {node_name}: label={target_label}, trigger={target_trigger}")
+
+    # 在当前节点里注入 label 和 default-trigger
+    # 找到节点内容的最后位置（\n\t\t} 之前）
+    # 我们逐行处理：
+    lines = node_text.split('\n')
+    new_lines = []
+    has_label = False
+    has_trigger = False
+
+    for line in lines:
+        # 如果是结束行 \t\t};
+        stripped = line.strip()
+        if stripped == '};':
+            # 在此之前插入新属性
+            indent = '\t\t\t'
+            if not has_label:
+                new_lines.append(f'{indent}label = "{target_label}";')
+            if not has_trigger:
+                new_lines.append(f'{indent}linux,default-trigger = "{target_trigger}";')
+        if re.match(r'\s*label\s*=', line):
+            has_label = True
+        if 'linux,default-trigger' in line:
+            has_trigger = True
+        new_lines.append(line)
+
+    new_node = '\n'.join(new_lines)
+
+    # 替换回 block
+    # 注意：因为我们逐个替换 block，需要维护 offset
+    new_block = new_block[:node_start + offset] + new_node + new_block[node_end + offset:]
+    offset += len(new_node) - (node_end - node_start)
+    processed += 1
+
+if processed > 0:
+    txt = txt[:block_start] + new_block + txt[block_end:]
+    p.write_text(txt)
+    print(f"[OK] 修改了 {processed} 个 LED 节点")
+else:
+    print("[WARN] 未匹配到任何 LED 节点，DTS 未修改")
+PYEOF
+
+    log "--- 修改后的 gpio-leds 块 ---"
+    sed -n '/gpio-leds {/,/^};/p' "$DTS" | head -80 || true
+
+    log "[OK] DTS LED label 修改完成"
+}
+
 step_verify_kernel_options() {
-    log "===== 9.6 校验关键内核选项 ====="
+    log "===== 9.7 校验关键内核选项 ====="
     cd "$FRIENDLYWRT_DIR"
 
     local KSRC
@@ -555,10 +656,8 @@ step_verify_kernel_options() {
         return 0
     fi
 
-    log "内核源码路径: $KSRC"
     log "内核 .config: $KSRC/.config"
 
-    # 硬断言：只对 LED/GPIO 相关（DTS 直接依赖，缺失一定不工作）
     local opt
     for opt in \
         CONFIG_LEDS_GPIO \
@@ -576,7 +675,6 @@ step_verify_kernel_options() {
         fi
     done
 
-    # 软警告：可选触发器、GPIOLIB、INET_DIAG
     for opt in \
         CONFIG_LEDS_TRIGGER_TIMER \
         CONFIG_LEDS_TRIGGER_DEFAULT_ON \
@@ -599,7 +697,7 @@ step_verify_kernel_options() {
 }
 
 step_export_debug_artifacts() {
-    log "===== 9.7 导出内核调试产物（决定性证据） ====="
+    log "===== 9.8 导出内核调试产物 ====="
     cd "$FRIENDLYWRT_DIR"
 
     local DEBUG_DIR="$FRIENDLYWRT_DIR/.debug-artifacts"
@@ -620,19 +718,24 @@ step_export_debug_artifacts() {
         cp "$KSRC/.config" "$DEBUG_DIR/kernel.config.full"
         grep -E "^CONFIG_(LEDS|GPIO|PINCTRL|R8169|RTL|STMMAC|DWMAC|PHY_|PCI|NEW_LEDS|OF_GPIO|GPIOD|GPIOLIB|INET_DIAG|INET_TCP_DIAG|INET_UDP_DIAG|INET_RAW_DIAG)" \
             "$KSRC/.config" > "$DEBUG_DIR/kernel.config.filtered" 2>/dev/null || true
-        log "  [OK] kernel.config.full ($(wc -l < "$KSRC/.config") 行)"
+        log "  [OK] kernel.config.full"
     fi
 
     if [ -f "$KSRC/System.map" ]; then
         cp "$KSRC/System.map" "$DEBUG_DIR/System.map"
-        grep -E " (T|t) _?(leds_gpio_probe|leds_gpio_remove|led_gpio_set|led_classdev_register|ledtrig_netdev_activate|ledtrig_heartbeat_activate|ledtrig_timer_activate|rockchip_gpio_probe|rockchip_gpio_irq_handler|rockchip_pinctrl_probe|r8169_probe|stmmac_dvr_probe|dwmac_rk_probe)$" \
+        grep -E " (T|t) _?(leds_gpio_probe|led_gpio_set|led_classdev_register|ledtrig_netdev_activate|ledtrig_heartbeat_activate|rockchip_gpio_probe|r8169_probe|stmmac_dvr_probe|dwmac_rk_probe)$" \
             "$KSRC/System.map" > "$DEBUG_DIR/System.map.leds-net" 2>/dev/null || true
         log "  [OK] System.map"
     fi
 
     if [ -f "$KSRC/vmlinux" ]; then
         cp "$KSRC/vmlinux" "$DEBUG_DIR/vmlinux"
-        log "  [OK] vmlinux ($(du -h "$KSRC/vmlinux" | awk '{print $1}'))"
+        log "  [OK] vmlinux"
+    fi
+
+    local DTS="$KSRC/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts"
+    if [ -f "$DTS" ]; then
+        cp "$DTS" "$DEBUG_DIR/rk3568-nanopi-r5s.dts.modified"
     fi
 
     local DTB_FILE="$KSRC/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dtb"
@@ -652,6 +755,7 @@ step_compile() {
     cd "$FRIENDLYWRT_DIR"
 
     step_sync_config
+    step_patch_led_dts_smart
     step_verify_kernel_options
 
     local s
@@ -680,7 +784,6 @@ main() {
     step_bridge_kernel_config
     step_clean_legacy_patches
     step_add_fan_control
-    step_patch_led_default_trigger
     step_add_led_and_network_fallback
     step_init_config
     step_apply_customizations
