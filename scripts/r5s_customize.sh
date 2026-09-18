@@ -119,8 +119,6 @@ EOF
 SSHD_CONFIG="/etc/ssh/sshd_config"
 if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
-    sed -i 's/^#*Port .*/Port 2222/' "$SSHD_CONFIG"
-    sed -i '/^Port 22$/d' "$SSHD_CONFIG"
     /etc/init.d/sshd enable
     /etc/init.d/sshd restart
 fi
@@ -162,8 +160,8 @@ EOF
 
     cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
 #!/bin/sh
-[ -f /etc/.opt_partition_done ] && exit 0
-touch /etc/.opt_partition_done
+# /opt 独立分区：首次启动时若 p3 未格式化则格式化；若 p3 未扩展到磁盘末尾则扩展
+LOG="logger -t opt-init"
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
 [ -z "$ROOT_DEV" ] && exit 0
@@ -177,32 +175,63 @@ case "$ROOT_DEV" in
 esac
 
 OPT_DEV="${DISK}${P}3"
-[ ! -b "$OPT_DEV" ] && { logger -t opt-init "p3 not found, skip"; exit 0; }
+[ ! -b "$OPT_DEV" ] && { $LOG "p3 not found, skip"; exit 0; }
 
+# 若首次启动，扩展 p3 到磁盘末尾
+if [ ! -f /etc/.opt_resized ]; then
+    DISK_SECTORS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
+    if [ -n "$DISK_SECTORS" ]; then
+        P3_START=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
+        NEW_P3_LAST=$((DISK_SECTORS - 34))
+
+        if [ -n "$P3_START" ] && [ "$P3_START" -lt "$NEW_P3_LAST" ]; then
+            CURRENT_P3_SECTORS=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
+            if [ "$CURRENT_P3_SECTORS" -lt "$((NEW_P3_LAST - P3_START + 1))" ]; then
+                $LOG "resizing p3 to fill disk (start=$P3_START last=$NEW_P3_LAST)"
+                if command -v sgdisk >/dev/null 2>&1; then
+                    sgdisk -e "$DISK" >/dev/null 2>&1 || true
+                    sgdisk -d 3 -n 3:${P3_START}:${NEW_P3_LAST} -t 3:8300 -c 3:opt "$DISK" >/dev/null 2>&1 || true
+                elif command -v parted >/dev/null 2>&1; then
+                    parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1 || true
+                fi
+                partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
+                sleep 1
+            fi
+        fi
+    fi
+    touch /etc/.opt_resized
+fi
+
+# 若 p3 未格式化，格式化
 FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
 if [ "$FSTYPE" != "ext4" ]; then
-    logger -t opt-init "mkfs.ext4 on $OPT_DEV"
+    $LOG "mkfs.ext4 on $OPT_DEV"
     mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1 || exit 0
+else
+    if command -v resize2fs >/dev/null 2>&1; then
+        resize2fs "$OPT_DEV" >/dev/null 2>&1 || true
+    fi
 fi
 
 UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
 [ -z "$UUID" ] && exit 0
 
-uci -q delete fstab.opt
-uci set fstab.opt=mount
-uci set fstab.opt.target='/opt'
-uci set fstab.opt.uuid="$UUID"
-uci set fstab.opt.fstype='ext4'
-uci set fstab.opt.options='rw,relatime'
-uci set fstab.opt.enabled='1'
-uci commit fstab
+if ! uci -q get fstab.opt >/dev/null 2>&1; then
+    uci set fstab.opt=mount
+    uci set fstab.opt.target='/opt'
+    uci set fstab.opt.uuid="$UUID"
+    uci set fstab.opt.fstype='ext4'
+    uci set fstab.opt.options='rw,relatime'
+    uci set fstab.opt.enabled='1'
+    uci commit fstab
+fi
 
 mkdir -p /opt
 mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt 2>/dev/null
 mkdir -p /opt/docker
 chmod 0700 /opt/docker
 
-logger -t opt-init "/opt mounted on $OPT_DEV UUID=$UUID"
+$LOG "/opt mounted on $OPT_DEV UUID=$UUID"
 exit 0
 EOF
     chmod +x files/etc/uci-defaults/90-opt-partition
@@ -288,7 +317,7 @@ DTS_EOF
     echo "pwm-fan node injected (45C->1, 50C->2)"
 }
 
-# 在镜像 GPT 中加入 p3=/opt（2GB），然后 gzip -9n 压缩
+# 在镜像 GPT 中加入 p3=/opt，大小 = 从 p2 末尾到镜像末尾
 add_opt_partition() {
     local OUT="bin/targets/rockchip/armv8"
 
@@ -304,9 +333,8 @@ add_opt_partition() {
 import struct, zlib, sys, os
 
 img = sys.argv[1]
-P3_SIZE = 2 * 1024 * 1024 * 1024
-SECTOR  = 512
-ALIGN   = 2048
+SECTOR = 512
+ALIGN  = 2048
 
 with open(img, 'r+b') as f:
     f.seek(512)
@@ -322,17 +350,14 @@ with open(img, 'r+b') as f:
         print("p3 exists, skip"); sys.exit(0)
 
     p2_last = struct.unpack('<Q', entries[128+40:128+48])[0]
-
     p3_first = ((p2_last + 1 + ALIGN - 1) // ALIGN) * ALIGN
-    p3_last  = p3_first + (P3_SIZE // SECTOR) - 1
 
-    new_size = (p3_last + 1 + 33) * SECTOR
-    if os.path.getsize(img) < new_size:
-        f.truncate(new_size)
+    img_size = os.path.getsize(img)
+    img_last_lba = (img_size // SECTOR) - 1
+    p3_last = img_last_lba - 33
 
-    new_last_lba = (new_size // SECTOR) - 1
-    header[32:40] = struct.pack('<Q', new_last_lba)
-    header[48:56] = struct.pack('<Q', new_last_lba - 33)
+    if p3_last <= p3_first:
+        print("ERROR: no space for p3"); sys.exit(1)
 
     entries[p3_off:p3_off+16] = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
     entries[p3_off+16:p3_off+32] = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
@@ -340,6 +365,8 @@ with open(img, 'r+b') as f:
     entries[p3_off+40:p3_off+48] = struct.pack('<Q', p3_last)
     name = "opt".encode('utf-16-le')
     entries[p3_off+56:p3_off+56+len(name)] = name
+
+    header[48:56] = struct.pack('<Q', p3_last)
 
     header[88:92] = struct.pack('<I', zlib.crc32(entries) & 0xFFFFFFFF)
 
@@ -350,15 +377,16 @@ with open(img, 'r+b') as f:
     f.seek(1024); f.write(entries)
 
     backup_header = bytearray(header)
-    backup_header[24:32] = struct.pack('<Q', new_last_lba)
+    backup_header[24:32] = struct.pack('<Q', img_last_lba)
     backup_header[32:40] = struct.pack('<Q', 1)
     backup_header[16:20] = b'\x00\x00\x00\x00'
     backup_header[16:20] = struct.pack('<I', zlib.crc32(backup_header) & 0xFFFFFFFF)
 
-    f.seek((new_last_lba - 32) * SECTOR); f.write(entries)
-    f.seek(new_last_lba * SECTOR);        f.write(backup_header)
+    f.seek((img_last_lba - 32) * SECTOR); f.write(entries)
+    f.seek(img_last_lba * SECTOR);        f.write(backup_header)
 
-    print(f"p3 added: LBA {p3_first}..{p3_last} ({P3_SIZE//1024//1024}MB), img={new_size//1024//1024}MB")
+    p3_mb = (p3_last - p3_first + 1) * SECTOR // 1024 // 1024
+    print(f"p3 added: LBA {p3_first}..{p3_last} ({p3_mb}MB), img={img_size//1024//1024}MB")
 PYEOF
 
         gzip -9n -c "$IMG" > "${IMG}.gz"
@@ -467,7 +495,8 @@ config_stage() {
                kmod-r8169 \
                iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
-               ip6tables-nft ip6tables-extra; do
+               ip6tables-nft ip6tables-extra \
+               sgdisk parted gptfdisk; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
@@ -496,6 +525,7 @@ config_stage() {
     grep -E "^CONFIG_PACKAGE_(docker|dockerd|containerd|runc|luci-app-dockerman|luci-lib-docker)" .config || true
     grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || true
     grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || true
+    grep -E "^CONFIG_PACKAGE_sgdisk=y" .config || true
     grep -E "^CONFIG_TARGET_IMAGES_GZIP" .config || true
 
     local KV
