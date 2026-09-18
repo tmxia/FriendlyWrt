@@ -82,8 +82,7 @@ jobs:
           name: ${{ steps.release_tag.outputs.tag }}
           draft: false
           prerelease: false
-          allow_updates: true
-          overwrite: true
+          overwrite_files: true
 
   build:
     name: Build r5s
@@ -163,16 +162,6 @@ jobs:
           cd openwrt
           ./scripts/feeds update -a 2>&1 | tail -30
 
-          echo "===== 检查 dockerfeed 是否含 docker 包 ====="
-          if [ -d feeds/dockerfeed ]; then
-            find feeds/dockerfeed -maxdepth 3 -type d \( -name 'docker' -o -name 'dockerd' -o -name 'containerd' -o -name 'runc' -o -name 'luci-app-dockerman' \) 2>/dev/null | head -20 || true
-          fi
-
-          echo "===== 检查 dockerfeed 是否含 clashoo ====="
-          if [ -d feeds/dockerfeed ]; then
-            find feeds/dockerfeed -maxdepth 3 -type d -name 'clashoo' 2>/dev/null | head -5 || true
-          fi
-
       - name: Apply custom modifications
         run: |
           cd openwrt
@@ -183,8 +172,8 @@ jobs:
           cd openwrt
           ./scripts/feeds install -a 2>&1 | tail -40
 
-          echo "===== 已安装的 docker / clashoo 包 ====="
-          find package/feeds -maxdepth 3 -type d \( -name 'docker' -o -name 'dockerd' -o -name 'containerd' -o -name 'runc' -o -name 'luci-app-dockerman' -o -name 'clashoo' \) 2>/dev/null | head -20 || true
+          echo "===== 已安装的 clashoo / docker 相关包 ====="
+          find package/feeds -maxdepth 3 -type d \( -name 'clashoo' -o -name 'luci-app-dockerman' \) 2>/dev/null | head -20 || true
 
       - name: Load R5S configuration
         run: |
@@ -298,17 +287,14 @@ jobs:
           echo "===== $OUT/ 目录内容 ====="
           ls -lh "$OUT"/*nanopi-r5s* 2>/dev/null || true
 
-          # SD 卡镜像（rockchip 目标完整盘镜像）
           SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4-sysupgrade.img.gz" -type f | head -1)
           [ -n "$SDIMG" ] || { echo "::error::未找到 *nanopi-r5s-ext4-sysupgrade.img.gz（SD 卡镜像）"; exit 1; }
           echo "[OK] SD 卡镜像: $SDIMG ($(stat -c%s "$SDIMG") 字节)"
 
-          # squashfs sysupgrade
           SYSUP_SQ=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" -type f | head -1)
           [ -n "$SYSUP_SQ" ] || { echo "::error::未找到 *nanopi-r5s-squashfs-sysupgrade.img.gz"; exit 1; }
           echo "[OK] squashfs sysupgrade: $SYSUP_SQ ($(stat -c%s "$SYSUP_SQ") 字节)"
 
-          # manifest
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "::error::未找到 *nanopi-r5s.manifest"; exit 1; }
           echo "[OK] manifest: $MANIFEST"
@@ -326,7 +312,6 @@ jobs:
           DATE=$(date +%Y.%m.%d)
           PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
-          # SD 卡完整盘镜像
           SDIMG=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-ext4-sysupgrade.img.gz" -type f | head -1)
           if [ -n "$SDIMG" ] && [ -s "$SDIMG" ]; then
             cp "$SDIMG" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
@@ -336,18 +321,15 @@ jobs:
             exit 1
           fi
 
-          # squashfs sysupgrade
           SYSUP_SQ=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" -type f | head -1)
           if [ -n "$SYSUP_SQ" ] && [ -s "$SYSUP_SQ" ]; then
             cp "$SYSUP_SQ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
             echo "squashfs sysupgrade: ${PREFIX}-squashfs-sysupgrade.img.gz"
           fi
 
-          # manifest
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] && cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
 
-          # 官方 sha256sums
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
 
@@ -378,7 +360,7 @@ jobs:
             artifact/*-manifest.txt
             artifact/*-sha256sums.txt
             artifact/SHA256SUMS
-          overwrite: true
+          overwrite_files: true
 
   cleanup_self:
     name: Cleanup Self Workflow History
