@@ -4,7 +4,6 @@ set -e
 STAGE="$1"
 
 CLASHOO_FEED="src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main"
-DOCKER_FEED="src-git dockerfeed https://github.com/kenzok8/openwrt-packages.git;main"
 AMLOGIC_REPO="https://github.com/ophub/luci-app-amlogic.git"
 
 CACHE_IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY:-local/unknown}" | tr '[:upper:]' '[:lower:]')/r5s-base-cache:openwrt-25.12"
@@ -17,7 +16,6 @@ pre_feeds() {
            -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
 
     grep -q "src-git clashoo" feeds.conf || echo "$CLASHOO_FEED" >> feeds.conf
-    grep -q "src-git dockerfeed" feeds.conf || echo "$DOCKER_FEED" >> feeds.conf
 
     echo "===== feeds.conf 最终内容 ====="
     cat feeds.conf
@@ -43,7 +41,6 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # 只读检查官方 board.d/02_network，确认 R5S 网络映射
     NET_FILE="target/linux/rockchip/armv8/base-files/etc/board.d/02_network"
     if [ -f "$NET_FILE" ]; then
         echo "===== 02_network: nanopi-r5s 条目（官方原样，只读） ====="
@@ -91,7 +88,6 @@ uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
 
 # ---- Docker 数据目录 ----
-# OpenWrt ext4 镜像没有独立 opt 分区，data-root=/opt/docker 需要先建目录
 mkdir -p /opt/docker
 chmod 0700 /opt/docker
 
@@ -249,7 +245,6 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # ---- 必备软件包（含 Docker 生态） ----
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag \
                luci-app-amlogic luci-lib-nixio \
                luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
