@@ -263,12 +263,12 @@ pre_build() {
 &cpu_thermal {
     trips {
         cpu_warm: cpu_warm {
-            temperature = <40000>;
+            temperature = <45000>;
             hysteresis = <2000>;
             type = "active";
         };
         cpu_hot: cpu_hot {
-            temperature = <45000>;
+            temperature = <50000>;
             hysteresis = <2000>;
             type = "active";
         };
@@ -285,7 +285,7 @@ pre_build() {
     };
 };
 DTS_EOF
-    echo "pwm-fan node injected"
+    echo "pwm-fan node injected (45C->1, 50C->2)"
 }
 
 # 在镜像 GPT 中加入 p3=/opt（2GB），然后 gzip -9n 压缩
