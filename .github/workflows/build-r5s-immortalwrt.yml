@@ -31,7 +31,7 @@ env:
   ROOTFS_PARTSIZE: '2048'
   ENABLE_DOCKER: 'true'
   DOCKER_BOOTARGS: 'cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory swapaccount=1'
-  CACHE_VERSION: 'v5'
+  CACHE_VERSION: 'v6'
 
 jobs:
   prepare_release:
@@ -140,7 +140,7 @@ jobs:
         mkdir -p ./artifact
         echo "CPU cores: $(nproc)"
 
-    - name: Prepare ImmortalWrt workspace
+    - name: Prepare workspace and cache key
       run: |
         mkdir -p project
         cd project
@@ -155,8 +155,20 @@ jobs:
         mkdir -p configs/rockchip
         touch configs/rockchip/01-nanopi
 
-    - name: Setup cache keys
-      id: cache_keys
+        # 快照关键文件供 hashFiles() 计算缓存 key
+        mkdir -p "$GITHUB_WORKSPACE/.cache-key"
+        CK="$GITHUB_WORKSPACE/.cache-key"
+        cp friendlywrt/target/linux/rockchip/Makefile "$CK/rockchip.Makefile" 2>/dev/null || true
+        cp friendlywrt/toolchain/Makefile "$CK/toolchain.Makefile" 2>/dev/null || true
+        cp friendlywrt/include/version.mk "$CK/version.mk" 2>/dev/null || true
+        find friendlywrt/target/linux/rockchip/patches-6.12 -type f 2>/dev/null | \
+          sort | xargs md5sum 2>/dev/null | md5sum > "$CK/patches.md5" || echo "none" > "$CK/patches.md5"
+        find friendlywrt/target/linux/generic/patches-6.12 -type f 2>/dev/null | \
+          sort | xargs md5sum 2>/dev/null | md5sum > "$CK/generic-patches.md5" || echo "none" > "$CK/generic-patches.md5"
+        ls -la "$CK/"
+
+    - name: Setup month key
+      id: mk
       run: echo "ym=$(date +%Y-%m)" >> "$GITHUB_OUTPUT"
 
     - name: Restore staging_dir
@@ -164,7 +176,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: project/friendlywrt/staging_dir
-        key: staging-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-${{ hashFiles('project/friendlywrt/target/linux/rockchip/Makefile', 'project/friendlywrt/toolchain/Makefile', 'project/friendlywrt/include/version.mk') }}
+        key: staging-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-${{ hashFiles('.cache-key/**') }}
         restore-keys: |
           staging-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-
           staging-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-
@@ -173,7 +185,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.ccache
-        key: ccache-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}
+        key: ccache-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-${{ steps.mk.outputs.ym }}
         restore-keys: |
           ccache-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-
           ccache-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-
@@ -182,7 +194,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: project/friendlywrt/dl
-        key: dl-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ steps.cache_keys.outputs.ym }}
+        key: dl-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ steps.mk.outputs.ym }}
         restore-keys: |
           dl-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-
 
@@ -190,17 +202,9 @@ jobs:
       uses: actions/cache@v4
       with:
         path: /tmp/go-mod-cache
-        key: gomod-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ steps.cache_keys.outputs.ym }}
+        key: gomod-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ steps.mk.outputs.ym }}
         restore-keys: |
           gomod-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-
-
-    - name: Snapshot staging_dir state
-      run: |
-        if [ -d project/friendlywrt/staging_dir ]; then
-          find project/friendlywrt/staging_dir -type f -exec stat -c "%Y %n" {} \; 2>/dev/null | sort -k2 > /tmp/staging_before.txt
-        else
-          : > /tmp/staging_before.txt
-        fi
 
     - name: Run custom kernel config & build
       env:
@@ -209,42 +213,24 @@ jobs:
         IMMORTALWRT: '1'
       run: bash scripts/custome_kernel_config_new.sh
 
-    - name: Check staging_dir changes
-      id: staging_changes
-      if: always()
-      run: |
-        if [ ! -d project/friendlywrt/staging_dir ]; then
-          echo "changed=false" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        find project/friendlywrt/staging_dir -type f -exec stat -c "%Y %n" {} \; 2>/dev/null | sort -k2 > /tmp/staging_after.txt
-        if diff -q /tmp/staging_before.txt /tmp/staging_after.txt > /dev/null 2>&1; then
-          echo "changed=false" >> "$GITHUB_OUTPUT"
-        else
-          echo "changed=true" >> "$GITHUB_OUTPUT"
-        fi
-
     - name: Save staging_dir cache
-      if: always() && steps.staging_restore.outputs.cache-hit != 'true' && steps.staging_changes.outputs.changed == 'true'
+      if: always() && steps.staging_restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v4
       with:
         path: project/friendlywrt/staging_dir
-        key: staging-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-${{ hashFiles('project/friendlywrt/target/linux/rockchip/Makefile', 'project/friendlywrt/toolchain/Makefile', 'project/friendlywrt/include/version.mk') }}-retry-${{ github.run_id }}
+        key: staging-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-${{ hashFiles('.cache-key/**') }}-r${{ github.run_id }}
 
     - name: Save ccache
-      if: always() && steps.staging_changes.outputs.changed == 'true'
+      if: always()
       uses: actions/cache/save@v4
       with:
         path: ~/.ccache
-        key: ccache-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-retry-${{ github.run_id }}
+        key: ccache-${{ env.CACHE_VERSION }}-${{ env.IMMORTALWRT_BRANCH }}-${{ env.FLAVOR }}-${{ steps.mk.outputs.ym }}-r${{ github.run_id }}
 
-    - name: Clean go-mod-cache
-      if: always()
-      run: rm -rf project/friendlywrt/dl/go-mod-cache
-
-    - name: Show cache stats
+    - name: Clean go-mod-cache and show stats
       if: always()
       run: |
+        rm -rf project/friendlywrt/dl/go-mod-cache
         ccache -s || true
         du -sh "$CCACHE_DIR" project/friendlywrt/staging_dir project/friendlywrt/dl 2>/dev/null || true
 
