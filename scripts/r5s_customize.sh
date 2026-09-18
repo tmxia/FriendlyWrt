@@ -28,7 +28,7 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # 内核选项：容器/网络/PWM/风扇/LED netdev
+    # 内核选项：容器/网络/PWM/风扇/LED netdev + LED_TRIGGER_PHY（配合 CVE-2026-23368）
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
@@ -36,7 +36,7 @@ post_feeds() {
                MEMCG BLK_CGROUP CFS_BANDWIDTH FAIR_GROUP_SCHED RT_GROUP_SCHED \
                CGROUP_PERF CGROUP_NET_PRIO \
                PWM PWM_SYSFS PWM_ROCKCHIP SENSORS_PWM_FAN \
-               LEDS_TRIGGER_NETDEV; do
+               LEDS_TRIGGER_NETDEV LED_TRIGGER_PHY; do
         sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
         sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
@@ -56,7 +56,7 @@ post_feeds() {
 
     mkdir -p files/etc/uci-defaults files/etc/docker files/sbin
 
-    # shell 版 mountpoint（无需 util-linux，直接从 /proc/mounts 判断）
+    # shell 版 mountpoint
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
 QUIET=0; DEV=0
@@ -172,7 +172,6 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/90-led-setup
 
-    # 首启挂载 p3 为 /opt（编译时已加好 p3 分区，这里只做 mkfs + mount + fstab）
     cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
 #!/bin/sh
 [ -f /etc/.opt_partition_done ] && exit 0
@@ -192,7 +191,6 @@ esac
 OPT_DEV="${DISK}${P}3"
 [ ! -b "$OPT_DEV" ] && { logger -t opt-init "p3 not found, skip"; exit 0; }
 
-# 格式化（若是空盘或非 ext4）
 FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
 if [ "$FSTYPE" != "ext4" ]; then
     logger -t opt-init "mkfs.ext4 on $OPT_DEV"
@@ -233,29 +231,26 @@ EOF
 EOF
 }
 
-# 注入 R5S 风扇 dts（温控点 40/45℃，与原脚本一致）
+# 注入 R5S 风扇 dts + 调用 patch01.sh 应用 CVE-2026-23368
 pre_build() {
-    echo "===== Pre-build: 注入 R5S 风扇 dts 节点 ====="
+    echo "===== Pre-build: 注入内核补丁 ====="
 
     make target/linux/prepare V=s > /dev/null 2>&1 || true
 
+    # ---------- 1) 风扇 PWM 节点 ----------
     local DTS=""
     DTS=$(find build_dir -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
     [ -z "$DTS" ] && DTS=$(find . -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
+
     if [ -z "$DTS" ]; then
-        echo "⚠️ 未找到 rk3568-nanopi-r5s.dts，跳过"
-        return 0
-    fi
-    echo "找到 dts: $DTS"
-
-    if grep -q "pwm-fan" "$DTS"; then
-        echo "✅ dts 已存在 pwm-fan 节点，跳过"
-        return 0
-    fi
-
-    cp "$DTS" "${DTS}.orig"
-
-    cat >> "$DTS" << 'DTS_EOF'
+        echo "⚠️ 未找到 rk3568-nanopi-r5s.dts，跳过风扇节点注入"
+    else
+        echo "找到 dts: $DTS"
+        if grep -q "pwm-fan" "$DTS"; then
+            echo "✅ dts 已存在 pwm-fan 节点，跳过"
+        else
+            cp "$DTS" "${DTS}.orig"
+            cat >> "$DTS" << 'DTS_EOF'
 
 &pinctrl {
     pwm4_fan {
@@ -307,19 +302,29 @@ pre_build() {
     };
 };
 DTS_EOF
+            echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，40℃→1档，45℃→2档）"
+        fi
+    fi
 
-    echo "✅ 已注入 pwm-fan 节点（GPIO0_C3 = PWM4_M1，40℃→1档，45℃→2档）"
+    # ---------- 2) CVE-2026-23368 内核补丁 ----------
+    local PATCH01="$GITHUB_WORKSPACE/scripts/patch01.sh"
+    if [ -f "$PATCH01" ]; then
+        echo "▶ 调用 patch01.sh（CVE-2026-23368）..."
+        bash "$PATCH01" || { echo "❌ patch01.sh 执行失败"; exit 1; }
+    else
+        echo "❌ 未找到 $PATCH01"
+        exit 1
+    fi
+
+    echo "===== Pre-build 完成 ====="
 }
 
-# 编译完成后：
-#   1) 直接修改 .img 的 GPT 加 p3=/opt（无 gzip 解压，不可能碰 trailing garbage）
-#   2) gzip -9n 生成纯净 .img.gz（无时间戳，可复现）
+# 编译完成后：修改 .img 的 GPT 加 p3=/opt，gzip -9n 压缩
 add_opt_partition() {
     echo "===== Post-build: 修改 .img GPT 加 p3=/opt，然后压缩 ====="
 
     local OUT="bin/targets/rockchip/armv8"
 
-    # ---------- ext4 sysupgrade ----------
     local IMG_EXT4
     IMG_EXT4=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
     if [ -n "$IMG_EXT4" ]; then
@@ -342,7 +347,6 @@ with open(img, 'r+b') as f:
     f.seek(1024)
     entries = bytearray(f.read(128 * 128))
 
-    # p3 = index 2
     p3_off = 2 * 128
     if entries[p3_off:p3_off+16] != b'\x00' * 16:
         print("p3 已存在，跳过")
@@ -356,7 +360,6 @@ with open(img, 'r+b') as f:
     p3_last = 0xFFFFFFFFFFFFFFFF
     print(f"p3 first={p3_first}, last=max (内核自动截断)")
 
-    # Linux filesystem GUID（小端序）
     p3_type = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
     p3_uuid = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
 
@@ -367,7 +370,6 @@ with open(img, 'r+b') as f:
     name = "opt".encode('utf-16-le')
     entries[p3_off+56:p3_off+56+len(name)] = name
 
-    # header last_usable_lba 设为 max-33
     header[48:56] = struct.pack('<Q', 0xFFFFFFFFFFFFFFFF - 33)
 
     entries_crc = zlib.crc32(entries) & 0xFFFFFFFF
@@ -389,7 +391,6 @@ PYEOF
         echo "⚠️ 未找到 *-ext4-sysupgrade.img（未压缩）"
     fi
 
-    # ---------- squashfs sysupgrade ----------
     local IMG_SQ
     IMG_SQ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-squashfs-sysupgrade.img" ! -name "*.gz" 2>/dev/null | head -1)
     if [ -n "$IMG_SQ" ]; then
@@ -401,7 +402,6 @@ PYEOF
         echo "⚠️ 未找到 *-squashfs-sysupgrade.img（未压缩）"
     fi
 
-    # ---------- 清理未压缩 .img（节省空间） ----------
     [ -n "$IMG_EXT4" ] && rm -f "$IMG_EXT4"
     [ -n "$IMG_SQ" ] && rm -f "$IMG_SQ"
 
@@ -549,12 +549,14 @@ config_stage() {
     echo "===== SFTP ====="
     grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || echo "  (无)"
 
-    # 在 config_stage 中重新计算内核 config 路径（KERNEL_CONFIG_FILE 是 post_feeds 的局部变量）
     local KV
     KV=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile 2>/dev/null | cut -d= -f2 | tr -d ' ')
     [ -z "$KV" ] && KV="6.12"
     echo "===== 风扇/PWM 内核 ====="
     grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || echo "  (无)"
+
+    echo "===== LED trigger 内核 ====="
+    grep -E "^CONFIG_(LEDS_TRIGGER_NETDEV|LED_TRIGGER_PHY)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || echo "  (无)"
 
     echo "===== mountpoint ====="
     [ -f files/sbin/mountpoint ] && echo "[OK] shell 版已打包" || echo "[FAIL] 未找到 files/sbin/mountpoint"
