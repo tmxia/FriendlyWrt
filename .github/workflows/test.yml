@@ -1,0 +1,68 @@
+name: Probe Python Packages
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['v24.10', 'v25.12']
+    steps:
+      - name: Show host python
+        run: |
+          python3 --version
+          pip3 --version
+
+      - name: Download packages with pip
+        run: |
+          mkdir -p /tmp/pipdl
+          pip3 download \
+            --no-deps \
+            --dest /tmp/pipdl \
+            telethon tailer demjson3 bleach tqdm docker \
+            2>&1 | tail -20
+          echo ""
+          echo "===== Downloaded files ====="
+          ls -lh /tmp/pipdl/
+
+      - name: Extract and check for binary extensions
+        run: |
+          cd /tmp/pipdl
+          mkdir -p extract
+          for f in *.whl *.tar.gz; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            case "$f" in
+              *.whl) unzip -q "$f" -d "extract/$f" ;;
+              *.tar.gz) mkdir -p "extract/$f" && tar xzf "$f" -C "extract/$f" ;;
+            esac
+          done
+          echo ""
+          echo "===== Files by extension ====="
+          find extract -type f | sed 's/.*\.//' | sort | uniq -c | sort -rn
+          echo ""
+          echo "===== Any .so / .pyd / .dylib (binary extensions) ====="
+          find extract -type f \( -name "*.so" -o -name "*.pyd" -o -name "*.dylib" \) | head -30
+          echo ""
+          echo "===== Total extracted size ====="
+          du -sh extract
+
+      - name: Check python version in OpenWrt config
+        run: |
+          cd /tmp
+          git clone --depth=1 -b master-${{ matrix.version }} \
+            https://github.com/friendlyarm/friendlywrt friendlywrt 2>/dev/null || true
+          cd friendlywrt
+          echo "===== Python version candidates ====="
+          grep -rE "PYTHON3_VERSION|python3\.1[0-9]" \
+            lang/python/python3/Makefile 2>/dev/null | head -10
+          echo ""
+          echo "===== Which python3 package versions exist ====="
+          ls lang/python/ 2>/dev/null | head -20
+          echo ""
+          echo "===== site-packages path pattern ====="
+          grep -rE "site-packages|python3\.[0-9]+" \
+            lang/python/python3/files/ 2>/dev/null | head -10
