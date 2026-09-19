@@ -1,4 +1,4 @@
-name: Verify Release Artifacts
+name: Verify Release Artifacts With Openwrt
 
 on:
   workflow_dispatch:
