@@ -4,16 +4,46 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (如 FriendlyWrt-2026-09-19)'
-        required: true
+        description: 'Release tag (留空则自动使用最新 release)'
+        required: false
+        default: ''
 
 jobs:
+  resolve_tag:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - name: Pick release tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+            echo "Using user-provided tag: $TAG"
+          else
+            TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName')
+            echo "Auto-selected latest release tag: $TAG"
+          fi
+          [ -n "$TAG" ] || { echo "ERROR: no release tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   verify:
+    needs: resolve_tag
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
         version: ['24.10', '25.12']
+        include:
+          - version: '24.10'
+            expect_gib: '2.0 GiB'
+            expect_mib_old: '1024.0 MiB'
+          - version: '25.12'
+            expect_gib: '2.5 GiB'
+            expect_mib_old: '1536.0 MiB'
     steps:
       - name: Install tools
         run: |
@@ -23,10 +53,12 @@ jobs:
       - name: Download img.gz (${{ matrix.version }})
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve_tag.outputs.tag }}
         run: |
           IMG="R5S-R5C-Series-FriendlyWrt-${{ matrix.version }}-docker.img.gz"
+          echo "Release tag: $RELEASE_TAG"
           echo "Downloading $IMG ..."
-          gh release download "${{ github.event.inputs.release_tag }}" \
+          gh release download "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --pattern "$IMG" \
             --output firmware.img.gz \
@@ -48,12 +80,14 @@ jobs:
           echo "==================== [${{ matrix.version }}] 判定 ===================="
           UD_LINE=$(sudo sgdisk -p firmware.img | grep -i userdata)
           echo "userdata 行: $UD_LINE"
-          if echo "$UD_LINE" | grep -q "2.0 GiB"; then
-            echo "✅ userdata 已是 2G —— 编译侧分区修改成功"
-          elif echo "$UD_LINE" | grep -q "1024.0 MiB"; then
-            echo "❌ userdata 仍是 1G —— 编译侧 sed 未生效或被覆盖"
+          if echo "$UD_LINE" | grep -q "${{ matrix.expect_gib }}"; then
+            echo "✅ userdata 已是 ${{ matrix.expect_gib }} —— 编译侧分区修改成功"
+          elif echo "$UD_LINE" | grep -q "${{ matrix.expect_mib_old }}"; then
+            echo "❌ userdata 仍是 ${{ matrix.expect_mib_old }} —— 编译侧 sed 未生效或被覆盖"
+            exit 1
           else
-            echo "⚠️ 无法识别大小，请人工核对上面输出"
+            echo "⚠️ 未识别的 userdata 大小，请人工核对"
+            exit 1
           fi
 
       - name: Extract parameter info from image
@@ -62,4 +96,4 @@ jobs:
           sudo strings firmware.img 2>/dev/null | grep -i "mtdparts" | head -5 || echo "(未找到 mtdparts 字符串)"
           echo ""
           echo "==================== [${{ matrix.version }}] 镜像内 userdata 相关字符串 ===================="
-          sudo strings firmware.img 2>/dev/null | grep -iE "userdata|0x00200000|0x00400000" | head -10 || echo "(未找到)"
+          sudo strings firmware.img 2>/dev/null | grep -iE "userdata|0x00200000|0x00400000|0x00500000" | head -10 || echo "(未找到)"
