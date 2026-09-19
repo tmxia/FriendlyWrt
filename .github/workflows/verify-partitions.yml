@@ -1,4 +1,4 @@
-name: Verify Firmware Partitions
+name: Verify Release Artifacts With FriendlyWrt
 
 on:
   workflow_dispatch:
