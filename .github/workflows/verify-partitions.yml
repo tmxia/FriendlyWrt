@@ -1,0 +1,65 @@
+name: Verify Firmware Partitions
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (如 FriendlyWrt-2026-09-19)'
+        required: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['24.10', '25.12']
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdisk
+
+      - name: Download img.gz (${{ matrix.version }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          IMG="R5S-R5C-Series-FriendlyWrt-${{ matrix.version }}-docker.img.gz"
+          echo "Downloading $IMG ..."
+          gh release download "${{ github.event.inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "$IMG" \
+            --output firmware.img.gz \
+            --clobber
+          ls -lh firmware.img.gz
+
+      - name: Analyze GPT (${{ matrix.version }})
+        run: |
+          gunzip -f firmware.img.gz
+          echo ""
+          echo "==================== [${{ matrix.version }}] GPT 分区表 ===================="
+          sudo sgdisk -p firmware.img
+          echo ""
+          echo "==================== [${{ matrix.version }}] userdata 分区行 ===================="
+          sudo sgdisk -p firmware.img | grep -i userdata || echo "(未找到 userdata)"
+
+      - name: Verify userdata size (${{ matrix.version }})
+        run: |
+          echo "==================== [${{ matrix.version }}] 判定 ===================="
+          UD_LINE=$(sudo sgdisk -p firmware.img | grep -i userdata)
+          echo "userdata 行: $UD_LINE"
+          if echo "$UD_LINE" | grep -q "2.0 GiB"; then
+            echo "✅ userdata 已是 2G —— 编译侧分区修改成功"
+          elif echo "$UD_LINE" | grep -q "1024.0 MiB"; then
+            echo "❌ userdata 仍是 1G —— 编译侧 sed 未生效或被覆盖"
+          else
+            echo "⚠️ 无法识别大小，请人工核对上面输出"
+          fi
+
+      - name: Extract parameter info from image
+        run: |
+          echo "==================== [${{ matrix.version }}] 镜像内 mtdparts 字符串 ===================="
+          sudo strings firmware.img 2>/dev/null | grep -i "mtdparts" | head -5 || echo "(未找到 mtdparts 字符串)"
+          echo ""
+          echo "==================== [${{ matrix.version }}] 镜像内 userdata 相关字符串 ===================="
+          sudo strings firmware.img 2>/dev/null | grep -iE "userdata|0x00200000|0x00400000" | head -10 || echo "(未找到)"
