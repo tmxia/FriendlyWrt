@@ -160,7 +160,7 @@ EOF
 
     cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
 #!/bin/sh
-# /opt 独立分区：首次启动时若 p3 未格式化则格式化；若 p3 未扩展到磁盘末尾则扩展
+# /opt 独立分区：boot 阶段一次性完成 —— 扩展 p3 到磁盘末尾 + 格式化 + 挂载
 LOG="logger -t opt-init"
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
@@ -177,36 +177,31 @@ esac
 OPT_DEV="${DISK}${P}3"
 [ ! -b "$OPT_DEV" ] && { $LOG "p3 not found, skip"; exit 0; }
 
-# 若首次启动，扩展 p3 到磁盘末尾
+# 首次启动：扩展 p3 到磁盘末尾
 if [ ! -f /etc/.opt_resized ]; then
     DISK_SECTORS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
     if [ -n "$DISK_SECTORS" ]; then
         P3_START=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
-        NEW_P3_LAST=$((DISK_SECTORS - 34))
+        P3_CURRENT_SIZE=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
+        TARGET_SIZE=$((DISK_SECTORS - P3_START - 33))   # 预留 33 扇区给 backup GPT
 
-        if [ -n "$P3_START" ] && [ "$P3_START" -lt "$NEW_P3_LAST" ]; then
-            CURRENT_P3_SECTORS=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
-            if [ "$CURRENT_P3_SECTORS" -lt "$((NEW_P3_LAST - P3_START + 1))" ]; then
-                $LOG "resizing p3 to fill disk (start=$P3_START last=$NEW_P3_LAST)"
-                if command -v sgdisk >/dev/null 2>&1; then
-                    sgdisk -e "$DISK" >/dev/null 2>&1 || true
-                    sgdisk -d 3 -n 3:${P3_START}:${NEW_P3_LAST} -t 3:8300 -c 3:opt "$DISK" >/dev/null 2>&1 || true
-                elif command -v parted >/dev/null 2>&1; then
-                    parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1 || true
-                fi
-                partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
-                sleep 1
+        if [ -n "$P3_START" ] && [ "$P3_CURRENT_SIZE" -lt "$TARGET_SIZE" ]; then
+            $LOG "resizing p3: current=$P3_CURRENT_SIZE target=$TARGET_SIZE"
+            if command -v parted >/dev/null 2>&1; then
+                parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1 || $LOG "parted resizepart failed"
             fi
+            partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
+            sleep 1
         fi
     fi
     touch /etc/.opt_resized
 fi
 
-# 若 p3 未格式化，格式化
+# 若 p3 未格式化，按当前大小格式化为 ext4
 FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
 if [ "$FSTYPE" != "ext4" ]; then
     $LOG "mkfs.ext4 on $OPT_DEV"
-    mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1 || exit 0
+    mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1 || { $LOG "mkfs failed"; exit 0; }
 else
     if command -v resize2fs >/dev/null 2>&1; then
         resize2fs "$OPT_DEV" >/dev/null 2>&1 || true
@@ -214,7 +209,7 @@ else
 fi
 
 UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
-[ -z "$UUID" ] && exit 0
+[ -z "$UUID" ] && { $LOG "no UUID"; exit 0; }
 
 if ! uci -q get fstab.opt >/dev/null 2>&1; then
     uci set fstab.opt=mount
@@ -317,7 +312,7 @@ DTS_EOF
     echo "pwm-fan node injected (45C->1, 50C->2)"
 }
 
-# 在镜像 GPT 中加入 p3=/opt，大小 = 从 p2 末尾到镜像末尾
+# 在镜像 GPT 中加入 p3=/opt（至少 256MB），并完整更新 primary + backup GPT
 add_opt_partition() {
     local OUT="bin/targets/rockchip/armv8"
 
@@ -325,7 +320,12 @@ add_opt_partition() {
         local IMG="$1"
 
         if [ ! -f "$IMG" ] && [ -f "${IMG}.gz" ]; then
-            gzip -d "${IMG}.gz"
+            gunzip -c "${IMG}.gz" > "$IMG" 2>/dev/null || true
+            if [ ! -s "$IMG" ] || [ "$(stat -c%s "$IMG")" -lt 100000000 ]; then
+                echo "ERROR: gunzip failed for ${IMG}.gz"
+                return 1
+            fi
+            rm -f "${IMG}.gz"
         fi
         [ -f "$IMG" ] || return 0
 
@@ -335,6 +335,8 @@ import struct, zlib, sys, os
 img = sys.argv[1]
 SECTOR = 512
 ALIGN  = 2048
+P3_MIN = 256 * 1024 * 1024   # p3 最小 256MB
+BACKUP_GPT_SECTORS = 33      # 32 entries + 1 header
 
 with open(img, 'r+b') as f:
     f.seek(512)
@@ -352,13 +354,23 @@ with open(img, 'r+b') as f:
     p2_last = struct.unpack('<Q', entries[128+40:128+48])[0]
     p3_first = ((p2_last + 1 + ALIGN - 1) // ALIGN) * ALIGN
 
-    img_size = os.path.getsize(img)
-    img_last_lba = (img_size // SECTOR) - 1
-    p3_last = img_last_lba - 33
+    # 原始文件末尾（如果没被扩展过）
+    orig_img_size = os.path.getsize(img)
+    orig_last_lba = (orig_img_size // SECTOR) - 1
 
-    if p3_last <= p3_first:
-        print("ERROR: no space for p3"); sys.exit(1)
+    # p3 至少 256MB
+    p3_last_min = p3_first + (P3_MIN // SECTOR) - 1
 
+    # 新的磁盘末尾：p3 结束位置 + backup GPT 占用
+    new_last_lba = max(orig_last_lba, p3_last_min + BACKUP_GPT_SECTORS)
+    new_img_size = (new_last_lba + 1) * SECTOR
+
+    if new_img_size > orig_img_size:
+        f.truncate(new_img_size)
+
+    p3_last = new_last_lba - BACKUP_GPT_SECTORS
+
+    # ---------- 写入 p3 entry ----------
     entries[p3_off:p3_off+16] = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
     entries[p3_off+16:p3_off+32] = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
     entries[p3_off+32:p3_off+40] = struct.pack('<Q', p3_first)
@@ -366,29 +378,32 @@ with open(img, 'r+b') as f:
     name = "opt".encode('utf-16-le')
     entries[p3_off+56:p3_off+56+len(name)] = name
 
-    header[48:56] = struct.pack('<Q', p3_last)
-
+    # ---------- 完整更新 primary header ----------
+    header[24:32] = struct.pack('<Q', 1)              # my_lba = 1
+    header[32:40] = struct.pack('<Q', new_last_lba)   # alternate_lba = 磁盘末尾
+    header[48:56] = struct.pack('<Q', p3_last)        # last_usable_lba = p3_last
     header[88:92] = struct.pack('<I', zlib.crc32(entries) & 0xFFFFFFFF)
-
     header[16:20] = b'\x00\x00\x00\x00'
     header[16:20] = struct.pack('<I', zlib.crc32(header) & 0xFFFFFFFF)
 
     f.seek(512);  f.write(header)
     f.seek(1024); f.write(entries)
 
+    # ---------- 写 backup GPT 到磁盘末尾 ----------
     backup_header = bytearray(header)
-    backup_header[24:32] = struct.pack('<Q', img_last_lba)
-    backup_header[32:40] = struct.pack('<Q', 1)
+    backup_header[24:32] = struct.pack('<Q', new_last_lba)   # my_lba
+    backup_header[32:40] = struct.pack('<Q', 1)              # alternate_lba
     backup_header[16:20] = b'\x00\x00\x00\x00'
     backup_header[16:20] = struct.pack('<I', zlib.crc32(backup_header) & 0xFFFFFFFF)
 
-    f.seek((img_last_lba - 32) * SECTOR); f.write(entries)
-    f.seek(img_last_lba * SECTOR);        f.write(backup_header)
+    f.seek((new_last_lba - 32) * SECTOR); f.write(entries)
+    f.seek(new_last_lba * SECTOR);        f.write(backup_header)
 
     p3_mb = (p3_last - p3_first + 1) * SECTOR // 1024 // 1024
-    print(f"p3 added: LBA {p3_first}..{p3_last} ({p3_mb}MB), img={img_size//1024//1024}MB")
+    print(f"p3 added: LBA {p3_first}..{p3_last} ({p3_mb}MB), img={new_img_size//1024//1024}MB")
 PYEOF
 
+        rm -f "${IMG}.gz"
         gzip -9n -c "$IMG" > "${IMG}.gz"
         rm -f "$IMG"
     }
@@ -496,7 +511,7 @@ config_stage() {
                iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra \
-               sgdisk parted gptfdisk; do
+               sgdisk gptfdisk; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
