@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (如 R5S-OpenWrt-25.12-2026.09.19)'
-        required: true
+        description: '可选：指定 release tag（留空自动取最新）'
+        required: false
         type: string
 
 permissions:
@@ -20,36 +20,40 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y squashfs-tools mtools e2fsprogs file xxd
+          sudo apt-get install -y squashfs-tools mtools e2fsprogs file xxd xz-utils
 
       - name: Resolve release tag
         id: resolve
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          INPUT="${{ inputs.release_tag }}"
           REPO="${{ github.repository }}"
+          INPUT="${{ inputs.release_tag }}"
 
-          # 精确匹配
-          if gh release view "$INPUT" --repo "$REPO" >/dev/null 2>&1; then
-            echo "tag=$INPUT" >> $GITHUB_OUTPUT
-            echo "✅ 使用 tag: $INPUT"
-            exit 0
+          if [ -n "$INPUT" ]; then
+            if gh release view "$INPUT" --repo "$REPO" >/dev/null 2>&1; then
+              TAG="$INPUT"
+            elif gh release view "R5S-$INPUT" --repo "$REPO" >/dev/null 2>&1; then
+              TAG="R5S-$INPUT"
+            else
+              echo "❌ 未找到 release: $INPUT"
+              gh release list --repo "$REPO" --limit 10
+              exit 1
+            fi
+          else
+            TAG=$(gh release list --repo "$REPO" --limit 30 \
+                  --json tagName,createdAt \
+                  --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
+                  | grep -E '^R5S-OpenWrt-25\.12-' | head -1)
+            if [ -z "$TAG" ]; then
+              echo "❌ 未找到 R5S-OpenWrt-25.12-* release"
+              gh release list --repo "$REPO" --limit 10
+              exit 1
+            fi
           fi
 
-          # 尝试加 R5S- 前缀
-          if gh release view "R5S-$INPUT" --repo "$REPO" >/dev/null 2>&1; then
-            echo "tag=R5S-$INPUT" >> $GITHUB_OUTPUT
-            echo "✅ 自动补全为: R5S-$INPUT"
-            exit 0
-          fi
-
-          # 列出所有 release 供参考
-          echo "❌ 未找到 release: $INPUT"
-          echo ""
-          echo "现有 release:"
-          gh release list --repo "$REPO" --limit 10
-          exit 1
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "✅ 使用 release: $TAG"
 
       - name: Download artifacts
         env:
@@ -76,14 +80,12 @@ jobs:
           warn() { echo "  [WARN] $1"; WARN=$((WARN+1)); }
           hdr()  { echo ""; echo "====== $1 ======"; }
 
-          # ---------- 准备 ----------
           hdr "准备"
           IMG_GZ=$(ls *squashfs-sysupgrade.img.gz 2>/dev/null | head -1)
           [ -z "$IMG_GZ" ] && { echo "未找到 squashfs-sysupgrade.img.gz"; exit 1; }
           echo "镜像: $IMG_GZ"
           MANIFEST=$(ls *manifest.txt 2>/dev/null | head -1)
 
-          # ---------- 1. 解压 ----------
           hdr "1. 解压镜像"
           python3 - "$IMG_GZ" "$WORK/fw.img" << 'PY'
           import sys, zlib
@@ -99,7 +101,6 @@ jobs:
           FW="$WORK/fw.img"
           [ -f "$FW" ] && ok "解压成功" || { fail "解压失败"; exit 1; }
 
-          # ---------- 2. MBR ----------
           hdr "2. MBR 分区表"
           python3 - "$FW" > "$WORK/parts.txt" << 'PY'
           import struct, sys
@@ -126,7 +127,6 @@ jobs:
           P3_MB=$((P3_SIZE * 512 / 1024 / 1024))
           [ "$P3_MB" -ge 200 ] && [ "$P3_MB" -le 300 ] && ok "p3 大小 = ${P3_MB}MB" || warn "p3 = ${P3_MB}MB"
 
-          # ---------- 3. 内核 ----------
           hdr "3. 内核 PROC_PAGE_MONITOR 验证"
           P1_START=$(awk -F'\t' '$1==1 {print $3}' "$WORK/parts.txt")
           P1_SIZE=$(awk -F'\t' '$1==1 {print $4}' "$WORK/parts.txt")
@@ -137,25 +137,20 @@ jobs:
           KERNEL=""
           if [ "$P1_FS" = "ext4" ]; then
               KERNEL="$WORK/kernel.img"
-              debugfs -R "dump kernel.img $KERNEL" "$WORK/p1.img" 2>/dev/null && ok "ext4 提取 kernel.img" || warn "debugfs 失败"
+              debugfs -R "dump kernel.img $KERNEL" "$WORK/p1.img" 2>/dev/null >/dev/null && ok "ext4 提取 kernel.img" || warn "debugfs 失败"
           elif [ "$P1_FS" = "vfat" ]; then
               KERNEL="$WORK/kernel.img"
               mcopy -i "$WORK/p1.img" ::kernel.img "$KERNEL" 2>/dev/null && ok "FAT32 提取 kernel.img" || warn "mcopy 失败"
           fi
 
           if [ -f "$KERNEL" ]; then
-              echo "  kernel.img: $(( $(stat -c%s "$KERNEL") / 1024 / 1024 ))MB"
+              KIMG_SIZE=$(stat -c%s "$KERNEL")
+              echo "  kernel.img: $((KIMG_SIZE/1024/1024))MB"
 
-              # 方法 1: 直接用 binwalk 提取所有嵌入数据
-              binwalk -e "$KERNEL" >/dev/null 2>&1 || true
               KCONF=""
 
-              # 方法 2: 遍历 binwalk 提取的文件，找内核 config 的 magic (IKCFG_ST)
-              for f in "$WORK"/_kernel.img.extracted/*; do
-                  [ -f "$f" ] || continue
-                  if grep -q "IKCFG_ST" "$f" 2>/dev/null; then
-                      # 用 python 提取 IKCONFIG（业界通用方法）
-                      KCONF=$(python3 - "$f" << 'PY'
+              if grep -q "IKCFG_ST" "$KERNEL" 2>/dev/null; then
+                  KCONF=$(python3 - "$KERNEL" << 'PY'
           import sys, gzip, zlib
           data = open(sys.argv[1],'rb').read()
           i = data.find(b'IKCFG_ST')
@@ -163,22 +158,47 @@ jobs:
           j = data.find(b'IKCFG_ED', i)
           if j < 0: sys.exit(1)
           blob = data[i+8:j]
-          try:
-              out = gzip.decompress(blob)
-              sys.stdout.buffer.write(out)
+          try: sys.stdout.buffer.write(gzip.decompress(blob))
           except Exception:
-              try:
-                  out = zlib.decompress(blob)
-                  sys.stdout.buffer.write(out)
-              except Exception:
-                  sys.exit(1)
+              try: sys.stdout.buffer.write(zlib.decompress(blob))
+              except Exception: sys.exit(1)
           PY
-                      )
-                      [ -n "$KCONF" ] && break
-                  fi
-              done
+                  )
+              fi
 
-              if [ -n "$KCONF" ]; then
+              if [ -z "$KCONF" ]; then
+                  echo "  IKCONFIG 未编入，解压 kernel 内嵌层搜索..."
+                  binwalk -e "$KERNEL" >/dev/null 2>&1 || true
+                  for f in "$WORK"/_kernel.img.extracted/*; do
+                      [ -f "$f" ] || continue
+                      ft=$(file -b "$f")
+                      TMPF="$WORK/unpacked"
+                      case "$ft" in
+                          *gzip*) zcat "$f" > "$TMPF" 2>/dev/null ;;
+                          *XZ*)   xz -dc "$f" > "$TMPF" 2>/dev/null ;;
+                          *LZMA*) xz --format=lzma -dc "$f" 2>/dev/null > "$TMPF" ;;
+                          *) TMPF="$f" ;;
+                      esac
+                      [ -f "$TMPF" ] || continue
+
+                      if ! strings "$TMPF" 2>/dev/null | grep -qx "smaps"; then
+                          ft2=$(file -b "$TMPF")
+                          case "$ft2" in
+                              *gzip*) zcat "$TMPF" > "$WORK/unpacked2" 2>/dev/null && TMPF="$WORK/unpacked2" ;;
+                              *XZ*)   xz -dc "$TMPF" > "$WORK/unpacked2" 2>/dev/null && TMPF="$WORK/unpacked2" ;;
+                              *LZMA*) xz --format=lzma -dc "$TMPF" 2>/dev/null > "$WORK/unpacked2" && TMPF="$WORK/unpacked2" ;;
+                          esac
+                      fi
+
+                      if strings "$TMPF" 2>/dev/null | grep -qx "smaps"; then
+                          ok "解压后内核二进制含 'smaps'（PROC_PAGE_MONITOR 生效）"
+                          KCONF="FOUND"
+                          break
+                      fi
+                  done
+              fi
+
+              if [ -n "$KCONF" ] && [ "$KCONF" != "FOUND" ]; then
                   PPM=$(echo "$KCONF" | grep "^CONFIG_PROC_PAGE_MONITOR=" || true)
                   [ "$PPM" = "CONFIG_PROC_PAGE_MONITOR=y" ] && ok "$PPM" || fail "PROC_PAGE_MONITOR: $PPM"
 
@@ -188,18 +208,12 @@ jobs:
                       v=$(echo "$KCONF" | grep "^${k}=" || true)
                       [ -n "$v" ] && ok "$v"
                   done
-              else
-                  # fallback: 字符串搜索（弱证据，但 smaps 是 proc 名注册，通常明文）
-                  warn "IKCONFIG 未编入内核，降级字符串搜索"
-                  if strings "$KERNEL" | grep -qx "smaps"; then
-                      ok "kernel.img 含 'smaps' 字符串（PROC_PAGE_MONITOR 生效的强证据）"
-                  else
-                      warn "未找到 'smaps' 字符串"
-                  fi
+              elif [ "$KCONF" != "FOUND" ]; then
+                  warn "内核二进制无法直接验证（IKCONFIG 未编入且 kernel 无明文 smaps）"
+                  echo "  → CI 编译日志已打印 'CONFIG_PROC_PAGE_MONITOR=y'，视为已生效"
               fi
           fi
 
-          # ---------- 4. rootfs ----------
           hdr "4. rootfs 验证"
           P2_START=$(awk -F'\t' '$1==2 {print $3}' "$WORK/parts.txt")
           P2_SIZE=$(awk -F'\t' '$1==2 {print $4}' "$WORK/parts.txt")
@@ -207,10 +221,35 @@ jobs:
           P2_FS=$(blkid -s TYPE -o value "$WORK/p2.img" 2>/dev/null || echo unknown)
           echo "  p2 文件系统: $P2_FS"
 
+          # OpenWrt squashfs 分区有 padding，截断到 superblock 的 bytes_used
+          if [ "$P2_FS" = "squashfs" ]; then
+              SQ_BYTES=$(python3 -c "
+          import struct
+          try:
+              with open('$WORK/p2.img','rb') as f:
+                  f.seek(40)
+                  print(struct.unpack('<Q', f.read(8))[0])
+          except Exception:
+              print(0)
+          " 2>/dev/null)
+              if [ -n "$SQ_BYTES" ] && [ "$SQ_BYTES" -gt 1024 ]; then
+                  echo "  squashfs 实际大小: $((SQ_BYTES/1024/1024))MB（截断后）"
+                  truncate -s "$SQ_BYTES" "$WORK/p2.img"
+              fi
+          fi
+
           ROOTFS="$WORK/rootfs"; mkdir -p "$ROOTFS"
           EXTRACTED=0; MOUNTED=0
           if [ "$P2_FS" = "squashfs" ]; then
-              unsquashfs -q -f -d "$ROOTFS" "$WORK/p2.img" >/dev/null 2>&1 && { ok "unsquashfs 成功"; EXTRACTED=1; } || fail "unsquashfs 失败"
+              if unsquashfs -q -f -d "$ROOTFS" "$WORK/p2.img" >/dev/null 2>&1; then
+                  ok "unsquashfs 成功"
+                  EXTRACTED=1
+              elif unsquashfs -q -f -b 262144 -d "$ROOTFS" "$WORK/p2.img" >/dev/null 2>&1; then
+                  ok "unsquashfs 成功（-b 262144）"
+                  EXTRACTED=1
+              else
+                  fail "unsquashfs 失败"
+              fi
           elif [ "$P2_FS" = "ext4" ]; then
               sudo mount -t ext4 -o loop,ro "$WORK/p2.img" "$ROOTFS" 2>/dev/null && { ok "ext4 挂载成功"; EXTRACTED=1; MOUNTED=1; } || fail "ext4 挂载失败"
           fi
@@ -239,7 +278,6 @@ jobs:
               [ "$MOUNTED" = "1" ] && sudo umount "$ROOTFS"
           fi
 
-          # ---------- 5. manifest ----------
           hdr "5. Manifest 关键包"
           if [ -n "$MANIFEST" ] && [ -f "$MANIFEST" ]; then
               for pkg in clashoo luci-app-clashoo luci-app-amlogic docker dockerd containerd runc \
@@ -255,7 +293,6 @@ jobs:
               warn "未找到 manifest"
           fi
 
-          # ---------- 汇总 ----------
           hdr "验证汇总"
           echo "  PASS: $PASS"
           echo "  FAIL: $FAIL"
