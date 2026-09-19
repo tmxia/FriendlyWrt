@@ -1,0 +1,94 @@
+name: Probe Partition Files
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Clone key repos (shallow)
+        run: |
+          mkdir -p probe
+          cd probe
+          git clone --depth=1 -b master-v24.10 https://github.com/friendlyarm/friendlywrt_device_rk3568 device-rk3568 || echo "device-rk3568 clone failed"
+          git clone --depth=1 -b master-v24.10 https://github.com/friendlyarm/friendlywrt_configs configs || echo "configs clone failed"
+          git clone --depth=1 -b kernel-6.1.y   https://github.com/friendlyarm/sd-fuse_rk3568 sd-fuse || echo "sd-fuse clone failed"
+          git clone --depth=1                    https://github.com/friendlyarm/friendlywrt_scripts scripts || echo "scripts clone failed"
+          ls -la
+
+      - name: 1. Files containing mtdparts
+        run: |
+          cd probe
+          echo "========== mtdparts 关键文件 =========="
+          grep -rln "mtdparts" . 2>/dev/null | grep -v "\.git/" | head -40
+
+      - name: 2. Files containing (opt) partition
+        run: |
+          cd probe
+          echo "========== 含 (opt) 分区的文件 =========="
+          grep -rln "(opt)" . 2>/dev/null | grep -v "\.git/" | head -40
+
+      - name: 3. Files containing real offsets (0x00446000 / 0x00246000)
+        run: |
+          cd probe
+          echo "========== 含设备真实偏移的文件 =========="
+          grep -rln "0x00446000\|0x00246000" . 2>/dev/null | grep -v "\.git/" | head -40
+
+      - name: 4. All parameter* files
+        run: |
+          cd probe
+          echo "========== 所有 parameter* 文件 =========="
+          find . -iname "parameter*" -type f 2>/dev/null | grep -v "\.git/"
+
+      - name: 5. Dump content of every parameter* file
+        run: |
+          cd probe
+          echo "========== parameter* 文件内容 =========="
+          find . -iname "parameter*" -type f 2>/dev/null | grep -v "\.git/" | while read f; do
+            echo ""
+            echo "########## FILE: $f ##########"
+            echo "--- 大小: $(wc -c < "$f") 字节 ---"
+            cat "$f"
+            echo ""
+            echo "########## END: $f ##########"
+            echo ""
+          done
+
+      - name: 6. Grep ROOTFS/USERDATA/OPT variables in scripts
+        run: |
+          cd probe
+          echo "========== 变量定义（ROOTFS/USERDATA/OPT/PARTITION）=========="
+          grep -rn "ROOTFS_PARTITION_SIZE\|USERDATA_PARTITION_ADDR\|USERDATA_SIZE\|OPT_OFFSET\|PARTITION_SIZE\|USERDATA_OFFSET" \
+            . 2>/dev/null | grep -v "\.git/" | head -60
+
+      - name: 7. Show sd-fuse directory structure
+        run: |
+          cd probe
+          echo "========== sd-fuse 目录结构 =========="
+          find sd-fuse -maxdepth 3 -type d 2>/dev/null | head -40
+          echo ""
+          echo "========== sd-fuse/prebuilt 内容 =========="
+          ls -la sd-fuse/prebuilt/ 2>/dev/null
+          echo ""
+          echo "========== sd-fuse 下所有 .txt / .template =========="
+          find sd-fuse -name "*.txt" -o -name "*.template" 2>/dev/null | head -30
+
+      - name: 8. Grep for the exact partition layout line
+        run: |
+          cd probe
+          echo "========== 完整 mtdparts 行 =========="
+          grep -rhn "CMDLINE:.*mtdparts" . 2>/dev/null | grep -v "\.git/" | head -20
+
+      - name: 9. Final summary
+        run: |
+          cd probe
+          echo "=========================================="
+          echo "  汇总："
+          echo "=========================================="
+          echo "含 mtdparts 的文件数：$(grep -rln 'mtdparts' . 2>/dev/null | grep -v '\.git/' | wc -l)"
+          echo "含 (opt) 的文件数：$(grep -rln '(opt)' . 2>/dev/null | grep -v '\.git/' | wc -l)"
+          echo "parameter* 文件数：$(find . -iname 'parameter*' -type f 2>/dev/null | grep -v '\.git/' | wc -l)"
+          echo ""
+          echo "如果上述数字都是 0，说明文件不在这些仓库里。"
+          echo "下一步需要全量 repo sync 才能找到（用完整 Build FriendlyWrt 流程）。"
