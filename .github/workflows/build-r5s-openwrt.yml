@@ -11,14 +11,14 @@ on:
         default: 'true'
         type: choice
         options: ['false', 'true']
-      kernel_mode:
-        description: 'Kernel mode'
+      kernel_track:
+        description: 'Kernel track'
         required: false
-        default: 'upstream'
+        default: 'openwrt'
         type: choice
         options:
-          - 'upstream'
-          - 'latest'
+          - 'openwrt'
+          - 'linux-stable'
 
 permissions:
   contents: write
@@ -147,8 +147,8 @@ jobs:
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: Auto-update kernel
-        if: inputs.kernel_mode == 'latest'
+      - name: Switch to linux-stable kernel
+        if: inputs.kernel_track == 'linux-stable'
         run: |
           cd /workdir/openwrt
           FILE="target/linux/generic/kernel-6.12"
@@ -160,8 +160,8 @@ jobs:
                    | sort -uV | tail -1 \
                    | grep -oE '6\.12\.[0-9]+' | cut -d. -f3)
 
-          echo "OpenWrt 内置: 6.12.$CUR"
-          echo "kernel.org:  6.12.$LATEST"
+          echo "OpenWrt 分支内置: 6.12.$CUR"
+          echo "linux-stable:    6.12.$LATEST"
 
           if [ "$CUR" = "$LATEST" ]; then
             echo "已是最新，跳过"
@@ -204,7 +204,7 @@ jobs:
           make defconfig
 
       - name: Restore cache
-        if: inputs.kernel_mode != 'latest'
+        if: inputs.kernel_track != 'linux-stable'
         run: |
           cd /workdir
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_restore
@@ -224,7 +224,7 @@ jobs:
       - name: Checkpoint base cache
         if: |
           steps.compile_base.outcome == 'success' &&
-          inputs.kernel_mode != 'latest'
+          inputs.kernel_track != 'linux-stable'
         run: |
           cd /workdir/openwrt
 
