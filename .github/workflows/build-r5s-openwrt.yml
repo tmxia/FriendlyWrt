@@ -250,24 +250,8 @@ jobs:
           file "$IMG_SQ_GZ" | grep -q "gzip compressed data" || exit 1
           python3 -c "import zlib;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_SQ_GZ','rb').read());exit(0 if d.eof else 1)" || exit 1
 
-          # 校验 ext4 镜像含 p3 分区（原生 p3 由 ptgen 生成）
           echo "===== 校验 ext4 镜像 GPT 分区 ====="
-          python3 - "$IMG_EXT4_GZ" << 'PYEOF'
-import gzip, struct, sys
-with gzip.open(sys.argv[1], 'rb') as f:
-    f.seek(512)
-    hdr = f.read(92)
-    assert hdr[:8] == b'EFI PART', "not a GPT image"
-    f.seek(1024)
-    entries = f.read(128 * 128)
-    p3 = entries[2 * 128:3 * 128]
-    if p3[:16] == b'\x00' * 16:
-        print("ERROR: p3 not present in GPT")
-        sys.exit(1)
-    first, last = struct.unpack('<QQ', p3[32:48])
-    name = p3[56:128].decode('utf-16-le', 'ignore').rstrip('\x00')
-    print(f"p3 present: LBA {first}..{last} ({(last-first+1)*512//1024//1024} MB) name='{name}'")
-PYEOF
+          python3 -c "import gzip,sys;f=gzip.open(sys.argv[1],'rb');f.seek(512);assert f.read(8)==b'EFI PART','not GPT';f.seek(1024);e=f.read(128*128);assert e[256:272]!=b'\x00'*16,'p3 missing';print('p3 present in GPT')" "$IMG_EXT4_GZ"
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
