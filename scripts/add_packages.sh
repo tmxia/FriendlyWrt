@@ -165,15 +165,16 @@ BASE_MK="device/friendlyelec/rk3568/base.mk"
 CUR_UD=$(grep '^TARGET_USERDATA_PARTSIZE=' "$BASE_MK" | cut -d= -f2)
 if [ "$CUR_UD" = "1024" ]; then
     sed -i 's|^TARGET_USERDATA_PARTSIZE=.*|TARGET_USERDATA_PARTSIZE=2048|' "$BASE_MK"
-    sed -i 's|^TARGET_SD_IMAGESIZE=.*|TARGET_SD_IMAGESIZE=4096|' "$BASE_MK"
+    sed -i 's|TARGET_SD_IMAGESIZE=.*|    TARGET_SD_IMAGESIZE=4096|' "$BASE_MK"
     echo "userdata partition set to 2G (24.10)"
 elif [ "$CUR_UD" = "1536" ]; then
     sed -i 's|^TARGET_USERDATA_PARTSIZE=.*|TARGET_USERDATA_PARTSIZE=2560|' "$BASE_MK"
-    sed -i 's|^TARGET_SD_IMAGESIZE=.*|TARGET_SD_IMAGESIZE=4864|' "$BASE_MK"
+    sed -i 's|TARGET_SD_IMAGESIZE=.*|    TARGET_SD_IMAGESIZE=4864|' "$BASE_MK"
     echo "userdata partition set to 2.5G (25.12)"
 else
     echo "Unknown TARGET_USERDATA_PARTSIZE=$CUR_UD, skipping"
 fi
-grep -E "^TARGET_(ROOTFS_PARTSIZE|USERDATA_PARTSIZE|SD_IMAGESIZE)=" "$BASE_MK"
+echo "=== Partition config after patch ==="
+grep -E "TARGET_(ROOTFS_PARTSIZE|USERDATA_PARTSIZE|SD_IMAGESIZE)=" "$BASE_MK"
 
 echo "All configurations applied and verified."
