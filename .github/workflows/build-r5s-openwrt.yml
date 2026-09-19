@@ -234,21 +234,11 @@ jobs:
             exit 1
           fi
 
-      # ↓↓↓ 新增：格式诊断 ↓↓↓
-      - name: Diagnose image formats
+      - name: Verify and collect artifacts
         if: success()
-        run: |
-          cd /workdir/openwrt
-          bash $GITHUB_WORKSPACE/scripts/diagnose_images.sh bin/targets/rockchip/armv8
-
-      - name: Post-process images
-        if: success()
-        continue-on-error: true
         run: |
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
-
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} add_opt_part
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -259,6 +249,25 @@ jobs:
           [ -n "$IMG_SQ_GZ" ] || { echo "squashfs img missing"; exit 1; }
           file "$IMG_SQ_GZ" | grep -q "gzip compressed data" || exit 1
           python3 -c "import zlib;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_SQ_GZ','rb').read());exit(0 if d.eof else 1)" || exit 1
+
+          # 校验 ext4 镜像含 p3 分区（原生 p3 由 ptgen 生成）
+          echo "===== 校验 ext4 镜像 GPT 分区 ====="
+          python3 - "$IMG_EXT4_GZ" << 'PYEOF'
+import gzip, struct, sys
+with gzip.open(sys.argv[1], 'rb') as f:
+    f.seek(512)
+    hdr = f.read(92)
+    assert hdr[:8] == b'EFI PART', "not a GPT image"
+    f.seek(1024)
+    entries = f.read(128 * 128)
+    p3 = entries[2 * 128:3 * 128]
+    if p3[:16] == b'\x00' * 16:
+        print("ERROR: p3 not present in GPT")
+        sys.exit(1)
+    first, last = struct.unpack('<QQ', p3[32:48])
+    name = p3[56:128].decode('utf-16-le', 'ignore').rstrip('\x00')
+    print(f"p3 present: LBA {first}..{last} ({(last-first+1)*512//1024//1024} MB) name='{name}'")
+PYEOF
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
@@ -299,15 +308,6 @@ jobs:
         with:
           name: r5s-firmware
           path: artifact/
-          retention-days: 30
-
-      - name: Upload diagnose log as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: r5s-diagnose
-          path: /tmp/diagnose.log
-          if-no-files-found: ignore
           retention-days: 30
 
   cleanup_self:
