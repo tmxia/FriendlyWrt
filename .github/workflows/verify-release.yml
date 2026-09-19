@@ -47,11 +47,7 @@ jobs:
                   --json tagName,createdAt \
                   --jq 'sort_by(.createdAt) | reverse | .[].tagName' \
                   | grep -E '^R5S-OpenWrt-25\.12-' | head -1)
-            if [ -z "$TAG" ]; then
-              echo "❌ 未找到 R5S-OpenWrt-25.12-* release"
-              gh release list --repo "$REPO" --limit 10
-              exit 1
-            fi
+            [ -z "$TAG" ] && { echo "❌ 未找到 release"; gh release list --repo "$REPO" --limit 10; exit 1; }
           fi
 
           echo "tag=$TAG" >> $GITHUB_OUTPUT
@@ -148,7 +144,6 @@ jobs:
           if [ -f "$KERNEL" ]; then
               echo "  kernel.img: $(( $(stat -c%s "$KERNEL") / 1024 / 1024 ))MB"
 
-              # 尝试 1: IKCONFIG magic
               KCONF=""
               if grep -q "IKCFG_ST" "$KERNEL" 2>/dev/null; then
                   KCONF=$(python3 - "$KERNEL" << 'PY'
@@ -163,16 +158,6 @@ jobs:
               except Exception: sys.exit(1)
           PY
                   )
-              fi
-
-              # 尝试 2: 用 fdtget 从 FIT image 里提取 kernel
-              if [ -z "$KCONF" ]; then
-                  # FIT magic 0xd00dfeed
-                  FIT_OFF=$(grep -aboP '\xd0\x0d\xfe\xed' "$KERNEL" 2>/dev/null | head -1 | cut -d: -f1)
-                  if [ -n "$FIT_OFF" ]; then
-                      echo "  发现 FIT image 于 offset $FIT_OFF"
-                      # 提取 FIT 里的 kernel sub-image（这里简化：直接尝试从 FIT 里提取压缩流）
-                  fi
               fi
 
               if [ -n "$KCONF" ]; then
@@ -192,17 +177,14 @@ jobs:
               fi
           fi
 
-          hdr "4. rootfs /etc/uci-defaults（尽力验证）"
+          hdr "4. rootfs /etc/uci-defaults（sudo 解压）"
           P2_START=$(awk -F'\t' '$1==2 {print $3}' "$WORK/parts.txt")
           P2_SIZE=$(awk -F'\t' '$1==2 {print $4}' "$WORK/parts.txt")
           dd if="$FW" of="$WORK/p2.img" bs=512 skip="$P2_START" count="$P2_SIZE" 2>/dev/null
           P2_FS=$(blkid -s TYPE -o value "$WORK/p2.img" 2>/dev/null || echo unknown)
           echo "  p2 文件系统: $P2_FS"
 
-          # squashfs: 用 superblock 里的 bytes_used 截断
           if [ "$P2_FS" = "squashfs" ]; then
-              # squashfs superblock:
-              # offset 0: magic (u32), 4: inodes, ..., 40: bytes_used (u64)
               SQ_BYTES=$(python3 -c "
           import struct
           try:
@@ -213,33 +195,32 @@ jobs:
               print(0)
           " 2>/dev/null)
               echo "  squashfs bytes_used: $((SQ_BYTES/1024/1024))MB"
-              if [ -n "$SQ_BYTES" ] && [ "$SQ_BYTES" -gt 1024 ]; then
-                  truncate -s "$SQ_BYTES" "$WORK/p2.img"
-              fi
+              [ -n "$SQ_BYTES" ] && [ "$SQ_BYTES" -gt 1024 ] && truncate -s "$SQ_BYTES" "$WORK/p2.img"
           fi
 
           ROOTFS="$WORK/rootfs"; mkdir -p "$ROOTFS"
           EXTRACTED=0; MOUNTED=0
 
           if [ "$P2_FS" = "squashfs" ]; then
-              echo "  尝试 1: unsquashfs (squashfs-tools)"
-              if unsquashfs -d "$ROOTFS" "$WORK/p2.img" 2>"$WORK/sq.err" >/dev/null; then
+              echo "  尝试 1: sudo unsquashfs (squashfs-tools)"
+              if sudo unsquashfs -d "$ROOTFS" "$WORK/p2.img" >"$WORK/sq.out" 2>"$WORK/sq.err"; then
                   ok "unsquashfs 成功"
                   EXTRACTED=1
+                  sudo chmod -R a+rX "$ROOTFS" 2>/dev/null || true
               else
-                  echo "    unsquashfs 错误："
-                  sed 's/^/      /' "$WORK/sq.err" | head -5
+                  echo "    错误详情："
+                  tail -5 "$WORK/sq.err" | sed 's/^/      /'
                   rm -rf "$ROOTFS"; mkdir -p "$ROOTFS"
 
-                  echo "  尝试 2: sqfs2tar (squashfs-tools-ng)"
+                  echo "  尝试 2: sudo sqfs2tar (squashfs-tools-ng)"
                   if command -v sqfs2tar >/dev/null 2>&1 && \
-                     sqfs2tar "$WORK/p2.img" 2>"$WORK/sq2.err" | tar -xf - -C "$ROOTFS" 2>/dev/null; then
+                     sudo sqfs2tar "$WORK/p2.img" 2>"$WORK/sq2.err" | sudo tar -xf - -C "$ROOTFS" 2>/dev/null; then
                       ok "sqfs2tar 成功"
                       EXTRACTED=1
+                      sudo chmod -R a+rX "$ROOTFS" 2>/dev/null || true
                   else
-                      [ -f "$WORK/sq2.err" ] && sed 's/^/      /' "$WORK/sq2.err" | head -3
-                      warn "两种 squashfs 工具均失败（CI 编译日志已证明 /etc/uci-defaults/99-custom 打包成功）"
-                      echo "      → 该文件是显式 cat > files/etc/uci-defaults/99-custom 写入，必然进 rootfs"
+                      [ -f "$WORK/sq2.err" ] && tail -5 "$WORK/sq2.err" | sed 's/^/      /'
+                      fail "两种 squashfs 工具均失败"
                   fi
               fi
           elif [ "$P2_FS" = "ext4" ]; then
