@@ -25,6 +25,7 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
+    # PROC_PAGE_MONITOR: Redis 需要 /proc/<pid>/smaps
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
@@ -32,17 +33,14 @@ post_feeds() {
                MEMCG BLK_CGROUP CFS_BANDWIDTH FAIR_GROUP_SCHED RT_GROUP_SCHED \
                CGROUP_PERF CGROUP_NET_PRIO \
                PWM PWM_SYSFS PWM_ROCKCHIP SENSORS_PWM_FAN \
-               LEDS_TRIGGER_NETDEV LED_TRIGGER_PHY; do
+               LEDS_TRIGGER_NETDEV LED_TRIGGER_PHY \
+               PROC_PAGE_MONITOR; do
         sed -i "/^# CONFIG_${opt} is not set/d" "$KERNEL_CONFIG_FILE"
         sed -i "/^CONFIG_${opt}=/d" "$KERNEL_CONFIG_FILE"
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ============================================================
-    # 让 ptgen（MBR 模式）天生生成 3 分区：kernel + rootfs + opt
-    #   - ptgen 前 truncate 预留 opt 空间
-    #   - ptgen 参数追加 -t 0x83 -p 256m（MBR Linux 分区）
-    # ============================================================
+    # ptgen 天生生成 3 分区：kernel + rootfs + opt
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -53,7 +51,7 @@ with open(path, "r") as f:
     content = f.read()
 
 if "R5S_OPT_PATCHED" in content:
-    print("gen_image_generic.sh already patched, skip")
+    print("already patched, skip")
     sys.exit(0)
 
 if 'set $(ptgen' not in content:
@@ -61,30 +59,25 @@ if 'set $(ptgen' not in content:
 if '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"' not in content:
     print("ERROR: rootfs partition args not found"); sys.exit(1)
 
-# ① ptgen 前 truncate，预留 opt 256MB + 32MB 对齐余量
 content = content.replace(
     'set $(ptgen',
     'truncate -s $((KERNELSIZE + ROOTFSSIZE + 288))M "$OUTPUT"\nset $(ptgen',
     1
 )
-
-# ② ptgen 追加第三分区（MBR: 0x83 = Linux filesystem）
 content = content.replace(
     '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"',
     '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m" -t 0x83 -p 256m',
     1
 )
-
 content = "# R5S_OPT_PATCHED - added opt partition (MBR) to ptgen\n" + content
 
 with open(path, "w") as f:
     f.write(content)
 
-print("===== patched gen_image_generic.sh =====")
+print("patched gen_image_generic.sh:")
 for i, line in enumerate(content.split("\n"), 1):
     if "R5S_OPT_PATCHED" in line or "truncate -s" in line or "ptgen -o" in line:
         print(f"  {i}: {line}")
-print("========================================")
 PYEOF
 
     mkdir -p package/custom
@@ -129,6 +122,19 @@ MP_EOF
 
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
+# 补全 docker0 network 声明（25.12 上游缺此配置，容器网络会被 firewall4 drop）
+if ! uci -q get network.docker.device >/dev/null 2>&1; then
+    uci set network.docker='interface'
+    uci set network.docker.device='docker0'
+    uci set network.docker.proto='none'
+    uci set network.docker.auto='0'
+fi
+if ! uci show network 2>/dev/null | grep -qE "\.name=['\"]?docker0['\"]?"; then
+    uci add network device >/dev/null
+    uci set network.@device[-1].type='bridge'
+    uci set network.@device[-1].name='docker0'
+fi
+
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -209,7 +215,7 @@ EOF
 
     cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
 #!/bin/sh
-# /opt 独立分区：首次启动扩展到磁盘末尾 + 格式化 + 挂载
+# /opt 首次启动扩展到磁盘末尾 + 格式化 + 挂载
 LOG="logger -t opt-init"
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
@@ -236,7 +242,7 @@ if [ ! -f /etc/.opt_resized ]; then
         if [ -n "$P3_START" ] && [ "$P3_CURRENT_SIZE" -lt "$TARGET_SIZE" ]; then
             $LOG "resizing p3: current=$P3_CURRENT_SIZE target=$TARGET_SIZE"
             if command -v parted >/dev/null 2>&1; then
-                parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1 || $LOG "parted resizepart failed"
+                parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1 || $LOG "parted failed"
             fi
             partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
             sleep 1
@@ -250,9 +256,7 @@ if [ "$FSTYPE" != "ext4" ]; then
     $LOG "mkfs.ext4 on $OPT_DEV"
     mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1 || { $LOG "mkfs failed"; exit 0; }
 else
-    if command -v resize2fs >/dev/null 2>&1; then
-        resize2fs "$OPT_DEV" >/dev/null 2>&1 || true
-    fi
+    command -v resize2fs >/dev/null 2>&1 && resize2fs "$OPT_DEV" >/dev/null 2>&1 || true
 fi
 
 UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
@@ -485,6 +489,7 @@ config_stage() {
     [ -z "$KV" ] && KV="6.12"
     grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
     grep -E "^CONFIG_(LEDS_TRIGGER_NETDEV|LED_TRIGGER_PHY)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
+    grep -E "^CONFIG_PROC_PAGE_MONITOR=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
 
     [ -f files/sbin/mountpoint ] || { echo "missing files/sbin/mountpoint"; exit 1; }
 }
