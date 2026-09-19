@@ -429,7 +429,7 @@ config_stage() {
     ENABLE_PKGS="
     bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
     wireguard-tools python3-light
-    bash perl parted curl dosfstools e2fsprogs resize2fs lsblk pv losetup uuidgen fdisk
+    bash perl parted curl dosfstools e2fsprogs resize2fs lsblk pv losetup uuidgen fdisk wget-ssl
     block-mount blkid
     "
     for pkg in $ENABLE_PKGS; do
