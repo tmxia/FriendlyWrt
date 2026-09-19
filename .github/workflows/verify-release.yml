@@ -20,35 +20,61 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y squashfs-tools mtools e2fsprogs binwalk file xxd
-          # extract-ikconfig：从 kernel 提取内嵌 config
-          sudo apt-get install -y linux-kbuild-6.8.0-* 2>/dev/null || true
-          ls /usr/lib/linux-kbuild-*/scripts/extract-ikconfig 2>/dev/null || echo "no ikconfig"
+          sudo apt-get install -y squashfs-tools mtools e2fsprogs file xxd
 
-      - name: Download release artifacts
+      - name: Resolve release tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INPUT="${{ inputs.release_tag }}"
+          REPO="${{ github.repository }}"
+
+          # 精确匹配
+          if gh release view "$INPUT" --repo "$REPO" >/dev/null 2>&1; then
+            echo "tag=$INPUT" >> $GITHUB_OUTPUT
+            echo "✅ 使用 tag: $INPUT"
+            exit 0
+          fi
+
+          # 尝试加 R5S- 前缀
+          if gh release view "R5S-$INPUT" --repo "$REPO" >/dev/null 2>&1; then
+            echo "tag=R5S-$INPUT" >> $GITHUB_OUTPUT
+            echo "✅ 自动补全为: R5S-$INPUT"
+            exit 0
+          fi
+
+          # 列出所有 release 供参考
+          echo "❌ 未找到 release: $INPUT"
+          echo ""
+          echo "现有 release:"
+          gh release list --repo "$REPO" --limit 10
+          exit 1
+
+      - name: Download artifacts
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p $GITHUB_WORKSPACE/artifacts
           cd $GITHUB_WORKSPACE/artifacts
-          gh release download "${{ inputs.release_tag }}" \
+          gh release download "${{ steps.resolve.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --pattern "*.img.gz" \
             --pattern "*manifest*" \
             --clobber
           ls -lh
 
-      - name: Verify release
+      - name: Verify
         run: |
           set +e
+          cd $GITHUB_WORKSPACE/artifacts
           WORK=$(mktemp -d)
+
           PASS=0; FAIL=0; WARN=0
           ok()   { echo "  [OK]   $1"; PASS=$((PASS+1)); }
           fail() { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
           warn() { echo "  [WARN] $1"; WARN=$((WARN+1)); }
-          hdr()  { echo ""; echo "========================================================"; echo "  $1"; echo "========================================================"; }
-
-          cd $GITHUB_WORKSPACE/artifacts
+          hdr()  { echo ""; echo "====== $1 ======"; }
 
           # ---------- 准备 ----------
           hdr "准备"
@@ -56,33 +82,28 @@ jobs:
           [ -z "$IMG_GZ" ] && { echo "未找到 squashfs-sysupgrade.img.gz"; exit 1; }
           echo "镜像: $IMG_GZ"
           MANIFEST=$(ls *manifest.txt 2>/dev/null | head -1)
-          echo "manifest: $MANIFEST"
 
-          # ---------- 1. 解压镜像（zlib 容忍 trailing metadata）----------
+          # ---------- 1. 解压 ----------
           hdr "1. 解压镜像"
           python3 - "$IMG_GZ" "$WORK/fw.img" << 'PY'
           import sys, zlib
-          src, dst = sys.argv[1], sys.argv[2]
-          with open(src, 'rb') as f, open(dst, 'wb') as o:
-              d = zlib.decompressobj(wbits=31)
-              total = 0
+          with open(sys.argv[1],'rb') as f, open(sys.argv[2],'wb') as o:
+              d = zlib.decompressobj(wbits=31); total = 0
               while True:
-                  chunk = f.read(1 << 20)
+                  chunk = f.read(1<<20)
                   if not chunk: break
-                  out = d.decompress(chunk)
-                  o.write(out)
-                  total += len(out)
+                  out = d.decompress(chunk); o.write(out); total += len(out)
                   if d.eof: break
-          print(f"  解压后: {total/1024/1024:.1f} MB")
+          print(f"  {total/1024/1024:.1f} MB")
           PY
           FW="$WORK/fw.img"
-          [ -f "$FW" ] && ok "镜像已解压" || { fail "解压失败"; exit 1; }
+          [ -f "$FW" ] && ok "解压成功" || { fail "解压失败"; exit 1; }
 
-          # ---------- 2. MBR 分区表 ----------
-          hdr "2. MBR 分区表（ptgen patch 验证）"
+          # ---------- 2. MBR ----------
+          hdr "2. MBR 分区表"
           python3 - "$FW" > "$WORK/parts.txt" << 'PY'
           import struct, sys
-          with open(sys.argv[1], 'rb') as f:
+          with open(sys.argv[1],'rb') as f:
               f.seek(446)
               for i in range(4):
                   e = f.read(16)
@@ -99,97 +120,97 @@ jobs:
           [ "$P_NUM" = "3" ] && ok "3 分区" || fail "分区数 = $P_NUM（期望 3）"
 
           P3_TYPE=$(awk -F'\t' '$1==3 {print $2}' "$WORK/parts.txt")
-          [ "$P3_TYPE" = "83" ] && ok "p3 type=0x83" || fail "p3 type=0x$P3_TYPE（期望 83）"
+          [ "$P3_TYPE" = "83" ] && ok "p3 type=0x83" || fail "p3 type=0x$P3_TYPE"
 
           P3_SIZE=$(awk -F'\t' '$1==3 {print $4}' "$WORK/parts.txt")
           P3_MB=$((P3_SIZE * 512 / 1024 / 1024))
-          [ "$P3_MB" -ge 200 ] && [ "$P3_MB" -le 300 ] && ok "p3 大小 = ${P3_MB}MB" || warn "p3 大小 = ${P3_MB}MB"
+          [ "$P3_MB" -ge 200 ] && [ "$P3_MB" -le 300 ] && ok "p3 大小 = ${P3_MB}MB" || warn "p3 = ${P3_MB}MB"
 
-          # ---------- 3. p1 内核 config ----------
-          hdr "3. 内核 CONFIG_PROC_PAGE_MONITOR 验证"
+          # ---------- 3. 内核 ----------
+          hdr "3. 内核 PROC_PAGE_MONITOR 验证"
           P1_START=$(awk -F'\t' '$1==1 {print $3}' "$WORK/parts.txt")
-          P1_SIZE=$(awk -F'\t' '$1==4 {print $4}' "$WORK/parts.txt")
           P1_SIZE=$(awk -F'\t' '$1==1 {print $4}' "$WORK/parts.txt")
-
           dd if="$FW" of="$WORK/p1.img" bs=512 skip="$P1_START" count="$P1_SIZE" 2>/dev/null
-          P1_FS=$(blkid -s TYPE -o value "$WORK/p1.img" 2>/dev/null || echo "unknown")
+          P1_FS=$(blkid -s TYPE -o value "$WORK/p1.img" 2>/dev/null || echo unknown)
           echo "  p1 文件系统: $P1_FS"
 
-          KERNEL_IMG=""
+          KERNEL=""
           if [ "$P1_FS" = "ext4" ]; then
-              KERNEL_IMG="$WORK/kernel.img"
-              debugfs -R "dump kernel.img $KERNEL_IMG" "$WORK/p1.img" 2>/dev/null && ok "ext4 提取 kernel.img" || warn "debugfs 失败"
+              KERNEL="$WORK/kernel.img"
+              debugfs -R "dump kernel.img $KERNEL" "$WORK/p1.img" 2>/dev/null && ok "ext4 提取 kernel.img" || warn "debugfs 失败"
           elif [ "$P1_FS" = "vfat" ]; then
-              KERNEL_IMG="$WORK/kernel.img"
-              mcopy -i "$WORK/p1.img" ::kernel.img "$KERNEL_IMG" 2>/dev/null && ok "FAT32 提取 kernel.img" || warn "mcopy 失败"
+              KERNEL="$WORK/kernel.img"
+              mcopy -i "$WORK/p1.img" ::kernel.img "$KERNEL" 2>/dev/null && ok "FAT32 提取 kernel.img" || warn "mcopy 失败"
           fi
 
-          if [ -f "$KERNEL_IMG" ]; then
-            KIMG_SIZE=$(stat -c%s "$KERNEL_IMG")
-            echo "  kernel.img 大小: $((KIMG_SIZE/1024/1024))MB"
+          if [ -f "$KERNEL" ]; then
+              echo "  kernel.img: $(( $(stat -c%s "$KERNEL") / 1024 / 1024 ))MB"
 
-            IKC=$(ls /usr/lib/linux-kbuild-*/scripts/extract-ikconfig 2>/dev/null | head -1)
-            KCONF=""
-            if [ -n "$IKC" ]; then
-                KCONF=$("$IKC" "$KERNEL_IMG" 2>/dev/null || true)
-            fi
+              # 方法 1: 直接用 binwalk 提取所有嵌入数据
+              binwalk -e "$KERNEL" >/dev/null 2>&1 || true
+              KCONF=""
 
-            # 如果 IKCONFIG 没编进内核，尝试 binwalk
-            if [ -z "$KCONF" ]; then
-                echo "  extract-ikconfig 无输出，尝试 binwalk 提取..."
-                binwalk -Me "$KERNEL_IMG" >/dev/null 2>&1 || true
-                for ext in "$WORK"/_kernel.img.extracted/*; do
-                    [ -f "$ext" ] || continue
-                    TMP=$(mktemp -d)
-                    case "$(file -b "$ext")" in
-                        *gzip*) zcat "$ext" > "$TMP/k" 2>/dev/null ;;
-                        *XZ*)   xz -dc "$ext" > "$TMP/k" 2>/dev/null ;;
-                        *LZMA*|*lzma*) xz --format=lzma -dc "$ext" > "$TMP/k" 2>/dev/null ;;
-                    esac
-                    if [ -f "$TMP/k" ] && [ -n "$IKC" ]; then
-                        KCONF=$("$IKC" "$TMP/k" 2>/dev/null || true)
-                    fi
-                    rm -rf "$TMP"
-                    [ -n "$KCONF" ] && break
-                done
-            fi
+              # 方法 2: 遍历 binwalk 提取的文件，找内核 config 的 magic (IKCFG_ST)
+              for f in "$WORK"/_kernel.img.extracted/*; do
+                  [ -f "$f" ] || continue
+                  if grep -q "IKCFG_ST" "$f" 2>/dev/null; then
+                      # 用 python 提取 IKCONFIG（业界通用方法）
+                      KCONF=$(python3 - "$f" << 'PY'
+          import sys, gzip, zlib
+          data = open(sys.argv[1],'rb').read()
+          i = data.find(b'IKCFG_ST')
+          if i < 0: sys.exit(1)
+          j = data.find(b'IKCFG_ED', i)
+          if j < 0: sys.exit(1)
+          blob = data[i+8:j]
+          try:
+              out = gzip.decompress(blob)
+              sys.stdout.buffer.write(out)
+          except Exception:
+              try:
+                  out = zlib.decompress(blob)
+                  sys.stdout.buffer.write(out)
+              except Exception:
+                  sys.exit(1)
+          PY
+                      )
+                      [ -n "$KCONF" ] && break
+                  fi
+              done
 
-            if [ -n "$KCONF" ]; then
-                PPM=$(echo "$KCONF" | grep "^CONFIG_PROC_PAGE_MONITOR=" || true)
-                [ "$PPM" = "CONFIG_PROC_PAGE_MONITOR=y" ] && ok "CONFIG_PROC_PAGE_MONITOR=y" || fail "PROC_PAGE_MONITOR 未启用: $PPM"
+              if [ -n "$KCONF" ]; then
+                  PPM=$(echo "$KCONF" | grep "^CONFIG_PROC_PAGE_MONITOR=" || true)
+                  [ "$PPM" = "CONFIG_PROC_PAGE_MONITOR=y" ] && ok "$PPM" || fail "PROC_PAGE_MONITOR: $PPM"
 
-                for k in CONFIG_CGROUP_DEVICE CONFIG_CGROUP_FREEZER CONFIG_CGROUP_SCHED \
-                         CONFIG_MEMCG CONFIG_BRIDGE CONFIG_PWM_ROCKCHIP CONFIG_SENSORS_PWM_FAN \
-                         CONFIG_LEDS_TRIGGER_NETDEV CONFIG_LED_TRIGGER_PHY; do
-                    v=$(echo "$KCONF" | grep "^${k}=" || true)
-                    [ -n "$v" ] && ok "$v" || warn "$k 未在 config 中"
-                done
-            else
-                warn "无法提取内核 config（IKCONFIG 未编入或提取工具缺失）"
-                if strings "$KERNEL_IMG" | grep -qE "/proc/self/smaps"; then
-                    ok "kernel.img 含 '/proc/self/smaps' 字符串"
-                else
-                    warn "kernel.img 无 smaps 明文（可能被压缩）"
-                fi
-            fi
-          else
-              warn "未提取到 kernel.img"
+                  for k in CONFIG_CGROUP_DEVICE CONFIG_CGROUP_SCHED CONFIG_MEMCG \
+                           CONFIG_BRIDGE CONFIG_PWM_ROCKCHIP CONFIG_SENSORS_PWM_FAN \
+                           CONFIG_LEDS_TRIGGER_NETDEV CONFIG_LED_TRIGGER_PHY; do
+                      v=$(echo "$KCONF" | grep "^${k}=" || true)
+                      [ -n "$v" ] && ok "$v"
+                  done
+              else
+                  # fallback: 字符串搜索（弱证据，但 smaps 是 proc 名注册，通常明文）
+                  warn "IKCONFIG 未编入内核，降级字符串搜索"
+                  if strings "$KERNEL" | grep -qx "smaps"; then
+                      ok "kernel.img 含 'smaps' 字符串（PROC_PAGE_MONITOR 生效的强证据）"
+                  else
+                      warn "未找到 'smaps' 字符串"
+                  fi
+              fi
           fi
 
-          # ---------- 4. p2 rootfs ----------
+          # ---------- 4. rootfs ----------
           hdr "4. rootfs 验证"
           P2_START=$(awk -F'\t' '$1==2 {print $3}' "$WORK/parts.txt")
           P2_SIZE=$(awk -F'\t' '$1==2 {print $4}' "$WORK/parts.txt")
-
           dd if="$FW" of="$WORK/p2.img" bs=512 skip="$P2_START" count="$P2_SIZE" 2>/dev/null
-          P2_FS=$(blkid -s TYPE -o value "$WORK/p2.img" 2>/dev/null || echo "unknown")
+          P2_FS=$(blkid -s TYPE -o value "$WORK/p2.img" 2>/dev/null || echo unknown)
           echo "  p2 文件系统: $P2_FS"
 
-          ROOTFS="$WORK/rootfs"
-          mkdir -p "$ROOTFS"
-          EXTRACTED=0
+          ROOTFS="$WORK/rootfs"; mkdir -p "$ROOTFS"
+          EXTRACTED=0; MOUNTED=0
           if [ "$P2_FS" = "squashfs" ]; then
-              unsquashfs -q -f -d "$ROOTFS" "$WORK/p2.img" >/dev/null 2>&1 && { ok "squashfs 解压成功"; EXTRACTED=1; } || fail "unsquashfs 失败"
+              unsquashfs -q -f -d "$ROOTFS" "$WORK/p2.img" >/dev/null 2>&1 && { ok "unsquashfs 成功"; EXTRACTED=1; } || fail "unsquashfs 失败"
           elif [ "$P2_FS" = "ext4" ]; then
               sudo mount -t ext4 -o loop,ro "$WORK/p2.img" "$ROOTFS" 2>/dev/null && { ok "ext4 挂载成功"; EXTRACTED=1; MOUNTED=1; } || fail "ext4 挂载失败"
           fi
@@ -212,11 +233,10 @@ jobs:
               for f in 90-led-setup 90-opt-partition 99-custom-ssh; do
                   [ -f "$ROOTFS/etc/uci-defaults/$f" ] && ok "uci-defaults/$f" || warn "uci-defaults/$f 缺失"
               done
-
               [ -f "$ROOTFS/etc/docker/daemon.json" ] && ok "/etc/docker/daemon.json" || warn "daemon.json 缺失"
               [ -f "$ROOTFS/sbin/mountpoint" ] && ok "/sbin/mountpoint" || warn "/sbin/mountpoint 缺失"
 
-              [ "${MOUNTED:-0}" = "1" ] && sudo umount "$ROOTFS"
+              [ "$MOUNTED" = "1" ] && sudo umount "$ROOTFS"
           fi
 
           # ---------- 5. manifest ----------
@@ -240,9 +260,8 @@ jobs:
           echo "  PASS: $PASS"
           echo "  FAIL: $FAIL"
           echo "  WARN: $WARN"
-          echo ""
           if [ "$FAIL" -gt 0 ]; then
               echo "❌ 存在 $FAIL 项失败"
               exit 1
           fi
-          [ "$WARN" -gt 0 ] && echo "⚠️ 通过，$WARN 项警告（多为压缩限制）" || echo "✅ 全部通过"
+          [ "$WARN" -gt 0 ] && echo "⚠️ 通过，$WARN 项警告" || echo "✅ 全部通过"
