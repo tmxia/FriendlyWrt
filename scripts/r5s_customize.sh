@@ -38,6 +38,55 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
+    # ============================================================
+    # 让 ptgen 天生生成 3 分区（kernel + rootfs + opt）
+    #   - 在 ptgen 调用前 truncate 文件预留 opt 空间
+    #   - ptgen 参数追加 -t 0x8300 -p 256m
+    # ============================================================
+    python3 - << 'PYEOF'
+import sys, os
+path = "scripts/gen_image_generic.sh"
+if not os.path.exists(path):
+    print(f"ERROR: {path} not found"); sys.exit(1)
+
+with open(path, "r") as f:
+    content = f.read()
+
+if "R5S_OPT_PATCHED" in content:
+    print("gen_image_generic.sh already patched, skip")
+    sys.exit(0)
+
+if 'set $(ptgen' not in content:
+    print("ERROR: 'set $(ptgen' not found"); sys.exit(1)
+if '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"' not in content:
+    print("ERROR: rootfs partition args not found"); sys.exit(1)
+
+# ① ptgen 前 truncate，预留 opt 256MB + 32MB 对齐余量
+content = content.replace(
+    'set $(ptgen',
+    'truncate -s $((KERNELSIZE + ROOTFSSIZE + 288))M "$OUTPUT"\nset $(ptgen',
+    1
+)
+
+# ② ptgen 追加第三分区
+content = content.replace(
+    '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"',
+    '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m" -t 0x8300 -p 256m',
+    1
+)
+
+content = "# R5S_OPT_PATCHED - added opt partition to ptgen\n" + content
+
+with open(path, "w") as f:
+    f.write(content)
+
+print("===== patched gen_image_generic.sh =====")
+for i, line in enumerate(content.split("\n"), 1):
+    if "R5S_OPT_PATCHED" in line or "truncate -s" in line or "ptgen -o" in line:
+        print(f"  {i}: {line}")
+print("========================================")
+PYEOF
+
     mkdir -p package/custom
     rm -rf package/custom/luci-app-amlogic
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
@@ -160,7 +209,7 @@ EOF
 
     cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
 #!/bin/sh
-# /opt 独立分区：boot 阶段一次性完成 —— 扩展 p3 到磁盘末尾 + 格式化 + 挂载
+# /opt 独立分区：首次启动扩展到磁盘末尾 + 格式化 + 挂载
 LOG="logger -t opt-init"
 
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
@@ -310,142 +359,6 @@ DTS_EOF
     echo "pwm-fan node injected (45C->1, 50C->2)"
 }
 
-# 在镜像 GPT 中加入 p3=/opt，自动处理 sparse/GPT 格式
-add_opt_partition() {
-    local OUT="bin/targets/rockchip/armv8"
-
-    process_img() {
-        local IMG="$1"
-
-        # 解压 .gz（容忍 trailing garbage）
-        if [ ! -f "$IMG" ] && [ -f "${IMG}.gz" ]; then
-            gunzip -c "${IMG}.gz" > "$IMG" 2>/dev/null || true
-            if [ ! -s "$IMG" ] || [ "$(stat -c%s "$IMG")" -lt 10000000 ]; then
-                echo "ERROR: gunzip failed for ${IMG}.gz"
-                return 1
-            fi
-            rm -f "${IMG}.gz"
-        fi
-        [ -f "$IMG" ] || return 0
-
-        # 探测头部 magic
-        local MAGIC
-        MAGIC=$(head -c 4 "$IMG" | od -An -tx1 | tr -d ' \n')
-        echo "img magic[0:4] = $MAGIC"
-
-        # Android sparse image magic (小端 0xED26FF3A)
-        if [ "$MAGIC" = "3aff26ed" ]; then
-            echo "detected Android sparse image, converting to raw"
-            if ! command -v simg2img >/dev/null 2>&1; then
-                echo "ERROR: simg2img not found (install android-sdk-libsparse-utils)"
-                return 1
-            fi
-            if ! simg2img "$IMG" "${IMG}.raw"; then
-                echo "ERROR: simg2img failed"
-                return 1
-            fi
-            mv "${IMG}.raw" "$IMG"
-            echo "converted to raw, size=$(stat -c%s "$IMG") bytes"
-        fi
-
-        # 打印 offset 512 处的签名用于诊断
-        local SIG512
-        SIG512=$(dd if="$IMG" bs=1 skip=512 count=8 2>/dev/null | od -An -c | tr -d ' \n')
-        echo "bytes[512:520] = $SIG512"
-
-        python3 - "$IMG" << 'PYEOF'
-import struct, zlib, sys, os
-
-img = sys.argv[1]
-SECTOR = 512
-ALIGN  = 2048
-P3_MIN = 256 * 1024 * 1024
-BACKUP_GPT_SECTORS = 33
-
-img_size = os.path.getsize(img)
-print(f"raw img size = {img_size} ({img_size//1024//1024} MB)")
-
-with open(img, 'r+b') as f:
-    f.seek(512)
-    header = bytearray(f.read(92))
-
-    if header[:8] != b'EFI PART':
-        f.seek(0)
-        head = f.read(64)
-        print(f"head[0:64] = {head.hex()}")
-        print("ERROR: not a GPT image (expected 'EFI PART' at offset 512)")
-        sys.exit(1)
-
-    f.seek(1024)
-    entries = bytearray(f.read(128 * 128))
-
-    p3_off = 2 * 128
-    if entries[p3_off:p3_off+16] != b'\x00' * 16:
-        print("p3 exists, skip"); sys.exit(0)
-
-    p2_last = struct.unpack('<Q', entries[128+40:128+48])[0]
-    p3_first = ((p2_last + 1 + ALIGN - 1) // ALIGN) * ALIGN
-
-    orig_img_size = os.path.getsize(img)
-    orig_last_lba = (orig_img_size // SECTOR) - 1
-
-    p3_last_min = p3_first + (P3_MIN // SECTOR) - 1
-    new_last_lba = max(orig_last_lba, p3_last_min + BACKUP_GPT_SECTORS)
-    new_img_size = (new_last_lba + 1) * SECTOR
-
-    if new_img_size > orig_img_size:
-        f.truncate(new_img_size)
-
-    p3_last = new_last_lba - BACKUP_GPT_SECTORS
-
-    entries[p3_off:p3_off+16] = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
-    entries[p3_off+16:p3_off+32] = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
-    entries[p3_off+32:p3_off+40] = struct.pack('<Q', p3_first)
-    entries[p3_off+40:p3_off+48] = struct.pack('<Q', p3_last)
-    name = "opt".encode('utf-16-le')
-    entries[p3_off+56:p3_off+56+len(name)] = name
-
-    header[32:40] = struct.pack('<Q', new_last_lba)
-    header[48:56] = struct.pack('<Q', p3_last)
-    header[88:92] = struct.pack('<I', zlib.crc32(entries) & 0xFFFFFFFF)
-    header[16:20] = b'\x00\x00\x00\x00'
-    header[16:20] = struct.pack('<I', zlib.crc32(header) & 0xFFFFFFFF)
-
-    f.seek(512);  f.write(header)
-    f.seek(1024); f.write(entries)
-
-    backup_header = bytearray(header)
-    backup_header[24:32] = struct.pack('<Q', new_last_lba)
-    backup_header[32:40] = struct.pack('<Q', 1)
-    backup_header[16:20] = b'\x00\x00\x00\x00'
-    backup_header[16:20] = struct.pack('<I', zlib.crc32(backup_header) & 0xFFFFFFFF)
-
-    f.seek((new_last_lba - 32) * SECTOR); f.write(entries)
-    f.seek(new_last_lba * SECTOR);        f.write(backup_header)
-
-    p3_mb = (p3_last - p3_first + 1) * SECTOR // 1024 // 1024
-    print(f"p3 added: LBA {p3_first}..{p3_last} ({p3_mb}MB), img={new_img_size//1024//1024}MB")
-PYEOF
-
-        rm -f "${IMG}.gz"
-        gzip -9n -c "$IMG" > "${IMG}.gz"
-        rm -f "$IMG"
-    }
-
-    local IMG_EXT4 IMG_SQ
-    IMG_EXT4=$(find "$OUT" -maxdepth 1 -type f \
-        \( -name "*nanopi-r5s-ext4-sysupgrade.img" -o -name "*nanopi-r5s-ext4-sysupgrade.img.gz" \) \
-        2>/dev/null | head -1)
-    [ -n "$IMG_EXT4" ] && process_img "${IMG_EXT4%.gz}"
-
-    IMG_SQ=$(find "$OUT" -maxdepth 1 -type f \
-        \( -name "*nanopi-r5s-squashfs-sysupgrade.img" -o -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" \) \
-        2>/dev/null | head -1)
-    [ -n "$IMG_SQ" ] && process_img "${IMG_SQ%.gz}"
-
-    ls -lh "$OUT"/*nanopi-r5s* 2>/dev/null || true
-}
-
 cache_restore() {
     if docker pull "$CACHE_IMAGE" 2>/dev/null; then
         cd /workdir
@@ -577,12 +490,11 @@ config_stage() {
 }
 
 case "$STAGE" in
-    pre)            pre_feeds ;;
-    post)           post_feeds ;;
-    config)         config_stage ;;
-    pre_build)      pre_build ;;
-    add_opt_part)   add_opt_partition ;;
+    pre)        pre_feeds ;;
+    post)       post_feeds ;;
+    config)     config_stage ;;
+    pre_build)  pre_build ;;
     cache_restore)  cache_restore ;;
     cache_save)     cache_save ;;
-    *)              echo "Usage: $0 {pre|post|config|pre_build|add_opt_part|cache_restore|cache_save}"; exit 1 ;;
+    *)          echo "Usage: $0 {pre|post|config|pre_build|cache_restore|cache_save}"; exit 1 ;;
 esac
