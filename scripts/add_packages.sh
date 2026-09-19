@@ -110,6 +110,10 @@ for pkg in $DISABLE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
     grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
 done
+echo "=== Disabled packages ==="
+for pkg in $DISABLE_PKGS; do
+    grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "  [DISABLED] $pkg" || echo "  [MISS]     $pkg"
+done
 
 # Force-enable required packages
 for pkg in $ENSURE_PKGS; do
@@ -117,12 +121,20 @@ for pkg in $ENSURE_PKGS; do
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
+echo "=== Enabled system packages ==="
+for pkg in $ENSURE_PKGS; do
+    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "  [ENABLED]  $pkg" || echo "  [MISS]     $pkg"
+done
 
 # Force-enable Clashoo packages in .config
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
     echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+done
+echo "=== Enabled Clashoo packages ==="
+for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
+    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "  [ENABLED]  $pkg" || echo "  [MISS]     $pkg"
 done
 
 cd ..
