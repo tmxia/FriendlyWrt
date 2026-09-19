@@ -250,8 +250,8 @@ jobs:
           file "$IMG_SQ_GZ" | grep -q "gzip compressed data" || exit 1
           python3 -c "import zlib;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_SQ_GZ','rb').read());exit(0 if d.eof else 1)" || exit 1
 
-          echo "===== 校验 ext4 镜像 GPT 分区 ====="
-          python3 -c "import gzip,sys;f=gzip.open(sys.argv[1],'rb');f.seek(512);assert f.read(8)==b'EFI PART','not GPT';f.seek(1024);e=f.read(128*128);assert e[256:272]!=b'\x00'*16,'p3 missing';print('p3 present in GPT')" "$IMG_EXT4_GZ"
+          echo "===== 校验 ext4 镜像 MBR 分区 ====="
+          python3 -c "import gzip,sys;f=gzip.open(sys.argv[1],'rb');f.seek(446);e=f.read(64);t=e[32+4];assert t!=0,'p3 missing (type=0)';print(f'p3 present in MBR, type=0x{t:02x}')" "$IMG_EXT4_GZ"
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
