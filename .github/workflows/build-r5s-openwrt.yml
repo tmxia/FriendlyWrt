@@ -40,34 +40,13 @@ jobs:
     if: github.event.repository.owner.id == github.event.sender.id
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
-      kernel_tag: ${{ steps.kernel.outputs.tag }}
     steps:
-      - name: Resolve kernel tag suffix
-        id: kernel
-        run: |
-          MODE="${{ inputs.kernel_mode }}"
-          [ -z "$MODE" ] && MODE="upstream"
-
-          if [ "$MODE" = "latest" ]; then
-            KV=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
-                 | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
-                 | sort -uV | tail -1 \
-                 | grep -oE '6\.12\.[0-9]+')
-            [ -z "$KV" ] && { echo "❌ 拉取 kernel.org 失败"; exit 1; }
-            SUFFIX="-k$(echo "$KV" | tr -d '.')"
-            echo "最新 6.12.x: $KV (suffix: $SUFFIX)"
-          else
-            SUFFIX=""
-            echo "使用 upstream 默认内核"
-          fi
-          echo "tag=$SUFFIX" >> $GITHUB_OUTPUT
-
       - name: Generate release tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}${{ steps.kernel.outputs.tag }}-$(date +%Y.%m.%d)"
+          BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-$(date +%Y.%m.%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -168,13 +147,12 @@ jobs:
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      # 动态获取 kernel.org 最新 6.12.x，与 OpenWrt 内置版本对比，若更新则应用
       - name: Auto-update kernel
         if: inputs.kernel_mode == 'latest'
         run: |
           cd /workdir/openwrt
           FILE="target/linux/generic/kernel-6.12"
-          [ -f "$FILE" ] || { echo "❌ 无 $FILE"; exit 1; }
+          [ -f "$FILE" ] || { echo "无 $FILE"; exit 1; }
 
           CUR=$(grep -oE '^LINUX_VERSION-6\.12 = \.[0-9]+' "$FILE" | grep -oE '[0-9]+$')
           LATEST=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
@@ -186,19 +164,17 @@ jobs:
           echo "kernel.org:  6.12.$LATEST"
 
           if [ "$CUR" = "$LATEST" ]; then
-            echo "✅ 已是最新，跳过"
+            echo "已是最新，跳过"
             exit 0
           fi
 
           HASH=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc \
                  | grep "linux-6.12.$LATEST.tar.xz" | awk '{print $1}')
-          [ ${#HASH} -eq 64 ] || { echo "❌ 无法获取 hash"; exit 1; }
+          [ ${#HASH} -eq 64 ] || { echo "无法获取 hash"; exit 1; }
 
           echo "升级 6.12.$CUR → 6.12.$LATEST"
           sed -i "s|^LINUX_VERSION-6.12 = .*|LINUX_VERSION-6.12 = .$LATEST|" "$FILE"
           sed -i "s|^LINUX_KERNEL_HASH-6\.12\..*|LINUX_KERNEL_HASH-6.12.$LATEST = $HASH|" "$FILE"
-
-          echo "===== 修改后 ====="
           grep -E '^LINUX_VERSION-6\.12|^LINUX_KERNEL_HASH-6\.12' "$FILE"
 
       - name: Prepare feeds
@@ -327,7 +303,7 @@ jobs:
 
           mkdir -p $GITHUB_WORKSPACE/artifact
           DATE=$(date +%Y.%m.%d)
-          PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}${{ needs.prepare_release.outputs.kernel_tag }}-${DATE}"
+          PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
           cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
           cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
