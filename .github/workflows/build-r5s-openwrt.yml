@@ -101,7 +101,6 @@ jobs:
           sudo docker image prune --all --force || true
           sudo apt-get clean
 
-          # 8G swap，防止 OOM
           sudo swapoff -a || true
           sudo rm -f /swapfile
           sudo fallocate -l 8G /swapfile
@@ -109,7 +108,6 @@ jobs:
           sudo mkswap /swapfile > /dev/null
           sudo swapon /swapfile
 
-          # Docker 数据目录迁移到 /workdir（根分区空间不足）
           sudo systemctl stop docker || true
           sudo mkdir -p /workdir/docker
           echo '{"data-root": "/workdir/docker"}' | sudo tee /etc/docker/daemon.json
@@ -159,7 +157,6 @@ jobs:
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
           make defconfig
 
-          # 强制关闭 legacy iptables
           for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
             sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
             grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
@@ -189,7 +186,6 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          # 忽略时间戳会刷新但内容未变的 stamp 文件
           IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$"
 
           CHANGED=$(find build_dir staging_dir -type f -newer /workdir/base_compilation_marker -path "*/stamp/*" 2>/dev/null | \
@@ -238,8 +234,16 @@ jobs:
             exit 1
           fi
 
+      # ↓↓↓ 新增：格式诊断 ↓↓↓
+      - name: Diagnose image formats
+        if: success()
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/scripts/diagnose_images.sh bin/targets/rockchip/armv8
+
       - name: Post-process images
         if: success()
+        continue-on-error: true
         run: |
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
@@ -288,13 +292,22 @@ jobs:
             $GITHUB_WORKSPACE/artifact/*-manifest.txt \
             $GITHUB_WORKSPACE/artifact/*-sha256sums.txt \
             $GITHUB_WORKSPACE/artifact/SHA256SUMS \
-            --clobber
+            --clobber || true
 
       - uses: actions/upload-artifact@v4
         if: success()
         with:
           name: r5s-firmware
           path: artifact/
+          retention-days: 30
+
+      - name: Upload diagnose log as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r5s-diagnose
+          path: /tmp/diagnose.log
+          if-no-files-found: ignore
           retention-days: 30
 
   cleanup_self:
