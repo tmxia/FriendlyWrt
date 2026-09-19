@@ -11,14 +11,14 @@ on:
         default: 'true'
         type: choice
         options: ['false', 'true']
-      openwrt_branch:
-        description: 'OpenWrt branch'
+      kernel_mode:
+        description: 'Kernel mode'
         required: false
-        default: 'openwrt-25.12'
+        default: 'upstream'
         type: choice
         options:
-          - 'openwrt-25.12'
-          - 'main'
+          - 'upstream'
+          - 'latest'
 
 permissions:
   contents: write
@@ -29,6 +29,7 @@ env:
   AUTO_REPLACE_TAG: 'false'
   OPENWRT_VER: '25.12'
   MODEL_NAME: 'R5S'
+  OPENWRT_BRANCH: 'openwrt-25.12'
   OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
   CONFIG_FILE: 'scripts/r5s.config'
   DIY_SH: 'scripts/r5s_customize.sh'
@@ -39,28 +40,34 @@ jobs:
     if: github.event.repository.owner.id == github.event.sender.id
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
-      branch: ${{ steps.branch.outputs.value }}
+      kernel_tag: ${{ steps.kernel.outputs.tag }}
     steps:
-      - name: Resolve branch
-        id: branch
+      - name: Resolve kernel tag suffix
+        id: kernel
         run: |
-          BRANCH="${{ inputs.openwrt_branch }}"
-          [ -z "$BRANCH" ] && BRANCH="openwrt-25.12"
-          echo "value=$BRANCH" >> $GITHUB_OUTPUT
-          echo "分支: $BRANCH"
+          MODE="${{ inputs.kernel_mode }}"
+          [ -z "$MODE" ] && MODE="upstream"
+
+          if [ "$MODE" = "latest" ]; then
+            KV=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
+                 | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
+                 | sort -uV | tail -1 \
+                 | grep -oE '6\.12\.[0-9]+')
+            [ -z "$KV" ] && { echo "❌ 拉取 kernel.org 失败"; exit 1; }
+            SUFFIX="-k$(echo "$KV" | tr -d '.')"
+            echo "最新 6.12.x: $KV (suffix: $SUFFIX)"
+          else
+            SUFFIX=""
+            echo "使用 upstream 默认内核"
+          fi
+          echo "tag=$SUFFIX" >> $GITHUB_OUTPUT
 
       - name: Generate release tag
         id: release_tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BRANCH="${{ steps.branch.outputs.value }}"
-          if [ "$BRANCH" = "main" ]; then
-            BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-main-$(date +%Y.%m.%d)"
-          else
-            BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-$(date +%Y.%m.%d)"
-          fi
-
+          BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}${{ steps.kernel.outputs.tag }}-$(date +%Y.%m.%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -91,6 +98,7 @@ jobs:
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -156,13 +164,42 @@ jobs:
       - name: Clone OpenWrt
         working-directory: /workdir
         run: |
-          git clone -b ${{ needs.prepare_release.outputs.branch }} --single-branch \
+          git clone -b ${{ env.OPENWRT_BRANCH }} --single-branch \
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-          echo "===== 内核版本 ====="
+      # 动态获取 kernel.org 最新 6.12.x，与 OpenWrt 内置版本对比，若更新则应用
+      - name: Auto-update kernel
+        if: inputs.kernel_mode == 'latest'
+        run: |
           cd /workdir/openwrt
-          grep -E '^LINUX_VERSION-6\.12' include/kernel-version.mk || true
+          FILE="target/linux/generic/kernel-6.12"
+          [ -f "$FILE" ] || { echo "❌ 无 $FILE"; exit 1; }
+
+          CUR=$(grep -oE '^LINUX_VERSION-6\.12 = \.[0-9]+' "$FILE" | grep -oE '[0-9]+$')
+          LATEST=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
+                   | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
+                   | sort -uV | tail -1 \
+                   | grep -oE '6\.12\.[0-9]+' | cut -d. -f3)
+
+          echo "OpenWrt 内置: 6.12.$CUR"
+          echo "kernel.org:  6.12.$LATEST"
+
+          if [ "$CUR" = "$LATEST" ]; then
+            echo "✅ 已是最新，跳过"
+            exit 0
+          fi
+
+          HASH=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc \
+                 | grep "linux-6.12.$LATEST.tar.xz" | awk '{print $1}')
+          [ ${#HASH} -eq 64 ] || { echo "❌ 无法获取 hash"; exit 1; }
+
+          echo "升级 6.12.$CUR → 6.12.$LATEST"
+          sed -i "s|^LINUX_VERSION-6.12 = .*|LINUX_VERSION-6.12 = .$LATEST|" "$FILE"
+          sed -i "s|^LINUX_KERNEL_HASH-6\.12\..*|LINUX_KERNEL_HASH-6.12.$LATEST = $HASH|" "$FILE"
+
+          echo "===== 修改后 ====="
+          grep -E '^LINUX_VERSION-6\.12|^LINUX_KERNEL_HASH-6\.12' "$FILE"
 
       - name: Prepare feeds
         run: |
@@ -190,9 +227,8 @@ jobs:
           done
           make defconfig
 
-      # 缓存仅在默认分支启用，避免 main 分支混用 openwrt-25.12 缓存
       - name: Restore cache
-        if: needs.prepare_release.outputs.branch == 'openwrt-25.12'
+        if: inputs.kernel_mode != 'latest'
         run: |
           cd /workdir
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_restore
@@ -212,7 +248,7 @@ jobs:
       - name: Checkpoint base cache
         if: |
           steps.compile_base.outcome == 'success' &&
-          needs.prepare_release.outputs.branch == 'openwrt-25.12'
+          inputs.kernel_mode != 'latest'
         run: |
           cd /workdir/openwrt
 
@@ -270,10 +306,8 @@ jobs:
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
 
-          echo "===== 实际编译的内核版本 ====="
-          grep -E '^LINUX_VERSION-6\.12' include/kernel-version.mk || true
-          find bin/targets/rockchip/armv8 -maxdepth 1 -name "kmods" -type d -exec ls {} \; 2>/dev/null || true
-          ls -d bin/targets/rockchip/armv8/kmods/*/ 2>/dev/null | head -1 || true
+          echo "===== 编译使用的内核版本 ====="
+          grep -E '^LINUX_VERSION-6\.12' target/linux/generic/kernel-6.12 || true
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -293,11 +327,7 @@ jobs:
 
           mkdir -p $GITHUB_WORKSPACE/artifact
           DATE=$(date +%Y.%m.%d)
-          if [ "${{ needs.prepare_release.outputs.branch }}" = "main" ]; then
-            PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-main-${DATE}"
-          else
-            PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
-          fi
+          PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}${{ needs.prepare_release.outputs.kernel_tag }}-${DATE}"
 
           cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
           cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
