@@ -177,13 +177,12 @@ esac
 OPT_DEV="${DISK}${P}3"
 [ ! -b "$OPT_DEV" ] && { $LOG "p3 not found, skip"; exit 0; }
 
-# 首次启动：扩展 p3 到磁盘末尾
 if [ ! -f /etc/.opt_resized ]; then
     DISK_SECTORS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
     if [ -n "$DISK_SECTORS" ]; then
         P3_START=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
         P3_CURRENT_SIZE=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
-        TARGET_SIZE=$((DISK_SECTORS - P3_START - 33))   # 预留 33 扇区给 backup GPT
+        TARGET_SIZE=$((DISK_SECTORS - P3_START - 33))
 
         if [ -n "$P3_START" ] && [ "$P3_CURRENT_SIZE" -lt "$TARGET_SIZE" ]; then
             $LOG "resizing p3: current=$P3_CURRENT_SIZE target=$TARGET_SIZE"
@@ -197,7 +196,6 @@ if [ ! -f /etc/.opt_resized ]; then
     touch /etc/.opt_resized
 fi
 
-# 若 p3 未格式化，按当前大小格式化为 ext4
 FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
 if [ "$FSTYPE" != "ext4" ]; then
     $LOG "mkfs.ext4 on $OPT_DEV"
@@ -312,16 +310,17 @@ DTS_EOF
     echo "pwm-fan node injected (45C->1, 50C->2)"
 }
 
-# 在镜像 GPT 中加入 p3=/opt（至少 256MB），并完整更新 primary + backup GPT
+# 在镜像 GPT 中加入 p3=/opt，自动处理 sparse/GPT 格式
 add_opt_partition() {
     local OUT="bin/targets/rockchip/armv8"
 
     process_img() {
         local IMG="$1"
 
+        # 解压 .gz（容忍 trailing garbage）
         if [ ! -f "$IMG" ] && [ -f "${IMG}.gz" ]; then
             gunzip -c "${IMG}.gz" > "$IMG" 2>/dev/null || true
-            if [ ! -s "$IMG" ] || [ "$(stat -c%s "$IMG")" -lt 100000000 ]; then
+            if [ ! -s "$IMG" ] || [ "$(stat -c%s "$IMG")" -lt 10000000 ]; then
                 echo "ERROR: gunzip failed for ${IMG}.gz"
                 return 1
             fi
@@ -329,20 +328,53 @@ add_opt_partition() {
         fi
         [ -f "$IMG" ] || return 0
 
+        # 探测头部 magic
+        local MAGIC
+        MAGIC=$(head -c 4 "$IMG" | od -An -tx1 | tr -d ' \n')
+        echo "img magic[0:4] = $MAGIC"
+
+        # Android sparse image magic (小端 0xED26FF3A)
+        if [ "$MAGIC" = "3aff26ed" ]; then
+            echo "detected Android sparse image, converting to raw"
+            if ! command -v simg2img >/dev/null 2>&1; then
+                echo "ERROR: simg2img not found (install android-sdk-libsparse-utils)"
+                return 1
+            fi
+            if ! simg2img "$IMG" "${IMG}.raw"; then
+                echo "ERROR: simg2img failed"
+                return 1
+            fi
+            mv "${IMG}.raw" "$IMG"
+            echo "converted to raw, size=$(stat -c%s "$IMG") bytes"
+        fi
+
+        # 打印 offset 512 处的签名用于诊断
+        local SIG512
+        SIG512=$(dd if="$IMG" bs=1 skip=512 count=8 2>/dev/null | od -An -c | tr -d ' \n')
+        echo "bytes[512:520] = $SIG512"
+
         python3 - "$IMG" << 'PYEOF'
 import struct, zlib, sys, os
 
 img = sys.argv[1]
 SECTOR = 512
 ALIGN  = 2048
-P3_MIN = 256 * 1024 * 1024   # p3 最小 256MB
-BACKUP_GPT_SECTORS = 33      # 32 entries + 1 header
+P3_MIN = 256 * 1024 * 1024
+BACKUP_GPT_SECTORS = 33
+
+img_size = os.path.getsize(img)
+print(f"raw img size = {img_size} ({img_size//1024//1024} MB)")
 
 with open(img, 'r+b') as f:
     f.seek(512)
     header = bytearray(f.read(92))
+
     if header[:8] != b'EFI PART':
-        print("ERROR: not a GPT image"); sys.exit(1)
+        f.seek(0)
+        head = f.read(64)
+        print(f"head[0:64] = {head.hex()}")
+        print("ERROR: not a GPT image (expected 'EFI PART' at offset 512)")
+        sys.exit(1)
 
     f.seek(1024)
     entries = bytearray(f.read(128 * 128))
@@ -354,14 +386,10 @@ with open(img, 'r+b') as f:
     p2_last = struct.unpack('<Q', entries[128+40:128+48])[0]
     p3_first = ((p2_last + 1 + ALIGN - 1) // ALIGN) * ALIGN
 
-    # 原始文件末尾（如果没被扩展过）
     orig_img_size = os.path.getsize(img)
     orig_last_lba = (orig_img_size // SECTOR) - 1
 
-    # p3 至少 256MB
     p3_last_min = p3_first + (P3_MIN // SECTOR) - 1
-
-    # 新的磁盘末尾：p3 结束位置 + backup GPT 占用
     new_last_lba = max(orig_last_lba, p3_last_min + BACKUP_GPT_SECTORS)
     new_img_size = (new_last_lba + 1) * SECTOR
 
@@ -370,7 +398,6 @@ with open(img, 'r+b') as f:
 
     p3_last = new_last_lba - BACKUP_GPT_SECTORS
 
-    # ---------- 写入 p3 entry ----------
     entries[p3_off:p3_off+16] = bytes.fromhex('af3dc60f838472478e793d69d8477de4')
     entries[p3_off+16:p3_off+32] = bytes.fromhex('8f3c4a1e5b2d4f7e9a1c3e5f7a9b1d3f')
     entries[p3_off+32:p3_off+40] = struct.pack('<Q', p3_first)
@@ -378,10 +405,8 @@ with open(img, 'r+b') as f:
     name = "opt".encode('utf-16-le')
     entries[p3_off+56:p3_off+56+len(name)] = name
 
-    # ---------- 完整更新 primary header ----------
-    header[24:32] = struct.pack('<Q', 1)              # my_lba = 1
-    header[32:40] = struct.pack('<Q', new_last_lba)   # alternate_lba = 磁盘末尾
-    header[48:56] = struct.pack('<Q', p3_last)        # last_usable_lba = p3_last
+    header[32:40] = struct.pack('<Q', new_last_lba)
+    header[48:56] = struct.pack('<Q', p3_last)
     header[88:92] = struct.pack('<I', zlib.crc32(entries) & 0xFFFFFFFF)
     header[16:20] = b'\x00\x00\x00\x00'
     header[16:20] = struct.pack('<I', zlib.crc32(header) & 0xFFFFFFFF)
@@ -389,10 +414,9 @@ with open(img, 'r+b') as f:
     f.seek(512);  f.write(header)
     f.seek(1024); f.write(entries)
 
-    # ---------- 写 backup GPT 到磁盘末尾 ----------
     backup_header = bytearray(header)
-    backup_header[24:32] = struct.pack('<Q', new_last_lba)   # my_lba
-    backup_header[32:40] = struct.pack('<Q', 1)              # alternate_lba
+    backup_header[24:32] = struct.pack('<Q', new_last_lba)
+    backup_header[32:40] = struct.pack('<Q', 1)
     backup_header[16:20] = b'\x00\x00\x00\x00'
     backup_header[16:20] = struct.pack('<I', zlib.crc32(backup_header) & 0xFFFFFFFF)
 
