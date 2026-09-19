@@ -1,0 +1,169 @@
+name: Diagnose Image Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_BRANCH: 'openwrt-25.12'
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone OpenWrt (shallow)
+        run: |
+          git clone --depth 1 -b ${OPENWRT_BRANCH} --single-branch \
+            ${OPENWRT_REPO} /tmp/openwrt 2>&1 | tail -3
+
+      - name: Apply feeds.conf (与主流程一致)
+        run: |
+          cd /tmp/openwrt
+          [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf
+          sed -i '/^#/d' feeds.conf
+          sed -i -e 's|git.openwrt.org/feed|github.com/openwrt|g' \
+                 -e 's|git.openwrt.org/project|github.com/openwrt|g' feeds.conf
+          grep -q "src-git clashoo" feeds.conf || \
+            echo "src-git clashoo https://github.com/kenzok8/openwrt-clashoo.git;main" >> feeds.conf
+
+      - name: Collect everything into one log
+        run: |
+          set +e
+          LOG=/tmp/diagnose.log
+          cd /tmp/openwrt
+
+          sep() { printf '%.0s%s\n' {1..80} | tr ' ' '='; }
+          hdr() { echo ""; sep; echo "## $1"; sep; }
+
+          exec > >(tee "$LOG") 2>&1
+
+          hdr "GIT INFO"
+          git log -1 --format="commit: %H"
+          git log -1 --format="date:   %cd"
+          git branch --show-current
+
+          hdr "TARGET/linux/rockchip/image 目录树"
+          find target/linux/rockchip/image -type f | sort
+
+          hdr "target/linux/rockchip/image/Makefile (全文)"
+          cat target/linux/rockchip/image/Makefile 2>/dev/null
+
+          hdr "target/linux/rockchip/image/armv8.mk (全文)"
+          cat target/linux/rockchip/image/armv8.mk 2>/dev/null
+
+          hdr "target/linux/rockchip/image 下所有 *.mk 全文"
+          for f in target/linux/rockchip/image/*.mk; do
+            [ -f "$f" ] || continue
+            echo ""
+            echo "----- $f -----"
+            cat "$f"
+          done
+
+          hdr "所有 image/*.cfg (genimage 配置文件)"
+          for f in target/linux/rockchip/image/*.cfg target/linux/rockchip/image/*/*.cfg; do
+            [ -f "$f" ] || continue
+            echo ""
+            echo "----- $f -----"
+            cat "$f"
+          done
+
+          hdr "R5S 相关关键字全文搜索"
+          grep -rn -i "nanopi-r5s\|nanopi_r5s\|friendlyarm.*r5s" \
+            target/linux/rockchip/ 2>/dev/null | head -80
+
+          hdr "IMAGE/ 与 Build/ 定义搜索 (rockchip)"
+          grep -rn "^IMAGE/\|define Build/\|IMAGE/sdcard\|sdcard.img" \
+            target/linux/rockchip/image/ 2>/dev/null | head -80
+
+          hdr "include/image.mk 里 sdcard 相关"
+          grep -n "sdcard\|IMAGE/sdcard\|Build/sdcard" \
+            include/image.mk include/*.mk 2>/dev/null | head -60
+
+          hdr "include/image.mk 里 genimage 相关"
+          grep -n "genimage" include/image.mk include/*.mk 2>/dev/null | head -40
+
+          hdr "include/image.mk 里 ptgen 相关"
+          grep -n "ptgen" include/image.mk include/*.mk 2>/dev/null | head -40
+
+          hdr "Build/genimage 宏定义 (若存在)"
+          awk '/define Build\/genimage/,/^endef/' include/image.mk 2>/dev/null
+
+          hdr "Build/sdcard-img 宏定义 (若存在)"
+          awk '/define Build\/sdcard-img/,/^endef/' include/image.mk 2>/dev/null
+
+          hdr "Build/ptgen 宏定义 (若存在)"
+          awk '/define Build\/ptgen/,/^endef/' include/image.mk 2>/dev/null
+
+          hdr "Build/boot-img 宏定义 (若存在)"
+          awk '/define Build\/boot-img/,/^endef/' include/image.mk 2>/dev/null
+
+          hdr "target/linux/rockchip/Makefile"
+          cat target/linux/rockchip/Makefile 2>/dev/null
+
+          hdr "target/linux/rockchip/config-6.12 中 partition/block 相关"
+          grep -E "CONFIG_(BLK|EFI_PARTITION|PARTITION|MTD|MMC_BLOCK|GPT)" \
+            target/linux/rockchip/config-6.12 2>/dev/null | head -60
+
+          hdr "package/base-files/files/sbin/ 与 block-mount 相关"
+          ls -la package/base-files/files/sbin/ 2>/dev/null
+          find package/base-files/files -name "*partition*" -o -name "*mount*" 2>/dev/null | head -20
+
+          hdr "genimage 在 staging_dir 或工具链里是否存在 (不构建时可能为空)"
+          ls -la staging_dir/host/bin/genimage 2>/dev/null || echo "  not built"
+          find . -name "genimage" -type f 2>/dev/null | head -5
+
+          hdr "ptgen 工具源码位置"
+          find . -name "ptgen*" -type f 2>/dev/null | head -10
+          grep -rn "ptgen" scripts/ tools/ 2>/dev/null | head -20
+
+          hdr "sysupgrade.img / sdcard.img 输出规则搜索"
+          grep -rn "sysupgrade.img\|sdcard.img\|factory.img" \
+            target/linux/rockchip/ include/ 2>/dev/null | head -40
+
+          hdr "CONFIG_TARGET_ROOTFS_PARTSIZE 用法"
+          grep -rn "TARGET_ROOTFS_PARTSIZE\|ROOTFS_PARTSIZE" \
+            include/ scripts/ config/ 2>/dev/null | head -30
+
+          hdr "CONFIG_TARGET_KERNEL_PARTSIZE 用法"
+          grep -rn "TARGET_KERNEL_PARTSIZE\|KERNEL_PARTSIZE" \
+            include/ scripts/ config/ 2>/dev/null | head -30
+
+          hdr "scripts/ 目录中与 image 生成相关的脚本"
+          ls -la scripts/ | grep -i "image\|genimage\|partition" || echo "  none"
+
+          hdr "OpenWrt 版本信息"
+          cat version 2>/dev/null || echo "no version file"
+          cat include/version.mk 2>/dev/null | head -10
+
+          hdr "END"
+          echo "诊断完成，日志大小: $(stat -c%s "$LOG") 字节"
+
+      - name: Show log in summary
+        if: always()
+        run: |
+          echo "## Diagnose Summary" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          head -200 /tmp/diagnose.log >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload diagnose log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-image-diagnose
+          path: /tmp/diagnose.log
+          retention-days: 30
+
+      - name: Upload rockchip image dir
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rockchip-image-dir
+          path: /tmp/openwrt/target/linux/rockchip/image/
+          retention-days: 30
