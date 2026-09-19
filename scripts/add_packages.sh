@@ -159,4 +159,9 @@ echo "--- DISABLED ---"
 for pkg in $DISABLE_PKGS; do check_pkg "$pkg"; done
 
 cd ..
+
+# Enlarge userdata partition to 2G
+PARTMAP_SCRIPT="scripts/sd-fuse/tools/generate-partmap-txt.sh"
+[ -f "$PARTMAP_SCRIPT" ] && sed -i 's/USERDATA_SIZE=1073741824/USERDATA_SIZE=2147483648/' "$PARTMAP_SCRIPT"
+
 echo "All configurations applied and verified."
