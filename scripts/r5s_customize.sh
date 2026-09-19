@@ -39,9 +39,9 @@ post_feeds() {
     done
 
     # ============================================================
-    # 让 ptgen 天生生成 3 分区（kernel + rootfs + opt）
-    #   - 在 ptgen 调用前 truncate 文件预留 opt 空间
-    #   - ptgen 参数追加 -t 0x8300 -p 256m
+    # 让 ptgen（MBR 模式）天生生成 3 分区：kernel + rootfs + opt
+    #   - ptgen 前 truncate 预留 opt 空间
+    #   - ptgen 参数追加 -t 0x83 -p 256m（MBR Linux 分区）
     # ============================================================
     python3 - << 'PYEOF'
 import sys, os
@@ -68,14 +68,14 @@ content = content.replace(
     1
 )
 
-# ② ptgen 追加第三分区
+# ② ptgen 追加第三分区（MBR: 0x83 = Linux filesystem）
 content = content.replace(
     '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"',
-    '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m" -t 0x8300 -p 256m',
+    '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m" -t 0x83 -p 256m',
     1
 )
 
-content = "# R5S_OPT_PATCHED - added opt partition to ptgen\n" + content
+content = "# R5S_OPT_PATCHED - added opt partition (MBR) to ptgen\n" + content
 
 with open(path, "w") as f:
     f.write(content)
