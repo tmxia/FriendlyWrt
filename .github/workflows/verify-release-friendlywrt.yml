@@ -30,6 +30,15 @@ jobs:
           [ -n "$TAG" ] || { echo "ERROR: no release tag"; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
+      - name: List available assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          echo "Assets in $RELEASE_TAG:"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | sort
+
   verify:
     needs: resolve_tag
     runs-on: ubuntu-22.04
@@ -68,32 +77,22 @@ jobs:
       - name: Analyze GPT (${{ matrix.version }})
         run: |
           gunzip -f firmware.img.gz
-          echo ""
-          echo "==================== [${{ matrix.version }}] GPT 分区表 ===================="
+          echo "==================== [${{ matrix.version }}] GPT ===================="
           sudo sgdisk -p firmware.img
           echo ""
-          echo "==================== [${{ matrix.version }}] userdata 分区行 ===================="
+          echo "==================== [${{ matrix.version }}] userdata ===================="
           sudo sgdisk -p firmware.img | grep -i userdata || echo "(未找到 userdata)"
 
       - name: Verify userdata size (${{ matrix.version }})
         run: |
-          echo "==================== [${{ matrix.version }}] 判定 ===================="
           UD_LINE=$(sudo sgdisk -p firmware.img | grep -i userdata)
           echo "userdata 行: $UD_LINE"
           if echo "$UD_LINE" | grep -q "${{ matrix.expect_gib }}"; then
-            echo "✅ userdata 已是 ${{ matrix.expect_gib }} —— 编译侧分区修改成功"
+            echo "✅ userdata 已是 ${{ matrix.expect_gib }}"
           elif echo "$UD_LINE" | grep -q "${{ matrix.expect_mib_old }}"; then
-            echo "❌ userdata 仍是 ${{ matrix.expect_mib_old }} —— 编译侧 sed 未生效或被覆盖"
+            echo "❌ userdata 仍是 ${{ matrix.expect_mib_old }} —— 编译侧修改未生效"
             exit 1
           else
-            echo "⚠️ 未识别的 userdata 大小，请人工核对"
+            echo "⚠️ 未识别的 userdata 大小"
             exit 1
           fi
-
-      - name: Extract parameter info from image
-        run: |
-          echo "==================== [${{ matrix.version }}] 镜像内 mtdparts 字符串 ===================="
-          sudo strings firmware.img 2>/dev/null | grep -i "mtdparts" | head -5 || echo "(未找到 mtdparts 字符串)"
-          echo ""
-          echo "==================== [${{ matrix.version }}] 镜像内 userdata 相关字符串 ===================="
-          sudo strings firmware.img 2>/dev/null | grep -iE "userdata|0x00200000|0x00400000|0x00500000" | head -10 || echo "(未找到)"
