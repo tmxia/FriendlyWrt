@@ -40,7 +40,7 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ptgen 天生生成 3 分区：kernel + rootfs + opt
+    # ptgen 生成 3 分区：kernel + rootfs + opt
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -120,9 +120,11 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
+    # 首次启动初始化：docker0 声明 → 网络/防火墙 → 密码/主题 → SSH → LED → /opt 分区
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
-# 补全 docker0 network 声明（25.12 上游缺此配置，容器网络会被 firewall4 drop）
+
+# docker0 network 声明（25.12 上游缺，否则容器网络被 firewall4 drop）
 if ! uci -q get network.docker.device >/dev/null 2>&1; then
     uci set network.docker='interface'
     uci set network.docker.device='docker0'
@@ -140,6 +142,8 @@ uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
 uci delete network.lan.netmask 2>/dev/null
 uci set network.lan.delegate='0'
+uci set network.wan.clientid=''
+uci set network.wan.peerdns='1'
 uci commit network
 
 uci set dhcp.lan.ignore='1'
@@ -152,12 +156,7 @@ uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
 uci commit firewall
 
-uci set network.wan.clientid=''
-uci set network.wan.peerdns='1'
-uci commit network
-
 printf "tony\ntony\n" | passwd root
-
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
 uci commit luci
@@ -165,122 +164,93 @@ uci commit luci
 for f in /etc/apk/repositories.d/*.list; do
     [ -f "$f" ] && sed -i '/clashoo/d; /dockerfeed/d' "$f"
 done
-exit 0
-EOF
-    chmod +x files/etc/uci-defaults/99-custom
 
-    cat > files/etc/uci-defaults/99-custom-ssh << 'EOF'
-#!/bin/sh
 SSHD_CONFIG="/etc/ssh/sshd_config"
 if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' "$SSHD_CONFIG"
     /etc/init.d/sshd enable
     /etc/init.d/sshd restart
 fi
-exit 0
-EOF
-    chmod +x files/etc/uci-defaults/99-custom-ssh
 
-    cat > files/etc/uci-defaults/90-led-setup << 'EOF'
-#!/bin/sh
-uci -q delete system.wan_led
-uci set system.wan_led=led
-uci set system.wan_led.name='wan'
-uci set system.wan_led.sysfs='green:wan'
-uci set system.wan_led.trigger='netdev'
-uci set system.wan_led.dev='eth0'
-uci set system.wan_led.mode='link'
-
-uci -q delete system.lan1_led
-uci set system.lan1_led=led
-uci set system.lan1_led.name='lan1'
-uci set system.lan1_led.sysfs='green:lan-1'
-uci set system.lan1_led.trigger='netdev'
-uci set system.lan1_led.dev='eth1'
-uci set system.lan1_led.mode='link'
-
-uci -q delete system.lan2_led
-uci set system.lan2_led=led
-uci set system.lan2_led.name='lan2'
-uci set system.lan2_led.sysfs='green:lan-2'
-uci set system.lan2_led.trigger='netdev'
-uci set system.lan2_led.dev='eth2'
-uci set system.lan2_led.mode='link'
-
+for entry in "wan_led:green:wan:eth0" "lan1_led:green:lan-1:eth1" "lan2_led:green:lan-2:eth2"; do
+    name="${entry%%:*}"; rest="${entry#*:}"
+    sysfs="${rest%%:*}"; dev="${rest#*:}"
+    uci -q delete "system.${name}"
+    uci set "system.${name}=led"
+    uci set "system.${name}.name=${name}"
+    uci set "system.${name}.sysfs=${sysfs}"
+    uci set "system.${name}.trigger=netdev"
+    uci set "system.${name}.dev=${dev}"
+    uci set "system.${name}.mode=link"
+done
 uci commit system
-/etc/init.d/led restart
-exit 0
-EOF
-    chmod +x files/etc/uci-defaults/90-led-setup
+/etc/init.d/led restart 2>/dev/null || true
 
-    cat > files/etc/uci-defaults/90-opt-partition << 'EOF'
-#!/bin/sh
-# /opt 首次启动扩展到磁盘末尾 + 格式化 + 挂载
+# /opt: 扩展 p3 到磁盘末尾 + 格式化 + 挂载
 LOG="logger -t opt-init"
-
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
-[ -z "$ROOT_DEV" ] && exit 0
-REAL_DEV=$(readlink -f "$ROOT_DEV" 2>/dev/null)
-[ -b "$REAL_DEV" ] && ROOT_DEV="$REAL_DEV"
+if [ -n "$ROOT_DEV" ]; then
+    REAL_DEV=$(readlink -f "$ROOT_DEV" 2>/dev/null)
+    [ -b "$REAL_DEV" ] && ROOT_DEV="$REAL_DEV"
 
-case "$ROOT_DEV" in
-    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; P="p" ;;
-    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; P="" ;;
-    *) exit 0 ;;
-esac
+    case "$ROOT_DEV" in
+        /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; P="p" ;;
+        /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; P="" ;;
+        *) DISK="" ;;
+    esac
 
-OPT_DEV="${DISK}${P}3"
-[ ! -b "$OPT_DEV" ] && { $LOG "p3 not found, skip"; exit 0; }
-
-if [ ! -f /etc/.opt_resized ]; then
-    DISK_SECTORS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
-    if [ -n "$DISK_SECTORS" ]; then
-        P3_START=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
-        P3_CURRENT_SIZE=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
-        TARGET_SIZE=$((DISK_SECTORS - P3_START - 33))
-
-        if [ -n "$P3_START" ] && [ "$P3_CURRENT_SIZE" -lt "$TARGET_SIZE" ]; then
-            $LOG "resizing p3: current=$P3_CURRENT_SIZE target=$TARGET_SIZE"
-            if command -v parted >/dev/null 2>&1; then
-                parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1 || $LOG "parted failed"
+    if [ -n "$DISK" ]; then
+        OPT_DEV="${DISK}${P}3"
+        if [ -b "$OPT_DEV" ]; then
+            if [ ! -f /etc/.opt_resized ]; then
+                DISK_SECTORS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
+                if [ -n "$DISK_SECTORS" ]; then
+                    P3_START=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
+                    P3_CUR=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
+                    TARGET=$((DISK_SECTORS - P3_START - 33))
+                    if [ -n "$P3_START" ] && [ "$P3_CUR" -lt "$TARGET" ]; then
+                        $LOG "resizing p3: $P3_CUR -> $TARGET"
+                        command -v parted >/dev/null 2>&1 && \
+                            parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1
+                        partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
+                        sleep 1
+                    fi
+                fi
+                touch /etc/.opt_resized
             fi
-            partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
-            sleep 1
+
+            FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
+            if [ "$FSTYPE" != "ext4" ]; then
+                $LOG "mkfs.ext4 on $OPT_DEV"
+                mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1
+            else
+                command -v resize2fs >/dev/null 2>&1 && resize2fs "$OPT_DEV" >/dev/null 2>&1 || true
+            fi
+
+            UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
+            if [ -n "$UUID" ]; then
+                if ! uci -q get fstab.opt >/dev/null 2>&1; then
+                    uci set fstab.opt=mount
+                    uci set fstab.opt.target='/opt'
+                    uci set fstab.opt.uuid="$UUID"
+                    uci set fstab.opt.fstype='ext4'
+                    uci set fstab.opt.options='rw,relatime'
+                    uci set fstab.opt.enabled='1'
+                    uci commit fstab
+                fi
+                mkdir -p /opt
+                mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt 2>/dev/null
+                mkdir -p /opt/docker
+                chmod 0700 /opt/docker
+                $LOG "/opt mounted on $OPT_DEV UUID=$UUID"
+            fi
         fi
     fi
-    touch /etc/.opt_resized
 fi
 
-FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
-if [ "$FSTYPE" != "ext4" ]; then
-    $LOG "mkfs.ext4 on $OPT_DEV"
-    mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1 || { $LOG "mkfs failed"; exit 0; }
-else
-    command -v resize2fs >/dev/null 2>&1 && resize2fs "$OPT_DEV" >/dev/null 2>&1 || true
-fi
-
-UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
-[ -z "$UUID" ] && { $LOG "no UUID"; exit 0; }
-
-if ! uci -q get fstab.opt >/dev/null 2>&1; then
-    uci set fstab.opt=mount
-    uci set fstab.opt.target='/opt'
-    uci set fstab.opt.uuid="$UUID"
-    uci set fstab.opt.fstype='ext4'
-    uci set fstab.opt.options='rw,relatime'
-    uci set fstab.opt.enabled='1'
-    uci commit fstab
-fi
-
-mkdir -p /opt
-mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt 2>/dev/null
-mkdir -p /opt/docker
-chmod 0700 /opt/docker
-
-$LOG "/opt mounted on $OPT_DEV UUID=$UUID"
 exit 0
 EOF
-    chmod +x files/etc/uci-defaults/90-opt-partition
+    chmod +x files/etc/uci-defaults/99-custom
 
     cat > files/etc/docker/daemon.json << 'EOF'
 {
