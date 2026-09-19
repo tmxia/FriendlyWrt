@@ -24,14 +24,7 @@ ENSURE_PKGS="
 bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq wireguard-tools python3-light
 "
 
-# Python/coreutils packages from OpenWrt feeds
-PY3_PKGS="
-python3-requests python3-paramiko python3-pytz python3-bs4
-python3-dateutil python3-bleach python3-tqdm python3-docker
-python3-pip coreutils-timeout coreutils-date unrar
-"
-
-for pkg in $ENSURE_PKGS $PY3_PKGS; do
+for pkg in $ENSURE_PKGS; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
@@ -119,7 +112,7 @@ for pkg in $DISABLE_PKGS; do
 done
 
 # Force-enable required packages
-for pkg in $ENSURE_PKGS $PY3_PKGS; do
+for pkg in $ENSURE_PKGS; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
@@ -161,7 +154,7 @@ check_pkg() {
     grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
 }
 echo "--- ENABLED ---"
-for pkg in $ENSURE_PKGS $PY3_PKGS; do check_pkg "$pkg"; done
+for pkg in $ENSURE_PKGS; do check_pkg "$pkg"; done
 echo "--- DISABLED ---"
 for pkg in $DISABLE_PKGS; do check_pkg "$pkg"; done
 
@@ -172,25 +165,16 @@ BASE_MK="device/friendlyelec/rk3568/base.mk"
 CUR_UD=$(grep '^TARGET_USERDATA_PARTSIZE=' "$BASE_MK" | cut -d= -f2)
 if [ "$CUR_UD" = "1024" ]; then
     sed -i 's|^TARGET_USERDATA_PARTSIZE=.*|TARGET_USERDATA_PARTSIZE=2048|' "$BASE_MK"
-    sed -i 's|TARGET_SD_IMAGESIZE=3000|TARGET_SD_IMAGESIZE=4096|' "$BASE_MK"
+    sed -i 's|^[[:space:]]*TARGET_SD_IMAGESIZE=3000|    TARGET_SD_IMAGESIZE=4096|' "$BASE_MK"
     echo "userdata partition set to 2G (24.10)"
 elif [ "$CUR_UD" = "1536" ]; then
     sed -i 's|^TARGET_USERDATA_PARTSIZE=.*|TARGET_USERDATA_PARTSIZE=2560|' "$BASE_MK"
-    sed -i 's|TARGET_SD_IMAGESIZE=3584|TARGET_SD_IMAGESIZE=4864|' "$BASE_MK"
+    sed -i 's|^[[:space:]]*TARGET_SD_IMAGESIZE=3584|    TARGET_SD_IMAGESIZE=4864|' "$BASE_MK"
     echo "userdata partition set to 2.5G (25.12)"
 else
     echo "Unknown TARGET_USERDATA_PARTSIZE=$CUR_UD, skipping"
 fi
 echo "=== Partition config after patch ==="
 grep -E "TARGET_(ROOTFS_PARTSIZE|USERDATA_PARTSIZE|SD_IMAGESIZE)=" "$BASE_MK"
-
-# Built-in pure python packages not in OpenWrt feeds
-PY_SITE="friendlywrt/files/usr/lib/python3.11/site-packages"
-mkdir -p "$PY_SITE"
-pip3 install --target="$PY_SITE" --no-compile --no-cache-dir \
-    telethon tailer demjson3 2>&1 | tail -5
-echo "=== Built-in python packages ==="
-ls "$PY_SITE" | head -20
-du -sh "$PY_SITE"
 
 echo "All configurations applied and verified."
