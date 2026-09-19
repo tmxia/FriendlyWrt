@@ -118,45 +118,12 @@ for pkg in $ENSURE_PKGS; do
     grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
 
-# Ensure Clashoo packages are enabled (two-pass for robustness)
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
-    sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/CONFIG_PACKAGE_${pkg}=y/" .config
-    grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
-done
-
-# Second pass to overwrite any accidental removals
+# Force-enable Clashoo packages in .config
 for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
     sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
     sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
     echo "CONFIG_PACKAGE_${pkg}=y" >> .config
 done
-
-# Verify critical packages are enabled
-echo "=== Verifying Clashoo packages ==="
-MISSING=0
-for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag; do
-    if grep -q "^CONFIG_PACKAGE_${pkg}=y" .config; then
-        echo "[OK] CONFIG_PACKAGE_${pkg}=y"
-    else
-        echo "[FAIL] CONFIG_PACKAGE_${pkg} not enabled"
-        MISSING=1
-    fi
-done
-if [ $MISSING -eq 1 ]; then
-    echo "ERROR: Clashoo packages missing, aborting."
-    exit 1
-fi
-
-# Print final status summary
-echo "=== Final package status ==="
-check_pkg() {
-    grep -q "^CONFIG_PACKAGE_$1=y" .config && echo "  [ENABLED]  $1" || echo "  [DISABLED] $1"
-}
-echo "--- ENABLED ---"
-for pkg in $ENSURE_PKGS; do check_pkg "$pkg"; done
-echo "--- DISABLED ---"
-for pkg in $DISABLE_PKGS; do check_pkg "$pkg"; done
 
 cd ..
 
