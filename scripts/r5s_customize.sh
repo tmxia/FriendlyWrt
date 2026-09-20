@@ -25,7 +25,6 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # 非 Docker 内核选项
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_SCHED CGROUP_BPF CGROUP_PIDS CGROUP_RDMA CGROUP_NET_CLASSID \
@@ -38,7 +37,7 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ptgen 加 p3 占位(256M)，首启扩至磁盘末尾。不加 truncate（破坏 metadata）。
+    # ptgen 加 p3(256M)，首启扩到磁盘末尾
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -49,28 +48,18 @@ with open(path, "r") as f:
     content = f.read()
 
 if "R5S_OPT_PATCHED" in content:
-    print("already patched, skip")
-    sys.exit(0)
+    print("already patched, skip"); sys.exit(0)
 
-if 'set $(ptgen' not in content:
-    print("ERROR: 'set $(ptgen' not found"); sys.exit(1)
-if '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"' not in content:
-    print("ERROR: rootfs partition args not found"); sys.exit(1)
+if 'set $(ptgen' not in content or '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"' not in content:
+    print("ERROR: ptgen args not found"); sys.exit(1)
 
 content = content.replace(
     '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"',
-    '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m" -t 0x83 -p 256m',
-    1
-)
+    '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m" -t 0x83 -p 256m', 1)
 content = "# R5S_OPT_PATCHED\n" + content
-
 with open(path, "w") as f:
     f.write(content)
-
 print("patched gen_image_generic.sh")
-for i, line in enumerate(content.split("\n"), 1):
-    if "R5S_OPT_PATCHED" in line or "0x83" in line:
-        print(f"  {i}: {line}")
 PYEOF
 
     mkdir -p package/custom
@@ -78,9 +67,10 @@ PYEOF
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
     rm -rf package/custom/luci-app-amlogic/.git
 
-    mkdir -p files/etc/uci-defaults files/etc/docker files/etc/sysctl.d files/sbin files/usr/bin
+    mkdir -p files/sbin files/usr/bin files/etc/uci-defaults \
+             files/etc/docker files/etc/sysctl.d files/etc/hotplug.d/net
 
-    # /sbin/mountpoint 补丁
+    # 1. mountpoint 命令补丁
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
 QUIET=0; DEV=0
@@ -114,14 +104,22 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # /opt 初始化（幂等，rc.local 每次启动调用）
-    cat > files/usr/bin/opt-init.sh << 'OPTEOF'
+    # 2. rc.local：内联 /opt 挂载逻辑（首启扩分区+挂载，每次启动保证挂载）
+    cat > files/etc/rc.local << 'RCEOF'
 #!/bin/sh
+# /opt 初始化：首启扩 p3 到磁盘末尾，之后保证挂载
 LOG=/tmp/opt-init.log
 exec >>"$LOG" 2>&1
 echo "=== $(date +%FT%T) opt-init ==="
 
-ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
+# 兼容 squashfs+overlay：真实根在 /rom
+ROOT_DEV=$(findmnt -n -o SOURCE /rom 2>/dev/null | head -1)
+[ ! -b "$ROOT_DEV" ] && {
+    PARTUUID=$(sed -n 's/.*root=PARTUUID=\([^ ]*\).*/\1/p' /proc/cmdline)
+    [ -n "$PARTUUID" ] && ROOT_DEV=$(blkid -t "PARTUUID=$PARTUUID" -o device 2>/dev/null | head -1)
+}
+[ ! -b "$ROOT_DEV" ] && ROOT_DEV=$(sed -n 's/.*root=\(\/dev\/[^ ]*\).*/\1/p' /proc/cmdline)
+echo "root=$ROOT_DEV"
 REAL=$(readlink -f "$ROOT_DEV" 2>/dev/null)
 [ -b "$REAL" ] && ROOT_DEV="$REAL"
 
@@ -133,78 +131,82 @@ esac
 OPT_DEV="${DISK}${P}3"
 [ -b "$OPT_DEV" ] || { echo "no p3"; exit 0; }
 
+# 若已挂载则退出
+mountpoint -q /opt && { echo "already mounted"; exit 0; }
+
+# 停 docker、卸载残留
 [ -x /etc/init.d/dockerd ] && /etc/init.d/dockerd stop 2>/dev/null
 sleep 1
 umount /opt/docker 2>/dev/null || true
 umount /opt 2>/dev/null || true
 
+# 扩分区
 DS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
 PS=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
 PC=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
-if [ -n "$DS" ] && [ -n "$PS" ] && [ -n "$PC" ]; then
-    TG=$((DS - PS - 33))
-    if [ "$PC" -lt "$TG" ]; then
-        echo "resize p3: $PC -> $TG"
-        command -v parted >/dev/null 2>&1 && parted -s "$DISK" resizepart 3 100%
-        partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
-        sleep 2
-    fi
+if [ -n "$DS" ] && [ -n "$PS" ] && [ -n "$PC" ] && [ "$PC" -lt $((DS - PS - 33)) ]; then
+    echo "resize p3: $PC -> $((DS - PS - 33))"
+    parted -s "$DISK" resizepart 3 100% 2>/dev/null
+    partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
+    sleep 2
 fi
 
+# 文件系统：非 ext4 则格式化；ext4 则 fsck + resize
 FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
 if [ "$FSTYPE" != "ext4" ]; then
-    echo "mkfs.ext4 (fstype=$FSTYPE)"
     mkfs.ext4 -L opt -F "$OPT_DEV"
 else
     e2fsck -fy "$OPT_DEV" >/dev/null 2>&1 || true
-    if ! resize2fs "$OPT_DEV" 2>/dev/null; then
-        echo "resize2fs failed, recreating"
-        mkfs.ext4 -L opt -F "$OPT_DEV"
-    fi
+    resize2fs "$OPT_DEV" 2>/dev/null || mkfs.ext4 -L opt -F "$OPT_DEV"
 fi
 
+# 写 fstab + 挂载
 UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
-if [ -n "$UUID" ]; then
-    [ "$(uci -q get fstab.opt.uuid)" = "$UUID" ] || {
-        uci -q delete fstab.opt 2>/dev/null || true
-        uci set fstab.opt=mount
-        uci set fstab.opt.target='/opt'
-        uci set fstab.opt.uuid="$UUID"
-        uci set fstab.opt.fstype='ext4'
-        uci set fstab.opt.options='rw,relatime'
-        uci set fstab.opt.enabled='1'
+[ -n "$UUID" ] && {
+    [ "$(uci -q get fstab.@mount[-1].uuid)" = "$UUID" ] || {
+        while uci -q delete fstab.@mount[-1]; do :; done
+        uci add fstab mount >/dev/null
+        uci set fstab.@mount[-1].target='/opt'
+        uci set fstab.@mount[-1].uuid="$UUID"
+        uci set fstab.@mount[-1].fstype='ext4'
+        uci set fstab.@mount[-1].options='rw,relatime'
+        uci set fstab.@mount[-1].enabled='1'
         uci commit fstab
-        echo "fstab.opt.uuid=$UUID"
     }
     mkdir -p /opt/docker
     chmod 0700 /opt/docker
-    mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt
+    mount -t ext4 "$OPT_DEV" /opt
     echo "mounted: $(df -h /opt 2>/dev/null | tail -1)"
-fi
-
+}
 echo "=== done ==="
-exit 0
-OPTEOF
-    chmod +x files/usr/bin/opt-init.sh
-
-    # rc.local：/opt 初始化 + 延迟重启 led（修复 netdev trigger 时机）
-    cat > files/etc/rc.local << 'RCEOF'
-[ -x /usr/bin/opt-init.sh ] && /usr/bin/opt-init.sh >/dev/null 2>&1
-
-# 网卡就绪后重新应用 LED netdev trigger
-(
-    sleep 20
-    /etc/init.d/led restart >/dev/null 2>&1
-) &
-
 exit 0
 RCEOF
     chmod +x files/etc/rc.local
 
-    # 代理/网络优化 sysctl
-    cat > files/etc/sysctl.d/31-optimize-proxy.conf << 'EOF'
+    # 3. LED hotplug：网卡就绪后触发 led restart
+    cat > files/etc/hotplug.d/net/99-led-netdev << 'HOTPLUG_EOF'
+#!/bin/sh
+[ "$ACTION" = "add" ] || exit 0
+(
+    i=0
+    while [ $i -lt 30 ]; do
+        if [ -e /sys/class/net/eth0 ] && [ -e /sys/class/net/eth1 ] && [ -e /sys/class/net/eth2 ]; then
+            /etc/init.d/led restart >/dev/null 2>&1
+            exit 0
+        fi
+        sleep 1
+        i=$((i+1))
+    done
+) &
+HOTPLUG_EOF
+    chmod +x files/etc/hotplug.d/net/99-led-netdev
+
+    # 4. sysctl 合并版
+    cat > files/etc/sysctl.d/99-r5s.conf << 'EOF'
+# 代理/网络优化
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
+net.core.optmem_max = 65535
 net.ipv4.tcp_fin_timeout = 30
 net.ipv4.tcp_keepalive_time = 1200
 net.ipv4.ip_local_port_range = 10000 65535
@@ -213,11 +215,8 @@ net.ipv4.tcp_rmem = 8192 262144 67108864
 net.ipv4.tcp_wmem = 8192 262144 67108864
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
-net.core.optmem_max = 65535
 net.ipv4.tcp_notsent_lowat = 16384
-EOF
-
-    cat > files/etc/sysctl.d/11-nf-conntrack.conf << 'EOF'
+# conntrack
 net.netfilter.nf_conntrack_acct=1
 net.netfilter.nf_conntrack_checksum=0
 net.netfilter.nf_conntrack_max=65535
@@ -227,7 +226,7 @@ net.netfilter.nf_conntrack_udp_timeout_stream=180
 net.netfilter.nf_conntrack_helper=1
 EOF
 
-    # 首次刷机系统配置
+    # 5. 首次刷机系统配置
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
@@ -251,14 +250,13 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
-# firewall: LAN zone
+# firewall
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
 uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
 
-# firewall: docker zone (docker0 默认网络)
 uci set firewall.docker=zone
 uci set firewall.docker.name='docker'
 uci set firewall.docker.input='ACCEPT'
@@ -280,7 +278,7 @@ uci set firewall.fwd_lan_docker=forwarding
 uci set firewall.fwd_lan_docker.src='lan'
 uci set firewall.fwd_lan_docker.dest='docker'
 
-# firewall: dockernet zone (br-* 通配，覆盖所有自定义网络)
+# dockernet zone：br-* 通配，自动覆盖所有自定义 Docker 网络
 uci set firewall.dockernet=zone
 uci set firewall.dockernet.name='dockernet'
 uci set firewall.dockernet.input='ACCEPT'
@@ -304,7 +302,7 @@ uci set firewall.fwd_lan_dockernet.dest='dockernet'
 
 uci commit firewall
 
-# Docker: alt_config_file 指向 /etc/docker/daemon.json（文件优先）
+# Docker UCI
 uci set dockerd.globals.data_root='/opt/docker'
 uci -q delete dockerd.globals.registry_mirrors
 uci add_list dockerd.globals.registry_mirrors='https://docker.1ms.run'
@@ -330,31 +328,37 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     /etc/init.d/sshd restart
 fi
 
-# LED：绑定 R5S 网卡（eth0=WAN, eth1=LAN1, eth2=LAN2）
+# LED：函数式，避免 shell 解析 bug
 uci -q delete system.wan_led 2>/dev/null
 uci -q delete system.lan1_led 2>/dev/null
 uci -q delete system.lan2_led 2>/dev/null
+uci -q delete system.led_wan 2>/dev/null
+uci -q delete system.led_lan1 2>/dev/null
+uci -q delete system.led_lan2 2>/dev/null
 
-for pair in "wan:green:wan:eth0" "lan1:green:lan-1:eth1" "lan2:green:lan-2:eth2"; do
-    name="${pair%%:*}"
-    rest="${pair#*:}"
-    sysfs="green:${rest%%:*}"
-    dev="${rest#*:}"
-    uci -q delete "system.led_${name}"
+add_led() {
+    local name="$1" sysfs="$2" dev="$3"
     uci set "system.led_${name}=led"
     uci set "system.led_${name}.name=$(echo $name | tr a-z A-Z)"
     uci set "system.led_${name}.sysfs=${sysfs}"
     uci set "system.led_${name}.trigger=netdev"
     uci set "system.led_${name}.dev=${dev}"
     uci set "system.led_${name}.mode=link"
-done
+}
+
+add_led wan  "green:wan"   eth0
+add_led lan1 "green:lan-1" eth1
+add_led lan2 "green:lan-2" eth2
+
 uci commit system
-/etc/init.d/led restart 2>/dev/null || true
+/etc/init.d/led enable
+/etc/init.d/led start 2>/dev/null || true
 
 exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
+    # 6. Docker daemon.json
     cat > files/etc/docker/daemon.json << 'EOF'
 {
   "data-root": "/opt/docker",
@@ -400,30 +404,16 @@ pre_build() {
 
 &cpu_thermal {
     trips {
-        cpu_warm: cpu_warm {
-            temperature = <45000>;
-            hysteresis = <2000>;
-            type = "active";
-        };
-        cpu_hot: cpu_hot {
-            temperature = <50000>;
-            hysteresis = <2000>;
-            type = "active";
-        };
+        cpu_warm: cpu_warm { temperature = <45000>; hysteresis = <2000>; type = "active"; };
+        cpu_hot: cpu_hot { temperature = <50000>; hysteresis = <2000>; type = "active"; };
     };
     cooling-maps {
-        map_warm {
-            trip = <&cpu_warm>;
-            cooling-device = <&fan 1 1>;
-        };
-        map_hot {
-            trip = <&cpu_hot>;
-            cooling-device = <&fan 2 3>;
-        };
+        map_warm { trip = <&cpu_warm>; cooling-device = <&fan 1 1>; };
+        map_hot  { trip = <&cpu_hot>;  cooling-device = <&fan 2 3>; };
     };
 };
 DTS_EOF
-    echo "pwm-fan node injected (GPIO3_B6 / pwm11m0, 45C->1, 50C->3)"
+    echo "pwm-fan node injected"
 }
 
 cache_restore() {
@@ -444,13 +434,11 @@ cache_restore() {
     else
         echo "no cache"
     fi
-
     df -hT
 }
 
 cache_save() {
     cd /workdir/openwrt
-
     for linux_dir in build_dir/target-*/linux-*/; do
         [ -d "$linux_dir" ] && (cd "$linux_dir" && ls -dt linux-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
     done
@@ -537,16 +525,10 @@ config_stage() {
     done
     [ $MISSING -eq 1 ] && exit 1
 
-    local KV
-    KV=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile 2>/dev/null | cut -d= -f2 | tr -d ' ')
-    [ -z "$KV" ] && KV="6.12"
-    grep -E "^CONFIG_(PWM|PWM_SYSFS|PWM_ROCKCHIP|SENSORS_PWM_FAN)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
-    grep -E "^CONFIG_(LEDS_TRIGGER_NETDEV|LED_TRIGGER_PHY)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
-    grep -E "^CONFIG_PROC_PAGE_MONITOR=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
-
-    for f in files/sbin/mountpoint files/usr/bin/opt-init.sh files/etc/rc.local \
+    for f in files/sbin/mountpoint files/etc/rc.local \
+             files/etc/hotplug.d/net/99-led-netdev \
              files/etc/docker/daemon.json files/etc/uci-defaults/99-custom \
-             files/etc/sysctl.d/31-optimize-proxy.conf files/etc/sysctl.d/11-nf-conntrack.conf; do
+             files/etc/sysctl.d/99-r5s.conf; do
         [ -f "$f" ] || { echo "missing: $f"; exit 1; }
     done
 }
