@@ -25,7 +25,7 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # 非 Docker 内核选项（Docker 相关在 r5s.config）
+    # 非 Docker 内核选项
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_SCHED CGROUP_BPF CGROUP_PIDS CGROUP_RDMA CGROUP_NET_CLASSID \
@@ -38,8 +38,7 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ptgen 加 p3 占位(256M)，opt-init.sh 首次启动扩至磁盘末尾。
-    # 不加 truncate（会破坏 fwtool metadata）。
+    # ptgen 加 p3 占位(256M)，首启扩至磁盘末尾。不加 truncate（破坏 metadata）。
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -115,7 +114,7 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # /opt 初始化：p3 扩容 + ext4 + fstab + 挂载
+    # /opt 初始化（幂等，rc.local 每次启动调用）
     cat > files/usr/bin/opt-init.sh << 'OPTEOF'
 #!/bin/sh
 LOG=/tmp/opt-init.log
@@ -189,13 +188,12 @@ OPTEOF
     chmod +x files/usr/bin/opt-init.sh
 
     cat > files/etc/rc.local << 'RCEOF'
-# 每次启动执行 /opt 初始化（幂等）
 [ -x /usr/bin/opt-init.sh ] && /usr/bin/opt-init.sh >/dev/null 2>&1
 exit 0
 RCEOF
     chmod +x files/etc/rc.local
 
-    # sysctl 优化（参考官方 device/common/default-settings）
+    # 代理/网络优化 sysctl
     cat > files/etc/sysctl.d/31-optimize-proxy.conf << 'EOF'
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
@@ -245,13 +243,14 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
-# firewall
+# firewall: LAN zone
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
 uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
 
+# firewall: docker zone (docker0 默认网络)
 uci set firewall.docker=zone
 uci set firewall.docker.name='docker'
 uci set firewall.docker.input='ACCEPT'
@@ -273,9 +272,31 @@ uci set firewall.fwd_lan_docker=forwarding
 uci set firewall.fwd_lan_docker.src='lan'
 uci set firewall.fwd_lan_docker.dest='docker'
 
+# firewall: dockernet zone (br-* 通配，覆盖所有自定义网络)
+uci set firewall.dockernet=zone
+uci set firewall.dockernet.name='dockernet'
+uci set firewall.dockernet.input='ACCEPT'
+uci set firewall.dockernet.output='ACCEPT'
+uci set firewall.dockernet.forward='ACCEPT'
+uci set firewall.dockernet.device='br-*'
+uci set firewall.dockernet.masq='1'
+uci set firewall.dockernet.mtu_fix='1'
+
+uci set firewall.fwd_dockernet_wan=forwarding
+uci set firewall.fwd_dockernet_wan.src='dockernet'
+uci set firewall.fwd_dockernet_wan.dest='wan'
+
+uci set firewall.fwd_dockernet_lan=forwarding
+uci set firewall.fwd_dockernet_lan.src='dockernet'
+uci set firewall.fwd_dockernet_lan.dest='lan'
+
+uci set firewall.fwd_lan_dockernet=forwarding
+uci set firewall.fwd_lan_dockernet.src='lan'
+uci set firewall.fwd_lan_dockernet.dest='dockernet'
+
 uci commit firewall
 
-# Docker：文件优先（alt_config_file），UCI 值作为回退
+# Docker: alt_config_file 指向 /etc/docker/daemon.json（文件优先）
 uci set dockerd.globals.data_root='/opt/docker'
 uci -q delete dockerd.globals.registry_mirrors
 uci add_list dockerd.globals.registry_mirrors='https://docker.1ms.run'
@@ -474,7 +495,6 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
-    # Docker 依赖由 kconfig select 自动拉，这里只确保显式包
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag \
                luci-app-amlogic luci-lib-nixio \
                luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
