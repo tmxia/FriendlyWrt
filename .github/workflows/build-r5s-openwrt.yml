@@ -176,53 +176,64 @@ jobs:
             echo "::warning::Cannot checkout $KERNEL_VERSION, using branch HEAD"
           fi
 
-      - name: Switch to linux-stable kernel
+      - name: Switch to linux-stable kernel using kernel_bump.sh
         if: env.KERNEL_TRACK == 'linux-stable'
         run: |
           cd /workdir/openwrt
 
-          MAP=$(grep -rln '^LINUX_VERSION-6\.12' include/ target/linux/ 2>/dev/null || true)
-
-          echo "=== LINUX_VERSION-6.12 definition files ==="
-          echo "$MAP"
-
-          if [ -z "$MAP" ]; then
-            echo "no version definition found"
-            exit 1
-          fi
-
-          CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' $MAP | head -1 | sed -E 's/.*\.([0-9]+).*/\1/')
-          echo "Current: 6.12.$CUR"
-
           if [ -n "$KERNEL_VERSION" ]; then
-            LATEST="${KERNEL_VERSION#6.12.}"
-            echo "Pinned version: 6.12.$LATEST"
+            TARGET="${KERNEL_VERSION#6.12.}"
+            echo "Pinned version from watcher: 6.12.$TARGET"
           else
-            LATEST=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
+            TARGET=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
                      | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
                      | sort -uV | tail -1 \
                      | grep -oE '6\.12\.[0-9]+' | cut -d. -f3)
-            echo "Auto-detected: 6.12.$LATEST"
+            echo "Auto-detected latest: 6.12.$TARGET"
           fi
 
-          if [ "$CUR" = "$LATEST" ]; then
-            echo "Already up-to-date, skip"
-            exit 0
+          CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk | sed -E 's/.*\.([0-9]+).*/\1/')
+          echo "OpenWrt branch builtin: 6.12.$CUR"
+
+          if [ "$CUR" = "$TARGET" ]; then
+            echo "Already up-to-date, skip kernel_bump"
+          else
+            echo "=== Running kernel_bump.sh 6.12.$CUR -> 6.12.$TARGET ==="
+            ./scripts/kernel_bump.sh -p rockchip -s v6.12 -t v6.12 || {
+              echo "kernel_bump.sh failed, falling back to manual version patch"
+              MAP=$(grep -rln '^LINUX_VERSION-6\.12' include/ target/linux/ 2>/dev/null)
+              HASH=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc \
+                     | grep "linux-6.12.$TARGET.tar.xz" | awk '{print $1}')
+              for FILE in $MAP; do
+                sed -i "s|^LINUX_VERSION-6.12 = .*|LINUX_VERSION-6.12 = .$TARGET|" "$FILE"
+                sed -i "s|^LINUX_KERNEL_HASH-6\.12\..*|LINUX_KERNEL_HASH-6.12.$TARGET = $HASH|" "$FILE"
+              done
+            }
           fi
 
-          HASH=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc \
-                 | grep "linux-6.12.$LATEST.tar.xz" | awk '{print $1}')
-          [ ${#HASH} -eq 64 ] || { echo "cannot fetch hash"; exit 1; }
-          echo "Hash: $HASH"
+          echo "=== After kernel_bump ==="
+          grep -rn '^LINUX_VERSION-6\.12\|^LINUX_KERNEL_HASH-6\.12' include/ target/linux/ 2>/dev/null || true
 
-          for FILE in $MAP; do
-            echo "Patching $FILE"
-            sed -i "s|^LINUX_VERSION-6.12 = .*|LINUX_VERSION-6.12 = .$LATEST|" "$FILE"
-            sed -i "s|^LINUX_KERNEL_HASH-6\.12\..*|LINUX_KERNEL_HASH-6.12.$LATEST = $HASH|" "$FILE"
-          done
+      - name: Refresh kernel patches for new version
+        if: env.KERNEL_TRACK == 'linux-stable'
+        run: |
+          cd /workdir/openwrt
 
-          echo "=== After patch ==="
-          grep -rn '^LINUX_VERSION-6\.12\|^LINUX_KERNEL_HASH-6\.12' $MAP
+          echo "=== Refreshing kernel patches ==="
+          make target/linux/refresh V=s KERNEL_PATCHVER=6.12 LINUX_VERSION=${KERNEL_VERSION:-6.12.110} 2>&1 | tail -80 || true
+
+          echo "=== Checking for .rej files ==="
+          REJ=$(find target/linux -name '*.rej' -type f 2>/dev/null)
+          if [ -n "$REJ" ]; then
+            echo "::warning::Found .rej files after refresh:"
+            echo "$REJ"
+          else
+            echo "No .rej files, patches refreshed successfully"
+          fi
+
+          echo "=== Patches after refresh ==="
+          find target/linux/generic/backport-6.12 -name '*.patch' | wc -l
+          echo "backport patches"
 
       - name: Prepare feeds
         run: |
@@ -278,7 +289,7 @@ jobs:
           RC=$?
           set -e
           if [ "$RC" -ne 0 ]; then
-            echo "=== tools/compile failed, retry V=s ==="
+            echo "=== tools/compile failed ==="
             make tools/compile -j1 V=s > /tmp/tools_verbose.log 2>&1 || true
             grep -n -A 30 -B 10 -iE 'error|fail' /tmp/tools_verbose.log | tail -200
             exit 1
@@ -368,6 +379,9 @@ jobs:
 
           echo "===== Kernel version used ====="
           grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null || true
+
+          echo "===== Check .rej files ====="
+          find target/linux -name '*.rej' -type f 2>/dev/null || echo "none"
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
