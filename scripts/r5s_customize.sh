@@ -149,11 +149,41 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
+# firewall：LAN zone + docker zone + 跨 zone forwarding
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
 uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
+
+if ! uci -q get firewall.docker >/dev/null 2>&1; then
+    uci add firewall zone >/dev/null
+    uci rename firewall.@zone[-1]='docker'
+fi
+uci set firewall.docker.name='docker'
+uci set firewall.docker.input='ACCEPT'
+uci set firewall.docker.output='ACCEPT'
+uci set firewall.docker.forward='ACCEPT'
+uci set firewall.docker.network='docker'
+uci set firewall.docker.masq='1'
+uci set firewall.docker.mtu_fix='1'
+
+# 跨 zone forwarding（必须，否则容器出不了外网）
+add_fwd() {
+    local s="$1" d="$2" i
+    for i in $(seq 0 30); do
+        if [ "$(uci -q get firewall.@forwarding[$i].src)" = "$s" ] && \
+           [ "$(uci -q get firewall.@forwarding[$i].dest)" = "$d" ]; then
+            return 0
+        fi
+    done
+    uci add firewall forwarding >/dev/null
+    uci set "firewall.@forwarding[-1].src=$s"
+    uci set "firewall.@forwarding[-1].dest=$d"
+}
+add_fwd docker wan
+add_fwd docker lan
+add_fwd lan docker
 uci commit firewall
 
 printf "tony\ntony\n" | passwd root
