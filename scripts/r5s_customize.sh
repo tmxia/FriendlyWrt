@@ -25,12 +25,11 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
+    # 非 Docker 内核选项（Docker 相关在 r5s.config）
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
-               BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
-               CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
-               CGROUP_PIDS CGROUP_RDMA CGROUP_HUGETLB CGROUP_NET_CLASSID \
-               MEMCG BLK_CGROUP CFS_BANDWIDTH FAIR_GROUP_SCHED RT_GROUP_SCHED \
-               CGROUP_PERF CGROUP_NET_PRIO \
+               NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
+               CGROUP_SCHED CGROUP_BPF CGROUP_PIDS CGROUP_RDMA CGROUP_NET_CLASSID \
+               BLK_CGROUP CFS_BANDWIDTH FAIR_GROUP_SCHED RT_GROUP_SCHED \
                PWM PWM_SYSFS PWM_ROCKCHIP SENSORS_PWM_FAN \
                LEDS_TRIGGER_NETDEV LED_TRIGGER_PHY \
                PROC_PAGE_MONITOR; do
@@ -39,8 +38,8 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ptgen 加 p3 占位(256M)，实际大小由 opt-init.sh 首次启动扩到磁盘末尾。
-    # 不要加 truncate：会破坏 fwtool metadata，导致 sysupgrade 必须 -F。
+    # ptgen 加 p3 占位(256M)，opt-init.sh 首次启动扩至磁盘末尾。
+    # 不加 truncate（会破坏 fwtool metadata）。
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -80,7 +79,7 @@ PYEOF
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
     rm -rf package/custom/luci-app-amlogic/.git
 
-    mkdir -p files/etc/uci-defaults files/sbin files/usr/bin files/etc/docker
+    mkdir -p files/etc/uci-defaults files/etc/docker files/etc/sysctl.d files/sbin files/usr/bin
 
     # /sbin/mountpoint 补丁
     cat > files/sbin/mountpoint << 'MP_EOF'
@@ -116,7 +115,7 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # /opt 初始化：p3 扩容 + ext4 + fstab + 挂载（不涉及 Docker）
+    # /opt 初始化：p3 扩容 + ext4 + fstab + 挂载
     cat > files/usr/bin/opt-init.sh << 'OPTEOF'
 #!/bin/sh
 LOG=/tmp/opt-init.log
@@ -158,6 +157,7 @@ if [ "$FSTYPE" != "ext4" ]; then
     echo "mkfs.ext4 (fstype=$FSTYPE)"
     mkfs.ext4 -L opt -F "$OPT_DEV"
 else
+    e2fsck -fy "$OPT_DEV" >/dev/null 2>&1 || true
     if ! resize2fs "$OPT_DEV" 2>/dev/null; then
         echo "resize2fs failed, recreating"
         mkfs.ext4 -L opt -F "$OPT_DEV"
@@ -194,6 +194,32 @@ OPTEOF
 exit 0
 RCEOF
     chmod +x files/etc/rc.local
+
+    # sysctl 优化（参考官方 device/common/default-settings）
+    cat > files/etc/sysctl.d/31-optimize-proxy.conf << 'EOF'
+net.core.rmem_max = 67108864
+net.core.wmem_max = 67108864
+net.ipv4.tcp_fin_timeout = 30
+net.ipv4.tcp_keepalive_time = 1200
+net.ipv4.ip_local_port_range = 10000 65535
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_rmem = 8192 262144 67108864
+net.ipv4.tcp_wmem = 8192 262144 67108864
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_no_metrics_save = 1
+net.core.optmem_max = 65535
+net.ipv4.tcp_notsent_lowat = 16384
+EOF
+
+    cat > files/etc/sysctl.d/11-nf-conntrack.conf << 'EOF'
+net.netfilter.nf_conntrack_acct=1
+net.netfilter.nf_conntrack_checksum=0
+net.netfilter.nf_conntrack_max=65535
+net.netfilter.nf_conntrack_tcp_timeout_established=7440
+net.netfilter.nf_conntrack_udp_timeout=60
+net.netfilter.nf_conntrack_udp_timeout_stream=180
+net.netfilter.nf_conntrack_helper=1
+EOF
 
     # 首次刷机系统配置
     cat > files/etc/uci-defaults/99-custom << 'EOF'
@@ -249,9 +275,7 @@ uci set firewall.fwd_lan_docker.dest='docker'
 
 uci commit firewall
 
-# ---- Docker: 双轨配置 ----
-# 主：alt_config_file 指向 /etc/docker/daemon.json（文件优先）
-# 备：UCI 值同步设置（删掉 alt_config_file 立即生效）
+# Docker：文件优先（alt_config_file），UCI 值作为回退
 uci set dockerd.globals.data_root='/opt/docker'
 uci -q delete dockerd.globals.registry_mirrors
 uci add_list dockerd.globals.registry_mirrors='https://docker.1ms.run'
@@ -296,7 +320,6 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    # 主配置文件：/etc/docker/daemon.json（用户习惯位置）
     cat > files/etc/docker/daemon.json << 'EOF'
 {
   "data-root": "/opt/docker",
@@ -451,17 +474,12 @@ config_stage() {
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
     done
 
+    # Docker 依赖由 kconfig select 自动拉，这里只确保显式包
     for pkg in clashoo luci-app-clashoo luci-i18n-clashoo-zh-cn kmod-inet-diag \
                luci-app-amlogic luci-lib-nixio \
                luci-app-ttyd ttyd luci-i18n-ttyd-zh-cn \
-               docker dockerd docker-compose containerd runc tini libnetwork \
                luci-app-dockerman luci-lib-docker luci-i18n-dockerman-zh-cn \
                openssh-sftp-server \
-               kmod-br-netfilter kmod-veth kmod-nf-ipvs kmod-ipt-physdev \
-               kmod-ipt-tee kmod-ipt-nat6 kmod-ipt-nat-extra \
-               kmod-nf-nathelper kmod-nf-nathelper-extra \
-               kmod-fs-overlay kmod-fuse \
-               kmod-r8169 \
                iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra \
@@ -485,17 +503,13 @@ config_stage() {
 
     local MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
-               docker dockerd containerd runc luci-app-dockerman openssh-sftp-server parted; do
+               dockerd luci-app-dockerman openssh-sftp-server parted; do
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || { echo "missing: $pkg"; MISSING=1; }
     done
+    for opt in DOCKER_NET_MACVLAN DOCKER_STO_EXT4; do
+        grep -q "^CONFIG_${opt}=y" .config || { echo "missing: $opt"; MISSING=1; }
+    done
     [ $MISSING -eq 1 ] && exit 1
-
-    grep -E "^CONFIG_PACKAGE_kmod-(r8169|r8125|r8168)" .config || true
-    grep -E "^CONFIG_PACKAGE_(docker|dockerd|containerd|runc|luci-app-dockerman|luci-lib-docker)" .config || true
-    grep -E "^CONFIG_PACKAGE_openssh-sftp-server" .config || true
-    grep -E "^CONFIG_PACKAGE_resize2fs=y" .config || true
-    grep -E "^CONFIG_PACKAGE_sgdisk=y" .config || true
-    grep -E "^CONFIG_TARGET_IMAGES_GZIP" .config || true
 
     local KV
     KV=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile 2>/dev/null | cut -d= -f2 | tr -d ' ')
@@ -505,7 +519,8 @@ config_stage() {
     grep -E "^CONFIG_PROC_PAGE_MONITOR=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
 
     for f in files/sbin/mountpoint files/usr/bin/opt-init.sh files/etc/rc.local \
-             files/etc/docker/daemon.json files/etc/uci-defaults/99-custom; do
+             files/etc/docker/daemon.json files/etc/uci-defaults/99-custom \
+             files/etc/sysctl.d/31-optimize-proxy.conf files/etc/sysctl.d/11-nf-conntrack.conf; do
         [ -f "$f" ] || { echo "missing: $f"; exit 1; }
     done
 }
