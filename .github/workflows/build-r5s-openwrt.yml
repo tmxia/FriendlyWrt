@@ -604,10 +604,11 @@ jobs:
           echo "===== Kernel version used ====="
           grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null || true
 
-          if [ -f /workdir/target_version.txt ]; then
+          if [ -f /workdir/patch_report.txt ]; then
             echo "===== Patch adaptation report ====="
-            cat /workdir/patch_report.txt 2>/dev/null || \
-              echo "(restored from patches/$PATCH_BRANCH, no in-run adaptation)"
+            cat /workdir/patch_report.txt
+          else
+            echo "===== Patch source: restored from patches/$PATCH_BRANCH ====="
           fi
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
@@ -637,8 +638,9 @@ jobs:
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
 
-          [ -f /workdir/patch_report.txt ] && \
-            cp /workdir/patch_report.txt "$GITHUB_WORKSPACE/artifact/${PREFIX}-patch-report.txt" || true
+          if [ -f /workdir/patch_report.txt ]; then
+            cp /workdir/patch_report.txt "$GITHUB_WORKSPACE/artifact/${PREFIX}-patch-report.txt"
+          fi
 
           cd $GITHUB_WORKSPACE/artifact
           rm -f SHA256SUMS
@@ -647,18 +649,28 @@ jobs:
           done
           ls -lh
 
-      - name: Upload artifacts
+      - name: Upload to release
         if: success()
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          cd $GITHUB_WORKSPACE/artifact
+
+          shopt -s nullglob
+          FILES=(*.gz *-manifest.txt *-sha256sums.txt *-patch-report.txt SHA256SUMS)
+          shopt -u nullglob
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "no files to upload"
+            exit 0
+          fi
+
+          echo "uploading ${#FILES[@]} files to release:"
+          printf '  %s\n' "${FILES[@]}"
+
           gh release upload "${{ needs.prepare_release.outputs.release_tag }}" \
-            $GITHUB_WORKSPACE/artifact/*.gz \
-            $GITHUB_WORKSPACE/artifact/*-manifest.txt \
-            $GITHUB_WORKSPACE/artifact/*-sha256sums.txt \
-            $GITHUB_WORKSPACE/artifact/*-patch-report.txt \
-            $GITHUB_WORKSPACE/artifact/SHA256SUMS \
-            --clobber || true
+            "${FILES[@]}" \
+            --clobber
 
       - uses: actions/upload-artifact@v4
         if: success()
