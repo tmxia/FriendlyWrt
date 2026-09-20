@@ -30,6 +30,10 @@ permissions:
   actions: write
   packages: write
 
+concurrency:
+  group: build-r5s-${{ inputs.kernel_track || 'default' }}
+  cancel-in-progress: false
+
 env:
   AUTO_REPLACE_TAG: 'false'
   OPENWRT_VER: '25.12'
@@ -42,7 +46,12 @@ env:
 jobs:
   prepare_release:
     runs-on: ubuntu-latest
-    if: github.event.repository.owner.id == github.event.sender.id
+    concurrency:
+      group: r5s-prepare-release
+      cancel-in-progress: false
+    if: |
+      github.event.repository.owner.id == github.event.sender.id ||
+      github.triggering_actor == 'github-actions[bot]'
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
     steps:
@@ -362,7 +371,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: r5s-firmware
+          name: r5s-firmware-${{ env.KERNEL_TRACK }}
           path: artifact/
           retention-days: 30
 
