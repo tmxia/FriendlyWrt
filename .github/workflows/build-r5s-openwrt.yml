@@ -42,6 +42,7 @@ env:
   OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
   CONFIG_FILE: 'scripts/r5s.config'
   DIY_SH: 'scripts/r5s_customize.sh'
+  PATCH_BRANCH: 'patches'
 
 jobs:
   prepare_release:
@@ -176,64 +177,236 @@ jobs:
             echo "::warning::Cannot checkout $KERNEL_VERSION, using branch HEAD"
           fi
 
-      - name: Switch to linux-stable kernel using kernel_bump.sh
+      - name: Switch to linux-stable kernel
         if: env.KERNEL_TRACK == 'linux-stable'
         run: |
           cd /workdir/openwrt
 
           if [ -n "$KERNEL_VERSION" ]; then
             TARGET="${KERNEL_VERSION#6.12.}"
-            echo "Pinned version from watcher: 6.12.$TARGET"
           else
             TARGET=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
                      | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
                      | sort -uV | tail -1 \
                      | grep -oE '6\.12\.[0-9]+' | cut -d. -f3)
-            echo "Auto-detected latest: 6.12.$TARGET"
           fi
+          echo "$TARGET" > /workdir/target_version.txt
+          echo "Target: 6.12.$TARGET"
 
           CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk | sed -E 's/.*\.([0-9]+).*/\1/')
-          echo "OpenWrt branch builtin: 6.12.$CUR"
+          echo "Builtin: 6.12.$CUR"
 
           if [ "$CUR" = "$TARGET" ]; then
-            echo "Already up-to-date, skip kernel_bump"
-          else
-            echo "=== Running kernel_bump.sh 6.12.$CUR -> 6.12.$TARGET ==="
-            ./scripts/kernel_bump.sh -p rockchip -s v6.12 -t v6.12 || {
-              echo "kernel_bump.sh failed, falling back to manual version patch"
-              MAP=$(grep -rln '^LINUX_VERSION-6\.12' include/ target/linux/ 2>/dev/null)
-              HASH=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc \
-                     | grep "linux-6.12.$TARGET.tar.xz" | awk '{print $1}')
-              for FILE in $MAP; do
-                sed -i "s|^LINUX_VERSION-6.12 = .*|LINUX_VERSION-6.12 = .$TARGET|" "$FILE"
-                sed -i "s|^LINUX_KERNEL_HASH-6\.12\..*|LINUX_KERNEL_HASH-6.12.$TARGET = $HASH|" "$FILE"
-              done
-            }
+            echo "Already up-to-date, skip version bump"
+            exit 0
           fi
 
-          echo "=== After kernel_bump ==="
-          grep -rn '^LINUX_VERSION-6\.12\|^LINUX_KERNEL_HASH-6\.12' include/ target/linux/ 2>/dev/null || true
+          HASH=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc \
+                 | grep "linux-6.12.$TARGET.tar.xz" | awk '{print $1}')
+          [ ${#HASH} -eq 64 ] || { echo "cannot fetch hash"; exit 1; }
 
-      - name: Refresh kernel patches for new version
+          MAP=$(grep -rln '^LINUX_VERSION-6\.12' include/ target/linux/ 2>/dev/null || true)
+          for FILE in $MAP; do
+            echo "Patching $FILE"
+            sed -i "s|^LINUX_VERSION-6.12 = .*|LINUX_VERSION-6.12 = .$TARGET|" "$FILE"
+            sed -i "s|^LINUX_KERNEL_HASH-6\.12\..*|LINUX_KERNEL_HASH-6.12.$TARGET = $HASH|" "$FILE"
+          done
+
+      - name: Restore adapted patches from patch branch
+        id: restore_patches
         if: env.KERNEL_TRACK == 'linux-stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "restored=false" >> "$GITHUB_OUTPUT"
+
+          if [ ! -f /workdir/target_version.txt ]; then
+            echo "no target_version.txt, skipping"
+            exit 0
+          fi
+          TARGET=$(cat /workdir/target_version.txt)
+          VERSION_DIR="6.12.$TARGET"
+
+          cd /workdir
+          if git clone --branch "$PATCH_BRANCH" --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              patches-repo 2>&1 | tail -3; then
+            echo "patch branch cloned"
+          else
+            echo "patch branch not found, will create on publish"
+            rm -rf patches-repo
+            mkdir -p patches-repo
+            cd patches-repo
+            git init -q
+            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git checkout -q -b "$PATCH_BRANCH"
+            exit 0
+          fi
+
+          if [ ! -f "/workdir/patches-repo/$VERSION_DIR/READY" ]; then
+            echo "$VERSION_DIR not found in patch branch, will adapt"
+            exit 0
+          fi
+
+          echo "found adapted patches for $VERSION_DIR"
+          cd /workdir/openwrt
+          for DIR in backport-6.12 pending-6.12 hack-6.12; do
+            SRC="/workdir/patches-repo/$VERSION_DIR/generic-$DIR"
+            DST="target/linux/generic/$DIR"
+            if [ -d "$SRC" ]; then
+              rm -rf "$DST"
+              mkdir -p "$DST"
+              cp -r "$SRC"/. "$DST"/
+              echo "restored $DIR: $(ls $DST | wc -l) files"
+            fi
+          done
+          SRC="/workdir/patches-repo/$VERSION_DIR/rockchip-patches-6.12"
+          DST="target/linux/rockchip/patches-6.12"
+          if [ -d "$SRC" ]; then
+            rm -rf "$DST"
+            mkdir -p "$DST"
+            cp -r "$SRC"/. "$DST"/
+            echo "restored rockchip-patches-6.12: $(ls $DST | wc -l) files"
+          fi
+
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+
+      - name: Adapt kernel patches via 3-way merge
+        if: |
+          env.KERNEL_TRACK == 'linux-stable' &&
+          steps.restore_patches.outputs.restored != 'true'
         run: |
           cd /workdir/openwrt
 
-          echo "=== Refreshing kernel patches ==="
-          make target/linux/refresh V=s KERNEL_PATCHVER=6.12 LINUX_VERSION=${KERNEL_VERSION:-6.12.110} 2>&1 | tail -80 || true
+          TARGET=$(cat /workdir/target_version.txt)
+          LINUX_FULL="6.12.$TARGET"
+          echo "=== Adapt patches for linux-$LINUX_FULL ==="
 
-          echo "=== Checking for .rej files ==="
-          REJ=$(find target/linux -name '*.rej' -type f 2>/dev/null)
-          if [ -n "$REJ" ]; then
-            echo "::warning::Found .rej files after refresh:"
-            echo "$REJ"
-          else
-            echo "No .rej files, patches refreshed successfully"
+          cd /tmp
+          wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_FULL.tar.xz" -O linux-src.tar.xz
+          tar -xf linux-src.tar.xz
+          cd "linux-$LINUX_FULL"
+
+          git init -q
+          git config user.email "ci@local"
+          git config user.name "ci"
+          git add -A
+          git commit -q -m "base $LINUX_FULL" || true
+
+          PATCH_DIRS="target/linux/generic/backport-6.12 target/linux/generic/pending-6.12 target/linux/generic/hack-6.12 target/linux/rockchip/patches-6.12"
+
+          REMOVED=0
+          DISABLED=0
+          FIXED=0
+          KEPT=0
+          : > /workdir/patch_report.txt
+
+          for DIR in $PATCH_DIRS; do
+            FULL_DIR="/workdir/openwrt/$DIR"
+            [ -d "$FULL_DIR" ] || continue
+            for PATCH in "$FULL_DIR"/*.patch; do
+              [ -f "$PATCH" ] || continue
+              NAME="$(basename "$PATCH")"
+              REL="$DIR/$NAME"
+
+              if git apply --check "$PATCH" 2>/dev/null; then
+                git apply "$PATCH" 2>/dev/null
+                git add -A
+                git commit -q -m "apply $REL" || true
+                echo "[OK]      $REL" >> /workdir/patch_report.txt
+                KEPT=$((KEPT+1))
+                continue
+              fi
+
+              if git apply -R --check "$PATCH" 2>/dev/null; then
+                rm -f "$PATCH"
+                echo "[REMOVE]  $REL (already upstream)" >> /workdir/patch_report.txt
+                REMOVED=$((REMOVED+1))
+                continue
+              fi
+
+              if git apply --3way "$PATCH" 2>/dev/null; then
+                git add -A
+                git commit -q -m "3way $REL" || true
+                git diff --no-color "HEAD~1" HEAD -- > "$PATCH.new" 2>/dev/null || true
+                if [ -s "$PATCH.new" ]; then
+                  mv "$PATCH.new" "$PATCH"
+                  echo "[3WAY]    $REL" >> /workdir/patch_report.txt
+                  FIXED=$((FIXED+1))
+                else
+                  rm -f "$PATCH.new"
+                  echo "[OK-3WAY] $REL" >> /workdir/patch_report.txt
+                  FIXED=$((FIXED+1))
+                fi
+                continue
+              fi
+
+              mv "$PATCH" "${PATCH}.disabled"
+              echo "[DISABLE] $REL" >> /workdir/patch_report.txt
+              DISABLED=$((DISABLED+1))
+            done
+          done
+
+          echo "===== Patch adaptation summary ====="
+          echo "kept=$KEPT removed=$REMOVED 3way=$FIXED disabled=$DISABLED"
+          cat /workdir/patch_report.txt
+
+      - name: Publish adapted patches to patch branch
+        if: |
+          env.KERNEL_TRACK == 'linux-stable' &&
+          steps.restore_patches.outputs.restored != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET=$(cat /workdir/target_version.txt)
+          VERSION_DIR="6.12.$TARGET"
+
+          cd /workdir/patches-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin "$PATCH_BRANCH" 2>/dev/null || true
+          git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
+
+          mkdir -p "$VERSION_DIR"
+          for DIR in backport-6.12 pending-6.12 hack-6.12; do
+            SRC="/workdir/openwrt/target/linux/generic/$DIR"
+            DST="$VERSION_DIR/generic-$DIR"
+            if [ -d "$SRC" ]; then
+              rm -rf "$DST"
+              mkdir -p "$DST"
+              find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
+            fi
+          done
+          SRC="/workdir/openwrt/target/linux/rockchip/patches-6.12"
+          DST="$VERSION_DIR/rockchip-patches-6.12"
+          if [ -d "$SRC" ]; then
+            rm -rf "$DST"
+            mkdir -p "$DST"
+            find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
           fi
 
-          echo "=== Patches after refresh ==="
-          find target/linux/generic/backport-6.12 -name '*.patch' | wc -l
-          echo "backport patches"
+          cp /workdir/patch_report.txt "$VERSION_DIR/patch-report.txt" 2>/dev/null || true
+          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$VERSION_DIR/READY"
+
+          git add "$VERSION_DIR"
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+          git commit -q -m "patches: adapt for 6.12.$TARGET"
+
+          for attempt in 1 2 3; do
+            echo "== push attempt $attempt =="
+            if git push origin "HEAD:$PATCH_BRANCH"; then
+              echo "pushed to $PATCH_BRANCH"
+              exit 0
+            fi
+            git fetch origin "$PATCH_BRANCH"
+            git rebase "origin/$PATCH_BRANCH" || { git rebase --abort || true; exit 1; }
+            sleep 3
+          done
+          echo "::warning::failed to push patches after 3 attempts"
+          exit 0
 
       - name: Prepare feeds
         run: |
@@ -312,7 +485,7 @@ jobs:
           if [ "$RC" -ne 0 ]; then
             echo "=== toolchain/compile failed, retry V=s ==="
             make toolchain/compile -j1 V=s > /tmp/tc_verbose.log 2>&1 || true
-            grep -n -A 30 -B 10 -iE 'error|fail' /tmp/tc_verbose.log | tail -200
+            grep -n -A 30 -B 10 -iE 'error|fail' /tmp/tc_verbose.log | tail -300
             exit 1
           fi
 
@@ -380,8 +553,11 @@ jobs:
           echo "===== Kernel version used ====="
           grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null || true
 
-          echo "===== Check .rej files ====="
-          find target/linux -name '*.rej' -type f 2>/dev/null || echo "none"
+          if [ -f /workdir/target_version.txt ]; then
+            echo "===== Patch adaptation report ====="
+            cat /workdir/patch_report.txt 2>/dev/null || \
+              echo "(restored from patches/$PATCH_BRANCH, no in-run adaptation)"
+          fi
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -410,6 +586,9 @@ jobs:
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
 
+          [ -f /workdir/patch_report.txt ] && \
+            cp /workdir/patch_report.txt "$GITHUB_WORKSPACE/artifact/${PREFIX}-patch-report.txt" || true
+
           cd $GITHUB_WORKSPACE/artifact
           rm -f SHA256SUMS
           for f in *; do
@@ -426,6 +605,7 @@ jobs:
             $GITHUB_WORKSPACE/artifact/*.gz \
             $GITHUB_WORKSPACE/artifact/*-manifest.txt \
             $GITHUB_WORKSPACE/artifact/*-sha256sums.txt \
+            $GITHUB_WORKSPACE/artifact/*-patch-report.txt \
             $GITHUB_WORKSPACE/artifact/SHA256SUMS \
             --clobber || true
 
