@@ -14,7 +14,7 @@ on:
       kernel_track:
         description: 'Kernel track'
         required: false
-        default: 'openwrt'
+        default: 'linux-stable'
         type: choice
         options:
           - 'openwrt'
