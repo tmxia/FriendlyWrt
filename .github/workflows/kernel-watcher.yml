@@ -14,126 +14,208 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check_kernel:
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      nanopi_changed: ${{ steps.nanopi.outputs.changed }}
+      nanopi_sha: ${{ steps.nanopi.outputs.sha }}
+      nanopi_msg: ${{ steps.nanopi_msg.outputs.msg }}
+      openwrt_changed: ${{ steps.openwrt.outputs.changed }}
+      openwrt_sha: ${{ steps.openwrt.outputs.sha }}
+      stable_changed: ${{ steps.stable.outputs.changed }}
+      stable_ver: ${{ steps.stable.outputs.version }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get latest commit SHA for nanopi6-v6.1.y
-        id: sha
+      - name: Fetch nanopi6-v6.1.y SHA
+        id: nanopi
         run: |
           RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
             -H "User-Agent: kernel-watcher" \
-            "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y" \
-            || true)
+            "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y" || true)
           SHA=$(printf '%s' "$RESP" | jq -r '.sha // empty' 2>/dev/null || true)
           if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
-            echo "::warning::Cannot fetch upstream SHA, skipping this cycle."
-            printf '%s' "$RESP" | head -c 500
-            echo
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "sha=" >> "$GITHUB_OUTPUT"
+            echo "::warning::Cannot fetch nanopi6-v6.1.y SHA"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "ok=true" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "Current SHA: $SHA"
 
-      - name: Check if SHA already processed
-        id: check
-        if: steps.sha.outputs.ok == 'true'
-        run: |
-          SHA="${{ steps.sha.outputs.sha }}"
-          SHA8="${SHA:0:8}"
-
-          # 确保拿到远端 master 最新历史
           git fetch origin master || true
-
-          echo "== Searching git log for existing processing record =="
-          # 主要判据：git log 中是否已有处理该 SHA 的提交
-          MATCH=$(git log origin/master --pretty=format:'%H %s' | grep "update kernel SHA ${SHA8}" || true)
-          if [ -n "$MATCH" ]; then
-            echo "Found existing commit: $MATCH"
-            echo "Already processed SHA ${SHA8}, skip."
-            echo "processed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "== Fallback: check .kernel-version on origin/master =="
+          RECORDED=""
           if git cat-file -e origin/master:.kernel-version 2>/dev/null; then
-            RECORDED=$(git show origin/master:.kernel-version 2>/dev/null | head -n1 | tr -d '[:space:]' || true)
-            echo "origin/master:.kernel-version first line = '$RECORDED'"
-            if [ -n "$RECORDED" ] && [ "$RECORDED" != "none" ]; then
-              if [ "$RECORDED" = "$SHA" ]; then
-                echo "SHA matches .kernel-version, skip."
-                echo "processed=true" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
-            fi
-          else
-            echo "origin/master:.kernel-version does not exist."
+            RECORDED=$(git show origin/master:.kernel-version | head -n1 | tr -d '[:space:]')
           fi
 
-          echo "SHA ${SHA8} not processed yet, proceeding."
-          echo "processed=false" >> "$GITHUB_OUTPUT"
+          echo "recorded=$RECORDED"
+          echo "current=$SHA"
+          if [ "$RECORDED" = "$SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Fetch latest upstream commit message
-        id: commits
-        if: steps.check.outputs.processed == 'false'
+      - name: Fetch nanopi6 commit message
+        id: nanopi_msg
+        if: steps.nanopi.outputs.changed == 'true'
         run: |
           MSG=$(curl -sS -H "Accept: application/vnd.github+json" \
                 -H "User-Agent: kernel-watcher" \
-                "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/${{ steps.sha.outputs.sha }}" \
+                "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/${{ steps.nanopi.outputs.sha }}" \
                 | jq -r '.commit.message // empty')
           [ -z "$MSG" ] && MSG="(no message)"
-          echo "Commit message length: ${#MSG}"
           {
             echo "msg<<__EOF__"
             echo "$MSG"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Compare and trigger build if changed
-        if: steps.check.outputs.processed == 'false'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Fetch openwrt-25.12 SHA
+        id: openwrt
         run: |
-          echo "Kernel updated, triggering build..."
-          gh workflow run build.yml -f version=both -f set=both --repo ${{ github.repository }}
+          RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: kernel-watcher" \
+            "https://api.github.com/repos/openwrt/openwrt/commits/openwrt-25.12" || true)
+          SHA=$(printf '%s' "$RESP" | jq -r '.sha // empty' 2>/dev/null || true)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::warning::Cannot fetch openwrt-25.12 SHA"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Update recorded SHA with latest commit log
-        if: steps.check.outputs.processed == 'false'
-        env:
-          SHA: ${{ steps.sha.outputs.sha }}
-          MSG: ${{ steps.commits.outputs.msg }}
-        run: |
           git fetch origin master || true
+          RECORDED=""
+          if git cat-file -e origin/master:.openwrt-25.12-version 2>/dev/null; then
+            RECORDED=$(git show origin/master:.openwrt-25.12-version | head -n1 | tr -d '[:space:]')
+          fi
 
-          {
-            echo "$SHA"
-            echo ""
-            echo "# 上游更新日志（UTC $(date -u +%Y-%m-%d)）"
-            echo ""
-            if [ -n "$MSG" ]; then
-              echo "$MSG"
-            else
-              echo "(no message)"
-            fi
-          } > .kernel-version
+          echo "recorded=$RECORDED"
+          echo "current=$SHA"
+          if [ "$RECORDED" = "$SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
 
+      - name: Fetch kernel.org 6.12 stable version
+        id: stable
+        run: |
+          VER=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
+                | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
+                | sort -uV | tail -1 \
+                | grep -oE '6\.12\.[0-9]+' || true)
+          if [ -z "$VER" ]; then
+            echo "::warning::Cannot fetch kernel.org 6.12 version"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+          git fetch origin master || true
+          RECORDED=""
+          if git cat-file -e origin/master:.linux-stable-6.12-version 2>/dev/null; then
+            RECORDED=$(git show origin/master:.linux-stable-6.12-version | head -n1 | tr -d '[:space:]')
+          fi
+
+          echo "recorded=$RECORDED"
+          echo "current=$VER"
+          if [ "$RECORDED" = "$VER" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  trigger:
+    needs: check
+    runs-on: ubuntu-latest
+    if: |
+      needs.check.outputs.nanopi_changed == 'true' ||
+      needs.check.outputs.openwrt_changed == 'true' ||
+      needs.check.outputs.stable_changed == 'true'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trigger nanopi6 build
+        if: needs.check.outputs.nanopi_changed == 'true'
+        run: |
+          echo "Triggering build.yml (nanopi6-v6.1.y updated)"
+          gh workflow run build.yml \
+            -f version=both \
+            -f set=both \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Trigger R5S openwrt build
+        if: needs.check.outputs.openwrt_changed == 'true'
+        run: |
+          echo "Triggering build-r5s-openwrt.yml with kernel_track=openwrt"
+          gh workflow run build-r5s-openwrt.yml \
+            -f kernel_track=openwrt \
+            -f kernel_version="${{ needs.check.outputs.openwrt_sha }}" \
+            -f replace_existing=true \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Trigger R5S linux-stable build
+        if: needs.check.outputs.stable_changed == 'true'
+        run: |
+          echo "Triggering build-r5s-openwrt.yml with kernel_track=linux-stable"
+          gh workflow run build-r5s-openwrt.yml \
+            -f kernel_track=linux-stable \
+            -f kernel_version="${{ needs.check.outputs.stable_ver }}" \
+            -f replace_existing=true \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Commit updated records
+        env:
+          NANOPI_CHANGED: ${{ needs.check.outputs.nanopi_changed }}
+          NANOPI_SHA: ${{ needs.check.outputs.nanopi_sha }}
+          NANOPI_MSG: ${{ needs.check.outputs.nanopi_msg }}
+          OPENWRT_CHANGED: ${{ needs.check.outputs.openwrt_changed }}
+          OPENWRT_SHA: ${{ needs.check.outputs.openwrt_sha }}
+          STABLE_CHANGED: ${{ needs.check.outputs.stable_changed }}
+          STABLE_VER: ${{ needs.check.outputs.stable_ver }}
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .kernel-version
+
+          if [ "$NANOPI_CHANGED" = "true" ] && [ -n "$NANOPI_SHA" ]; then
+            {
+              echo "$NANOPI_SHA"
+              echo ""
+              echo "# 上游更新日志（UTC $(date -u +%Y-%m-%d)）"
+              echo ""
+              if [ -n "$NANOPI_MSG" ]; then
+                echo "$NANOPI_MSG"
+              else
+                echo "(no message)"
+              fi
+            } > .kernel-version
+          fi
+
+          if [ "$OPENWRT_CHANGED" = "true" ] && [ -n "$OPENWRT_SHA" ]; then
+            echo "$OPENWRT_SHA" > .openwrt-25.12-version
+          fi
+
+          if [ "$STABLE_CHANGED" = "true" ] && [ -n "$STABLE_VER" ]; then
+            echo "$STABLE_VER" > .linux-stable-6.12-version
+          fi
+
+          git add .kernel-version .openwrt-25.12-version .linux-stable-6.12-version 2>/dev/null || git add -A
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          git commit -m "chore: update kernel SHA $(echo $SHA | cut -c1-8)"
+          git commit -m "chore: update kernel watch records [skip ci]"
 
           for attempt in 1 2 3; do
             echo "== Push attempt $attempt =="
@@ -141,13 +223,8 @@ jobs:
               echo "Push succeeded."
               exit 0
             fi
-            echo "Push failed, syncing with remote..."
             git fetch origin master
-            git rebase origin/master || {
-              echo "Rebase conflict, aborting."
-              git rebase --abort || true
-              exit 1
-            }
+            git rebase origin/master || { git rebase --abort || true; exit 1; }
             sleep 3
           done
           echo "::error::Push failed after 3 attempts."
@@ -156,7 +233,7 @@ jobs:
   cleanup_self:
     name: Cleanup Self Workflow History
     runs-on: ubuntu-latest
-    needs: [check_kernel]
+    needs: [check, trigger]
     if: ${{ always() }}
     permissions:
       actions: write
