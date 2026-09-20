@@ -160,7 +160,7 @@ jobs:
           gh workflow run build-r5s-openwrt.yml \
             -f kernel_track=openwrt \
             -f kernel_version="${{ needs.check.outputs.openwrt_sha }}" \
-            -f replace_existing=true \
+            -f replace_existing=false \
             --repo "$GITHUB_REPOSITORY"
 
       - name: Trigger R5S linux-stable build
@@ -170,7 +170,7 @@ jobs:
           gh workflow run build-r5s-openwrt.yml \
             -f kernel_track=linux-stable \
             -f kernel_version="${{ needs.check.outputs.stable_ver }}" \
-            -f replace_existing=true \
+            -f replace_existing=false \
             --repo "$GITHUB_REPOSITORY"
 
       - name: Commit updated records
