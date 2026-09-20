@@ -228,12 +228,17 @@ jobs:
           VERSION_DIR="6.12.$TARGET"
 
           cd /workdir
-          if git clone --branch "$PATCH_BRANCH" --single-branch \
-              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-              patches-repo 2>&1 | tail -3; then
-            echo "patch branch cloned"
-          else
-            echo "patch branch not found, will create on publish"
+
+          set +e
+          git clone --branch "$PATCH_BRANCH" --single-branch \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            patches-repo > /tmp/clone_patches.log 2>&1
+          CLONE_RC=$?
+          set -e
+
+          if [ "$CLONE_RC" -ne 0 ]; then
+            echo "patch branch '$PATCH_BRANCH' not found (rc=$CLONE_RC), will create on publish"
+            tail -3 /tmp/clone_patches.log
             rm -rf patches-repo
             mkdir -p patches-repo
             cd patches-repo
@@ -242,6 +247,8 @@ jobs:
             git checkout -q -b "$PATCH_BRANCH"
             exit 0
           fi
+
+          echo "patch branch cloned"
 
           if [ ! -f "/workdir/patches-repo/$VERSION_DIR/READY" ]; then
             echo "$VERSION_DIR not found in patch branch, will adapt"
@@ -364,8 +371,19 @@ jobs:
           cd /workdir/patches-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch origin "$PATCH_BRANCH" 2>/dev/null || true
-          git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
+
+          set +e
+          git fetch origin "$PATCH_BRANCH" > /dev/null 2>&1
+          FETCH_RC=$?
+          set -e
+
+          if [ "$FETCH_RC" -eq 0 ]; then
+            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
+            git reset --hard "origin/$PATCH_BRANCH" || true
+          else
+            echo "remote $PATCH_BRANCH not found, using local orphan"
+            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
+          fi
 
           mkdir -p "$VERSION_DIR"
           for DIR in backport-6.12 pending-6.12 hack-6.12; do
@@ -401,8 +419,7 @@ jobs:
               echo "pushed to $PATCH_BRANCH"
               exit 0
             fi
-            git fetch origin "$PATCH_BRANCH"
-            git rebase "origin/$PATCH_BRANCH" || { git rebase --abort || true; exit 1; }
+            echo "push failed, retrying"
             sleep 3
           done
           echo "::warning::failed to push patches after 3 attempts"
