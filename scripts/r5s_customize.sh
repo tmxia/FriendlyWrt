@@ -80,7 +80,7 @@ PYEOF
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
     rm -rf package/custom/luci-app-amlogic/.git
 
-    mkdir -p files/etc/uci-defaults files/etc/docker files/sbin files/usr/bin
+    mkdir -p files/etc/uci-defaults files/sbin files/usr/bin files/etc/docker
 
     # /sbin/mountpoint 补丁
     cat > files/sbin/mountpoint << 'MP_EOF'
@@ -116,28 +116,13 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # /opt 初始化：p3 扩容 + ext4 + fstab + 挂载 + dockerd UCI 幂等
+    # /opt 初始化：p3 扩容 + ext4 + fstab + 挂载（不涉及 Docker）
     cat > files/usr/bin/opt-init.sh << 'OPTEOF'
 #!/bin/sh
 LOG=/tmp/opt-init.log
 exec >>"$LOG" 2>&1
 echo "=== $(date +%FT%T) opt-init ==="
 
-# ---- dockerd UCI 幂等检查 ----
-if [ -x /etc/init.d/dockerd ] && [ -f /etc/docker/custom.json ]; then
-    [ "$(uci -q get dockerd.globals.alt_config_file)" = "/etc/docker/custom.json" ] || {
-        uci set dockerd.globals.alt_config_file='/etc/docker/custom.json'
-        uci commit dockerd
-        echo "set alt_config_file"
-    }
-    [ "$(uci -q get dockerd.globals.data_root)" = "/opt/docker" ] || {
-        uci set dockerd.globals.data_root='/opt/docker'
-        uci commit dockerd
-        echo "set data_root"
-    }
-fi
-
-# ---- p3 扩容 + 挂载 ----
 ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
 REAL=$(readlink -f "$ROOT_DEV" 2>/dev/null)
 [ -b "$REAL" ] && ROOT_DEV="$REAL"
@@ -203,7 +188,6 @@ exit 0
 OPTEOF
     chmod +x files/usr/bin/opt-init.sh
 
-    # rc.local：每次启动调用 opt-init.sh（配置保留，不像 uci-defaults 被新固件覆盖）
     cat > files/etc/rc.local << 'RCEOF'
 # 每次启动执行 /opt 初始化（幂等）
 [ -x /usr/bin/opt-init.sh ] && /usr/bin/opt-init.sh >/dev/null 2>&1
@@ -265,6 +249,18 @@ uci set firewall.fwd_lan_docker.dest='docker'
 
 uci commit firewall
 
+# ---- Docker: 双轨配置 ----
+# 主：alt_config_file 指向 /etc/docker/daemon.json（文件优先）
+# 备：UCI 值同步设置（删掉 alt_config_file 立即生效）
+uci set dockerd.globals.data_root='/opt/docker'
+uci -q delete dockerd.globals.registry_mirrors
+uci add_list dockerd.globals.registry_mirrors='https://docker.1ms.run'
+uci -q delete dockerd.globals.dns
+uci add_list dockerd.globals.dns='223.5.5.5'
+uci add_list dockerd.globals.dns='119.29.29.29'
+uci set dockerd.globals.alt_config_file='/etc/docker/daemon.json'
+uci commit dockerd
+
 printf "tony\ntony\n" | passwd root
 uci set luci.main.mediaurlbase='/luci-static/bootstrap'
 uci delete luci.themes.Argon 2>/dev/null || true
@@ -300,8 +296,8 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    # Docker：通过 alt_config_file 指向自定义 JSON（dockerd init 从 /tmp/dockerd/daemon.json 读，UCI 生成）
-    cat > files/etc/docker/custom.json << 'EOF'
+    # 主配置文件：/etc/docker/daemon.json（用户习惯位置）
+    cat > files/etc/docker/daemon.json << 'EOF'
 {
   "data-root": "/opt/docker",
   "registry-mirrors": ["https://docker.1ms.run"],
@@ -509,7 +505,7 @@ config_stage() {
     grep -E "^CONFIG_PROC_PAGE_MONITOR=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
 
     for f in files/sbin/mountpoint files/usr/bin/opt-init.sh files/etc/rc.local \
-             files/etc/docker/custom.json files/etc/uci-defaults/99-custom; do
+             files/etc/docker/daemon.json files/etc/uci-defaults/99-custom; do
         [ -f "$f" ] || { echo "missing: $f"; exit 1; }
     done
 }
