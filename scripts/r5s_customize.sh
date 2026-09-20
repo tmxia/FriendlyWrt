@@ -25,7 +25,6 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # PROC_PAGE_MONITOR: Redis 需要 /proc/<pid>/smaps
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                BRIDGE BRIDGE_NETFILTER NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_DEVICE CGROUP_FREEZER CGROUP_SCHED CGROUP_BPF \
@@ -40,7 +39,8 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ptgen 生成 3 分区：kernel + rootfs + opt
+    # ptgen 加 p3 占位(256M)，实际大小由 opt-init.sh 首次启动扩到磁盘末尾。
+    # 不要加 truncate：会破坏 fwtool metadata，导致 sysupgrade 必须 -F。
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -60,23 +60,18 @@ if '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"' not in content:
     print("ERROR: rootfs partition args not found"); sys.exit(1)
 
 content = content.replace(
-    'set $(ptgen',
-    'truncate -s $((KERNELSIZE + ROOTFSSIZE + 288))M "$OUTPUT"\nset $(ptgen',
-    1
-)
-content = content.replace(
     '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m"',
     '-t "${ROOTFSPARTTYPE}" -p "${ROOTFSSIZE}m" -t 0x83 -p 256m',
     1
 )
-content = "# R5S_OPT_PATCHED - added opt partition (MBR) to ptgen\n" + content
+content = "# R5S_OPT_PATCHED\n" + content
 
 with open(path, "w") as f:
     f.write(content)
 
-print("patched gen_image_generic.sh:")
+print("patched gen_image_generic.sh")
 for i, line in enumerate(content.split("\n"), 1):
-    if "R5S_OPT_PATCHED" in line or "truncate -s" in line or "ptgen -o" in line:
+    if "R5S_OPT_PATCHED" in line or "0x83" in line:
         print(f"  {i}: {line}")
 PYEOF
 
@@ -85,8 +80,9 @@ PYEOF
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
     rm -rf package/custom/luci-app-amlogic/.git
 
-    mkdir -p files/etc/uci-defaults files/etc/docker files/sbin
+    mkdir -p files/etc/uci-defaults files/etc/docker files/sbin files/usr/bin
 
+    # /sbin/mountpoint 补丁
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
 QUIET=0; DEV=0
@@ -120,23 +116,113 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # 首次启动初始化
+    # /opt 初始化：p3 扩容 + ext4 + fstab + 挂载 + dockerd UCI 幂等
+    cat > files/usr/bin/opt-init.sh << 'OPTEOF'
+#!/bin/sh
+LOG=/tmp/opt-init.log
+exec >>"$LOG" 2>&1
+echo "=== $(date +%FT%T) opt-init ==="
+
+# ---- dockerd UCI 幂等检查 ----
+if [ -x /etc/init.d/dockerd ] && [ -f /etc/docker/custom.json ]; then
+    [ "$(uci -q get dockerd.globals.alt_config_file)" = "/etc/docker/custom.json" ] || {
+        uci set dockerd.globals.alt_config_file='/etc/docker/custom.json'
+        uci commit dockerd
+        echo "set alt_config_file"
+    }
+    [ "$(uci -q get dockerd.globals.data_root)" = "/opt/docker" ] || {
+        uci set dockerd.globals.data_root='/opt/docker'
+        uci commit dockerd
+        echo "set data_root"
+    }
+fi
+
+# ---- p3 扩容 + 挂载 ----
+ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
+REAL=$(readlink -f "$ROOT_DEV" 2>/dev/null)
+[ -b "$REAL" ] && ROOT_DEV="$REAL"
+
+case "$ROOT_DEV" in
+    /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; P="p" ;;
+    /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; P="" ;;
+    *) echo "no disk"; exit 0 ;;
+esac
+OPT_DEV="${DISK}${P}3"
+[ -b "$OPT_DEV" ] || { echo "no p3"; exit 0; }
+
+[ -x /etc/init.d/dockerd ] && /etc/init.d/dockerd stop 2>/dev/null
+sleep 1
+umount /opt/docker 2>/dev/null || true
+umount /opt 2>/dev/null || true
+
+DS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
+PS=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
+PC=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
+if [ -n "$DS" ] && [ -n "$PS" ] && [ -n "$PC" ]; then
+    TG=$((DS - PS - 33))
+    if [ "$PC" -lt "$TG" ]; then
+        echo "resize p3: $PC -> $TG"
+        command -v parted >/dev/null 2>&1 && parted -s "$DISK" resizepart 3 100%
+        partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
+        sleep 2
+    fi
+fi
+
+FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
+if [ "$FSTYPE" != "ext4" ]; then
+    echo "mkfs.ext4 (fstype=$FSTYPE)"
+    mkfs.ext4 -L opt -F "$OPT_DEV"
+else
+    if ! resize2fs "$OPT_DEV" 2>/dev/null; then
+        echo "resize2fs failed, recreating"
+        mkfs.ext4 -L opt -F "$OPT_DEV"
+    fi
+fi
+
+UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
+if [ -n "$UUID" ]; then
+    [ "$(uci -q get fstab.opt.uuid)" = "$UUID" ] || {
+        uci -q delete fstab.opt 2>/dev/null || true
+        uci set fstab.opt=mount
+        uci set fstab.opt.target='/opt'
+        uci set fstab.opt.uuid="$UUID"
+        uci set fstab.opt.fstype='ext4'
+        uci set fstab.opt.options='rw,relatime'
+        uci set fstab.opt.enabled='1'
+        uci commit fstab
+        echo "fstab.opt.uuid=$UUID"
+    }
+    mkdir -p /opt/docker
+    chmod 0700 /opt/docker
+    mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt
+    echo "mounted: $(df -h /opt 2>/dev/null | tail -1)"
+fi
+
+echo "=== done ==="
+exit 0
+OPTEOF
+    chmod +x files/usr/bin/opt-init.sh
+
+    # rc.local：每次启动调用 opt-init.sh（配置保留，不像 uci-defaults 被新固件覆盖）
+    cat > files/etc/rc.local << 'RCEOF'
+# 每次启动执行 /opt 初始化（幂等）
+[ -x /usr/bin/opt-init.sh ] && /usr/bin/opt-init.sh >/dev/null 2>&1
+exit 0
+RCEOF
+    chmod +x files/etc/rc.local
+
+    # 首次刷机系统配置
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
-# docker0 声明（25.12 上游缺）
-if ! uci -q get network.docker.device >/dev/null 2>&1; then
-    uci set network.docker='interface'
-    uci set network.docker.device='docker0'
-    uci set network.docker.proto='none'
-    uci set network.docker.auto='0'
-fi
+# docker0 声明
 if ! uci show network 2>/dev/null | grep -qE "\.name=['\"]?docker0['\"]?"; then
     uci add network device >/dev/null
     uci set network.@device[-1].type='bridge'
     uci set network.@device[-1].name='docker0'
 fi
 
+# LAN / WAN
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -149,14 +235,13 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
-# firewall：LAN zone
+# firewall
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
 uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
 
-# docker zone：device 直绑（不用 network=，避免 netifd 接管 bridge）
 uci set firewall.docker=zone
 uci set firewall.docker.name='docker'
 uci set firewall.docker.input='ACCEPT'
@@ -166,7 +251,6 @@ uci set firewall.docker.device='docker0'
 uci set firewall.docker.masq='1'
 uci set firewall.docker.mtu_fix='1'
 
-# 三条 forwarding：docker <-> wan/lan
 uci set firewall.fwd_docker_wan=forwarding
 uci set firewall.fwd_docker_wan.src='docker'
 uci set firewall.fwd_docker_wan.dest='wan'
@@ -197,6 +281,7 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     /etc/init.d/sshd restart
 fi
 
+# LED
 for entry in "wan_led:green:wan:eth0" "lan1_led:green:lan-1:eth1" "lan2_led:green:lan-2:eth2"; do
     name="${entry%%:*}"; rest="${entry#*:}"
     sysfs="${rest%%:*}"; dev="${rest#*:}"
@@ -211,80 +296,21 @@ done
 uci commit system
 /etc/init.d/led restart 2>/dev/null || true
 
-# /opt: 扩展 p3 到磁盘末尾 + 格式化 + 挂载
-LOG="logger -t opt-init"
-ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null | head -1)
-if [ -n "$ROOT_DEV" ]; then
-    REAL_DEV=$(readlink -f "$ROOT_DEV" 2>/dev/null)
-    [ -b "$REAL_DEV" ] && ROOT_DEV="$REAL_DEV"
-
-    case "$ROOT_DEV" in
-        /dev/mmcblk*p*)     DISK="/dev/$(basename "$ROOT_DEV" | sed 's/p[0-9]*$//')"; P="p" ;;
-        /dev/sd[a-z][0-9]*) DISK="/dev/$(basename "$ROOT_DEV" | sed 's/[0-9]*$//')"; P="" ;;
-        *) DISK="" ;;
-    esac
-
-    if [ -n "$DISK" ]; then
-        OPT_DEV="${DISK}${P}3"
-        if [ -b "$OPT_DEV" ]; then
-            if [ ! -f /etc/.opt_resized ]; then
-                DISK_SECTORS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
-                if [ -n "$DISK_SECTORS" ]; then
-                    P3_START=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
-                    P3_CUR=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
-                    TARGET=$((DISK_SECTORS - P3_START - 33))
-                    if [ -n "$P3_START" ] && [ "$P3_CUR" -lt "$TARGET" ]; then
-                        $LOG "resizing p3: $P3_CUR -> $TARGET"
-                        command -v parted >/dev/null 2>&1 && \
-                            parted -s "$DISK" resizepart 3 100% >/dev/null 2>&1
-                        partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
-                        sleep 1
-                    fi
-                fi
-                touch /etc/.opt_resized
-            fi
-
-            FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
-            if [ "$FSTYPE" != "ext4" ]; then
-                $LOG "mkfs.ext4 on $OPT_DEV"
-                mkfs.ext4 -L opt -F "$OPT_DEV" >/dev/null 2>&1
-            else
-                command -v resize2fs >/dev/null 2>&1 && resize2fs "$OPT_DEV" >/dev/null 2>&1 || true
-            fi
-
-            UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
-            if [ -n "$UUID" ]; then
-                if ! uci -q get fstab.opt >/dev/null 2>&1; then
-                    uci set fstab.opt=mount
-                    uci set fstab.opt.target='/opt'
-                    uci set fstab.opt.uuid="$UUID"
-                    uci set fstab.opt.fstype='ext4'
-                    uci set fstab.opt.options='rw,relatime'
-                    uci set fstab.opt.enabled='1'
-                    uci commit fstab
-                fi
-                mkdir -p /opt
-                mountpoint -q /opt || mount -t ext4 "$OPT_DEV" /opt 2>/dev/null
-                mkdir -p /opt/docker
-                chmod 0700 /opt/docker
-                $LOG "/opt mounted on $OPT_DEV UUID=$UUID"
-            fi
-        fi
-    fi
-fi
-
 exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    cat > files/etc/docker/daemon.json << 'EOF'
+    # Docker：通过 alt_config_file 指向自定义 JSON（dockerd init 从 /tmp/dockerd/daemon.json 读，UCI 生成）
+    cat > files/etc/docker/custom.json << 'EOF'
 {
   "data-root": "/opt/docker",
+  "registry-mirrors": ["https://docker.1ms.run"],
+  "dns": ["223.5.5.5", "119.29.29.29"],
   "log-driver": "json-file",
-  "log-opts": {
-    "max-size": "10m",
-    "max-file": "3"
-  }
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "iptables": true,
+  "ip-forward": true,
+  "ip-masq": true
 }
 EOF
 }
@@ -297,11 +323,7 @@ pre_build() {
     [ -z "$DTS" ] && DTS=$(find . -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
 
     [ -z "$DTS" ] && { echo "r5s dts not found, skip"; return 0; }
-
-    if grep -q "pwm-fan" "$DTS"; then
-        echo "dts already patched"
-        return 0
-    fi
+    grep -q "pwm-fan" "$DTS" && { echo "dts already patched"; return 0; }
 
     cp "$DTS" "${DTS}.orig"
     cat >> "$DTS" << 'DTS_EOF'
@@ -486,7 +508,10 @@ config_stage() {
     grep -E "^CONFIG_(LEDS_TRIGGER_NETDEV|LED_TRIGGER_PHY)=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
     grep -E "^CONFIG_PROC_PAGE_MONITOR=" "target/linux/rockchip/config-${KV}" 2>/dev/null || true
 
-    [ -f files/sbin/mountpoint ] || { echo "missing files/sbin/mountpoint"; exit 1; }
+    for f in files/sbin/mountpoint files/usr/bin/opt-init.sh files/etc/rc.local \
+             files/etc/docker/custom.json files/etc/uci-defaults/99-custom; do
+        [ -f "$f" ] || { echo "missing: $f"; exit 1; }
+    done
 }
 
 case "$STAGE" in
