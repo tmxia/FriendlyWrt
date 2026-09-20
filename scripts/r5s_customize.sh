@@ -483,10 +483,10 @@ config_stage() {
     done
 
     ENABLE_PKGS="
-    bc vsftpd sudo unzip file procd logrotate coreutils-stat lsof jq
-    wireguard-tools python3-light
-    bash perl parted curl dosfstools e2fsprogs resize2fs lsblk pv losetup uuidgen fdisk wget-ssl
-    block-mount blkid
+    bc vsftpd sudo unzip file procd logrotate coreutils-stat wireguard-tools python3-light
+    bash perl parted curl dosfstools e2fsprogs resize2fs lsblk block-mount blkid
+    python3-requests python3-paramiko python3-pytz python3-dateutil python3-bs4
+coreutils-timeout coreutils-date
     "
     for pkg in $ENABLE_PKGS; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
