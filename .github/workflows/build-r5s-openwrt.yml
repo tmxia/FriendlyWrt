@@ -307,6 +307,7 @@ jobs:
           FIXED=0
           KEPT=0
           : > /workdir/patch_report.txt
+          mkdir -p /workdir/disabled-patches
 
           for DIR in $PATCH_DIRS; do
             FULL_DIR="/workdir/openwrt/$DIR"
@@ -348,7 +349,35 @@ jobs:
                 continue
               fi
 
-              mv "$PATCH" "${PATCH}.disabled"
+              BASE_COMMIT=$(git rev-parse HEAD)
+
+              set +e
+              patch -p1 --forward --merge --no-backup-if-mismatch < "$PATCH" > /tmp/patch_merge.log 2>&1
+              PM_RC=$?
+              set -e
+
+              if ! git diff --quiet; then
+                git diff > "$PATCH.new"
+                if [ -s "$PATCH.new" ]; then
+                  mv "$PATCH.new" "$PATCH"
+                  echo "[MERGE]   $REL (partial, rc=$PM_RC)" >> /workdir/patch_report.txt
+                  FIXED=$((FIXED+1))
+                else
+                  rm -f "$PATCH.new"
+                  echo "[NOOP]    $REL (rc=$PM_RC)" >> /workdir/patch_report.txt
+                  KEPT=$((KEPT+1))
+                fi
+                git add -A
+                git commit -q -m "merge $REL" || true
+                find . -name '*.rej' -delete 2>/dev/null || true
+                find . -name '*.orig' -delete 2>/dev/null || true
+                continue
+              fi
+
+              git reset --hard "$BASE_COMMIT" > /dev/null 2>&1 || true
+              git clean -fdx > /dev/null 2>&1 || true
+
+              mv "$PATCH" "/workdir/disabled-patches/$NAME"
               echo "[DISABLE] $REL" >> /workdir/patch_report.txt
               DISABLED=$((DISABLED+1))
             done
@@ -401,6 +430,11 @@ jobs:
             rm -rf "$DST"
             mkdir -p "$DST"
             find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
+          fi
+
+          if [ -d /workdir/disabled-patches ] && [ "$(ls -A /workdir/disabled-patches 2>/dev/null)" ]; then
+            mkdir -p "$VERSION_DIR/disabled"
+            cp /workdir/disabled-patches/* "$VERSION_DIR/disabled/" 2>/dev/null || true
           fi
 
           cp /workdir/patch_report.txt "$VERSION_DIR/patch-report.txt" 2>/dev/null || true
