@@ -187,8 +187,16 @@ exit 0
 OPTEOF
     chmod +x files/usr/bin/opt-init.sh
 
+    # rc.local：/opt 初始化 + 延迟重启 led（修复 netdev trigger 时机）
     cat > files/etc/rc.local << 'RCEOF'
 [ -x /usr/bin/opt-init.sh ] && /usr/bin/opt-init.sh >/dev/null 2>&1
+
+# 网卡就绪后重新应用 LED netdev trigger
+(
+    sleep 20
+    /etc/init.d/led restart >/dev/null 2>&1
+) &
+
 exit 0
 RCEOF
     chmod +x files/etc/rc.local
@@ -323,7 +331,6 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
 fi
 
 # LED：绑定 R5S 网卡（eth0=WAN, eth1=LAN1, eth2=LAN2）
-# 先清掉可能残留的旧配置（避免和 led_* 冲突）
 uci -q delete system.wan_led 2>/dev/null
 uci -q delete system.lan1_led 2>/dev/null
 uci -q delete system.lan2_led 2>/dev/null
@@ -486,7 +493,7 @@ config_stage() {
     bc vsftpd sudo unzip file procd logrotate coreutils-stat wireguard-tools python3-light
     bash perl parted curl dosfstools e2fsprogs resize2fs lsblk block-mount blkid
     python3-requests python3-paramiko python3-pytz python3-dateutil python3-bs4
-coreutils-timeout coreutils-date
+    coreutils-timeout coreutils-date
     "
     for pkg in $ENABLE_PKGS; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
