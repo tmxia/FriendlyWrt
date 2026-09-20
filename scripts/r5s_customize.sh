@@ -322,17 +322,24 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     /etc/init.d/sshd restart
 fi
 
-# LED
-for entry in "wan_led:green:wan:eth0" "lan1_led:green:lan-1:eth1" "lan2_led:green:lan-2:eth2"; do
-    name="${entry%%:*}"; rest="${entry#*:}"
-    sysfs="${rest%%:*}"; dev="${rest#*:}"
-    uci -q delete "system.${name}"
-    uci set "system.${name}=led"
-    uci set "system.${name}.name=${name}"
-    uci set "system.${name}.sysfs=${sysfs}"
-    uci set "system.${name}.trigger=netdev"
-    uci set "system.${name}.dev=${dev}"
-    uci set "system.${name}.mode=link"
+# LED：绑定 R5S 网卡（eth0=WAN, eth1=LAN1, eth2=LAN2）
+# 先清掉可能残留的旧配置（避免和 led_* 冲突）
+uci -q delete system.wan_led 2>/dev/null
+uci -q delete system.lan1_led 2>/dev/null
+uci -q delete system.lan2_led 2>/dev/null
+
+for pair in "wan:green:wan:eth0" "lan1:green:lan-1:eth1" "lan2:green:lan-2:eth2"; do
+    name="${pair%%:*}"
+    rest="${pair#*:}"
+    sysfs="green:${rest%%:*}"
+    dev="${rest#*:}"
+    uci -q delete "system.led_${name}"
+    uci set "system.led_${name}=led"
+    uci set "system.led_${name}.name=$(echo $name | tr a-z A-Z)"
+    uci set "system.led_${name}.sysfs=${sysfs}"
+    uci set "system.led_${name}.trigger=netdev"
+    uci set "system.led_${name}.dev=${dev}"
+    uci set "system.led_${name}.mode=link"
 done
 uci commit system
 /etc/init.d/led restart 2>/dev/null || true
@@ -368,25 +375,17 @@ pre_build() {
     cp "$DTS" "${DTS}.orig"
     cat >> "$DTS" << 'DTS_EOF'
 
-&pinctrl {
-    pwm4_fan {
-        pwm4_fan_pins: pwm4-fan-pins {
-            rockchip,pins = <0 RK_PC3 1 &pcfg_pull_none>;
-        };
-    };
-};
-
-&pwm4 {
+&pwm11 {
     status = "okay";
     pinctrl-names = "default";
-    pinctrl-0 = <&pwm4_fan_pins>;
+    pinctrl-0 = <&pwm11m0_pins>;
 };
 
 / {
     fan: pwm-fan {
         compatible = "pwm-fan";
         cooling-levels = <0 80 160 255>;
-        pwms = <&pwm4 0 40000 0>;
+        pwms = <&pwm11 0 40000 0>;
         #cooling-cells = <2>;
         status = "okay";
     };
@@ -417,7 +416,7 @@ pre_build() {
     };
 };
 DTS_EOF
-    echo "pwm-fan node injected (45C->1, 50C->2)"
+    echo "pwm-fan node injected (GPIO3_B6 / pwm11m0, 45C->1, 50C->3)"
 }
 
 cache_restore() {
