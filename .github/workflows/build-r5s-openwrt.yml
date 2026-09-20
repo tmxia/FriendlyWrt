@@ -14,7 +14,7 @@ on:
       kernel_track:
         description: 'Kernel track'
         required: false
-        default: 'linux-stable'
+        default: 'openwrt'
         type: choice
         options:
           - 'openwrt'
@@ -204,7 +204,8 @@ jobs:
           make defconfig
 
       - name: Restore cache
-        if: inputs.kernel_track != 'linux-stable'
+        env:
+          OPENWRT_BRANCH: ${{ inputs.kernel_track == 'linux-stable' && 'openwrt-25.12-linux-stable' || 'openwrt-25.12' }}
         run: |
           cd /workdir
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_restore
@@ -222,9 +223,9 @@ jobs:
           time make toolchain/compile -j$(nproc) || exit 1
 
       - name: Checkpoint base cache
-        if: |
-          steps.compile_base.outcome == 'success' &&
-          inputs.kernel_track != 'linux-stable'
+        if: steps.compile_base.outcome == 'success'
+        env:
+          OPENWRT_BRANCH: ${{ inputs.kernel_track == 'linux-stable' && 'openwrt-25.12-linux-stable' || 'openwrt-25.12' }}
         run: |
           cd /workdir/openwrt
 
