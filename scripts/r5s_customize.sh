@@ -120,11 +120,11 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # 首次启动初始化：docker0 声明 → 网络/防火墙 → 密码/主题 → SSH → LED → /opt 分区
+    # 首次启动初始化
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
-# docker0 network 声明（25.12 上游缺，否则容器网络被 firewall4 drop）
+# docker0 声明（25.12 上游缺）
 if ! uci -q get network.docker.device >/dev/null 2>&1; then
     uci set network.docker='interface'
     uci set network.docker.device='docker0'
@@ -149,11 +149,36 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
+# firewall：LAN zone
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
 uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
+
+# docker zone：device 直绑（不用 network=，避免 netifd 接管 bridge）
+uci set firewall.docker=zone
+uci set firewall.docker.name='docker'
+uci set firewall.docker.input='ACCEPT'
+uci set firewall.docker.output='ACCEPT'
+uci set firewall.docker.forward='ACCEPT'
+uci set firewall.docker.device='docker0'
+uci set firewall.docker.masq='1'
+uci set firewall.docker.mtu_fix='1'
+
+# 三条 forwarding：docker <-> wan/lan
+uci set firewall.fwd_docker_wan=forwarding
+uci set firewall.fwd_docker_wan.src='docker'
+uci set firewall.fwd_docker_wan.dest='wan'
+
+uci set firewall.fwd_docker_lan=forwarding
+uci set firewall.fwd_docker_lan.src='docker'
+uci set firewall.fwd_docker_lan.dest='lan'
+
+uci set firewall.fwd_lan_docker=forwarding
+uci set firewall.fwd_lan_docker.src='lan'
+uci set firewall.fwd_lan_docker.dest='docker'
+
 uci commit firewall
 
 printf "tony\ntony\n" | passwd root
