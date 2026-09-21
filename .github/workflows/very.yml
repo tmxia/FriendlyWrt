@@ -1,4 +1,4 @@
-name: Verify r5s.config
+name: Quick verify kernel config
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     env:
       OPENWRT_BRANCH: 'openwrt-25.12'
       OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
@@ -43,19 +43,9 @@ jobs:
             "$OPENWRT_REPO" /workdir/openwrt
           ln -sf /workdir/openwrt openwrt
 
-      - name: Update and install feeds
-        run: |
-          cd /workdir/openwrt
-          ./scripts/feeds update -a 2>&1 | tail -10
-          ./scripts/feeds install -a 2>&1 | tail -10
-
       - name: Prepare .config
         run: |
           cd /workdir/openwrt
-          if [ ! -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
-            echo "::error::config file not found: $CONFIG_FILE"
-            exit 1
-          fi
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
           echo "input lines: $(wc -l < .config)"
 
@@ -65,74 +55,79 @@ jobs:
           make defconfig > /tmp/defconfig.log 2>&1 || true
           tail -3 /tmp/defconfig.log
 
-      - name: Check each option in final .config
+      # 关键：只生成内核 .config，不编译
+      - name: Prepare target (generate kernel .config only)
         run: |
           cd /workdir/openwrt
-          INPUT="$GITHUB_WORKSPACE/$CONFIG_FILE"
-          FINAL=/workdir/openwrt/.config
-          REPORT=/workdir/verify-report.txt
+          echo "=== make target/linux/prepare ==="
+          set +e
+          make target/linux/prepare -j$(nproc) > /tmp/target_prepare.log 2>&1
+          RC=$?
+          set -e
+          echo "rc=$RC"
+          tail -20 /tmp/target_prepare.log
+
+      - name: Inspect kernel .config
+        run: |
+          cd /workdir/openwrt
+          REPORT=/workdir/kernel-verify.txt
           : > "$REPORT"
 
-          grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key val; do
-            [ -z "$key" ] && continue
-            key=$(echo "$key" | tr -d ' ')
-            val=$(echo "$val" | tr -d ' ')
+          echo "########## 1) OpenWrt target configs ##########" >> "$REPORT"
+          find target/linux -name 'config-6.12' | sort | while read f; do
+            echo "--- $f ---" >> "$REPORT"
+            grep -n "PROC_PAGE_MONITOR\|^CONFIG_PROC_FS\|^# CONFIG_PROC_FS" "$f" >> "$REPORT" 2>/dev/null || echo "  (no match)" >> "$REPORT"
+          done
 
-            case "$key" in
-              CONFIG_KERNEL_*|CONFIG_PACKAGE_*|CONFIG_DOCKER_*) ;;
-              *) continue ;;
-            esac
+          echo "" >> "$REPORT"
+          echo "########## 2) Final kernel .config ##########" >> "$REPORT"
+          KCFG=$(find build_dir -path '*/linux-rockchip_armv8/linux-6.12.*/.config' 2>/dev/null | head -1)
+          if [ -z "$KCFG" ]; then
+            KCFG=$(find build_dir -path '*/linux-6.12.*/.config' 2>/dev/null | head -1)
+          fi
+          if [ -n "$KCFG" ]; then
+            echo "file: $KCFG" >> "$REPORT"
+            grep -n "CONFIG_PROC_PAGE_MONITOR\|CONFIG_PROC_FS\b" "$KCFG" >> "$REPORT" || echo "  (no match)" >> "$REPORT"
+          else
+            echo "  !! kernel .config not found" >> "$REPORT"
+            find build_dir -maxdepth 4 -name '.config' -path '*linux*' 2>/dev/null >> "$REPORT"
+          fi
 
-            if grep -qE "^${key}=${val}$" "$FINAL"; then
-              echo "[OK]       $key=$val" >> "$REPORT"
-            elif grep -qE "^${key}=" "$FINAL"; then
-              fval=$(grep -E "^${key}=" "$FINAL" | head -1 | cut -d= -f2)
-              echo "[CHANGED]  $key: input=$val final=$fval" >> "$REPORT"
-            elif grep -qE "^# ${key} is not set" "$FINAL"; then
-              echo "[DISABLED] $key (explicitly off)" >> "$REPORT"
+          echo "" >> "$REPORT"
+          echo "########## 3) ARM64 COW patch presence (ff1712f953e2) ##########" >> "$REPORT"
+          KSRC=$(find build_dir -maxdepth 4 -type d -name 'linux-6.12.*' 2>/dev/null | head -1)
+          if [ -n "$KSRC" ]; then
+            echo "kernel src: $KSRC" >> "$REPORT"
+            PGT="$KSRC/arch/arm64/include/asm/pgtable.h"
+            if [ -f "$PGT" ]; then
+              echo "--- grep pte_wrprotect in $PGT ---" >> "$REPORT"
+              grep -n -A5 "pte_wrprotect" "$PGT" | head -40 >> "$REPORT" || true
+              if grep -q "dirty bit is preserved\|preserve.*dirty\|pte_mkclean" "$PGT"; then
+                echo "[PATCH PRESENT] dirty-bit preservation code found" >> "$REPORT"
+              else
+                echo "[PATCH MISSING?] cannot find dirty-bit preservation marker" >> "$REPORT"
+              fi
             else
-              echo "[MISSING]  $key" >> "$REPORT"
+              echo "  !! pgtable.h not found at $PGT" >> "$REPORT"
             fi
-          done
+          else
+            echo "  !! kernel source dir not found" >> "$REPORT"
+          fi
 
-      - name: Print summary
+          echo "" >> "$REPORT"
+          echo "########## 4) OpenWrt kernel-version.mk ##########" >> "$REPORT"
+          grep -n '^LINUX_VERSION-6.12\|^LINUX_KERNEL_HASH-6.12' include/kernel-version.mk >> "$REPORT" 2>/dev/null || true
+
+      - name: Print report
         run: |
-          R=/workdir/verify-report.txt
-          echo "================ SUMMARY ================"
-          for tag in OK CHANGED DISABLED MISSING; do
-            n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null | head -1)
-            [ -z "$n" ] && n=0
-            echo "$tag = $n"
-          done
-          echo ""
-          echo "--- MISSING ---"
-          grep '^\[MISSING\]' "$R" || echo "(none)"
-          echo ""
-          echo "--- DISABLED ---"
-          grep '^\[DISABLED\]' "$R" || echo "(none)"
-          echo ""
-          echo "--- CHANGED ---"
-          grep '^\[CHANGED\]' "$R" || echo "(none)"
+          echo "================= KERNEL VERIFY ================="
+          cat /workdir/kernel-verify.txt
+          echo "================================================="
           {
-            echo "### Config verification"
+            echo "### Kernel quick verify"
             echo ""
-            for tag in OK CHANGED DISABLED MISSING; do
-              n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null | head -1)
-              [ -z "$n" ] && n=0
-              echo "- $tag: $n"
-            done
-            echo ""
-            echo '**MISSING:**'
             echo '```'
-            grep '^\[MISSING\]' "$R" || echo "(none)"
-            echo '```'
-            echo '**DISABLED:**'
-            echo '```'
-            grep '^\[DISABLED\]' "$R" || echo "(none)"
-            echo '```'
-            echo '**CHANGED:**'
-            echo '```'
-            grep '^\[CHANGED\]' "$R" || echo "(none)"
+            cat /workdir/kernel-verify.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -140,10 +135,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: verify-report
+          name: kernel-verify-report
           path: |
-            /workdir/verify-report.txt
+            /workdir/kernel-verify.txt
             /workdir/openwrt/.config
             /tmp/defconfig.log
+            /tmp/target_prepare.log
           retention-days: 14
           if-no-files-found: warn
