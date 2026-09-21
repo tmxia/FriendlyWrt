@@ -293,13 +293,11 @@ jobs:
 
       # =====================================================================
       # 通用补丁适配：4 阶段
+      #   Phase 0: 确保 kernel tarball
       #   Phase 1: 反向扫描（干净内核上做，找冗余补丁）
       #   Phase 2: 删除冗余补丁
       #   Phase 3: make target/linux/prepare（让 OpenWrt 自己验证）
       #   Phase 4: 失败时输出结构化诊断
-      #
-      # 不假设：内核版本 / 平台 / 补丁前缀 / 目录结构 / 补丁数量
-      # 只做两件事：删冗余 / 报冲突
       # =====================================================================
       - name: Adapt kernel patches via OpenWrt
         id: adapt_patches
@@ -313,12 +311,21 @@ jobs:
           echo "=== adapt patches for linux-6.12.$TARGET ==="
 
           # ---------- Phase 0: 确保 kernel tarball ----------
+          mkdir -p dl
           TAR="dl/linux-6.12.$TARGET.tar.xz"
           if [ ! -s "$TAR" ]; then
-            echo "downloading kernel tarball"
-            wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.$TARGET.tar.xz" -O "$TAR"
+            echo "downloading kernel tarball via wget"
+            wget -q --tries=3 --timeout=60 \
+              "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.$TARGET.tar.xz" \
+              -O "$TAR" || true
           fi
-          [ -s "$TAR" ] || { echo "::error::cannot obtain kernel tarball"; exit 1; }
+          if [ ! -s "$TAR" ]; then
+            echo "wget failed, trying OpenWrt scripts/download.pl"
+            ./scripts/download.pl "dl" "linux-6.12.$TARGET.tar.xz" \
+              "https://cdn.kernel.org/pub/linux/kernel/v6.x" || true
+          fi
+          [ -s "$TAR" ] || { echo "::error::cannot obtain kernel tarball"; ls -la dl/ | tail -20; exit 1; }
+          echo "kernel tarball: $(ls -lh "$TAR" | awk '{print $5, $9}')"
 
           # ---------- Phase 1: 反向扫描（干净内核） ----------
           echo ""
@@ -503,11 +510,11 @@ jobs:
             rm -rf "$DST"; mkdir -p "$DST"
             find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
           fi
-          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ) (auto-removed $R_COUNT redundant)" > "$VERSION_DIR/READY"
+          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ) (auto: redundant patches removed)" > "$VERSION_DIR/READY"
 
           git add "$VERSION_DIR"
           git diff --cached --quiet && { echo "no changes"; exit 0; }
-          git commit -q -m "patches: adapt for 6.12.$TARGET (auto: redundant removed)"
+          git commit -q -m "patches: adapt for 6.12.$TARGET via OpenWrt prepare"
           for attempt in 1 2 3; do
             echo "push attempt $attempt"
             git push origin "HEAD:$PATCH_BRANCH" && { echo "pushed"; exit 0; }
@@ -527,6 +534,7 @@ jobs:
 
           KEEP="${PATCH_KEEP_VERSIONS:-2}"
           if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
+            echo "invalid PATCH_KEEP_VERSIONS, fallback to 2"
             KEEP=2
           fi
 
