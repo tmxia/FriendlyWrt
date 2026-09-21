@@ -4,12 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (留空则自动使用最新 release)'
+        description: 'Release tag (留空则用官方仓库最新 release)'
         required: false
         default: ''
 
 permissions:
   contents: read
+
+env:
+  # 官方固件镜像仓库（不是自编译仓库）
+  SOURCE_REPO: 'tmxia/FriendlyWrt'
 
 jobs:
   resolve_tag:
@@ -27,8 +31,8 @@ jobs:
             TAG="$INPUT_TAG"
             echo "Using user-provided tag: $TAG"
           else
-            TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName')
-            echo "Auto-selected latest release tag: $TAG"
+            TAG=$(gh release list --repo "$SOURCE_REPO" --limit 1 --json tagName --jq '.[0].tagName')
+            echo "Auto-selected latest tag from $SOURCE_REPO: $TAG"
           fi
           [ -n "$TAG" ] || { echo "ERROR: no release tag"; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -38,8 +42,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.pick.outputs.tag }}
         run: |
-          echo "Assets in $RELEASE_TAG:"
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+          echo "Assets in $SOURCE_REPO @ $RELEASE_TAG:"
+          gh release view "$RELEASE_TAG" --repo "$SOURCE_REPO" --json assets \
             --jq '.assets[].name' | sort
 
   extract:
@@ -61,10 +65,11 @@ jobs:
           RELEASE_TAG: ${{ needs.resolve_tag.outputs.tag }}
         run: |
           IMG="R5S-R5C-Series-FriendlyWrt-${{ matrix.version }}-docker.img.gz"
-          echo "Release tag: $RELEASE_TAG"
-          echo "Downloading $IMG ..."
+          echo "Source:  $SOURCE_REPO"
+          echo "Release: $RELEASE_TAG"
+          echo "Asset:   $IMG"
           gh release download "$RELEASE_TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "$SOURCE_REPO" \
             --pattern "$IMG" \
             --output firmware.img.gz \
             --clobber
@@ -75,22 +80,19 @@ jobs:
         run: |
           gunzip -f firmware.img.gz
 
-          # Map partitions
           sudo kpartx -av firmware.img
 
           ID=""; REL=""; ARCH=""; TGT=""; FOUND=""
           for dev in /dev/mapper/loop*p*; do
             [ -e "$dev" ] || continue
             MNT=$(mktemp -d)
-
-            # Try ext4 then squashfs
             for fstype in "" "-t ext4" "-t squashfs"; do
               if sudo mount -o ro $fstype "$dev" "$MNT" 2>/dev/null; then
                 if [ -f "$MNT/etc/openwrt_release" ]; then
-                  ID=$(  sed -n "s/^DISTRIB_ID=['\"]\([^'\"]*\)['\"].*/\1/p"         "$MNT/etc/openwrt_release")
-                  REL=$( sed -n "s/^DISTRIB_RELEASE=['\"]\([^'\"]*\)['\"].*/\1/p"    "$MNT/etc/openwrt_release")
-                  ARCH=$(sed -n "s/^DISTRIB_ARCH=['\"]\([^'\"]*\)['\"].*/\1/p"       "$MNT/etc/openwrt_release")
-                  TGT=$( sed -n "s/^DISTRIB_TARGET=['\"]\([^'\"]*\)['\"].*/\1/p"     "$MNT/etc/openwrt_release")
+                  ID=$(  sed -n "s/^DISTRIB_ID=['\"]\([^'\"]*\)['\"].*/\1/p"       "$MNT/etc/openwrt_release")
+                  REL=$( sed -n "s/^DISTRIB_RELEASE=['\"]\([^'\"]*\)['\"].*/\1/p"  "$MNT/etc/openwrt_release")
+                  ARCH=$(sed -n "s/^DISTRIB_ARCH=['\"]\([^'\"]*\)['\"].*/\1/p"     "$MNT/etc/openwrt_release")
+                  TGT=$( sed -n "s/^DISTRIB_TARGET=['\"]\([^'\"]*\)['\"].*/\1/p"   "$MNT/etc/openwrt_release")
                   FOUND="$dev"
                   sudo umount "$MNT"
                   break 2
@@ -104,17 +106,13 @@ jobs:
           sudo kpartx -d firmware.img
           rm -f firmware.img
 
-          echo "===== [${{ matrix.version }}] OS Info (from $FOUND) ====="
-          echo "DISTRIB_ID       = $ID"
-          echo "DISTRIB_RELEASE  = $REL"
-          echo "DISTRIB_ARCH     = $ARCH"
-          echo "DISTRIB_TARGET   = $TGT"
-          echo ""
+          echo "===== [${{ matrix.version }}] $FOUND ====="
+          echo "DISTRIB_ID      = $ID"
+          echo "DISTRIB_RELEASE = $REL"
+          echo "DISTRIB_ARCH    = $ARCH"
+          echo "DISTRIB_TARGET  = $TGT"
 
-          if [ -z "$ARCH" ]; then
-            echo "❌ Failed to extract openwrt_release"
-            exit 1
-          fi
+          [ -n "$ARCH" ] || { echo "❌ openwrt_release 提取失败"; exit 1; }
 
           {
             echo "id=$ID"
@@ -136,13 +134,3 @@ jobs:
             echo "| DISTRIB_TARGET | \`${{ steps.extract.outputs.target }}\` |"
             echo ""
           } >> $GITHUB_STEP_SUMMARY
-
-  report:
-    needs: [resolve_tag, extract]
-    runs-on: ubuntu-22.04
-    if: always()
-    steps:
-      - name: Final summary
-        run: |
-          echo "Release: ${{ needs.resolve_tag.outputs.tag }}"
-          echo "Extract job: ${{ needs.extract.result }}"
