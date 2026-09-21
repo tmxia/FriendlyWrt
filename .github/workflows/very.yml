@@ -1,0 +1,158 @@
+name: Verify r5s.config
+
+on:
+  workflow_dispatch:
+    inputs:
+      config_file:
+        description: 'Config file to verify'
+        required: false
+        default: 'scripts/r5s.config'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_BRANCH: 'openwrt-25.12'
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  CONFIG_FILE: ${{ inputs.config_file || 'scripts/r5s.config' }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache file g++ gawk \
+            gettext git libncurses-dev libssl-dev python3 python3-dev \
+            python3-pip python3-setuptools python3-pyelftools unzip wget \
+            zip zlib1g-dev libelf-dev subversion flex bison libtool \
+            autoconf automake cmake rsync quilt time jq swig zstd
+
+      - name: Clone OpenWrt
+        run: |
+          git clone -b "$OPENWRT_BRANCH" --single-branch --depth=1 \
+            "$OPENWRT_REPO" /workdir/openwrt
+          ln -sf /workdir/openwrt openwrt
+
+      - name: Prepare .config
+        run: |
+          cd /workdir/openwrt
+          cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
+          echo "=== input config lines: $(wc -l < .config) ==="
+
+      - name: Run defconfig
+        id: defconfig
+        run: |
+          cd /workdir/openwrt
+          set +e
+          make defconfig > /tmp/defconfig.log 2>&1
+          RC=$?
+          set -e
+          echo "rc=$RC" >> "$GITHUB_OUTPUT"
+          echo "=== defconfig log tail ==="
+          tail -50 /tmp/defconfig.log
+
+      - name: Extract final config
+        run: |
+          cd /workdir/openwrt
+          ./scripts/diffconfig.sh > /workdir/final.config
+          echo "=== final lines: $(wc -l < /workdir/final.config) ==="
+
+      - name: Classify each input option
+        run: |
+          cd /workdir/openwrt
+          INPUT="$GITHUB_WORKSPACE/$CONFIG_FILE"
+          FINAL=/workdir/final.config
+          REPORT=/workdir/verify-report.txt
+          : > "$REPORT"
+
+          # 1) 选项在 Kconfig 中是否存在
+          echo "########## 1) Kconfig existence check ##########" >> "$REPORT"
+          grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key _; do
+            [ -z "$key" ] && continue
+            key=$(echo "$key" | tr -d ' ')
+            # 在源码树搜索 "config ${key#CONFIG_}"
+            sym="${key#CONFIG_}"
+            if grep -rqE "^\s*(menu)?config ${sym}\b" \
+                 target/linux/ package/ include/ Config.in 2>/dev/null; then
+              echo "[FOUND]   $key" >> "$REPORT"
+            else
+              echo "[MISSING] $key" >> "$REPORT"
+            fi
+          done
+
+          # 2) 输入 vs 最终配置的差异
+          echo "" >> "$REPORT"
+          echo "########## 2) Kept / Dropped / Changed ##########" >> "$REPORT"
+          grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key val; do
+            [ -z "$key" ] && continue
+            key=$(echo "$key" | tr -d ' ')
+            val=$(echo "$val" | tr -d ' ')
+            line=$(grep -E "^${key}=" "$FINAL" | head -1)
+            if [ -z "$line" ]; then
+              if grep -qE "^# ${key} is not set" "$FINAL"; then
+                echo "[DROPPED] $key (turned into 'is not set')" >> "$REPORT"
+              else
+                echo "[DROPPED] $key (absent from final)" >> "$REPORT"
+              fi
+            else
+              fval="${line#*=}"
+              if [ "$fval" = "$val" ]; then
+                echo "[KEPT]    $key=$val" >> "$REPORT"
+              else
+                echo "[CHANGED] $key: input=$val final=$fval" >> "$REPORT"
+              fi
+            fi
+          done
+
+      - name: Focus on Docker / network options
+        run: |
+          REPORT=/workdir/verify-report.txt
+          FOCUS='CGROUP_PIDS|NETFILTER_XT_TARGET_REDIRECT|IP_NF_TARGET_MASQUERADE|OVERLAY_FS|NET_SCH_FQ_CODEL|TCP_CONG_BBR|RPS|RFS_ACCEL|CGROUP_SCHED|CFS_BANDWIDTH|CGROUP_NET_PRIO|CGROUP_HUGETLB|POSIX_MQUEUE|VETH|BRIDGE|BLK_DEV_LOOP|BPF_|DEBUG_INFO|CPU_FREQ|PROC_PAGE_MONITOR|MAGIC_SYSRQ|CPUSETS'
+          echo "" >> "$REPORT"
+          echo "########## 3) Focused options ##########" >> "$REPORT"
+          grep -E "$FOCUS" "$REPORT" >> /dev/null || true
+
+      - name: Print report
+        run: |
+          echo "================= VERIFY REPORT ================="
+          cat /workdir/verify-report.txt
+          echo "================================================="
+          MISSING=$(grep -c '^\[MISSING\]' /workdir/verify-report.txt || true)
+          DROPPED=$(grep -c '^\[DROPPED\]' /workdir/verify-report.txt || true)
+          CHANGED=$(grep -c '^\[CHANGED\]' /workdir/verify-report.txt || true)
+          echo "MISSING=$MISSING DROPPED=$DROPPED CHANGED=$CHANGED"
+          {
+            echo "### Config verification"
+            echo ""
+            echo "- MISSING (not in Kconfig): $MISSING"
+            echo "- DROPPED (ignored/overridden): $DROPPED"
+            echo "- CHANGED (value adjusted): $CHANGED"
+            echo ""
+            echo '```'
+            grep -E '^\[(MISSING|DROPPED|CHANGED)\]' /workdir/verify-report.txt || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-report
+          path: |
+            /workdir/verify-report.txt
+            /workdir/final.config
+            /tmp/defconfig.log
+          retention-days: 14
+
+      - name: Fail if missing options
+        run: |
+          if grep -q '^\[MISSING\]' /workdir/verify-report.txt; then
+            echo "::error::Some options are not in Kconfig tree"
+            exit 1
+          fi
