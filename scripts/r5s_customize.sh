@@ -25,7 +25,7 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # 内核选项
+    # Kernel options (non-Docker)
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_SCHED CGROUP_BPF CGROUP_PIDS CGROUP_RDMA CGROUP_NET_CLASSID \
@@ -38,7 +38,7 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ptgen 加 p3(256M)，首启扩到磁盘末尾（不加 truncate，避免破坏 fwtool metadata）
+    # Patch ptgen: add p3 placeholder 256M (no truncate -> keep fwtool metadata intact)
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -71,7 +71,7 @@ PYEOF
     mkdir -p files/sbin files/usr/bin files/etc/init.d files/etc/rc.d \
              files/etc/uci-defaults files/etc/docker files/etc/sysctl.d files/etc/hotplug.d/net
 
-    # mountpoint 命令补丁
+    # /sbin/mountpoint shim
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
 QUIET=0; DEV=0
@@ -105,7 +105,7 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # rc.local 服务（部分 base-files 版本缺失）
+    # rc.local init service (missing in some base-files)
     cat > files/etc/init.d/rc.local << 'INITEOF'
 #!/bin/sh /etc/rc.common
 START=95
@@ -117,14 +117,14 @@ INITEOF
     chmod +x files/etc/init.d/rc.local
     ln -sf ../init.d/rc.local files/etc/rc.d/S95rc.local
 
-    # rc.local：/opt 挂载 + 扩分区
+    # rc.local: /opt init (mount p3, resize on first boot)
     cat > files/etc/rc.local << 'RCEOF'
 #!/bin/sh
 LOG=/tmp/opt-init.log
 exec >>"$LOG" 2>&1
 echo "=== $(date +%FT%T) opt-init ==="
 
-# 兼容 squashfs+overlay：真实根在 /rom
+# Resolve real root block device (squashfs+overlay: real root in /rom)
 ROOT_DEV=$(findmnt -n -o SOURCE /rom 2>/dev/null | head -1)
 [ ! -b "$ROOT_DEV" ] && {
     PARTUUID=$(sed -n 's/.*root=PARTUUID=\([^ ]*\).*/\1/p' /proc/cmdline)
@@ -190,7 +190,7 @@ exit 0
 RCEOF
     chmod +x files/etc/rc.local
 
-    # LED hotplug：网卡就绪后触发 led restart
+    # LED hotplug: re-apply netdev trigger after NICs ready
     cat > files/etc/hotplug.d/net/99-led-netdev << 'HOTPLUG_EOF'
 #!/bin/sh
 [ "$ACTION" = "add" ] || exit 0
@@ -208,7 +208,7 @@ RCEOF
 HOTPLUG_EOF
     chmod +x files/etc/hotplug.d/net/99-led-netdev
 
-    # sysctl 优化
+    # sysctl tuning (proxy/network)
     cat > files/etc/sysctl.d/99-r5s.conf << 'EOF'
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
@@ -231,16 +231,18 @@ net.netfilter.nf_conntrack_udp_timeout_stream=180
 net.netfilter.nf_conntrack_helper=1
 EOF
 
-    # 首次刷机系统配置
+    # First-boot config
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
+# docker0 device declaration
 if ! uci show network 2>/dev/null | grep -qE "\.name=['\"]?docker0['\"]?"; then
     uci add network device >/dev/null
     uci set network.@device[-1].type='bridge'
     uci set network.@device[-1].name='docker0'
 fi
 
+# LAN / WAN
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -253,12 +255,14 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
+# Firewall: LAN zone
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
 uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
 
+# Firewall: docker zone (docker0)
 uci set firewall.docker=zone
 uci set firewall.docker.name='docker'
 uci set firewall.docker.input='ACCEPT'
@@ -280,7 +284,7 @@ uci set firewall.fwd_lan_docker=forwarding
 uci set firewall.fwd_lan_docker.src='lan'
 uci set firewall.fwd_lan_docker.dest='docker'
 
-# br-* 通配 zone：自动覆盖所有自定义 Docker 网络
+# Firewall: dockernet zone (br-* wildcard, all custom Docker networks)
 uci set firewall.dockernet=zone
 uci set firewall.dockernet.name='dockernet'
 uci set firewall.dockernet.input='ACCEPT'
@@ -304,6 +308,7 @@ uci set firewall.fwd_lan_dockernet.dest='dockernet'
 
 uci commit firewall
 
+# Docker: alt_config_file -> /etc/docker/daemon.json
 uci set dockerd.globals.data_root='/opt/docker'
 uci -q delete dockerd.globals.registry_mirrors
 uci add_list dockerd.globals.registry_mirrors='https://docker.1ms.run'
@@ -329,7 +334,7 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     /etc/init.d/sshd restart
 fi
 
-# LED 配置（netdev trigger）
+# LED: netdev trigger
 uci -q delete system.wan_led 2>/dev/null
 uci -q delete system.lan1_led 2>/dev/null
 uci -q delete system.lan2_led 2>/dev/null
@@ -388,15 +393,15 @@ pre_build() {
         echo "dts already patched (v2)"; return 0
     fi
 
-    # 从 clean 备份恢复，或清理旧注入
+    # Restore clean or strip old injection
     if [ -f "${DTS}.clean" ]; then
-        echo "从 .clean 恢复 DTS"
+        echo "restore DTS from .clean"
         cp "${DTS}.clean" "$DTS"
     elif ! grep -qE "pwm11m0_pins|pwm4_fan_pins|pwm-fan" "$DTS"; then
-        echo "备份干净 DTS 到 .clean"
+        echo "backup clean DTS to .clean"
         cp "$DTS" "${DTS}.clean"
     else
-        echo "清理旧 pwm-fan 注入"
+        echo "strip old pwm-fan injection"
         awk '
             /^&pwm11 \{/ { in_old=1; next }
             /^&pwm4 \{/  { in_old=1; next }
@@ -406,7 +411,7 @@ pre_build() {
         ' "$DTS" > "$DTS.tmp" && mv "$DTS.tmp" "$DTS"
     fi
 
-    # 官方 R5S 风扇配置：pwm0 (GPIO0_B7, pin 15), 20kHz, 5档, vcc5v0_sys
+    # Official R5S fan: pwm0 (GPIO0_B7 pin 15), 20kHz, 5-level, fan-supply=vcc5v0_sys
     cat >> "$DTS" << 'DTS_EOF'
 
 // ===== R5S_FAN_V2 =====
@@ -555,6 +560,17 @@ config_stage() {
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
+    # NIC driver: force r8125 (2.5G), disable r8169 (1G) - virtual package conflict
+    sed -i "/^# CONFIG_PACKAGE_kmod-r8125 is not set/d" .config
+    sed -i "/^CONFIG_PACKAGE_kmod-r8125=/d" .config
+    echo "CONFIG_PACKAGE_kmod-r8125=y" >> .config
+
+    for pkg in kmod-r8169 kmod-r8169-any kmod-r8169-rss; do
+        sed -i "s/^CONFIG_PACKAGE_${pkg}=.*/# CONFIG_PACKAGE_${pkg} is not set/" .config
+        grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+          echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+    done
+
     local MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
                dockerd luci-app-dockerman openssh-sftp-server parted; do
@@ -563,6 +579,8 @@ config_stage() {
     for opt in DOCKER_NET_MACVLAN DOCKER_STO_EXT4; do
         grep -q "^CONFIG_${opt}=y" .config || { echo "missing: $opt"; MISSING=1; }
     done
+    grep -q "^CONFIG_PACKAGE_kmod-r8125=y" .config || { echo "missing: kmod-r8125"; MISSING=1; }
+    grep -q "^# CONFIG_PACKAGE_kmod-r8169 is not set" .config || { echo "conflict: kmod-r8169 enabled"; MISSING=1; }
     [ $MISSING -eq 1 ] && exit 1
 
     for f in files/sbin/mountpoint files/etc/rc.local \
