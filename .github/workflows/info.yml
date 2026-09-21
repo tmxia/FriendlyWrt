@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (留空用最新)'
+        description: 'Release tag (留空=最新)'
         required: false
         default: ''
         type: string
@@ -16,7 +16,7 @@ jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
-      - name: Download firmware
+      - name: Download official rootfs tarballs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -26,77 +26,51 @@ jobs:
             TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')
           fi
           echo "Release: $TAG"
+
+          # 只下载 rootfs-friendlywrt-<ver>-docker.tgz，避开其它板子/资源
           gh release download "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "*.img.gz" \
-            --dir . 2>/dev/null || true
-          if [ -z "$(ls -A *.img.gz 2>/dev/null)" ]; then
-            gh release download "$TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern "*.img" \
-              --dir .
-          fi
+            --pattern "rootfs-friendlywrt-*-docker.tgz" \
+            --dir .
+
           ls -lh
 
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq kpartx
-
-      - name: Extract info from each image
+      - name: Extract info
         run: |
           cd /tmp/fw
           {
-            echo "## 官方固件架构与版本"
+            echo "## FriendlyWrt 官方固件架构信息"
             echo ""
-            echo "| 镜像 | DISTRIB_ID | DISTRIB_RELEASE | DISTRIB_ARCH | DISTRIB_TARGET |"
+            echo "| 源文件 | DISTRIB_ID | DISTRIB_RELEASE | DISTRIB_ARCH | DISTRIB_TARGET |"
             echo "|---|---|---|---|---|"
           } > /tmp/result.md
 
-          for img in *.img.gz *.img; do
-            [ -f "$img" ] || continue
-            echo "=== $img ==="
+          for tgz in rootfs-friendlywrt-*-docker.tgz; do
+            [ -f "$tgz" ] || continue
+            echo "=== $tgz ==="
 
-            # Decompress if gzipped
-            if [[ "$img" == *.gz ]]; then
-              raw="${img%.gz}"
-              gzip -dc "$img" > "$raw"
-            else
-              raw="$img"
+            # 只抽取 openwrt_release，避免解压整个 200MB
+            REL_FILE=$(tar -tzf "$tgz" 2>/dev/null | grep '/etc/openwrt_release$' | head -1)
+            if [ -z "$REL_FILE" ]; then
+              echo "  ❌ 未找到 etc/openwrt_release"
+              continue
             fi
 
-            # Map partitions
-            PARTS=$(sudo kpartx -av "$raw" 2>/dev/null | grep -oE 'loop[0-9]+p[0-9]+')
-
-            ID=""; REL=""; ARCH=""; TGT=""
-            for p in $PARTS; do
-              MNT=$(mktemp -d)
-              if sudo mount -o ro "/dev/mapper/$p" "$MNT" 2>/dev/null; then
-                if [ -f "$MNT/etc/openwrt_release" ]; then
-                  ID=$(grep "^DISTRIB_ID=" "$MNT/etc/openwrt_release" | cut -d"'" -f2)
-                  REL=$(grep "^DISTRIB_RELEASE=" "$MNT/etc/openwrt_release" | cut -d"'" -f2)
-                  ARCH=$(grep "^DISTRIB_ARCH=" "$MNT/etc/openwrt_release" | cut -d"'" -f2)
-                  TGT=$(grep "^DISTRIB_TARGET=" "$MNT/etc/openwrt_release" | cut -d"'" -f2)
-                  sudo umount "$MNT"
-                  rmdir "$MNT"
-                  break
-                fi
-                sudo umount "$MNT"
-              fi
-              rmdir "$MNT" 2>/dev/null
-            done
-
-            sudo kpartx -d "$raw" 2>/dev/null
-            [ "$raw" != "$img" ] && rm -f "$raw"
+            CONTENT=$(tar -xzf "$tgz" -O "$REL_FILE" 2>/dev/null)
+            ID=$(echo    "$CONTENT" | sed -n "s/^DISTRIB_ID=['\"]\([^'\"]*\)['\"].*/\1/p")
+            REL=$(echo   "$CONTENT" | sed -n "s/^DISTRIB_RELEASE=['\"]\([^'\"]*\)['\"].*/\1/p")
+            ARCH=$(echo  "$CONTENT" | sed -n "s/^DISTRIB_ARCH=['\"]\([^'\"]*\)['\"].*/\1/p")
+            TGT=$(echo   "$CONTENT" | sed -n "s/^DISTRIB_TARGET=['\"]\([^'\"]*\)['\"].*/\1/p")
 
             echo "  ID      = $ID"
             echo "  RELEASE = $REL"
             echo "  ARCH    = $ARCH"
             echo "  TARGET  = $TGT"
+            echo ""
 
-            echo "| $img | $ID | $REL | $ARCH | $TGT |" >> /tmp/result.md
+            echo "| $tgz | $ID | $REL | $ARCH | $TGT |" >> /tmp/result.md
           done
 
-          echo ""
+          echo "----- 结果 -----"
           cat /tmp/result.md
           cat /tmp/result.md >> $GITHUB_STEP_SUMMARY
