@@ -291,14 +291,6 @@ jobs:
           done
           make defconfig
 
-      # =====================================================================
-      # 通用补丁适配：4 阶段
-      #   Phase 0: 确保 kernel tarball
-      #   Phase 1: 反向扫描（干净内核上做，找冗余补丁）
-      #   Phase 2: 删除冗余补丁
-      #   Phase 3: make target/linux/prepare（让 OpenWrt 自己验证）
-      #   Phase 4: 失败时输出结构化诊断
-      # =====================================================================
       - name: Adapt kernel patches via OpenWrt
         id: adapt_patches
         if: |
@@ -310,7 +302,126 @@ jobs:
           TARGET=$(cat /workdir/target_version.txt)
           echo "=== adapt patches for linux-6.12.$TARGET ==="
 
-          # ---------- Phase 0: 确保 kernel tarball ----------
+          cat > /tmp/auto-fix-patch.py << 'PYEOF'
+          #!/usr/bin/env python3
+          import re
+          import sys
+          from pathlib import Path
+
+          def parse_patch(text):
+              preamble = []
+              files = []
+              cur_file = None
+              cur_hunk = None
+              for line in text.split('\n'):
+                  if line.startswith('--- '):
+                      if cur_hunk is not None:
+                          cur_file['hunks'].append(cur_hunk)
+                          cur_hunk = None
+                      if cur_file is not None:
+                          files.append(cur_file)
+                      cur_file = {'header': [line], 'hunks': [], 'target': None}
+                  elif line.startswith('@@ '):
+                      if cur_hunk is not None:
+                          cur_file['hunks'].append(cur_hunk)
+                      cur_hunk = {'header': line, 'lines': []}
+                  else:
+                      if cur_hunk is not None:
+                          cur_hunk['lines'].append(line)
+                      elif cur_file is not None:
+                          cur_file['header'].append(line)
+                      else:
+                          preamble.append(line)
+              if cur_hunk is not None and cur_file is not None:
+                  cur_file['hunks'].append(cur_hunk)
+              if cur_file is not None:
+                  files.append(cur_file)
+
+              for f in files:
+                  for h in f['header']:
+                      m = re.match(r'\+\+\+ [ab]/(\S+)', h)
+                      if m:
+                          f['target'] = m.group(1)
+                          break
+              return preamble, files
+
+          def hunk_added(hunk):
+              return [l[1:] for l in hunk['lines']
+                      if l.startswith('+') and not l.startswith('+++')]
+
+          def hunk_is_redundant(hunk, target_lines):
+              added = hunk_added(hunk)
+              if not added:
+                  return False
+              tset = set(target_lines)
+              return all(a in tset for a in added)
+
+          def serialize(preamble, files):
+              parts = list(preamble)
+              for f in files:
+                  parts.extend(f['header'])
+                  for h in f['hunks']:
+                      parts.append(h['header'])
+                      parts.extend(h['lines'])
+              return '\n'.join(parts)
+
+          def main():
+              if len(sys.argv) != 3:
+                  print(f"Usage: {sys.argv[0]} <patch> <kernel_root>", file=sys.stderr)
+                  return 2
+
+              patch_path = Path(sys.argv[1])
+              kernel_root = Path(sys.argv[2])
+
+              if not patch_path.exists():
+                  print(f"patch not found: {patch_path}", file=sys.stderr)
+                  return 2
+
+              text = patch_path.read_text(errors='replace')
+              preamble, files = parse_patch(text)
+              if not files:
+                  print("no file diffs parsed")
+                  return 2
+
+              any_removed = False
+              total = 0
+              for f in files:
+                  if not f['target']:
+                      continue
+                  tp = kernel_root / f['target']
+                  if not tp.exists():
+                      print(f"  target missing: {f['target']} (skip)")
+                      continue
+                  tlines = tp.read_text(errors='replace').split('\n')
+                  kept = []
+                  for h in f['hunks']:
+                      total += 1
+                      if hunk_is_redundant(h, tlines):
+                          print(f"  [REDUNDANT] {f['target']}: {h['header'][:70]}")
+                          any_removed = True
+                      else:
+                          kept.append(h)
+                  f['hunks'] = kept
+
+              if not any_removed:
+                  print(f"  no redundant hunk found in {patch_path.name}")
+                  return 1
+
+              remaining = sum(len(f['hunks']) for f in files)
+              if remaining == 0:
+                  print(f"  [DELETE] all hunks redundant: {patch_path.name}")
+                  patch_path.unlink()
+                  return 0
+
+              patch_path.write_text(serialize(preamble, files))
+              print(f"  rewrote {patch_path.name}: kept {remaining}/{total} hunks")
+              return 0
+
+          if __name__ == '__main__':
+              sys.exit(main())
+          PYEOF
+          chmod +x /tmp/auto-fix-patch.py
+
           mkdir -p dl
           TAR="dl/linux-6.12.$TARGET.tar.xz"
           if [ ! -s "$TAR" ]; then
@@ -319,24 +430,17 @@ jobs:
               "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.$TARGET.tar.xz" \
               -O "$TAR" || true
           fi
-          if [ ! -s "$TAR" ]; then
-            echo "wget failed, trying OpenWrt scripts/download.pl"
-            ./scripts/download.pl "dl" "linux-6.12.$TARGET.tar.xz" \
-              "https://cdn.kernel.org/pub/linux/kernel/v6.x" || true
-          fi
-          [ -s "$TAR" ] || { echo "::error::cannot obtain kernel tarball"; ls -la dl/ | tail -20; exit 1; }
+          [ -s "$TAR" ] || { echo "::error::cannot obtain kernel tarball"; exit 1; }
           echo "kernel tarball: $(ls -lh "$TAR" | awk '{print $5, $9}')"
 
-          # ---------- Phase 1: 反向扫描（干净内核） ----------
           echo ""
-          echo ">>> Phase 1: reverse-scan all patches for redundancy"
+          echo ">>> Phase 1: reverse-scan all patches for full-redundancy"
 
           TMP_DIR=$(mktemp -d)
           trap 'rm -rf "$TMP_DIR"' EXIT
-
           xzcat "$TAR" | tar -C "$TMP_DIR" -xf -
           KSCAN="$TMP_DIR/linux-6.12.$TARGET"
-          [ -d "$KSCAN" ] || { echo "::error::unexpected tarball layout"; ls "$TMP_DIR"; exit 1; }
+          [ -d "$KSCAN" ] || { echo "::error::unexpected tarball layout"; exit 1; }
 
           : > /tmp/redundant.txt
           SCAN=0
@@ -350,7 +454,7 @@ jobs:
               [ -f "$P" ] || continue
               SCAN=$((SCAN + 1))
               if patch -p1 --dry-run -R --fuzz=3 -i "$P" > /dev/null 2>&1; then
-                echo "  [REDUNDANT] $P"
+                echo "  [FULL-REDUNDANT] $P"
                 echo "$P" >> /tmp/redundant.txt
               fi
             done
@@ -358,12 +462,10 @@ jobs:
           cd /workdir/openwrt
 
           R_COUNT=$(wc -l < /tmp/redundant.txt | tr -d ' ')
-          echo "scanned=$SCAN redundant=$R_COUNT"
+          echo "scanned=$SCAN full-redundant=$R_COUNT"
 
-          # ---------- Phase 2: 删除冗余补丁 ----------
           if [ "$R_COUNT" -gt 0 ]; then
-            echo ""
-            echo ">>> Phase 2: removing redundant patches"
+            echo ">>> removing $R_COUNT fully-redundant patches"
             mkdir -p /workdir/disabled-patches
             while read -r P; do
               [ -z "$P" ] && continue
@@ -374,97 +476,122 @@ jobs:
             done < /tmp/redundant.txt
           fi
 
-          # ---------- Phase 3: 让 OpenWrt 自己验证 ----------
-          echo ""
-          echo ">>> Phase 3: make target/linux/prepare"
-          rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
-          rm -f staging_dir/target-*/.prepared 2>/dev/null || true
+          MAX_ROUNDS=8
+          ROUND=0
+          AUTO_FIXED=0
+          : > /tmp/all_auto_fixed.txt
 
-          set +e
-          make target/linux/prepare V=s > /tmp/prepare.log 2>&1
-          RC=$?
-          set -e
+          while [ $ROUND -lt $MAX_ROUNDS ]; do
+            ROUND=$((ROUND + 1))
+            echo ""
+            echo "========== Phase 2.$ROUND: make target/linux/prepare =========="
 
-          if [ $RC -eq 0 ]; then
-            echo "========== prepare OK =========="
-            if [ "$R_COUNT" -gt 0 ]; then
-              echo "adapted=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "adapted=false" >> "$GITHUB_OUTPUT"
+            rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
+            rm -f staging_dir/target-*/.prepared 2>/dev/null || true
+
+            set +e
+            make target/linux/prepare V=s > /tmp/prepare.log 2>&1
+            RC=$?
+            set -e
+
+            if [ $RC -eq 0 ]; then
+              echo "prepare OK on round $ROUND"
+              if [ "$R_COUNT" -gt 0 ] || [ "$AUTO_FIXED" -gt 0 ]; then
+                echo "adapted=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "adapted=false" >> "$GITHUB_OUTPUT"
+              fi
+              exit 0
             fi
-            exit 0
-          fi
 
-          # ---------- Phase 4: 失败诊断 ----------
-          echo "========== prepare failed (rc=$RC) =========="
+            echo "prepare failed (rc=$RC)"
+
+            FP1=$(grep -oE 'Please fix [^ !]+\.patch' /tmp/prepare.log | awk '{print $3}' || true)
+            FP2=$(grep -oE 'Patch [^ ]+\.patch does not apply' /tmp/prepare.log | awk '{print $2}' || true)
+            FAILED_PATCHES=$(printf '%s\n%s\n' "$FP1" "$FP2" | grep -v '^$' | sort -u || true)
+
+            if [ -z "$FAILED_PATCHES" ]; then
+              echo "cannot parse failing patches from log; stopping auto-fix"
+              break
+            fi
+
+            echo "failing patches:"
+            echo "$FAILED_PATCHES" | sed 's/^/  /'
+
+            KDIR=$(ls -d build_dir/target-*/linux-*/linux-*/ 2>/dev/null | head -1 || true)
+            if [ -z "$KDIR" ]; then
+              echo "kernel dir not found, cannot auto-fix"
+              break
+            fi
+
+            FIXED_THIS_ROUND=0
+            while read -r P; do
+              [ -z "$P" ] && continue
+              [ -f "$P" ] || continue
+              echo ""
+              echo "--- auto-fix attempt: $P ---"
+              set +e
+              python3 /tmp/auto-fix-patch.py "$P" "$KDIR"
+              FIX_RC=$?
+              set -e
+              if [ $FIX_RC -eq 0 ]; then
+                echo "  [FIXED] $P"
+                echo "$P" >> /tmp/all_auto_fixed.txt
+                AUTO_FIXED=$((AUTO_FIXED + 1))
+                FIXED_THIS_ROUND=$((FIXED_THIS_ROUND + 1))
+              else
+                echo "  [CANNOT-FIX] $P (has real conflicts)"
+              fi
+            done <<< "$FAILED_PATCHES"
+
+            if [ $FIXED_THIS_ROUND -eq 0 ]; then
+              echo ""
+              echo "no patch could be auto-fixed in round $ROUND; stopping"
+              break
+            fi
+
+            echo ""
+            echo "round $ROUND fixed $FIXED_THIS_ROUND patch(es), retrying prepare..."
+          done
+
+          echo ""
+          echo "========== auto-fix exhausted, showing diagnosis =========="
           echo ""
 
-          # 4.1 失败上下文
-          echo "=== last failure context (from prepare log) ==="
+          echo "=== last failure context ==="
           grep -B 8 -A 25 -iE 'Patch failed|No file to patch|can.t find file|does not apply|Error [0-9]' \
             /tmp/prepare.log | tail -120 || true
 
-          # 4.2 解析失败补丁名
           echo ""
-          echo "=== failing patches (parsed from log) ==="
-          FP1=$(grep -oE 'Please fix [^ !]+\.patch' /tmp/prepare.log | awk '{print $3}' | sort -u || true)
-          FP2=$(grep -oE 'Patch [^ ]+\.patch does not apply' /tmp/prepare.log | awk '{print $2}' | sort -u || true)
-          FAILED_PATCHES=$(printf '%s\n%s\n' "$FP1" "$FP2" | grep -v '^$' | sort -u || true)
-          if [ -n "$FAILED_PATCHES" ]; then
-            echo "$FAILED_PATCHES" | sed 's/^/  /'
-          else
-            echo "  (could not parse, see context above)"
-          fi
-
-          # 4.3 .rej 内容
-          echo ""
-          echo "=== .rej files ==="
-          REJ_LIST=$(find build_dir -name '*.rej' 2>/dev/null | head -30 || true)
-          if [ -n "$REJ_LIST" ]; then
-            echo "$REJ_LIST" | while read -r f; do
-              echo "--- $f ---"
-              head -80 "$f" 2>/dev/null || true
-              echo ""
-            done
-          else
-            echo "  (no .rej found — likely 'file not found' or 'patch already applied')"
-          fi
-
-          # 4.4 缺失文件诊断
-          KERNEL_DIR=$(ls -d build_dir/target-*/linux-*/linux-*/ 2>/dev/null | head -1 || true)
-          if [ -n "$KERNEL_DIR" ] && [ -n "$FAILED_PATCHES" ]; then
-            echo ""
-            echo "=== missing-file diagnosis ==="
-            echo "kernel dir: $KERNEL_DIR"
-            echo "$FAILED_PATCHES" | while read -r P; do
-              [ -f "$P" ] || continue
-              echo "patch: $P"
-              grep -E '^\+\+\+ b/' "$P" 2>/dev/null | sed 's|^+++ b/||' | sort -u | while read -r TF; do
-                [ -z "$TF" ] && continue
-                if [ -e "$KERNEL_DIR$TF" ]; then
-                  echo "    [ok]      $TF"
-                else
-                  echo "    [MISSING] $TF"
-                  base=$(basename "$TF")
-                  alt=$(find "$KERNEL_DIR" -name "$base" 2>/dev/null | head -3 || true)
-                  if [ -n "$alt" ]; then
-                    echo "      possible alternatives:"
-                    echo "$alt" | sed 's|^|        |'
-                  fi
-                fi
+          echo "=== .rej contents ==="
+          KDIR=$(ls -d build_dir/target-*/linux-*/linux-*/ 2>/dev/null | head -1 || true)
+          if [ -n "$KDIR" ]; then
+            REJ_LIST=$(find "$KDIR" -name '*.rej' 2>/dev/null | head -30 || true)
+            if [ -n "$REJ_LIST" ]; then
+              echo "$REJ_LIST" | while read -r f; do
+                echo "--- $f ---"
+                head -100 "$f" 2>/dev/null || true
+                echo ""
               done
-            done
+            else
+              echo "  (no .rej found)"
+            fi
           fi
 
           echo ""
-          echo "::error::patches need manual fix"
+          echo "=== patches auto-fixed this run ($AUTO_FIXED) ==="
+          sort -u /tmp/all_auto_fixed.txt 2>/dev/null | sed 's/^/  /' || true
+
+          echo ""
+          echo "::error::patches need manual fix (real conflicts remain)"
           echo "::notice::Automatic resolution summary:"
-          echo "::notice::  - redundant patches auto-removed this run: $R_COUNT"
+          echo "::notice::  - full-redundant patches removed: $R_COUNT"
+          echo "::notice::  - patches with redundant hunks auto-fixed: $AUTO_FIXED"
           echo "::notice::  - remaining failure: real conflict (needs human)"
           echo "::notice::Fix steps:"
           echo "::notice::  1. git clone -b $PATCH_BRANCH <repo> patches-repo"
           echo "::notice::  2. mkdir -p patches-repo/6.12.$TARGET/generic-backport-6.12"
-          echo "::notice::  3. Fix the failing patches (paths listed above)"
+          echo "::notice::  3. Fix the conflicting patches shown above"
           echo "::notice::  4. touch patches-repo/6.12.$TARGET/READY"
           echo "::notice::  5. git add . && git commit && git push"
           echo "::notice::  6. Re-run this workflow"
@@ -510,11 +637,11 @@ jobs:
             rm -rf "$DST"; mkdir -p "$DST"
             find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
           fi
-          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ) (auto: redundant patches removed)" > "$VERSION_DIR/READY"
+          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$VERSION_DIR/READY"
 
           git add "$VERSION_DIR"
           git diff --cached --quiet && { echo "no changes"; exit 0; }
-          git commit -q -m "patches: adapt for 6.12.$TARGET via OpenWrt prepare"
+          git commit -q -m "patches: adapt for 6.12.$TARGET"
           for attempt in 1 2 3; do
             echo "push attempt $attempt"
             git push origin "HEAD:$PATCH_BRANCH" && { echo "pushed"; exit 0; }
@@ -534,7 +661,6 @@ jobs:
 
           KEEP="${PATCH_KEEP_VERSIONS:-2}"
           if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
-            echo "invalid PATCH_KEEP_VERSIONS, fallback to 2"
             KEEP=2
           fi
 
@@ -564,8 +690,6 @@ jobs:
           else
             git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
           fi
-
-          echo "=== prune patch version dirs (keep latest $KEEP) ==="
 
           ALL=$(ls -d 6.12.* 2>/dev/null | sed 's:/$::' \
                 | grep -E '^6\.12\.[0-9]+$' \
@@ -798,9 +922,9 @@ jobs:
               [ -z "$VID" ] && continue
               if curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
                  "https://api.github.com${BASE}/$VID" >/dev/null 2>&1; then
-                echo "    ✓ deleted $VID"
+                echo "    deleted $VID"
               else
-                echo "    ✗ failed  $VID"
+                echo "    failed  $VID"
               fi
             done
           done
