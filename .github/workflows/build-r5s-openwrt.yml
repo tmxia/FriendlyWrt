@@ -43,6 +43,7 @@ env:
   CONFIG_FILE: 'scripts/r5s.config'
   DIY_SH: 'scripts/r5s_customize.sh'
   PATCH_BRANCH: 'patches'
+  CACHE_KEEP_VERSIONS: '2'
 
 jobs:
   prepare_release:
@@ -441,30 +442,21 @@ jobs:
           docker rmi "$TEMP" 2>/dev/null || true
 
           if [ "${KERNEL_TRACK}" = "linux-stable" ]; then
-            PULL_OK=""
             if [ -f /workdir/target_version.txt ]; then
               KV=$(cat /workdir/target_version.txt)
               if docker pull "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null; then
                 docker tag "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" "$TEMP"
                 docker push "$TEMP" >/dev/null 2>&1 || true
-                echo "alias+push from openwrt-25.12-linux-stable-6.12.${KV}"
-                PULL_OK="yes"
+                echo "alias from openwrt-25.12-linux-stable-6.12.${KV}"
+              else
+                echo "no cache for 6.12.${KV}, full rebuild"
               fi
             fi
-            if [ -z "$PULL_OK" ]; then
-              if docker pull "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null; then
-                docker tag "${BASE}:openwrt-25.12-linux-stable" "$TEMP"
-                docker push "$TEMP" >/dev/null 2>&1 || true
-                echo "alias+push from openwrt-25.12-linux-stable"
-                PULL_OK="yes"
-              fi
-            fi
-            [ -z "$PULL_OK" ] && echo "no linux-stable cache"
           else
             if docker pull "${BASE}:openwrt-25.12-openwrt" 2>/dev/null; then
               docker tag "${BASE}:openwrt-25.12-openwrt" "$TEMP"
               docker push "$TEMP" >/dev/null 2>&1 || true
-              echo "alias+push from openwrt-25.12-openwrt"
+              echo "alias from openwrt-25.12-openwrt"
             else
               echo "no openwrt cache"
             fi
@@ -483,11 +475,24 @@ jobs:
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
 
-          make tools/download -j1 || exit 1
-          time make tools/compile -j$(nproc) || exit 1
-
-          make toolchain/download -j1 || exit 1
-          time make toolchain/compile -j$(nproc) || exit 1
+          for STAGE in tools/download tools/compile toolchain/download toolchain/compile; do
+            echo "===== $STAGE ====="
+            set +e
+            make $STAGE -j$(nproc) > /tmp/stage.log 2>&1
+            RC=$?
+            set -e
+            if [ "$RC" -ne 0 ]; then
+              echo "===== $STAGE failed (rc=$RC), retry with V=s ====="
+              make $STAGE -j1 V=s > /tmp/stage_verbose.log 2>&1 || true
+              echo ""
+              echo "===== error context ====="
+              grep -n -B 20 -A 60 -iE 'error|fail' /tmp/stage_verbose.log | tail -300
+              echo ""
+              echo "===== last 400 lines ====="
+              tail -400 /tmp/stage_verbose.log
+              exit 1
+            fi
+          done
 
       - name: Checkpoint base cache
         if: steps.compile_base.outcome == 'success'
@@ -521,10 +526,6 @@ jobs:
           fi
 
           if [ "${KERNEL_TRACK}" = "linux-stable" ]; then
-            docker tag "$TEMP" "${BASE}:openwrt-25.12-linux-stable"
-            docker push "${BASE}:openwrt-25.12-linux-stable" >/dev/null 2>&1 || true
-            echo "pushed: openwrt-25.12-linux-stable"
-
             if [ -f /workdir/target_version.txt ]; then
               KV=$(cat /workdir/target_version.txt)
               docker tag "$TEMP" "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}"
@@ -532,7 +533,6 @@ jobs:
               echo "pushed: openwrt-25.12-linux-stable-6.12.${KV}"
               docker rmi "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null || true
             fi
-            docker rmi "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null || true
           else
             docker tag "$TEMP" "${BASE}:openwrt-25.12-openwrt"
             docker push "${BASE}:openwrt-25.12-openwrt" >/dev/null 2>&1 || true
@@ -541,6 +541,75 @@ jobs:
           fi
 
           docker rmi "$TEMP" 2>/dev/null || true
+
+      - name: Prune old cache versions
+        if: steps.compile_base.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
+        run: |
+          set -e
+          OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
+          PKG="r5s-base-cache"
+
+          echo "=== Cache prune for $PKG (keep latest ${KEEP} per prefix) ==="
+
+          OWNER_TYPE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                       "https://api.github.com/users/$OWNER" | jq -r .type 2>/dev/null || echo "User")
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            BASE="/orgs/$OWNER/packages/container/$PKG/versions"
+          else
+            BASE="/users/$OWNER/packages/container/$PKG/versions"
+          fi
+          echo "owner type: $OWNER_TYPE"
+
+          ALL=$(mktemp)
+          PAGE=1
+          while :; do
+            RESP=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                   "https://api.github.com${BASE}?per_page=100&page=$PAGE")
+            COUNT=$(echo "$RESP" | jq 'if type=="array" then length else 0 end')
+            [ "$COUNT" = "0" ] && break
+            echo "$RESP" | jq -c '.[]' >> "$ALL"
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+
+          TOTAL=$(wc -l < "$ALL" | tr -d ' ')
+          echo "total versions: $TOTAL"
+          [ "$TOTAL" = "0" ] && { rm -f "$ALL"; exit 0; }
+
+          for PREFIX in "openwrt-25.12-linux-stable-6.12." "openwrt-25.12-6.12."; do
+            echo ""
+            echo "--- ${PREFIX}* keep latest ${KEEP} ---"
+
+            PLAN=$(jq -r --arg p "$PREFIX" '
+              select((.metadata.container.tags // []) | any(startswith($p)))
+              | [.id, .created_at] | @tsv
+            ' "$ALL" | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}')
+
+            if [ -z "$PLAN" ]; then
+              echo "  (nothing to prune)"
+              continue
+            fi
+
+            N=$(echo "$PLAN" | wc -l | tr -d ' ')
+            echo "  pruning $N versions..."
+
+            echo "$PLAN" | while read -r VID; do
+              [ -z "$VID" ] && continue
+              if curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com${BASE}/$VID" >/dev/null 2>&1; then
+                echo "    ✓ deleted $VID"
+              else
+                echo "    ✗ failed  $VID"
+              fi
+            done
+          done
+
+          rm -f "$ALL"
+          echo ""
+          echo "=== prune done ==="
 
       - name: Prepare kernel and clean
         run: |
