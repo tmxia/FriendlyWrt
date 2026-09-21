@@ -116,6 +116,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # env prep: deps, swap, docker root, ccache
       - name: Setup environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -162,6 +163,7 @@ jobs:
           free -h
           df -hT
 
+      # clone src
       - name: Clone OpenWrt
         working-directory: /workdir
         run: |
@@ -169,6 +171,7 @@ jobs:
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
+      # pin openwrt commit (optional)
       - name: Pin OpenWrt commit
         if: env.KERNEL_TRACK == 'openwrt' && env.KERNEL_VERSION != ''
         run: |
@@ -181,6 +184,7 @@ jobs:
             echo "::warning::Cannot checkout $KERNEL_VERSION, using branch HEAD"
           fi
 
+      # switch to linux-stable kernel
       - name: Switch to linux-stable kernel
         if: env.KERNEL_TRACK == 'linux-stable'
         run: |
@@ -196,6 +200,7 @@ jobs:
           echo "$TARGET" > /workdir/target_version.txt
           echo "Target: 6.12.$TARGET"
 
+          # fixed awk parse (old sed returned empty on 25.12 branch)
           CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
                 | head -1 | awk -F'= ' '{print $2}' | tr -d '.')
           echo "Builtin: 6.12.$CUR"
@@ -212,10 +217,11 @@ jobs:
           MAP=$(grep -rln '^LINUX_VERSION-6\.12' include/ target/linux/ 2>/dev/null || true)
           for FILE in $MAP; do
             echo "Patching $FILE"
-            sed -i "s#^LINUX_VERSION-6.12 = .*#LINUX_VERSION-6.12 = .$TARGET#" "$FILE"
-            sed -i "s#^LINUX_KERNEL_HASH-6\.12\..*#LINUX_KERNEL_HASH-6.12.$TARGET = $HASH#" "$FILE"
+            sed -i "s%^LINUX_VERSION-6.12 = .*%LINUX_VERSION-6.12 = .$TARGET%" "$FILE"
+            sed -i "s%^LINUX_KERNEL_HASH-6\.12\..*%LINUX_KERNEL_HASH-6.12.$TARGET = $HASH%" "$FILE"
           done
 
+      # restore adapted patches
       - name: Restore adapted patches
         id: restore_patches
         if: env.KERNEL_TRACK == 'linux-stable'
@@ -264,6 +270,7 @@ jobs:
           fi
           echo "restored=true" >> "$GITHUB_OUTPUT"
 
+      # adapt patches via 3way
       - name: Adapt kernel patches
         if: env.KERNEL_TRACK == 'linux-stable' && steps.restore_patches.outputs.restored != 'true'
         run: |
@@ -355,6 +362,7 @@ jobs:
           echo "===== patch summary ====="
           echo "kept=$KEPT removed=$REMOVED 3way=$FIXED disabled=$DISABLED"
 
+      # publish patches
       - name: Publish adapted patches
         if: env.KERNEL_TRACK == 'linux-stable' && steps.restore_patches.outputs.restored != 'true'
         env:
@@ -409,18 +417,21 @@ jobs:
           done
           echo "::warning::push failed after 3 attempts"; exit 0
 
+      # feeds prep
       - name: Prepare feeds
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
           ./scripts/feeds update -a 2>&1 | tail -30
 
+      # apply customizations + install feeds
       - name: Apply customizations
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
 
+      # build config (do not modify r5s.config; append extras via sed %)
       - name: Configure build
         id: config
         run: |
@@ -430,18 +441,18 @@ jobs:
           make defconfig
 
           for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
-            sed -i "s#^CONFIG_PACKAGE_${pkg}=[ym]# # CONFIG_PACKAGE_${pkg} is not set#" .config
+            sed -i "s%^CONFIG_PACKAGE_${pkg}=[ym]%# CONFIG_PACKAGE_${pkg} is not set%" .config
             grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
               echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
           done
 
           grep -q '^CONFIG_CCACHE=' .config || echo 'CONFIG_CCACHE=y' >> .config
-          sed -i "s#^CONFIG_CCACHE_DIR=.*#CONFIG_CCACHE_DIR=\"/workdir/ccache\"#" .config
+          sed -i 's%^CONFIG_CCACHE_DIR=.*%CONFIG_CCACHE_DIR="/workdir/ccache"%' .config
           grep -q '^CONFIG_CCACHE_DIR=' .config || echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
 
           HEAVY="wpewebkit qt5base qt5quick qt5quick-controls qt5declarative qt5svg qt5tools qt5graphicaleffects weston wlroots gzdoom sdl2 sdl2-doom kmscube vkmark gstreamer1 gtk wpebackend-fdo libwpe cog libepoxy harfbuzz pango gdk-pixbuf libdisplay-info"
           for pkg in $HEAVY; do
-            sed -i "s#^CONFIG_PACKAGE_${pkg}=[ym]# # CONFIG_PACKAGE_${pkg} is not set#" .config
+            sed -i "s%^CONFIG_PACKAGE_${pkg}=[ym]%# CONFIG_PACKAGE_${pkg} is not set%" .config
           done
 
           make defconfig
@@ -455,6 +466,7 @@ jobs:
           echo "hash=$HASH" >> "$GITHUB_OUTPUT"
           echo "Config hash: $HASH"
 
+      # restore caches (3 layers + ccache)
       - name: Restore caches
         env:
           CONFIG_HASH: ${{ steps.config.outputs.hash }}
@@ -490,6 +502,7 @@ jobs:
 
           df -hT /workdir
 
+      # build base
       - name: Compile base
         id: compile_base
         run: |
@@ -508,6 +521,7 @@ jobs:
             fi
           done
 
+      # save tools + dl cache
       - name: Save tools and dl cache
         if: steps.compile_base.outcome == 'success'
         run: |
@@ -537,12 +551,14 @@ jobs:
           docker rmi "${REG}:dl-${KERNEL_TRACK}-${KV}" >/dev/null 2>&1 || true
           rm -rf /workdir/pack
 
+      # kernel prep (DTS inject, etc.)
       - name: Prepare kernel
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
           rm -rf bin/targets/rockchip/armv8
 
+      # build firmware
       - name: Compile firmware
         run: |
           cd /workdir/openwrt
@@ -570,6 +586,7 @@ jobs:
             exit 1
           fi
 
+      # save target + ccache
       - name: Save target and ccache
         if: success()
         env:
@@ -602,6 +619,7 @@ jobs:
           docker rmi "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" >/dev/null 2>&1 || true
           rm -rf /workdir/pack
 
+      # verify artifacts
       - name: Verify and collect artifacts
         if: success()
         run: |
@@ -645,6 +663,7 @@ jobs:
           done
           ls -lh
 
+      # upload release
       - name: Upload to release
         if: success()
         env:
@@ -685,6 +704,7 @@ jobs:
           delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
           repository: ${{ github.repository }}
 
+      # prune stale GHCR tags per prefix
       - name: Cleanup stale GHCR cache
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
