@@ -25,6 +25,7 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
+    # 内核选项
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_SCHED CGROUP_BPF CGROUP_PIDS CGROUP_RDMA CGROUP_NET_CLASSID \
@@ -37,7 +38,7 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # ptgen 加 p3(256M)，首启扩到磁盘末尾
+    # ptgen 加 p3(256M)，首启扩到磁盘末尾（不加 truncate，避免破坏 fwtool metadata）
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -67,10 +68,10 @@ PYEOF
     git clone --depth 1 "$AMLOGIC_REPO" package/custom/luci-app-amlogic 2>&1 | tail -2
     rm -rf package/custom/luci-app-amlogic/.git
 
-    mkdir -p files/sbin files/usr/bin files/etc/uci-defaults \
-             files/etc/docker files/etc/sysctl.d files/etc/hotplug.d/net
+    mkdir -p files/sbin files/usr/bin files/etc/init.d files/etc/rc.d \
+             files/etc/uci-defaults files/etc/docker files/etc/sysctl.d files/etc/hotplug.d/net
 
-    # 1. mountpoint 命令补丁
+    # mountpoint 命令补丁
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
 QUIET=0; DEV=0
@@ -104,7 +105,19 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # 2. rc.local：内联 /opt 挂载逻辑
+    # rc.local 服务（部分 base-files 版本缺失）
+    cat > files/etc/init.d/rc.local << 'INITEOF'
+#!/bin/sh /etc/rc.common
+START=95
+
+boot() {
+    [ -f /etc/rc.local ] && sh /etc/rc.local
+}
+INITEOF
+    chmod +x files/etc/init.d/rc.local
+    ln -sf ../init.d/rc.local files/etc/rc.d/S95rc.local
+
+    # rc.local：/opt 挂载 + 扩分区
     cat > files/etc/rc.local << 'RCEOF'
 #!/bin/sh
 LOG=/tmp/opt-init.log
@@ -177,7 +190,7 @@ exit 0
 RCEOF
     chmod +x files/etc/rc.local
 
-    # 3. LED hotplug：网卡就绪后触发 led restart
+    # LED hotplug：网卡就绪后触发 led restart
     cat > files/etc/hotplug.d/net/99-led-netdev << 'HOTPLUG_EOF'
 #!/bin/sh
 [ "$ACTION" = "add" ] || exit 0
@@ -195,7 +208,7 @@ RCEOF
 HOTPLUG_EOF
     chmod +x files/etc/hotplug.d/net/99-led-netdev
 
-    # 4. sysctl 合并版
+    # sysctl 优化
     cat > files/etc/sysctl.d/99-r5s.conf << 'EOF'
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
@@ -218,7 +231,7 @@ net.netfilter.nf_conntrack_udp_timeout_stream=180
 net.netfilter.nf_conntrack_helper=1
 EOF
 
-    # 5. 首次刷机系统配置
+    # 首次刷机系统配置
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
@@ -267,6 +280,7 @@ uci set firewall.fwd_lan_docker=forwarding
 uci set firewall.fwd_lan_docker.src='lan'
 uci set firewall.fwd_lan_docker.dest='docker'
 
+# br-* 通配 zone：自动覆盖所有自定义 Docker 网络
 uci set firewall.dockernet=zone
 uci set firewall.dockernet.name='dockernet'
 uci set firewall.dockernet.input='ACCEPT'
@@ -315,7 +329,7 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     /etc/init.d/sshd restart
 fi
 
-# LED
+# LED 配置（netdev trigger）
 uci -q delete system.wan_led 2>/dev/null
 uci -q delete system.lan1_led 2>/dev/null
 uci -q delete system.lan2_led 2>/dev/null
@@ -345,7 +359,7 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    # 6. Docker daemon.json
+    # Docker daemon.json
     cat > files/etc/docker/daemon.json << 'EOF'
 {
   "data-root": "/opt/docker",
@@ -370,23 +384,19 @@ pre_build() {
 
     echo "DTS: $DTS"
 
-    # 已有正确版本 → 跳过
     if grep -q "R5S_FAN_V2" "$DTS"; then
         echo "dts already patched (v2)"; return 0
     fi
 
-    # 从 clean 备份恢复（若有）
+    # 从 clean 备份恢复，或清理旧注入
     if [ -f "${DTS}.clean" ]; then
         echo "从 .clean 恢复 DTS"
         cp "${DTS}.clean" "$DTS"
     elif ! grep -qE "pwm11m0_pins|pwm4_fan_pins|pwm-fan" "$DTS"; then
-        # 当前 DTS 干净（无旧注入）→ 备份为 .clean
         echo "备份干净 DTS 到 .clean"
         cp "$DTS" "${DTS}.clean"
     else
-        # 有旧注入但无 .clean → 强行清理旧注入
         echo "清理旧 pwm-fan 注入"
-        # 删掉我们之前注入的所有内容（&pwm11/&pwm4 块 + 根节点 fan/pwm-fan + cpu_thermal 块）
         awk '
             /^&pwm11 \{/ { in_old=1; next }
             /^&pwm4 \{/  { in_old=1; next }
@@ -394,15 +404,12 @@ pre_build() {
             in_old { next }
             { print }
         ' "$DTS" > "$DTS.tmp" && mv "$DTS.tmp" "$DTS"
-        
-        # 标记这个 DTS 变脏的旧版本不能用作 clean，只能重编
     fi
 
-    # 追加 v2 配置（官方 DTB 反编译得到）
+    # 官方 R5S 风扇配置：pwm0 (GPIO0_B7, pin 15), 20kHz, 5档, vcc5v0_sys
     cat >> "$DTS" << 'DTS_EOF'
 
 // ===== R5S_FAN_V2 =====
-// 官方 R5S 配置：pwm0 (GPIO0_B7, pin 15), 20kHz, 5档, fan-supply=vcc5v0_sys
 &pwm0 {
     status = "okay";
     pinctrl-names = "default";
@@ -446,7 +453,7 @@ pre_build() {
 };
 // ===== END R5S_FAN_V2 =====
 DTS_EOF
-    echo "pwm-fan v2 injected: pwm0 (GPIO0_B7), 50000ns, 5-level, fan-supply=vcc5v0_sys"
+    echo "pwm-fan v2 injected: pwm0 (GPIO0_B7), 50000ns, 5-level"
 }
 
 cache_restore() {
@@ -559,10 +566,11 @@ config_stage() {
     [ $MISSING -eq 1 ] && exit 1
 
     for f in files/sbin/mountpoint files/etc/rc.local \
+             files/etc/init.d/rc.local files/etc/rc.d/S95rc.local \
              files/etc/hotplug.d/net/99-led-netdev \
              files/etc/docker/daemon.json files/etc/uci-defaults/99-custom \
              files/etc/sysctl.d/99-r5s.conf; do
-        [ -f "$f" ] || { echo "missing: $f"; exit 1; }
+        [ -e "$f" ] || { echo "missing: $f"; exit 1; }
     done
 }
 
