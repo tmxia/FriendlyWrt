@@ -291,6 +291,17 @@ jobs:
           done
           make defconfig
 
+      # =====================================================================
+      # 核心改动：用干净解压 + quilt -f 收集所有 .rej
+      # 流程：
+      #   Round 1: make target/linux/prepare —— 正常路径
+      #   若失败：
+      #     Round 2: 手动干净解压内核 + quilt push -a -f 收集所有 .rej
+      #       分析每个受影响补丁:
+      #         - 冗余（反向 clean apply）→ 标记删除
+      #         - 冲突（需要人工）→ 打印 .rej 内容，报错退出
+      #       若全部冗余 → 删除后重试 prepare
+      # =====================================================================
       - name: Adapt kernel patches via OpenWrt
         id: adapt_patches
         if: |
@@ -300,8 +311,9 @@ jobs:
           set -e
           cd /workdir/openwrt
           TARGET=$(cat /workdir/target_version.txt)
-          echo "=== adapt patches for linux-6.12.$TARGET via OpenWrt refresh ==="
+          echo "=== adapt patches for linux-6.12.$TARGET ==="
 
+          # ---------- Round 1: 正常 prepare ----------
           rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
           rm -f staging_dir/target-*/.prepared 2>/dev/null || true
 
@@ -319,59 +331,224 @@ jobs:
 
           echo "prepare failed (rc=$RC)"
           echo ""
-          echo "=== failure context ==="
+          echo "=== prepare1 failure context ==="
           grep -B 5 -A 30 -iE 'Patch failed|No file to patch|can.t find file|Error [0-9]' \
             /tmp/prepare1.log | tail -150 || true
 
-          echo ""
-          echo ">>> Round 2: make target/linux/refresh (quilt refresh)"
-          set +e
-          make target/linux/refresh V=s > /tmp/refresh.log 2>&1
-          RC2=$?
-          set -e
-          echo "refresh rc=$RC2"
-          tail -120 /tmp/refresh.log || true
+          # ---------- 准备内核 tarball ----------
+          TAR="dl/linux-6.12.$TARGET.tar.xz"
+          if [ ! -f "$TAR" ]; then
+            echo ""
+            echo ">>> tarball not cached, downloading"
+            wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.$TARGET.tar.xz" -O "$TAR"
+          fi
+          [ -s "$TAR" ] || { echo "::error::cannot obtain kernel tarball"; exit 1; }
 
-          REJ=$(find build_dir -name '*.rej' 2>/dev/null | head -50 || true)
-          if [ -n "$REJ" ]; then
-            echo ""
-            echo "===== .rej files remain, manual fix required ====="
-            echo "$REJ" | while read -r f; do
-              echo ""
-              echo "--- $f ---"
-              head -120 "$f"
-            done
-            echo ""
-            echo "===== corresponding original patches ====="
-            git status --short target/linux/generic target/linux/rockchip || true
-            echo "::error::OpenWrt refresh could not resolve all patches, manual fix required"
-            exit 1
+          # ---------- Round 2: 干净解压 + quilt -f 收集 .rej ----------
+          ARCH_DIR=$(ls -d build_dir/target-*/linux-rockchip_armv8 2>/dev/null | head -1 || true)
+          if [ -z "$ARCH_DIR" ]; then
+            ARCH_DIR="build_dir/target-aarch64_generic_musl/linux-rockchip_armv8"
+          fi
+          KDIR="$ARCH_DIR/linux-6.12.$TARGET"
+
+          echo ""
+          echo ">>> Round 2: clean extract + quilt push -a -f"
+          rm -rf "$ARCH_DIR"
+          mkdir -p "$ARCH_DIR"
+          xzcat "$TAR" | tar -C "$ARCH_DIR" -xf -
+
+          # 应用 generic/files（与 OpenWrt Makefile 一致）
+          if [ -d target/linux/generic/files ]; then
+            cp -fpR target/linux/generic/files/. "$KDIR/" 2>/dev/null || true
           fi
 
-          echo ""
-          echo ">>> Round 3: retry make target/linux/prepare"
-          rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
-          rm -f staging_dir/target-*/.prepared 2>/dev/null || true
-          set +e
-          make target/linux/prepare V=s > /tmp/prepare2.log 2>&1
-          RC3=$?
-          set -e
+          # 建立 patches 符号链接与 series（模仿 OpenWrt）
+          rm -rf "$KDIR/patches"; mkdir -p "$KDIR/patches"
+          for D in backport-6.12 pending-6.12 hack-6.12; do
+            SUB="generic-${D%-6.12}"
+            SRC="/workdir/openwrt/target/linux/generic/$D"
+            [ -d "$SRC" ] && ln -sfn "$SRC" "$KDIR/patches/$SUB"
+          done
+          if [ -d target/linux/rockchip/patches-6.12 ]; then
+            ln -sfn "/workdir/openwrt/target/linux/rockchip/patches-6.12" "$KDIR/patches/rockchip"
+          fi
 
-          if [ $RC3 -ne 0 ]; then
-            echo "prepare still failed after refresh"
-            grep -B 5 -A 30 -iE 'Patch failed|No file to patch|Error [0-9]' \
-              /tmp/prepare2.log | tail -150
+          : > "$KDIR/patches/series"
+          for SUB in generic-backport generic-pending generic-hack rockchip; do
+            PD="$KDIR/patches/$SUB"
+            [ -d "$PD" ] || continue
+            for p in "$PD"/*.patch; do
+              [ -f "$p" ] || continue
+              echo "$SUB/$(basename "$p")" >> "$KDIR/patches/series"
+            done
+          done
+          echo "series entries: $(wc -l < "$KDIR/patches/series")"
+
+          cd "$KDIR"
+          export QUILT_PATCHES="$KDIR/patches"
+          export QUILT_SERIES="$KDIR/patches/series"
+          rm -rf .pc
+          find . -name '*.rej' -delete 2>/dev/null || true
+          find . -name '*.orig' -delete 2>/dev/null || true
+
+          set +e
+          quilt --quiltrc=- push -a -f --fuzz=3 > /tmp/quilt_force.log 2>&1
+          QUILT_RC=$?
+          set -e
+          echo "quilt rc=$QUILT_RC"
+          tail -100 /tmp/quilt_force.log || true
+
+          # ---------- 收集 .rej ----------
+          ALL_REJ=$(find . -name '*.rej' -not -path './.pc/*' 2>/dev/null | sort || true)
+
+          if [ -z "$ALL_REJ" ]; then
+            echo ""
+            echo "no .rej produced — force-apply succeeded, retry prepare"
+            cd /workdir/openwrt
+            rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
+            rm -f staging_dir/target-*/.prepared 2>/dev/null || true
+            set +e
+            make target/linux/prepare V=s > /tmp/prepare3.log 2>&1
+            RC3=$?
+            set -e
+            if [ $RC3 -eq 0 ]; then
+              echo "prepare OK after force-apply"
+              echo "adapted=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "prepare still failed"
+            tail -200 /tmp/prepare3.log
             echo "::error::patches need manual fix"
             exit 1
           fi
 
-          echo "prepare OK after refresh"
-          echo "adapted=true" >> "$GITHUB_OUTPUT"
+          # ---------- 有 .rej：分类每个受影响补丁 ----------
+          echo ""
+          echo "===== .rej files ====="
+          echo "$ALL_REJ"
 
           echo ""
-          echo "===== patches modified by refresh ====="
-          git status --short target/linux/generic target/linux/rockchip || true
-          git diff --stat target/linux/generic target/linux/rockchip || true
+          echo "===== classify affected patches ====="
+          REDUNDANT_LIST=$(mktemp)
+          CONFLICT_LIST=$(mktemp)
+
+          echo "$ALL_REJ" | while read -r f; do
+            [ -z "$f" ] && continue
+            REL=$(echo "$f" | sed 's|^\./||; s|\.rej$||')
+
+            # 通过 quilt 的 .pc 目录反查是哪个补丁
+            PATCH_REL=""
+            if [ -d .pc ]; then
+              for pd in .pc/*/; do
+                PN=$(basename "$pd")
+                if [ -f "$pd$REL" ]; then
+                  PATCH_REL="$PN"
+                  break
+                fi
+              done
+            fi
+
+            if [ -z "$PATCH_REL" ]; then
+              echo "  [UNKNOWN] $REL  (cannot locate patch)"
+              echo "UNKNOWN:$REL" >> "$CONFLICT_LIST"
+              continue
+            fi
+
+            case "$PATCH_REL" in
+              generic-backport/*) ORIG="/workdir/openwrt/target/linux/generic/backport-6.12/$(basename "$PATCH_REL")" ;;
+              generic-pending/*)  ORIG="/workdir/openwrt/target/linux/generic/pending-6.12/$(basename "$PATCH_REL")" ;;
+              generic-hack/*)     ORIG="/workdir/openwrt/target/linux/generic/hack-6.12/$(basename "$PATCH_REL")" ;;
+              rockchip/*)         ORIG="/workdir/openwrt/target/linux/rockchip/patches-6.12/$(basename "$PATCH_REL")" ;;
+              *)                  ORIG="" ;;
+            esac
+
+            if [ -z "$ORIG" ] || [ ! -f "$ORIG" ]; then
+              echo "  [UNKNOWN] $PATCH_REL (patch file not found)"
+              echo "UNKNOWN:$PATCH_REL" >> "$CONFLICT_LIST"
+              continue
+            fi
+
+            if git apply -R --check "$ORIG" 2>/dev/null; then
+              echo "  [REDUNDANT] $PATCH_REL"
+              echo "$ORIG" >> "$REDUNDANT_LIST"
+            else
+              echo "  [CONFLICT]  $PATCH_REL"
+              echo "$ORIG" >> "$CONFLICT_LIST"
+            fi
+          done
+
+          RD_N=$(sort -u "$REDUNDANT_LIST" | grep -c . || echo 0)
+          CF_N=$(sort -u "$CONFLICT_LIST" | grep -c . || echo 0)
+          echo ""
+          echo "redundant=$RD_N conflicts=$CF_N"
+
+          echo ""
+          echo "===== .rej contents ====="
+          echo "$ALL_REJ" | while read -r f; do
+            [ -z "$f" ] && continue
+            echo ""
+            echo "--- $f ---"
+            head -120 "$f"
+          done
+
+          # ---------- 有真冲突：报错 ----------
+          if [ "$CF_N" -gt 0 ]; then
+            echo ""
+            echo "::error::patches need manual fix (conflicts=$CF_N, redundant=$RD_N)"
+            echo "::notice::Fix steps:"
+            echo "::notice::  1. git clone -b $PATCH_BRANCH <repo> patches-repo"
+            echo "::notice::  2. cd patches-repo && mkdir -p 6.12.$TARGET/generic-backport-6.12"
+            echo "::notice::  3. Fix or replace the conflicting patch files listed above"
+            echo "::notice::  4. touch 6.12.$TARGET/READY && git add . && git commit && git push"
+            echo "::notice::  5. Re-run this workflow"
+            echo "::notice::"
+            echo "::notice::Local reproduce:"
+            echo "::notice::  cd /workdir/openwrt"
+            echo "::notice::  make target/linux/prepare V=s"
+            echo "::notice::  cd $KDIR"
+            echo "::notice::  quilt push -a -f --fuzz=3"
+            echo "::notice::  find . -name '*.rej'"
+            echo ""
+            echo "===== conflicting patches ====="
+            sort -u "$CONFLICT_LIST" | sed 's/^/  /'
+            echo ""
+            echo "===== redundant patches (would be auto-removed) ====="
+            sort -u "$REDUNDANT_LIST" | sed 's/^/  /'
+            exit 1
+          fi
+
+          # ---------- 全部冗余：自动删除并重试 ----------
+          if [ "$RD_N" -gt 0 ]; then
+            echo ""
+            echo ">>> all affected patches are redundant, removing them"
+            sort -u "$REDUNDANT_LIST" | while read -r ORIG; do
+              [ -z "$ORIG" ] && continue
+              if [ -f "$ORIG" ] && git apply -R --check "$ORIG" 2>/dev/null; then
+                rm -f "$ORIG"
+                echo "  removed: $ORIG"
+              fi
+            done
+
+            cd /workdir/openwrt
+            rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
+            rm -f staging_dir/target-*/.prepared 2>/dev/null || true
+            set +e
+            make target/linux/prepare V=s > /tmp/prepare4.log 2>&1
+            RC4=$?
+            set -e
+            if [ $RC4 -eq 0 ]; then
+              echo "prepare OK after removing redundant patches"
+              echo "adapted=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "prepare still failed after removing redundant patches"
+            tail -200 /tmp/prepare4.log
+            echo "::error::patches need manual fix"
+            exit 1
+          fi
+
+          echo "::error::unexpected state: no conflicts but no redundant either"
+          exit 1
 
       - name: Publish adapted patches
         if: |
@@ -413,11 +590,11 @@ jobs:
             rm -rf "$DST"; mkdir -p "$DST"
             find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
           fi
-          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ) via OpenWrt refresh" > "$VERSION_DIR/READY"
+          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ) via quilt force-apply" > "$VERSION_DIR/READY"
 
           git add "$VERSION_DIR"
           git diff --cached --quiet && { echo "no changes"; exit 0; }
-          git commit -q -m "patches: adapt for 6.12.$TARGET via OpenWrt refresh"
+          git commit -q -m "patches: adapt for 6.12.$TARGET via quilt force-apply"
           for attempt in 1 2 3; do
             echo "push attempt $attempt"
             git push origin "HEAD:$PATCH_BRANCH" && { echo "pushed"; exit 0; }
@@ -426,10 +603,7 @@ jobs:
           echo "::warning::push failed after 3 attempts"; exit 0
 
       # =====================================================================
-      # 独立清理步骤：无论本次是否写了新版本，只要到了这里就清理一次
-      # - 保留最新 PATCH_KEEP_VERSIONS 个 6.12.<数字> 目录
-      # - 严格匹配目录名，disabled/ README 等不受影响
-      # - 无变化则直接退出，不产生空 commit
+      # patches 分支旧版本清理（独立步骤，always 触发）
       # =====================================================================
       - name: Prune old patch versions
         if: |
@@ -590,22 +764,8 @@ jobs:
             fi
 
             if grep -qE 'Patch failed|No file to patch|can.t find file' /tmp/stage_verbose.log; then
-              echo ""
-              echo ">>> patch issue detected, run refresh and retry once"
-              make target/linux/refresh V=s > /tmp/refresh_fallback.log 2>&1 || true
-              tail -60 /tmp/refresh_fallback.log || true
-
-              REJ=$(find build_dir -name '*.rej' 2>/dev/null | head -20 || true)
-              if [ -n "$REJ" ]; then
-                echo ">>> .rej remains, cannot auto-recover"
-                echo "$REJ" | while read -r f; do
-                  echo "--- $f ---"; head -80 "$f"
-                done
-                exit 1
-              fi
-              rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
-              rm -f staging_dir/target-*/.prepared 2>/dev/null || true
-              continue
+              echo ">>> patch issue detected in compile-base, cannot auto-recover"
+              exit 1
             fi
 
             echo ">>> cannot auto-recover, aborting"
