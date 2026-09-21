@@ -2,16 +2,6 @@ name: Cleanup GHCR All Cache
 
 on:
   workflow_dispatch:
-    inputs:
-      packages:
-        description: '要删除的包名（逗号分隔）'
-        required: true
-        default: 'r5s-base-cache,r5s-cache'
-      confirm:
-        description: '输入 DELETE 确认删除'
-        required: true
-        default: ''
-        type: string
 
 permissions:
   packages: write
@@ -21,13 +11,6 @@ jobs:
   cleanup:
     runs-on: ubuntu-latest
     steps:
-      - name: Verify confirm
-        run: |
-          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
-            echo "::error::未确认，输入 DELETE 才能执行"
-            exit 1
-          fi
-
       - name: Delete packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -35,24 +18,21 @@ jobs:
           OWNER_TYPE: ${{ github.event.repository.owner.type }}
         run: |
           set -e
-          IFS=',' read -ra PKGS <<< "${{ inputs.packages }}"
+          PKGS="r5s-base-cache r5s-cache"
 
-          for PKG in "${PKGS[@]}"; do
-            PKG=$(echo "$PKG" | xargs)
+          for PKG in $PKGS; do
             echo ""
             echo "==================== $PKG ===================="
 
             if [ "$OWNER_TYPE" = "Organization" ]; then
               BASE="/orgs/${OWNER}/packages/container/${PKG}/versions"
+              PKG_URL="/orgs/${OWNER}/packages/container/${PKG}"
             else
               BASE="/users/${OWNER}/packages/container/${PKG}/versions"
+              PKG_URL="/users/${OWNER}/packages/container/${PKG}"
             fi
 
             PAGE=1
-            TOTAL=0
-            DELETED=0
-            FAILED=0
-
             while :; do
               BATCH=$(gh api "${BASE}?per_page=100&page=${PAGE}" 2>/dev/null || echo "[]")
               COUNT=$(echo "$BATCH" | jq 'length' 2>/dev/null || echo 0)
@@ -62,31 +42,19 @@ jobs:
 
               echo "$BATCH" | jq -r '.[].id' | while read -r VID; do
                 [ -z "$VID" ] && continue
-                if gh api -X DELETE "${BASE}/${VID}" 2>/dev/null; then
-                  echo "    ✓ deleted $VID"
-                else
-                  echo "    ✗ failed  $VID"
-                fi
+                gh api -X DELETE "${BASE}/${VID}" >/dev/null 2>&1 \
+                  && echo "    ✓ $VID" \
+                  || echo "    ✗ $VID"
               done
 
-              TOTAL=$((TOTAL + COUNT))
               [ "$COUNT" -lt 100 ] && break
               PAGE=$((PAGE + 1))
             done
 
-            echo "  total: $TOTAL versions processed"
-
-            # Delete the package itself (container package metadata)
-            if [ "$OWNER_TYPE" = "Organization" ]; then
-              gh api -X DELETE "/orgs/${OWNER}/packages/container/${PKG}" 2>/dev/null \
-                && echo "  ✓ package metadata deleted" \
-                || echo "  (package metadata already gone or delete failed)"
-            else
-              gh api -X DELETE "/users/${OWNER}/packages/container/${PKG}" 2>/dev/null \
-                && echo "  ✓ package metadata deleted" \
-                || echo "  (package metadata already gone or delete failed)"
-            fi
+            gh api -X DELETE "$PKG_URL" >/dev/null 2>&1 \
+              && echo "  ✓ package deleted" \
+              || echo "  (package metadata already gone)"
           done
 
           echo ""
-          echo "===== Done ====="
+          echo "Done"
