@@ -1,0 +1,262 @@
+diff --git a/MAINTAINERS b/MAINTAINERS
+index ec2eb61..afa4cd6 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -14434,7 +14434,9 @@ M:	SkyLake Huang <SkyLake.Huang@mediatek.com>
+ L:	netdev@vger.kernel.org
+ S:	Maintained
+ F:	drivers/net/phy/mediatek/mtk-ge-soc.c
++F:	drivers/net/phy/mediatek/mtk-phy-lib.c
+ F:	drivers/net/phy/mediatek/mtk-ge.c
++F:	drivers/net/phy/mediatek/mtk.h
+ F:	drivers/phy/mediatek/phy-mtk-xfi-tphy.c
+ 
+ MEDIATEK I2C CONTROLLER DRIVER
+diff --git a/drivers/net/phy/mediatek/Kconfig b/drivers/net/phy/mediatek/Kconfig
+index 112d9c0..19b5d23 100644
+--- a/drivers/net/phy/mediatek/Kconfig
++++ b/drivers/net/phy/mediatek/Kconfig
+@@ -1,4 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0-only
++config MTK_NET_PHYLIB
++	tristate
++
+ config MEDIATEK_GE_PHY
+ 	tristate "MediaTek Gigabit Ethernet PHYs"
+ 	help
+@@ -13,6 +16,7 @@ config MEDIATEK_GE_SOC_PHY
+ 	tristate "MediaTek SoC Ethernet PHYs"
+ 	depends on (ARM64 && ARCH_MEDIATEK) || COMPILE_TEST
+ 	depends on NVMEM_MTK_EFUSE
++	select MTK_NET_PHYLIB
+ 	help
+ 	  Supports MediaTek SoC built-in Gigabit Ethernet PHYs.
+ 
+diff --git a/drivers/net/phy/mediatek/Makefile b/drivers/net/phy/mediatek/Makefile
+index 005bde2..814879d 100644
+--- a/drivers/net/phy/mediatek/Makefile
++++ b/drivers/net/phy/mediatek/Makefile
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: GPL-2.0
++obj-$(CONFIG_MTK_NET_PHYLIB)		+= mtk-phy-lib.o
+ obj-$(CONFIG_MEDIATEK_GE_PHY)		+= mtk-ge.o
+ obj-$(CONFIG_MEDIATEK_GE_SOC_PHY)	+= mtk-ge-soc.o
+diff --git a/drivers/net/phy/mediatek/mtk-ge-soc.c b/drivers/net/phy/mediatek/mtk-ge-soc.c
+index 4b2a9a5..578634f 100644
+--- a/drivers/net/phy/mediatek/mtk-ge-soc.c
++++ b/drivers/net/phy/mediatek/mtk-ge-soc.c
+@@ -8,6 +8,8 @@
+ #include <linux/phy.h>
+ #include <linux/regmap.h>
+ 
++#include "mtk.h"
++
+ #define MTK_GPHY_ID_MT7981			0x03a29461
+ #define MTK_GPHY_ID_MT7988			0x03a29481
+ 
+@@ -210,41 +212,6 @@
+ #define MTK_PHY_DA_TX_R50_PAIR_D		0x540
+ 
+ /* Registers on MDIO_MMD_VEND2 */
+-#define MTK_PHY_LED0_ON_CTRL			0x24
+-#define MTK_PHY_LED1_ON_CTRL			0x26
+-#define   MTK_PHY_LED_ON_MASK			GENMASK(6, 0)
+-#define   MTK_PHY_LED_ON_LINK1000		BIT(0)
+-#define   MTK_PHY_LED_ON_LINK100		BIT(1)
+-#define   MTK_PHY_LED_ON_LINK10			BIT(2)
+-#define   MTK_PHY_LED_ON_LINK			(MTK_PHY_LED_ON_LINK10 |\
+-						 MTK_PHY_LED_ON_LINK100 |\
+-						 MTK_PHY_LED_ON_LINK1000)
+-#define   MTK_PHY_LED_ON_LINKDOWN		BIT(3)
+-#define   MTK_PHY_LED_ON_FDX			BIT(4) /* Full duplex */
+-#define   MTK_PHY_LED_ON_HDX			BIT(5) /* Half duplex */
+-#define   MTK_PHY_LED_ON_FORCE_ON		BIT(6)
+-#define   MTK_PHY_LED_ON_POLARITY		BIT(14)
+-#define   MTK_PHY_LED_ON_ENABLE			BIT(15)
+-
+-#define MTK_PHY_LED0_BLINK_CTRL			0x25
+-#define MTK_PHY_LED1_BLINK_CTRL			0x27
+-#define   MTK_PHY_LED_BLINK_1000TX		BIT(0)
+-#define   MTK_PHY_LED_BLINK_1000RX		BIT(1)
+-#define   MTK_PHY_LED_BLINK_100TX		BIT(2)
+-#define   MTK_PHY_LED_BLINK_100RX		BIT(3)
+-#define   MTK_PHY_LED_BLINK_10TX		BIT(4)
+-#define   MTK_PHY_LED_BLINK_10RX		BIT(5)
+-#define   MTK_PHY_LED_BLINK_RX			(MTK_PHY_LED_BLINK_10RX |\
+-						 MTK_PHY_LED_BLINK_100RX |\
+-						 MTK_PHY_LED_BLINK_1000RX)
+-#define   MTK_PHY_LED_BLINK_TX			(MTK_PHY_LED_BLINK_10TX |\
+-						 MTK_PHY_LED_BLINK_100TX |\
+-						 MTK_PHY_LED_BLINK_1000TX)
+-#define   MTK_PHY_LED_BLINK_COLLISION		BIT(6)
+-#define   MTK_PHY_LED_BLINK_RX_CRC_ERR		BIT(7)
+-#define   MTK_PHY_LED_BLINK_RX_IDLE_ERR		BIT(8)
+-#define   MTK_PHY_LED_BLINK_FORCE_BLINK		BIT(9)
+-
+ #define MTK_PHY_LED1_DEFAULT_POLARITIES		BIT(1)
+ 
+ #define MTK_PHY_RG_BG_RASEL			0x115
+@@ -299,14 +266,6 @@ enum CAL_MODE {
+ 	SW_M
+ };
+ 
+-#define MTK_PHY_LED_STATE_FORCE_ON	0
+-#define MTK_PHY_LED_STATE_FORCE_BLINK	1
+-#define MTK_PHY_LED_STATE_NETDEV	2
+-
+-struct mtk_socphy_priv {
+-	unsigned long		led_state;
+-};
+-
+ struct mtk_socphy_shared {
+ 	u32			boottrap;
+ 	struct mtk_socphy_priv	priv[4];
+@@ -1130,6 +1089,7 @@ static int mt798x_phy_config_init(struct phy_device *phydev)
+ 	return mt798x_phy_calibration(phydev);
+ }
+ 
++<<<<<<<
+ static int mt798x_phy_hw_led_on_set(struct phy_device *phydev, u8 index,
+ 				    bool on)
+ {
+@@ -1175,27 +1135,25 @@ static int mt798x_phy_hw_led_blink_set(struct phy_device *phydev, u8 index,
+ 		return 0;
+ }
+ 
++=======
++>>>>>>>
+ static int mt798x_phy_led_blink_set(struct phy_device *phydev, u8 index,
+ 				    unsigned long *delay_on,
+ 				    unsigned long *delay_off)
+ {
+ 	bool blinking = false;
+-	int err = 0;
+-
+-	if (index > 1)
+-		return -EINVAL;
++	int err;
+ 
+-	if (delay_on && delay_off && (*delay_on > 0) && (*delay_off > 0)) {
+-		blinking = true;
+-		*delay_on = 50;
+-		*delay_off = 50;
+-	}
++	err = mtk_phy_led_num_dly_cfg(index, delay_on, delay_off, &blinking);
++	if (err < 0)
++		return err;
+ 
+-	err = mt798x_phy_hw_led_blink_set(phydev, index, blinking);
++	err = mtk_phy_hw_led_blink_set(phydev, index, blinking);
+ 	if (err)
+ 		return err;
+ 
+-	return mt798x_phy_hw_led_on_set(phydev, index, false);
++	return mtk_phy_hw_led_on_set(phydev, index, MTK_GPHY_LED_ON_MASK,
++				     false);
+ }
+ 
+ static int mt798x_phy_led_brightness_set(struct phy_device *phydev,
+@@ -1203,11 +1161,12 @@ static int mt798x_phy_led_brightness_set(struct phy_device *phydev,
+ {
+ 	int err;
+ 
+-	err = mt798x_phy_hw_led_blink_set(phydev, index, false);
++	err = mtk_phy_hw_led_blink_set(phydev, index, false);
+ 	if (err)
+ 		return err;
+ 
+-	return mt798x_phy_hw_led_on_set(phydev, index, (value != LED_OFF));
++	return mtk_phy_hw_led_on_set(phydev, index, MTK_GPHY_LED_ON_MASK,
++				     (value != LED_OFF));
+ }
+ 
+ static const unsigned long supported_triggers = (BIT(TRIGGER_NETDEV_FULL_DUPLEX) |
+@@ -1222,19 +1181,14 @@ static const unsigned long supported_triggers = (BIT(TRIGGER_NETDEV_FULL_DUPLEX)
+ static int mt798x_phy_led_hw_is_supported(struct phy_device *phydev, u8 index,
+ 					  unsigned long rules)
+ {
+-	if (index > 1)
+-		return -EINVAL;
+-
+-	/* All combinations of the supported triggers are allowed */
+-	if (rules & ~supported_triggers)
+-		return -EOPNOTSUPP;
+-
+-	return 0;
+-};
++	return mtk_phy_led_hw_is_supported(phydev, index, rules,
++					   supported_triggers);
++}
+ 
+ static int mt798x_phy_led_hw_control_get(struct phy_device *phydev, u8 index,
+ 					 unsigned long *rules)
+ {
++<<<<<<<
+ 	unsigned int bit_blink = MTK_PHY_LED_STATE_FORCE_BLINK + (index ? 16 : 0);
+ 	unsigned int bit_netdev = MTK_PHY_LED_STATE_NETDEV + (index ? 16 : 0);
+ 	unsigned int bit_on = MTK_PHY_LED_STATE_FORCE_ON + (index ? 16 : 0);
+@@ -1301,11 +1255,18 @@ static int mt798x_phy_led_hw_control_get(struct phy_device *phydev, u8 index,
+ 		*rules |= BIT(TRIGGER_NETDEV_TX);
+ 
+ 	return 0;
++=======
++	return mtk_phy_led_hw_ctrl_get(phydev, index, rules,
++				       MTK_GPHY_LED_ON_SET,
++				       MTK_GPHY_LED_RX_BLINK_SET,
++				       MTK_GPHY_LED_TX_BLINK_SET);
++>>>>>>>
+ };
+ 
+ static int mt798x_phy_led_hw_control_set(struct phy_device *phydev, u8 index,
+ 					 unsigned long rules)
+ {
++<<<<<<<
+ 	unsigned int bit_netdev = MTK_PHY_LED_STATE_NETDEV + (index ? 16 : 0);
+ 	struct mtk_socphy_priv *priv = phydev->priv;
+ 	u16 on = 0, blink = 0;
+@@ -1364,6 +1325,12 @@ static int mt798x_phy_led_hw_control_set(struct phy_device *phydev, u8 index,
+ 	return phy_write_mmd(phydev, MDIO_MMD_VEND2, index ?
+ 				MTK_PHY_LED1_BLINK_CTRL :
+ 				MTK_PHY_LED0_BLINK_CTRL, blink);
++=======
++	return mtk_phy_led_hw_ctrl_set(phydev, index, rules,
++				       MTK_GPHY_LED_ON_SET,
++				       MTK_GPHY_LED_RX_BLINK_SET,
++				       MTK_GPHY_LED_TX_BLINK_SET);
++>>>>>>>
+ };
+ 
+ static bool mt7988_phy_led_get_polarity(struct phy_device *phydev, int led_num)
+@@ -1437,14 +1404,6 @@ static int mt7988_phy_probe_shared(struct phy_device *phydev)
+ 	return 0;
+ }
+ 
+-static void mt798x_phy_leds_state_init(struct phy_device *phydev)
+-{
+-	int i;
+-
+-	for (i = 0; i < 2; ++i)
+-		mt798x_phy_led_hw_control_get(phydev, i, NULL);
+-}
+-
+ static int mt7988_phy_probe(struct phy_device *phydev)
+ {
+ 	struct mtk_socphy_shared *shared;
+@@ -1470,7 +1429,7 @@ static int mt7988_phy_probe(struct phy_device *phydev)
+ 
+ 	phydev->priv = priv;
+ 
+-	mt798x_phy_leds_state_init(phydev);
++	mtk_phy_leds_state_init(phydev);
+ 
+ 	err = mt7988_phy_fix_leds_polarities(phydev);
+ 	if (err)
+@@ -1497,7 +1456,7 @@ static int mt7981_phy_probe(struct phy_device *phydev)
+ 
+ 	phydev->priv = priv;
+ 
+-	mt798x_phy_leds_state_init(phydev);
++	mtk_phy_leds_state_init(phydev);
+ 
+ 	return mt798x_phy_calibration(phydev);
+ }
