@@ -31,7 +31,7 @@ permissions:
   packages: write
 
 concurrency:
-  group: build-r5s-${{ inputs.kernel_track || 'default' }}
+  group: build-r5s
   cancel-in-progress: false
 
 env:
@@ -432,30 +432,45 @@ jobs:
           done
           make defconfig
 
-      - name: Alias linux-stable cache tag
-        if: env.KERNEL_TRACK == 'linux-stable'
+      - name: Alias cache tag by track
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          TEMP="${BASE}:openwrt-25.12"
 
-          docker rmi "${BASE}:openwrt-25.12" 2>/dev/null || true
+          docker rmi "$TEMP" 2>/dev/null || true
 
-          if [ -f /workdir/target_version.txt ]; then
-            KV=$(cat /workdir/target_version.txt)
-            if docker pull "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null; then
-              docker tag "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" "${BASE}:openwrt-25.12"
-              echo "alias from versioned"
-              exit 0
+          if [ "${KERNEL_TRACK}" = "linux-stable" ]; then
+            PULL_OK=""
+            if [ -f /workdir/target_version.txt ]; then
+              KV=$(cat /workdir/target_version.txt)
+              if docker pull "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null; then
+                docker tag "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" "$TEMP"
+                docker push "$TEMP" >/dev/null 2>&1 || true
+                echo "alias+push from openwrt-25.12-linux-stable-6.12.${KV}"
+                PULL_OK="yes"
+              fi
+            fi
+            if [ -z "$PULL_OK" ]; then
+              if docker pull "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null; then
+                docker tag "${BASE}:openwrt-25.12-linux-stable" "$TEMP"
+                docker push "$TEMP" >/dev/null 2>&1 || true
+                echo "alias+push from openwrt-25.12-linux-stable"
+                PULL_OK="yes"
+              fi
+            fi
+            [ -z "$PULL_OK" ] && echo "no linux-stable cache"
+          else
+            if docker pull "${BASE}:openwrt-25.12-openwrt" 2>/dev/null; then
+              docker tag "${BASE}:openwrt-25.12-openwrt" "$TEMP"
+              docker push "$TEMP" >/dev/null 2>&1 || true
+              echo "alias+push from openwrt-25.12-openwrt"
+            else
+              echo "no openwrt cache"
             fi
           fi
 
-          if docker pull "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null; then
-            docker tag "${BASE}:openwrt-25.12-linux-stable" "${BASE}:openwrt-25.12"
-            echo "alias from base"
-            exit 0
-          fi
-
-          echo "no linux-stable cache"
+          docker rmi "$TEMP" 2>/dev/null || true
 
       - name: Restore cache
         run: |
@@ -491,34 +506,41 @@ jobs:
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
 
-      - name: Publish linux-stable cache tag
-        if: |
-          steps.compile_base.outcome == 'success' &&
-          env.KERNEL_TRACK == 'linux-stable'
+      - name: Publish cache tag by track
+        if: steps.compile_base.outcome == 'success'
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          TEMP="${BASE}:openwrt-25.12"
 
-          docker rmi "${BASE}:openwrt-25.12" 2>/dev/null || true
+          docker rmi "$TEMP" 2>/dev/null || true
 
-          if docker pull "${BASE}:openwrt-25.12" 2>/dev/null; then
-            docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable"
-            docker push "${BASE}:openwrt-25.12-linux-stable" || true
-            echo "pushed base tag"
+          if ! docker pull "$TEMP" 2>/dev/null; then
+            echo "no image pushed by cache_save, skip"
+            exit 0
+          fi
+
+          if [ "${KERNEL_TRACK}" = "linux-stable" ]; then
+            docker tag "$TEMP" "${BASE}:openwrt-25.12-linux-stable"
+            docker push "${BASE}:openwrt-25.12-linux-stable" >/dev/null 2>&1 || true
+            echo "pushed: openwrt-25.12-linux-stable"
 
             if [ -f /workdir/target_version.txt ]; then
               KV=$(cat /workdir/target_version.txt)
-              docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}"
-              docker push "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" || true
-              echo "pushed versioned tag"
-            fi
-
-            docker rmi "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null || true
-            if [ -f /workdir/target_version.txt ]; then
-              KV=$(cat /workdir/target_version.txt)
+              docker tag "$TEMP" "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}"
+              docker push "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" >/dev/null 2>&1 || true
+              echo "pushed: openwrt-25.12-linux-stable-6.12.${KV}"
               docker rmi "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null || true
             fi
+            docker rmi "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null || true
+          else
+            docker tag "$TEMP" "${BASE}:openwrt-25.12-openwrt"
+            docker push "${BASE}:openwrt-25.12-openwrt" >/dev/null 2>&1 || true
+            echo "pushed: openwrt-25.12-openwrt"
+            docker rmi "${BASE}:openwrt-25.12-openwrt" 2>/dev/null || true
           fi
+
+          docker rmi "$TEMP" 2>/dev/null || true
 
       - name: Prepare kernel and clean
         run: |
