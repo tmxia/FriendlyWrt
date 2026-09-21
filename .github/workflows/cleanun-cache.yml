@@ -1,23 +1,16 @@
-name: Cleanup Cache Images
+name: Cleanup GHCR All Cache
 
 on:
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: 'Dry run (只显示，不删除)'
-        required: false
-        default: 'true'
-        type: choice
-        options: ['true', 'false']
-      keep_versions:
-        description: '保留最新 N 个版本化 tag (每个 kernel track)'
-        required: false
-        default: '3'
-        type: string
-      max_age_days:
-        description: '删除超过 N 天未使用的 tag (0=不按时间删)'
-        required: false
-        default: '30'
+      packages:
+        description: '要删除的包名（逗号分隔）'
+        required: true
+        default: 'r5s-base-cache,r5s-cache'
+      confirm:
+        description: '输入 DELETE 确认删除'
+        required: true
+        default: ''
         type: string
 
 permissions:
@@ -26,186 +19,74 @@ permissions:
 
 jobs:
   cleanup:
-    name: Clean GHCR Cache
     runs-on: ubuntu-latest
     steps:
-      - name: Show input
+      - name: Verify confirm
         run: |
-          echo "Dry run        : ${{ inputs.dry_run }}"
-          echo "Keep versions  : ${{ inputs.keep_versions }}"
-          echo "Max age (days) : ${{ inputs.max_age_days }}"
+          if [ "${{ inputs.confirm }}" != "DELETE" ]; then
+            echo "::error::未确认，输入 DELETE 才能执行"
+            exit 1
+          fi
 
-      - name: List and clean cache versions
+      - name: Delete packages
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO_OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          DRY_RUN: ${{ inputs.dry_run }}
-          KEEP_VERSIONS: ${{ inputs.keep_versions }}
-          MAX_AGE_DAYS: ${{ inputs.max_age_days }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
         run: |
           set -e
+          IFS=',' read -ra PKGS <<< "${{ inputs.packages }}"
 
-          PKG="r5s-base-cache"
+          for PKG in "${PKGS[@]}"; do
+            PKG=$(echo "$PKG" | xargs)
+            echo ""
+            echo "==================== $PKG ===================="
 
-          # Determine owner type (user or org) to pick API endpoint
-          OWNER_TYPE=$(gh api "/users/${REPO_OWNER}" --jq '.type')
-          if [ "$OWNER_TYPE" = "Organization" ]; then
-            API_BASE="/orgs/${REPO_OWNER}/packages/container/${PKG}/versions"
-          else
-            API_BASE="/users/${REPO_OWNER}/packages/container/${PKG}/versions"
-          fi
-          echo "Owner type : $OWNER_TYPE"
-          echo "API base   : $API_BASE"
-          echo ""
-
-          # Fetch all versions with pagination
-          PER_PAGE=100
-          PAGE=1
-          : > /tmp/all_versions.jsonl
-
-          while :; do
-            BATCH=$(gh api "${API_BASE}?per_page=${PER_PAGE}&page=${PAGE}" 2>/dev/null || echo "[]")
-            COUNT=$(echo "$BATCH" | jq 'length' 2>/dev/null || echo 0)
-            [ "$COUNT" -eq 0 ] && break
-
-            echo "$BATCH" | jq -c '.[]' >> /tmp/all_versions.jsonl
-            echo "  page $PAGE: $COUNT versions"
-
-            [ "$COUNT" -lt "$PER_PAGE" ] && break
-            PAGE=$((PAGE + 1))
-          done
-
-          TOTAL=$(wc -l < /tmp/all_versions.jsonl)
-          echo ""
-          echo "Total versions: $TOTAL"
-          [ "$TOTAL" -eq 0 ] && { echo "Nothing to clean."; exit 0; }
-
-          echo ""
-          echo "===== Inventory ====="
-          printf "%-12s  %-45s  %-20s  %s\n" "ID" "TAGS" "CREATED" "SIZE"
-          printf "%-12s  %-45s  %-20s  %s\n" "----" "----" "-------" "----"
-          jq -r '
-            "\(.id)\t\((.metadata.container.tags // []) | join(","))\t\(.created_at)\t\(( (.metadata.container.tags // []) | length > 0 ) | tostring)"
-          ' /tmp/all_versions.jsonl | while IFS=$'\t' read -r id tags created _; do
-            [ -z "$tags" ] && tags="(untagged)"
-            printf "%-12s  %-45s  %-20s\n" "$id" "$tags" "$created"
-          done
-
-          echo ""
-          echo "===== Plan ====="
-
-          NOW_EPOCH=$(date -u +%s)
-          MAX_AGE_SEC=$(( MAX_AGE_DAYS * 86400 ))
-          : > /tmp/to_delete.txt
-
-          # 1. Untagged versions (older than 1 day) -> delete
-          echo "--- Rule 1: untagged (age > 1d) ---"
-          jq -r 'select((.metadata.container.tags // []) | length == 0) | [.id, .updated_at] | @tsv' /tmp/all_versions.jsonl | \
-          while IFS=$'\t' read -r id updated; do
-            UP_EPOCH=$(date -u -d "$updated" +%s 2>/dev/null || echo 0)
-            AGE=$(( NOW_EPOCH - UP_EPOCH ))
-            if [ "$AGE" -gt 86400 ]; then
-              echo "  DELETE  id=$id  age=$((AGE / 86400))d  (untagged)"
-              echo "$id" >> /tmp/to_delete.txt
-            fi
-          done
-
-          # 2. Versioned tags: keep newest KEEP_VERSIONS per prefix
-          for PREFIX in "openwrt-25.12-linux-stable-6.12." "openwrt-25.12-"; do
-            echo "--- Rule 2: prefix '$PREFIX' keep newest $KEEP_VERSIONS ---"
-            MATCH=$(jq -r --arg p "$PREFIX" '
-              select((.metadata.container.tags // []) | any(startswith($p) and (endswith("-linux-stable") | not)))
-              | [.id, (.metadata.container.tags | join(",")), .updated_at] | @tsv
-            ' /tmp/all_versions.jsonl | sort -t$'\t' -k3 -r)
-
-            [ -z "$MATCH" ] && { echo "  (no matches)"; continue; }
-
-            IDX=0
-            echo "$MATCH" | while IFS=$'\t' read -r id tags updated; do
-              IDX=$((IDX + 1))
-              if [ "$IDX" -le "$KEEP_VERSIONS" ]; then
-                echo "  KEEP    id=$id  $tags"
-              else
-                echo "  DELETE  id=$id  $tags"
-                echo "$id" >> /tmp/to_delete.txt
-              fi
-            done
-          done
-
-          # 3. Age-based: any tag older than MAX_AGE_DAYS
-          if [ "$MAX_AGE_DAYS" -gt 0 ]; then
-            echo "--- Rule 3: age > ${MAX_AGE_DAYS}d ---"
-            jq -r '[.id, (.metadata.container.tags | join(",")), .updated_at] | @tsv' /tmp/all_versions.jsonl | \
-            while IFS=$'\t' read -r id tags updated; do
-              UP_EPOCH=$(date -u -d "$updated" +%s 2>/dev/null || echo 0)
-              AGE=$(( NOW_EPOCH - UP_EPOCH ))
-              if [ "$AGE" -gt "$MAX_AGE_SEC" ]; then
-                echo "  DELETE  id=$id  $tags  age=$((AGE / 86400))d"
-                echo "$id" >> /tmp/to_delete.txt
-              fi
-            done
-          fi
-
-          # Dedup + ensure mandatory tags are always kept
-          MANDATORY_TAGS="openwrt-25.12 openwrt-25.12-linux-stable"
-          jq -r --arg m "$MANDATORY_TAGS" '
-            select((.metadata.container.tags // []) | any(. as $t | $m | split(" ") | index($t)))
-            | .id
-          ' /tmp/all_versions.jsonl > /tmp/mandatory_ids.txt
-
-          sort -u /tmp/to_delete.txt > /tmp/delete_unique.txt
-          if [ -s /tmp/mandatory_ids.txt ]; then
-            while read -r mid; do
-              sed -i "/^${mid}$/d" /tmp/delete_unique.txt
-            done < /tmp/mandatory_ids.txt
-          fi
-
-          DEL_COUNT=$(wc -l < /tmp/delete_unique.txt)
-          echo ""
-          echo "=========================="
-          echo "Total versions : $TOTAL"
-          echo "To delete      : $DEL_COUNT"
-          echo "=========================="
-          echo ""
-
-          if [ "$DEL_COUNT" -eq 0 ]; then
-            echo "Nothing to delete."
-            exit 0
-          fi
-
-          echo "IDs to delete:"
-          cat /tmp/delete_unique.txt | sed 's/^/  /'
-          echo ""
-
-          if [ "$DRY_RUN" = "true" ]; then
-            echo ">>> DRY RUN — nothing deleted. Set dry_run=false to apply."
-            exit 0
-          fi
-
-          echo ">>> Applying deletion..."
-          OK=0
-          FAIL=0
-          while read -r ID; do
-            [ -z "$ID" ] && continue
-            if gh api -X DELETE "${API_BASE}/${ID}" 2>/dev/null; then
-              echo "  ✓ deleted id=$ID"
-              OK=$((OK + 1))
+            if [ "$OWNER_TYPE" = "Organization" ]; then
+              BASE="/orgs/${OWNER}/packages/container/${PKG}/versions"
             else
-              echo "  ✗ failed  id=$ID"
-              FAIL=$((FAIL + 1))
+              BASE="/users/${OWNER}/packages/container/${PKG}/versions"
             fi
-          done < /tmp/delete_unique.txt
+
+            PAGE=1
+            TOTAL=0
+            DELETED=0
+            FAILED=0
+
+            while :; do
+              BATCH=$(gh api "${BASE}?per_page=100&page=${PAGE}" 2>/dev/null || echo "[]")
+              COUNT=$(echo "$BATCH" | jq 'length' 2>/dev/null || echo 0)
+              [ "$COUNT" -eq 0 ] && break
+
+              echo "  page $PAGE: $COUNT versions"
+
+              echo "$BATCH" | jq -r '.[].id' | while read -r VID; do
+                [ -z "$VID" ] && continue
+                if gh api -X DELETE "${BASE}/${VID}" 2>/dev/null; then
+                  echo "    ✓ deleted $VID"
+                else
+                  echo "    ✗ failed  $VID"
+                fi
+              done
+
+              TOTAL=$((TOTAL + COUNT))
+              [ "$COUNT" -lt 100 ] && break
+              PAGE=$((PAGE + 1))
+            done
+
+            echo "  total: $TOTAL versions processed"
+
+            # Delete the package itself (container package metadata)
+            if [ "$OWNER_TYPE" = "Organization" ]; then
+              gh api -X DELETE "/orgs/${OWNER}/packages/container/${PKG}" 2>/dev/null \
+                && echo "  ✓ package metadata deleted" \
+                || echo "  (package metadata already gone or delete failed)"
+            else
+              gh api -X DELETE "/users/${OWNER}/packages/container/${PKG}" 2>/dev/null \
+                && echo "  ✓ package metadata deleted" \
+                || echo "  (package metadata already gone or delete failed)"
+            fi
+          done
 
           echo ""
-          echo "Deleted: $OK  Failed: $FAIL"
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "## Cache Cleanup Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Dry run: \`${{ inputs.dry_run }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Keep versions: \`${{ inputs.keep_versions }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Max age (days): \`${{ inputs.max_age_days }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- Package: \`r5s-base-cache\`" >> $GITHUB_STEP_SUMMARY
+          echo "===== Done ====="
