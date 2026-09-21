@@ -20,7 +20,7 @@ on:
           - 'openwrt'
           - 'linux-stable'
       kernel_version:
-        description: 'Pinned version: openwrt commit SHA, or linux-stable 6.12.x'
+        description: 'Pinned version (empty = auto)'
         required: false
         default: ''
         type: string
@@ -43,11 +43,6 @@ env:
   CONFIG_FILE: 'scripts/r5s.config'
   DIY_SH: 'scripts/r5s_customize.sh'
   PATCH_BRANCH: 'patches'
-  CCACHE_DIR: /workdir/ccache
-  KEEP_TOOLS: '3'
-  KEEP_DL: '3'
-  KEEP_TARGET: '5'
-  KEEP_CCACHE: '5'
 
 jobs:
   prepare_release:
@@ -55,7 +50,7 @@ jobs:
     concurrency:
       group: r5s-prepare-release
       cancel-in-progress: false
-    if: github.event.repository.owner.id == github.event.sender.id || github.triggering_actor == 'github-actions[bot]'
+    if: github.event.repository.owner.id == github.event.sender.id
     outputs:
       release_tag: ${{ steps.release_tag.outputs.tag }}
     steps:
@@ -71,7 +66,9 @@ jobs:
           elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
             FORCE_BASE=true
           fi
+
           EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+
           if [ "$FORCE_BASE" = "true" ]; then
             for tag in $EXISTING_TAGS; do
               gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
@@ -116,7 +113,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # env prep: deps, swap, docker root, ccache
       - name: Setup environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -126,7 +122,10 @@ jobs:
 
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
-                      /usr/share/swift /usr/local/.ghcup /opt/az || true
+                      /usr/share/swift /usr/local/.ghcup /opt/az \
+                      /usr/local/share/powershell /opt/microsoft /opt/google \
+                      /opt/pipx /usr/lib/jvm /usr/local/sdkman /usr/local/go \
+                      /usr/local/share/chromium /opt/conda || true
           sudo docker image prune --all --force || true
           sudo apt-get clean
 
@@ -157,13 +156,9 @@ jobs:
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-          sudo mkdir -p /workdir/ccache
-          sudo chown -R $USER:$GROUPS /workdir/ccache
-
           free -h
           df -hT
 
-      # clone src
       - name: Clone OpenWrt
         working-directory: /workdir
         run: |
@@ -171,7 +166,6 @@ jobs:
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      # pin openwrt commit (optional)
       - name: Pin OpenWrt commit
         if: env.KERNEL_TRACK == 'openwrt' && env.KERNEL_VERSION != ''
         run: |
@@ -184,7 +178,6 @@ jobs:
             echo "::warning::Cannot checkout $KERNEL_VERSION, using branch HEAD"
           fi
 
-      # switch to linux-stable kernel
       - name: Switch to linux-stable kernel
         if: env.KERNEL_TRACK == 'linux-stable'
         run: |
@@ -200,7 +193,6 @@ jobs:
           echo "$TARGET" > /workdir/target_version.txt
           echo "Target: 6.12.$TARGET"
 
-          # fixed awk parse (old sed returned empty on 25.12 branch)
           CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
                 | head -1 | awk -F'= ' '{print $2}' | tr -d '.')
           echo "Builtin: 6.12.$CUR"
@@ -221,7 +213,6 @@ jobs:
             sed -i "s%^LINUX_KERNEL_HASH-6\.12\..*%LINUX_KERNEL_HASH-6.12.$TARGET = $HASH%" "$FILE"
           done
 
-      # restore adapted patches
       - name: Restore adapted patches
         id: restore_patches
         if: env.KERNEL_TRACK == 'linux-stable'
@@ -270,7 +261,6 @@ jobs:
           fi
           echo "restored=true" >> "$GITHUB_OUTPUT"
 
-      # adapt patches via 3way
       - name: Adapt kernel patches
         if: env.KERNEL_TRACK == 'linux-stable' && steps.restore_patches.outputs.restored != 'true'
         run: |
@@ -362,7 +352,6 @@ jobs:
           echo "===== patch summary ====="
           echo "kept=$KEPT removed=$REMOVED 3way=$FIXED disabled=$DISABLED"
 
-      # publish patches
       - name: Publish adapted patches
         if: env.KERNEL_TRACK == 'linux-stable' && steps.restore_patches.outputs.restored != 'true'
         env:
@@ -417,23 +406,19 @@ jobs:
           done
           echo "::warning::push failed after 3 attempts"; exit 0
 
-      # feeds prep
       - name: Prepare feeds
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
           ./scripts/feeds update -a 2>&1 | tail -30
 
-      # apply customizations + install feeds
       - name: Apply customizations
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
 
-      # build config (do not modify r5s.config; append extras via sed %)
       - name: Configure build
-        id: config
         run: |
           cd /workdir/openwrt
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
@@ -441,132 +426,118 @@ jobs:
           make defconfig
 
           for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
-            sed -i "s%^CONFIG_PACKAGE_${pkg}=[ym]%# CONFIG_PACKAGE_${pkg} is not set%" .config
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
             grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
               echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
           done
-
-          grep -q '^CONFIG_CCACHE=' .config || echo 'CONFIG_CCACHE=y' >> .config
-          sed -i 's%^CONFIG_CCACHE_DIR=.*%CONFIG_CCACHE_DIR="/workdir/ccache"%' .config
-          grep -q '^CONFIG_CCACHE_DIR=' .config || echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
-
-          HEAVY="wpewebkit qt5base qt5quick qt5quick-controls qt5declarative qt5svg qt5tools qt5graphicaleffects weston wlroots gzdoom sdl2 sdl2-doom kmscube vkmark gstreamer1 gtk wpebackend-fdo libwpe cog libepoxy harfbuzz pango gdk-pixbuf libdisplay-info"
-          for pkg in $HEAVY; do
-            sed -i "s%^CONFIG_PACKAGE_${pkg}=[ym]%# CONFIG_PACKAGE_${pkg} is not set%" .config
-          done
-
           make defconfig
 
-          echo "===== verified disabled heavy pkgs ====="
-          for pkg in $HEAVY; do
-            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "  [off] $pkg"
-          done
-
-          HASH=$(sha256sum .config | cut -c1-12)
-          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
-          echo "Config hash: $HASH"
-
-      # restore caches (3 layers + ccache)
-      - name: Restore caches
-        env:
-          CONFIG_HASH: ${{ steps.config.outputs.hash }}
+      - name: Alias linux-stable cache tag
+        if: env.KERNEL_TRACK == 'linux-stable'
         run: |
-          cd /workdir/openwrt
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          REG="ghcr.io/${REPO_LOWER}/r5s-cache"
-          KV=""
-          [ -f /workdir/target_version.txt ] && KV=$(cat /workdir/target_version.txt)
+          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
 
-          for TAG in "tools-${KERNEL_TRACK}" "dl-${KERNEL_TRACK}-${KV}" "target-${KERNEL_TRACK}-${KV}-${CONFIG_HASH}"; do
-            if docker pull "${REG}:${TAG}" 2>/dev/null; then
-              CID=$(docker create "${REG}:${TAG}")
-              echo "  restoring ${TAG}"
-              docker export "$CID" | tar -C /workdir/openwrt -xf - 2>/dev/null || true
-              docker rm "$CID" >/dev/null
-              docker rmi "${REG}:${TAG}" >/dev/null 2>&1 || true
-              echo "  ok ${TAG}"
-            else
-              echo "  miss ${TAG}"
+          docker rmi "${BASE}:openwrt-25.12" 2>/dev/null || true
+
+          if [ -f /workdir/target_version.txt ]; then
+            KV=$(cat /workdir/target_version.txt)
+            if docker pull "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null; then
+              docker tag "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" "${BASE}:openwrt-25.12"
+              echo "alias from versioned: openwrt-25.12-linux-stable-6.12.${KV}"
+              exit 0
             fi
-          done
-
-          if docker pull "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" 2>/dev/null; then
-            CID=$(docker create "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}")
-            docker export "$CID" | tar -C /workdir -xf - 2>/dev/null || true
-            docker rm "$CID" >/dev/null
-            docker rmi "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" >/dev/null 2>&1 || true
-            echo "  ok ccache"
-          else
-            echo "  miss ccache"
           fi
 
-          df -hT /workdir
+          if docker pull "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null; then
+            docker tag "${BASE}:openwrt-25.12-linux-stable" "${BASE}:openwrt-25.12"
+            echo "alias from linux-stable base"
+            exit 0
+          fi
 
-      # build base
+          echo "no linux-stable cache, script will pull default tag"
+
+      - name: Restore cache
+        run: |
+          cd /workdir
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_restore
+
       - name: Compile base
         id: compile_base
         run: |
           cd /workdir/openwrt
-          for STAGE in tools/download tools/compile toolchain/download toolchain/compile; do
-            echo "=== $STAGE ==="
-            set +e
-            make $STAGE -j$(nproc) > /tmp/stage.log 2>&1
-            RC=$?
-            set -e
-            if [ "$RC" -ne 0 ]; then
-              echo "=== $STAGE failed, retry V=s ==="
-              make $STAGE -j1 V=s > /tmp/stage_verbose.log 2>&1 || true
-              grep -n -A 30 -B 10 -iE 'error|fail' /tmp/stage_verbose.log | tail -200
-              exit 1
-            fi
-          done
+          touch /workdir/base_compilation_marker
 
-      # save tools + dl cache
-      - name: Save tools and dl cache
+          make tools/download -j1 || exit 1
+          time make tools/compile -j$(nproc) || exit 1
+
+          make toolchain/download -j1 || exit 1
+          time make toolchain/compile -j$(nproc) || exit 1
+
+      - name: Checkpoint base cache
         if: steps.compile_base.outcome == 'success'
         run: |
           cd /workdir/openwrt
+
+          IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$"
+
+          CHANGED=$(find build_dir staging_dir -type f -newer /workdir/base_compilation_marker -path "*/stamp/*" 2>/dev/null | \
+                    grep -E -v "$IGNORE_PATTERN" | wc -l)
+
+          if [ "$CHANGED" -eq 0 ]; then
+            echo "base cache up-to-date"
+            exit 0
+          fi
+
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
+
+      - name: Publish linux-stable cache tag
+        if: |
+          steps.compile_base.outcome == 'success' &&
+          env.KERNEL_TRACK == 'linux-stable'
+        run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          REG="ghcr.io/${REPO_LOWER}/r5s-cache"
+          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
 
-          rm -rf /workdir/pack
-          mkdir -p /workdir/pack/layer1
-          for t in staging_dir/host staging_dir/toolchain-aarch64_generic_musl build_dir/host build_dir/toolchain-aarch64_generic_musl; do
-            [ -e "$t" ] || continue
-            mkdir -p "/workdir/pack/layer1/$(dirname "$t")"
-            cp -a "$t" "/workdir/pack/layer1/$(dirname "$t")/"
-          done
-          tar -C /workdir/pack/layer1 -cf /workdir/pack/layer.tar .
-          docker import /workdir/pack/layer.tar "${REG}:tools-${KERNEL_TRACK}"
-          docker push "${REG}:tools-${KERNEL_TRACK}"
-          docker rmi "${REG}:tools-${KERNEL_TRACK}" >/dev/null 2>&1 || true
-          rm -rf /workdir/pack
+          docker rmi "${BASE}:openwrt-25.12" 2>/dev/null || true
 
-          KV=$(cat /workdir/target_version.txt 2>/dev/null || echo unknown)
-          mkdir -p /workdir/pack/layer1
-          [ -d dl ] && { mkdir -p /workdir/pack/layer1/dl; cp -a dl/. /workdir/pack/layer1/dl/; }
-          tar -C /workdir/pack/layer1 -cf /workdir/pack/layer.tar .
-          docker import /workdir/pack/layer.tar "${REG}:dl-${KERNEL_TRACK}-${KV}"
-          docker push "${REG}:dl-${KERNEL_TRACK}-${KV}"
-          docker rmi "${REG}:dl-${KERNEL_TRACK}-${KV}" >/dev/null 2>&1 || true
-          rm -rf /workdir/pack
+          if docker pull "${BASE}:openwrt-25.12" 2>/dev/null; then
+            docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable"
+            docker push "${BASE}:openwrt-25.12-linux-stable" || true
+            echo "pushed: openwrt-25.12-linux-stable"
 
-      # kernel prep (DTS inject, etc.)
-      - name: Prepare kernel
+            if [ -f /workdir/target_version.txt ]; then
+              KV=$(cat /workdir/target_version.txt)
+              docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}"
+              docker push "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" || true
+              echo "pushed: openwrt-25.12-linux-stable-6.12.${KV}"
+            fi
+
+            docker rmi "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null || true
+            if [ -f /workdir/target_version.txt ]; then
+              KV=$(cat /workdir/target_version.txt)
+              docker rmi "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null || true
+            fi
+          else
+            echo "no image pushed (CHANGED=0), skip"
+          fi
+
+      - name: Prepare kernel and clean
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
           rm -rf bin/targets/rockchip/armv8
 
-      # build firmware
       - name: Compile firmware
         run: |
           cd /workdir/openwrt
+
           set +e
           make download -j8 > /tmp/download.log 2>&1 || true
           make -j$(nproc) V=s > /tmp/build.log 2>&1
           BUILD_RESULT=$?
           set -e
+
           if [ "$BUILD_RESULT" -ne 0 ]; then
             echo "Build failed (exit: $BUILD_RESULT)"
             if [ "$BUILD_RESULT" -gt 128 ]; then
@@ -575,6 +546,7 @@ jobs:
               free -h
               sudo dmesg 2>/dev/null | grep -i -E "out of memory|oom-kill" | tail -20 || true
             fi
+
             FIRST_ERR=$(grep -n -m 1 -E "^make(\[[0-9]+\])?: \*\*\* .* Error [0-9]" /tmp/build.log | cut -d: -f1)
             if [ -n "$FIRST_ERR" ]; then
               START=$((FIRST_ERR > 150 ? FIRST_ERR - 150 : 1))
@@ -586,40 +558,6 @@ jobs:
             exit 1
           fi
 
-      # save target + ccache
-      - name: Save target and ccache
-        if: success()
-        env:
-          CONFIG_HASH: ${{ steps.config.outputs.hash }}
-        run: |
-          cd /workdir/openwrt
-          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          REG="ghcr.io/${REPO_LOWER}/r5s-cache"
-          KV=$(cat /workdir/target_version.txt 2>/dev/null || echo unknown)
-
-          rm -rf /workdir/pack
-          mkdir -p /workdir/pack/layer1
-          for t in staging_dir/target-aarch64_generic_musl build_dir/target-aarch64_generic_musl bin; do
-            [ -e "$t" ] || continue
-            mkdir -p "/workdir/pack/layer1/$(dirname "$t")"
-            cp -a "$t" "/workdir/pack/layer1/$(dirname "$t")/"
-          done
-          tar -C /workdir/pack/layer1 -cf /workdir/pack/layer.tar .
-          docker import /workdir/pack/layer.tar "${REG}:target-${KERNEL_TRACK}-${KV}-${CONFIG_HASH}"
-          docker push "${REG}:target-${KERNEL_TRACK}-${KV}-${CONFIG_HASH}"
-          docker rmi "${REG}:target-${KERNEL_TRACK}-${KV}-${CONFIG_HASH}" >/dev/null 2>&1 || true
-          rm -rf /workdir/pack
-
-          rm -rf /workdir/pack
-          mkdir -p /workdir/pack/layer1/workdir
-          cp -a /workdir/ccache /workdir/pack/layer1/workdir/
-          tar -C /workdir/pack/layer1 -cf /workdir/pack/layer.tar .
-          docker import /workdir/pack/layer.tar "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}"
-          docker push "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}"
-          docker rmi "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" >/dev/null 2>&1 || true
-          rm -rf /workdir/pack
-
-      # verify artifacts
       - name: Verify and collect artifacts
         if: success()
         run: |
@@ -643,7 +581,7 @@ jobs:
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
-          grep -E "^(kmod-r8125|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd) " "$MANIFEST" || true
+          grep -E "^(kmod-r8125|kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
 
           mkdir -p $GITHUB_WORKSPACE/artifact
           DATE=$(date +%Y-%m-%d)
@@ -652,6 +590,7 @@ jobs:
           cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
           cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
           cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
+
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
           [ -f /workdir/patch_report.txt ] && cp /workdir/patch_report.txt "$GITHUB_WORKSPACE/artifact/${PREFIX}-patch-report.txt"
@@ -663,7 +602,6 @@ jobs:
           done
           ls -lh
 
-      # upload release
       - name: Upload to release
         if: success()
         env:
@@ -686,16 +624,15 @@ jobs:
           retention-days: 30
 
   cleanup_self:
-    name: Cleanup runs and cache
+    name: Cleanup workflow history
     runs-on: ubuntu-latest
     needs: [prepare_release, build]
     if: ${{ always() }}
     permissions:
       actions: write
       contents: read
-      packages: write
     steps:
-      - name: Delete old workflow runs
+      - name: Delete old runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -703,60 +640,3 @@ jobs:
           retain_days: 0
           delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
           repository: ${{ github.repository }}
-
-      # prune stale GHCR tags per prefix
-      - name: Cleanup stale GHCR cache
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          OWNER="${{ github.repository_owner }}"
-          OWNER_TYPE="${{ github.event.repository.owner.type }}"
-          PKG="r5s-cache"
-
-          if [ "$OWNER_TYPE" = "Organization" ]; then
-            BASE="https://api.github.com/orgs/${OWNER}/packages/container/${PKG}/versions"
-          else
-            BASE="https://api.github.com/users/${OWNER}/packages/container/${PKG}/versions"
-          fi
-
-          echo "list versions: $BASE"
-          RESP=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
-                       -H "Accept: application/vnd.github+json" \
-                       "${BASE}?per_page=100")
-
-          if ! echo "$RESP" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            echo "no package or API error, skip"
-            echo "$RESP" | head -c 300
-            exit 0
-          fi
-
-          TMP=$(mktemp)
-          echo "$RESP" | jq -r '.[] | "\(.id)\t\(.updated_at)\t\(.metadata.container.tags[0] // "untagged")"' > "$TMP"
-          echo "total versions: $(wc -l < $TMP)"
-
-          for PREFIX in tools- dl- target- ccache-; do
-            case "$PREFIX" in
-              tools-)  KEEP="${KEEP_TOOLS}"  ;;
-              dl-)     KEEP="${KEEP_DL}"     ;;
-              target-) KEEP="${KEEP_TARGET}" ;;
-              ccache-) KEEP="${KEEP_CCACHE}" ;;
-            esac
-            echo "--- ${PREFIX}* keep=${KEEP} ---"
-            grep -P "^[0-9]+\t[^\t]+\t${PREFIX}" "$TMP" 2>/dev/null | \
-              sort -k2 -r > "/tmp/grp_${PREFIX}.txt" || true
-            TOTAL=$(wc -l < "/tmp/grp_${PREFIX}.txt")
-            echo "  found ${TOTAL}"
-            [ "$TOTAL" -le "$KEEP" ] && { echo "  ok"; continue; }
-            tail -n +$((KEEP + 1)) "/tmp/grp_${PREFIX}.txt" | while IFS=$'\t' read -r id updated tag; do
-              [ -z "$id" ] && continue
-              echo "  del id=$id tag=$tag"
-              curl -sS -X DELETE \
-                -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "${BASE}/${id}" >/dev/null || echo "    !! del fail id=$id"
-            done
-          done
-
-          rm -f "$TMP"
-          echo "cleanup done"
