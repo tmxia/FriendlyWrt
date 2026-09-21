@@ -22,8 +22,6 @@ jobs:
       nanopi_msg: ${{ steps.nanopi_msg.outputs.msg }}
       openwrt_changed: ${{ steps.openwrt.outputs.changed }}
       openwrt_sha: ${{ steps.openwrt.outputs.sha }}
-      stable_changed: ${{ steps.stable.outputs.changed }}
-      stable_ver: ${{ steps.stable.outputs.version }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -101,41 +99,12 @@ jobs:
             echo "changed=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Fetch kernel.org 6.12 stable version
-        id: stable
-        run: |
-          VER=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
-                | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
-                | sort -uV | tail -1 \
-                | grep -oE '6\.12\.[0-9]+' || true)
-          if [ -z "$VER" ]; then
-            echo "::warning::Cannot fetch kernel.org 6.12 version"
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-
-          git fetch origin master || true
-          RECORDED=""
-          if git cat-file -e origin/master:.linux-stable-6.12-version 2>/dev/null; then
-            RECORDED=$(git show origin/master:.linux-stable-6.12-version | head -n1 | tr -d '[:space:]')
-          fi
-
-          echo "recorded=$RECORDED"
-          echo "current=$VER"
-          if [ "$RECORDED" = "$VER" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
   trigger:
     needs: check
     runs-on: ubuntu-latest
     if: |
       needs.check.outputs.nanopi_changed == 'true' ||
-      needs.check.outputs.openwrt_changed == 'true' ||
-      needs.check.outputs.stable_changed == 'true'
+      needs.check.outputs.openwrt_changed == 'true'
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -153,23 +122,12 @@ jobs:
             -f set=both \
             --repo "$GITHUB_REPOSITORY"
 
-      - name: Trigger R5S openwrt build
+      - name: Trigger R5S build
         if: needs.check.outputs.openwrt_changed == 'true'
         run: |
-          echo "Triggering build-r5s-openwrt.yml with kernel_track=openwrt"
+          echo "Triggering build-r5s-openwrt.yml (openwrt-25.12 updated)"
+          echo "openwrt SHA: ${{ needs.check.outputs.openwrt_sha }}"
           gh workflow run build-r5s-openwrt.yml \
-            -f kernel_track=openwrt \
-            -f kernel_version="${{ needs.check.outputs.openwrt_sha }}" \
-            -f replace_existing=false \
-            --repo "$GITHUB_REPOSITORY"
-
-      - name: Trigger R5S linux-stable build
-        if: needs.check.outputs.stable_changed == 'true'
-        run: |
-          echo "Triggering build-r5s-openwrt.yml with kernel_track=linux-stable"
-          gh workflow run build-r5s-openwrt.yml \
-            -f kernel_track=linux-stable \
-            -f kernel_version="${{ needs.check.outputs.stable_ver }}" \
             -f replace_existing=false \
             --repo "$GITHUB_REPOSITORY"
 
@@ -180,8 +138,6 @@ jobs:
           NANOPI_MSG: ${{ needs.check.outputs.nanopi_msg }}
           OPENWRT_CHANGED: ${{ needs.check.outputs.openwrt_changed }}
           OPENWRT_SHA: ${{ needs.check.outputs.openwrt_sha }}
-          STABLE_CHANGED: ${{ needs.check.outputs.stable_changed }}
-          STABLE_VER: ${{ needs.check.outputs.stable_ver }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -204,11 +160,7 @@ jobs:
             echo "$OPENWRT_SHA" > .openwrt-25.12-version
           fi
 
-          if [ "$STABLE_CHANGED" = "true" ] && [ -n "$STABLE_VER" ]; then
-            echo "$STABLE_VER" > .linux-stable-6.12-version
-          fi
-
-          git add .kernel-version .openwrt-25.12-version .linux-stable-6.12-version 2>/dev/null || git add -A
+          git add .kernel-version .openwrt-25.12-version 2>/dev/null || git add -A
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
