@@ -46,7 +46,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="${MODEL_NAME}-OpenWrt-$(date +%Y-%m-%d)"
+          BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-$(date +%Y.%m.%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -409,6 +409,7 @@ jobs:
         run: |
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
+          TAG="${{ needs.prepare_release.outputs.release_tag }}"
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -427,33 +428,39 @@ jobs:
           grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
 
           mkdir -p $GITHUB_WORKSPACE/artifact
-          DATE=$(date +%Y-%m-%d)
-          PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
-          cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
-          cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
+          cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${TAG}-sdcard.img.gz"
+          cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${TAG}-squashfs-sysupgrade.img.gz"
+          cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${TAG}-manifest.txt"
 
-          echo "===== kernel version ====="
-          grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null || true
-          echo "openwrt commit: $(git rev-parse HEAD)"
+          SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
+          [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${TAG}-sha256sums.txt"
+
+          echo "kernel version:" >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt"
+          grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt" || true
+          echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt"
+          echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt"
 
           cd $GITHUB_WORKSPACE/artifact
+          rm -f SHA256SUMS
+          for f in *; do
+            [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
+          done
           echo ""
           echo "===== artifacts ====="
           ls -lh
 
-      - name: Upload to release
+      - name: Upload artifacts
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd $GITHUB_WORKSPACE/artifact
           shopt -s nullglob
-          FILES=(*.gz)
+          FILES=(*.gz *-manifest.txt *-sha256sums.txt *-build-info.txt SHA256SUMS)
           shopt -u nullglob
-          [ ${#FILES[@]} -eq 0 ] && { echo "no firmware files"; exit 1; }
-          echo "uploading ${#FILES[@]} firmware files to release"
-          printf '  %s\n' "${FILES[@]}"
+          [ ${#FILES[@]} -eq 0 ] && { echo "no files"; exit 0; }
+          echo "uploading ${#FILES[@]} files to release"
           gh release upload "${{ needs.prepare_release.outputs.release_tag }}" "${FILES[@]}" --clobber
 
       - uses: actions/upload-artifact@v4
