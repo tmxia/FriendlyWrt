@@ -97,7 +97,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup environment
+      - name: Setup, clone and detect kernel
+        id: setup
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -143,16 +144,15 @@ jobs:
           free -h
           df -hT
 
-      - name: Clone OpenWrt
-        working-directory: /workdir
-        run: |
+          echo ""
+          echo "===== clone OpenWrt ====="
+          cd /workdir
           git clone -b ${{ env.OPENWRT_BRANCH }} --single-branch \
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: Detect kernel version
-        id: detect_kv
-        run: |
+          echo ""
+          echo "===== detect kernel version ====="
           cd /workdir/openwrt
           KV=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
                | head -1 | awk -F'= ' '{print $2}' | tr -d '.')
@@ -165,12 +165,10 @@ jobs:
           echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
           echo "detected: kernel=6.12.$KV openwrt=$OW_HASH"
 
-      - name: Alias cache tag
-        id: cache_alias
-        run: |
+          echo ""
+          echo "===== alias cache tag ====="
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          KV="${{ steps.detect_kv.outputs.kernel }}"
           SPECIFIC="${BASE}:openwrt-25.12-linux-6.12.${KV}"
           GENERIC="${BASE}:openwrt-25.12"
 
@@ -181,30 +179,22 @@ jobs:
             docker tag "$SPECIFIC" "$GENERIC"
             docker push "$GENERIC" >/dev/null 2>&1 || true
             echo "cache hit: $SPECIFIC"
-            echo "hit=true" >> "$GITHUB_OUTPUT"
           else
             echo "no cache for kernel 6.12.${KV}, cold build"
-            echo "hit=false" >> "$GITHUB_OUTPUT"
           fi
 
           docker rmi "$GENERIC" 2>/dev/null || true
           docker rmi "$SPECIFIC" 2>/dev/null || true
 
-      - name: Prepare feeds
+      - name: Prepare build configuration
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
           ./scripts/feeds update -a 2>&1 | tail -30
 
-      - name: Apply customizations
-        run: |
-          cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
 
-      - name: Configure build
-        run: |
-          cd /workdir/openwrt
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
           make defconfig
@@ -216,8 +206,6 @@ jobs:
           done
           make defconfig
 
-      - name: Restore cache
-        run: |
           cd /workdir
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_restore
 
@@ -257,8 +245,12 @@ jobs:
 
           echo "===== compile base OK ====="
 
-      - name: Checkpoint base cache
+      - name: Save and publish cache
         if: steps.compile_base.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
+          KV: ${{ steps.setup.outputs.kernel }}
         run: |
           cd /workdir/openwrt
 
@@ -270,18 +262,18 @@ jobs:
           echo "changed stamp files: $CHANGED"
 
           if [ "$CHANGED" -eq 0 ]; then
-            echo "base cache up-to-date, skip save"
+            echo "base cache up-to-date, skip save and publish"
             exit 0
           fi
 
+          echo ""
+          echo "===== save cache ====="
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
 
-      - name: Publish cache tag
-        if: steps.compile_base.outcome == 'success'
-        run: |
+          echo ""
+          echo "===== publish cache tag ====="
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          KV="${{ steps.detect_kv.outputs.kernel }}"
           GENERIC="${BASE}:openwrt-25.12"
           SPECIFIC="${BASE}:openwrt-25.12-linux-6.12.${KV}"
 
@@ -290,37 +282,28 @@ jobs:
 
           if ! docker pull "$GENERIC" 2>/dev/null; then
             echo "no image pushed by cache_save, skip publish"
-            exit 0
-          fi
-
-          docker tag "$GENERIC" "$SPECIFIC"
-          if docker push "$SPECIFIC" >/dev/null 2>&1; then
-            echo "published: $SPECIFIC"
           else
-            echo "::warning::publish failed for $SPECIFIC"
+            docker tag "$GENERIC" "$SPECIFIC"
+            if docker push "$SPECIFIC" >/dev/null 2>&1; then
+              echo "published: $SPECIFIC"
+            else
+              echo "::warning::publish failed for $SPECIFIC"
+            fi
+            docker rmi "$SPECIFIC" 2>/dev/null || true
+            docker rmi "$GENERIC" 2>/dev/null || true
           fi
 
-          docker rmi "$SPECIFIC" 2>/dev/null || true
-          docker rmi "$GENERIC" 2>/dev/null || true
-
-      - name: Prune old cache versions
-        if: steps.compile_base.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
-        run: |
-          set -e
+          echo ""
+          echo "===== prune old cache versions ====="
           OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
           PKG="r5s-base-cache"
-
-          echo "=== prune cache: keep latest ${KEEP} per prefix ==="
 
           OWNER_TYPE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
                        "https://api.github.com/users/$OWNER" | jq -r .type 2>/dev/null || echo "User")
           if [ "$OWNER_TYPE" = "Organization" ]; then
-            BASE="/orgs/$OWNER/packages/container/$PKG/versions"
+            BASE_API="/orgs/$OWNER/packages/container/$PKG/versions"
           else
-            BASE="/users/$OWNER/packages/container/$PKG/versions"
+            BASE_API="/users/$OWNER/packages/container/$PKG/versions"
           fi
           echo "owner type: $OWNER_TYPE"
 
@@ -328,7 +311,7 @@ jobs:
           PAGE=1
           while :; do
             RESP=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-                   "https://api.github.com${BASE}?per_page=100&page=$PAGE")
+                   "https://api.github.com${BASE_API}?per_page=100&page=$PAGE")
             COUNT=$(echo "$RESP" | jq 'if type=="array" then length else 0 end')
             [ "$COUNT" = "0" ] && break
             echo "$RESP" | jq -c '.[]' >> "$ALL"
@@ -338,45 +321,38 @@ jobs:
 
           TOTAL=$(wc -l < "$ALL" | tr -d ' ')
           echo "total versions: $TOTAL"
-          [ "$TOTAL" = "0" ] && { rm -f "$ALL"; exit 0; }
 
-          PREFIX="openwrt-25.12-linux-6.12."
-          echo ""
-          echo "--- ${PREFIX}* keep latest ${KEEP} ---"
+          if [ "$TOTAL" != "0" ]; then
+            PREFIX="openwrt-25.12-linux-6.12."
+            PLAN=$(jq -r --arg p "$PREFIX" '
+              select((.metadata.container.tags // []) | any(startswith($p)))
+              | [.id, .created_at] | @tsv
+            ' "$ALL" | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}')
 
-          PLAN=$(jq -r --arg p "$PREFIX" '
-            select((.metadata.container.tags // []) | any(startswith($p)))
-            | [.id, .created_at] | @tsv
-          ' "$ALL" | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}')
-
-          if [ -z "$PLAN" ]; then
-            echo "  (nothing to prune)"
-          else
-            N=$(echo "$PLAN" | wc -l | tr -d ' ')
-            echo "  pruning $N versions..."
-            echo "$PLAN" | while read -r VID; do
-              [ -z "$VID" ] && continue
-              if curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                 "https://api.github.com${BASE}/$VID" >/dev/null 2>&1; then
-                echo "    deleted $VID"
-              else
-                echo "    failed  $VID"
-              fi
-            done
+            if [ -z "$PLAN" ]; then
+              echo "  (nothing to prune)"
+            else
+              N=$(echo "$PLAN" | wc -l | tr -d ' ')
+              echo "  pruning $N versions (keep $KEEP)..."
+              echo "$PLAN" | while read -r VID; do
+                [ -z "$VID" ] && continue
+                if curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                   "https://api.github.com${BASE_API}/$VID" >/dev/null 2>&1; then
+                  echo "    deleted $VID"
+                else
+                  echo "    failed  $VID"
+                fi
+              done
+            fi
           fi
-
           rm -f "$ALL"
           echo "=== prune done ==="
-
-      - name: Prepare kernel and clean
-        run: |
-          cd /workdir/openwrt
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
-          rm -rf bin/targets/rockchip/armv8
 
       - name: Compile firmware
         run: |
           cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
+          rm -rf bin/targets/rockchip/armv8
 
           set +e
           make download -j8 > /tmp/download.log 2>&1 || true
@@ -404,8 +380,10 @@ jobs:
             exit 1
           fi
 
-      - name: Verify and collect artifacts
+      - name: Collect and upload artifacts
         if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
@@ -446,22 +424,22 @@ jobs:
           for f in *; do
             [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
           done
-          echo ""
-          echo "===== artifacts ====="
-          ls -lh
 
-      - name: Upload artifacts
-        if: success()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd $GITHUB_WORKSPACE/artifact
+          echo ""
+          echo "===== upload to release ====="
           shopt -s nullglob
-          FILES=(*.gz *-manifest.txt *-sha256sums.txt *-build-info.txt SHA256SUMS)
+          RELEASE_FILES=(*.gz)
           shopt -u nullglob
-          [ ${#FILES[@]} -eq 0 ] && { echo "no files"; exit 0; }
-          echo "uploading ${#FILES[@]} files to release"
-          gh release upload "${{ needs.prepare_release.outputs.release_tag }}" "${FILES[@]}" --clobber
+          if [ ${#RELEASE_FILES[@]} -eq 0 ]; then
+            echo "no firmware files"; exit 1
+          fi
+          echo "uploading ${#RELEASE_FILES[@]} firmware files to release"
+          printf '  %s\n' "${RELEASE_FILES[@]}"
+          gh release upload "$TAG" "${RELEASE_FILES[@]}" --clobber
+
+          echo ""
+          echo "===== all artifacts ====="
+          ls -lh
 
       - uses: actions/upload-artifact@v4
         if: success()
