@@ -104,10 +104,9 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # 2. rc.local：内联 /opt 挂载逻辑（首启扩分区+挂载，每次启动保证挂载）
+    # 2. rc.local：内联 /opt 挂载逻辑
     cat > files/etc/rc.local << 'RCEOF'
 #!/bin/sh
-# /opt 初始化：首启扩 p3 到磁盘末尾，之后保证挂载
 LOG=/tmp/opt-init.log
 exec >>"$LOG" 2>&1
 echo "=== $(date +%FT%T) opt-init ==="
@@ -131,16 +130,13 @@ esac
 OPT_DEV="${DISK}${P}3"
 [ -b "$OPT_DEV" ] || { echo "no p3"; exit 0; }
 
-# 若已挂载则退出
 mountpoint -q /opt && { echo "already mounted"; exit 0; }
 
-# 停 docker、卸载残留
 [ -x /etc/init.d/dockerd ] && /etc/init.d/dockerd stop 2>/dev/null
 sleep 1
 umount /opt/docker 2>/dev/null || true
 umount /opt 2>/dev/null || true
 
-# 扩分区
 DS=$(cat /sys/class/block/$(basename "$DISK")/size 2>/dev/null)
 PS=$(cat /sys/class/block/$(basename "$OPT_DEV")/start 2>/dev/null)
 PC=$(cat /sys/class/block/$(basename "$OPT_DEV")/size 2>/dev/null)
@@ -151,7 +147,6 @@ if [ -n "$DS" ] && [ -n "$PS" ] && [ -n "$PC" ] && [ "$PC" -lt $((DS - PS - 33))
     sleep 2
 fi
 
-# 文件系统：非 ext4 则格式化；ext4 则 fsck + resize
 FSTYPE=$(blkid -s TYPE -o value "$OPT_DEV" 2>/dev/null)
 if [ "$FSTYPE" != "ext4" ]; then
     mkfs.ext4 -L opt -F "$OPT_DEV"
@@ -160,7 +155,6 @@ else
     resize2fs "$OPT_DEV" 2>/dev/null || mkfs.ext4 -L opt -F "$OPT_DEV"
 fi
 
-# 写 fstab + 挂载
 UUID=$(blkid -s UUID -o value "$OPT_DEV" 2>/dev/null)
 [ -n "$UUID" ] && {
     [ "$(uci -q get fstab.@mount[-1].uuid)" = "$UUID" ] || {
@@ -203,7 +197,6 @@ HOTPLUG_EOF
 
     # 4. sysctl 合并版
     cat > files/etc/sysctl.d/99-r5s.conf << 'EOF'
-# 代理/网络优化
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
 net.core.optmem_max = 65535
@@ -216,7 +209,6 @@ net.ipv4.tcp_wmem = 8192 262144 67108864
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_notsent_lowat = 16384
-# conntrack
 net.netfilter.nf_conntrack_acct=1
 net.netfilter.nf_conntrack_checksum=0
 net.netfilter.nf_conntrack_max=65535
@@ -230,14 +222,12 @@ EOF
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
-# docker0 声明
 if ! uci show network 2>/dev/null | grep -qE "\.name=['\"]?docker0['\"]?"; then
     uci add network device >/dev/null
     uci set network.@device[-1].type='bridge'
     uci set network.@device[-1].name='docker0'
 fi
 
-# LAN / WAN
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -250,7 +240,6 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
-# firewall
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
@@ -278,7 +267,6 @@ uci set firewall.fwd_lan_docker=forwarding
 uci set firewall.fwd_lan_docker.src='lan'
 uci set firewall.fwd_lan_docker.dest='docker'
 
-# dockernet zone：br-* 通配，自动覆盖所有自定义 Docker 网络
 uci set firewall.dockernet=zone
 uci set firewall.dockernet.name='dockernet'
 uci set firewall.dockernet.input='ACCEPT'
@@ -302,7 +290,6 @@ uci set firewall.fwd_lan_dockernet.dest='dockernet'
 
 uci commit firewall
 
-# Docker UCI
 uci set dockerd.globals.data_root='/opt/docker'
 uci -q delete dockerd.globals.registry_mirrors
 uci add_list dockerd.globals.registry_mirrors='https://docker.1ms.run'
@@ -328,7 +315,7 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     /etc/init.d/sshd restart
 fi
 
-# LED：函数式，避免 shell 解析 bug
+# LED
 uci -q delete system.wan_led 2>/dev/null
 uci -q delete system.lan1_led 2>/dev/null
 uci -q delete system.lan2_led 2>/dev/null
@@ -379,24 +366,55 @@ pre_build() {
     local DTS=""
     DTS=$(find build_dir -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
     [ -z "$DTS" ] && DTS=$(find . -type f -path "*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" 2>/dev/null | head -1)
-
     [ -z "$DTS" ] && { echo "r5s dts not found, skip"; return 0; }
-    grep -q "pwm-fan" "$DTS" && { echo "dts already patched"; return 0; }
 
-    cp "$DTS" "${DTS}.orig"
+    echo "DTS: $DTS"
+
+    # 已有正确版本 → 跳过
+    if grep -q "R5S_FAN_V2" "$DTS"; then
+        echo "dts already patched (v2)"; return 0
+    fi
+
+    # 从 clean 备份恢复（若有）
+    if [ -f "${DTS}.clean" ]; then
+        echo "从 .clean 恢复 DTS"
+        cp "${DTS}.clean" "$DTS"
+    elif ! grep -qE "pwm11m0_pins|pwm4_fan_pins|pwm-fan" "$DTS"; then
+        # 当前 DTS 干净（无旧注入）→ 备份为 .clean
+        echo "备份干净 DTS 到 .clean"
+        cp "$DTS" "${DTS}.clean"
+    else
+        # 有旧注入但无 .clean → 强行清理旧注入
+        echo "清理旧 pwm-fan 注入"
+        # 删掉我们之前注入的所有内容（&pwm11/&pwm4 块 + 根节点 fan/pwm-fan + cpu_thermal 块）
+        awk '
+            /^&pwm11 \{/ { in_old=1; next }
+            /^&pwm4 \{/  { in_old=1; next }
+            in_old && /^\};$/ { in_old=0; next }
+            in_old { next }
+            { print }
+        ' "$DTS" > "$DTS.tmp" && mv "$DTS.tmp" "$DTS"
+        
+        # 标记这个 DTS 变脏的旧版本不能用作 clean，只能重编
+    fi
+
+    # 追加 v2 配置（官方 DTB 反编译得到）
     cat >> "$DTS" << 'DTS_EOF'
 
-&pwm11 {
+// ===== R5S_FAN_V2 =====
+// 官方 R5S 配置：pwm0 (GPIO0_B7, pin 15), 20kHz, 5档, fan-supply=vcc5v0_sys
+&pwm0 {
     status = "okay";
     pinctrl-names = "default";
-    pinctrl-0 = <&pwm11m0_pins>;
+    pinctrl-0 = <&pwm0m0_pins>;
 };
 
 / {
     fan: pwm-fan {
         compatible = "pwm-fan";
-        cooling-levels = <0 80 160 255>;
-        pwms = <&pwm11 0 40000 0>;
+        cooling-levels = <0 18 102 170 255>;
+        fan-supply = <&vcc5v0_sys>;
+        pwms = <&pwm0 0 50000 0>;
         #cooling-cells = <2>;
         status = "okay";
     };
@@ -404,16 +422,31 @@ pre_build() {
 
 &cpu_thermal {
     trips {
-        cpu_warm: cpu_warm { temperature = <45000>; hysteresis = <2000>; type = "active"; };
-        cpu_hot: cpu_hot { temperature = <50000>; hysteresis = <2000>; type = "active"; };
+        cpu_warm: cpu_warm {
+            temperature = <45000>;
+            hysteresis = <2000>;
+            type = "active";
+        };
+        cpu_hot: cpu_hot {
+            temperature = <50000>;
+            hysteresis = <2000>;
+            type = "active";
+        };
     };
     cooling-maps {
-        map_warm { trip = <&cpu_warm>; cooling-device = <&fan 1 1>; };
-        map_hot  { trip = <&cpu_hot>;  cooling-device = <&fan 2 3>; };
+        map_warm {
+            trip = <&cpu_warm>;
+            cooling-device = <&fan 1 1>;
+        };
+        map_hot {
+            trip = <&cpu_hot>;
+            cooling-device = <&fan 2 4>;
+        };
     };
 };
+// ===== END R5S_FAN_V2 =====
 DTS_EOF
-    echo "pwm-fan node injected"
+    echo "pwm-fan v2 injected: pwm0 (GPIO0_B7), 50000ns, 5-level, fan-supply=vcc5v0_sys"
 }
 
 cache_restore() {
