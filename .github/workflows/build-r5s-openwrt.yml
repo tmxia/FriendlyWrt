@@ -444,18 +444,18 @@ jobs:
             KV=$(cat /workdir/target_version.txt)
             if docker pull "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null; then
               docker tag "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" "${BASE}:openwrt-25.12"
-              echo "alias from versioned: openwrt-25.12-linux-stable-6.12.${KV}"
+              echo "alias from versioned"
               exit 0
             fi
           fi
 
           if docker pull "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null; then
             docker tag "${BASE}:openwrt-25.12-linux-stable" "${BASE}:openwrt-25.12"
-            echo "alias from linux-stable base"
+            echo "alias from base"
             exit 0
           fi
 
-          echo "no linux-stable cache, script will pull default tag"
+          echo "no linux-stable cache"
 
       - name: Restore cache
         run: |
@@ -504,13 +504,13 @@ jobs:
           if docker pull "${BASE}:openwrt-25.12" 2>/dev/null; then
             docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable"
             docker push "${BASE}:openwrt-25.12-linux-stable" || true
-            echo "pushed: openwrt-25.12-linux-stable"
+            echo "pushed base tag"
 
             if [ -f /workdir/target_version.txt ]; then
               KV=$(cat /workdir/target_version.txt)
               docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}"
               docker push "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" || true
-              echo "pushed: openwrt-25.12-linux-stable-6.12.${KV}"
+              echo "pushed versioned tag"
             fi
 
             docker rmi "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null || true
@@ -518,8 +518,6 @@ jobs:
               KV=$(cat /workdir/target_version.txt)
               docker rmi "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null || true
             fi
-          else
-            echo "no image pushed (CHANGED=0), skip"
           fi
 
       - name: Prepare kernel and clean
@@ -621,10 +619,10 @@ jobs:
         with:
           name: r5s-firmware-${{ env.KERNEL_TRACK }}
           path: artifact/
-          retention-days: 30
+          retention-days: 3
 
   cleanup_self:
-    name: Cleanup workflow history
+    name: Cleanup runs and artifacts
     runs-on: ubuntu-latest
     needs: [prepare_release, build]
     if: ${{ always() }}
@@ -632,11 +630,45 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Delete old runs
-        uses: Mattraks/delete-workflow-runs@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          keep_minimum_runs: 0
-          retain_days: 0
-          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
-          repository: ${{ github.repository }}
+      - name: Delete old runs and orphan artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          KEEP=1
+          CURRENT_RUN="${{ github.run_id }}"
+
+          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+                 --jq '.workflow_runs[] | select(.name == "Build OpenWrt for NanoPi R5S") | .id' || echo "")
+
+          IDX=0
+          for RID in $RUNS; do
+            IDX=$((IDX + 1))
+            if [ "$RID" = "$CURRENT_RUN" ]; then
+              echo "keep current: $RID"
+              continue
+            fi
+            if [ "$IDX" -le "$KEEP" ]; then
+              echo "keep recent: $RID"
+              continue
+            fi
+            echo "delete run: $RID"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/$RID" 2>/dev/null || true
+          done
+
+          echo ""
+          echo "===== remaining artifacts ====="
+          LIVE_RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+                      --jq '.workflow_runs[].id' 2>/dev/null || echo "")
+
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | "\(.id)\t\(.workflow_run.id)\t\(.name)\t\(.size_in_bytes)"' 2>/dev/null | \
+          while IFS=$'\t' read -r AID RUNID NAME SIZE; do
+            [ -z "$AID" ] && continue
+            if echo "$LIVE_RUNS" | grep -q "^${RUNID}$"; then
+              echo "  keep   $NAME  ${SIZE}B"
+              continue
+            fi
+            echo "  delete $NAME  ${SIZE}B"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${AID}" 2>/dev/null || true
+          done
