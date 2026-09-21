@@ -46,7 +46,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-$(date +%Y.%m.%d)"
+          BASE_TAG="${MODEL_NAME}-OpenWrt-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -388,6 +388,9 @@ jobs:
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
           TAG="${{ needs.prepare_release.outputs.release_tag }}"
+          ARTIFACT_PREFIX=$(echo "$TAG" | sed "s/^${MODEL_NAME}-OpenWrt-/${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-/")
+          echo "release tag:     $TAG"
+          echo "artifact prefix: $ARTIFACT_PREFIX"
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -407,17 +410,17 @@ jobs:
 
           mkdir -p $GITHUB_WORKSPACE/artifact
 
-          cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${TAG}-sdcard.img.gz"
-          cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${TAG}-squashfs-sysupgrade.img.gz"
-          cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${TAG}-manifest.txt"
+          cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sdcard.img.gz"
+          cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-squashfs-sysupgrade.img.gz"
+          cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-manifest.txt"
 
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
-          [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${TAG}-sha256sums.txt"
+          [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sha256sums.txt"
 
-          echo "kernel version:" >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt"
-          grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt" || true
-          echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt"
-          echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${TAG}-build-info.txt"
+          echo "kernel version:" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt" || true
+          echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
 
           cd $GITHUB_WORKSPACE/artifact
           rm -f SHA256SUMS
