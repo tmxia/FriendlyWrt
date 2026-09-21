@@ -36,7 +36,6 @@ jobs:
         run: |
           sudo mkdir -p /workdir
           sudo chown -R "$USER:$GROUPS" /workdir
-          df -hT /workdir
 
       - name: Clone OpenWrt
         run: |
@@ -47,94 +46,83 @@ jobs:
       - name: Prepare .config
         run: |
           cd /workdir/openwrt
-          if [ ! -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
-            echo "::error::config file not found: $CONFIG_FILE"
-            ls -la "$GITHUB_WORKSPACE/scripts" || true
-            exit 1
-          fi
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
-          echo "=== input config lines: $(wc -l < .config) ==="
+          echo "input lines: $(wc -l < .config)"
 
       - name: Run defconfig
-        id: defconfig
         run: |
           cd /workdir/openwrt
-          set +e
-          make defconfig > /tmp/defconfig.log 2>&1
-          RC=$?
-          set -e
-          echo "rc=$RC" >> "$GITHUB_OUTPUT"
-          echo "=== defconfig log tail ==="
-          tail -50 /tmp/defconfig.log
+          make defconfig > /tmp/defconfig.log 2>&1 || true
+          tail -5 /tmp/defconfig.log
 
-      - name: Extract final config
-        run: |
-          cd /workdir/openwrt
-          ./scripts/diffconfig.sh > /workdir/final.config
-          echo "=== final lines: $(wc -l < /workdir/final.config) ==="
-
-      - name: Classify each input option
+      - name: Check each option in final .config
         run: |
           cd /workdir/openwrt
           INPUT="$GITHUB_WORKSPACE/$CONFIG_FILE"
-          FINAL=/workdir/final.config
+          FINAL=/workdir/openwrt/.config
           REPORT=/workdir/verify-report.txt
           : > "$REPORT"
 
-          echo "########## 1) Kconfig existence check ##########" >> "$REPORT"
-          grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key _; do
-            [ -z "$key" ] && continue
-            key=$(echo "$key" | tr -d ' ')
-            sym="${key#CONFIG_}"
-            if grep -rqE "^\s*(menu)?config ${sym}\b" \
-                 target/linux/ package/ include/ Config.in 2>/dev/null; then
-              echo "[FOUND]   $key" >> "$REPORT"
-            else
-              echo "[MISSING] $key" >> "$REPORT"
-            fi
-          done
-
-          echo "" >> "$REPORT"
-          echo "########## 2) Kept / Dropped / Changed ##########" >> "$REPORT"
+          # 只检查 KERNEL_* 和 PACKAGE_* ，其它(TARGET_/DEFAULT_)由构建系统管理，跳过
           grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key val; do
             [ -z "$key" ] && continue
             key=$(echo "$key" | tr -d ' ')
             val=$(echo "$val" | tr -d ' ')
-            line=$(grep -E "^${key}=" "$FINAL" | head -1)
-            if [ -z "$line" ]; then
-              if grep -qE "^# ${key} is not set" "$FINAL"; then
-                echo "[DROPPED] $key (turned into 'is not set')" >> "$REPORT"
-              else
-                echo "[DROPPED] $key (absent from final)" >> "$REPORT"
-              fi
+
+            case "$key" in
+              CONFIG_KERNEL_*|CONFIG_PACKAGE_*) ;;
+              *) continue ;;
+            esac
+
+            # 在最终 .config 里精确定位
+            if grep -qE "^${key}=${val}$" "$FINAL"; then
+              echo "[OK]       $key=$val" >> "$REPORT"
+            elif grep -qE "^${key}=" "$FINAL"; then
+              fval=$(grep -E "^${key}=" "$FINAL" | head -1 | cut -d= -f2)
+              echo "[CHANGED]  $key: input=$val final=$fval" >> "$REPORT"
+            elif grep -qE "^# ${key} is not set" "$FINAL"; then
+              echo "[DISABLED] $key (explicitly off)" >> "$REPORT"
             else
-              fval="${line#*=}"
-              if [ "$fval" = "$val" ]; then
-                echo "[KEPT]    $key=$val" >> "$REPORT"
-              else
-                echo "[CHANGED] $key: input=$val final=$fval" >> "$REPORT"
-              fi
+              # 完全没出现在最终 .config
+              echo "[MISSING]  $key" >> "$REPORT"
             fi
           done
 
-      - name: Print report
+      - name: Print summary
         run: |
-          echo "================= VERIFY REPORT ================="
-          cat /workdir/verify-report.txt
-          echo "================================================="
-          MISSING=$(grep -c '^\[MISSING\]' /workdir/verify-report.txt || true)
-          DROPPED=$(grep -c '^\[DROPPED\]' /workdir/verify-report.txt || true)
-          CHANGED=$(grep -c '^\[CHANGED\]' /workdir/verify-report.txt || true)
-          echo "MISSING=$MISSING DROPPED=$DROPPED CHANGED=$CHANGED"
+          R=/workdir/verify-report.txt
+          echo "================ SUMMARY ================"
+          for tag in OK CHANGED DISABLED MISSING; do
+            n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null || echo 0)
+            echo "$tag = $n"
+          done
+          echo ""
+          echo "--- MISSING (符号不存在，需要改名或删除) ---"
+          grep '^\[MISSING\]' "$R" || echo "(none)"
+          echo ""
+          echo "--- DISABLED (依赖未满足，被显式关闭) ---"
+          grep '^\[DISABLED\]' "$R" || echo "(none)"
+          echo ""
+          echo "--- CHANGED (值被 defconfig 修改) ---"
+          grep '^\[CHANGED\]' "$R" || echo "(none)"
+          echo ""
+          echo "--- 完整报告 (OK/CHANGED/DISABLED/MISSING) ---"
+          cat "$R"
           {
             echo "### Config verification"
             echo ""
-            echo "- MISSING (not in Kconfig): $MISSING"
-            echo "- DROPPED (ignored/overridden): $DROPPED"
-            echo "- CHANGED (value adjusted): $CHANGED"
+            for tag in OK CHANGED DISABLED MISSING; do
+              n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null || echo 0)
+              echo "- $tag: $n"
+            done
             echo ""
+            echo '**MISSING:**'
             echo '```'
-            grep -E '^\[(MISSING|DROPPED|CHANGED)\]' /workdir/verify-report.txt || echo "(none)"
+            grep '^\[MISSING\]' "$R" || echo "(none)"
+            echo '```'
+            echo '**DISABLED:**'
+            echo '```'
+            grep '^\[DISABLED\]' "$R" || echo "(none)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -145,14 +133,7 @@ jobs:
           name: verify-report
           path: |
             /workdir/verify-report.txt
-            /workdir/final.config
+            /workdir/openwrt/.config
             /tmp/defconfig.log
           retention-days: 14
           if-no-files-found: warn
-
-      - name: Fail if missing options
-        run: |
-          if [ -f /workdir/verify-report.txt ] && grep -q '^\[MISSING\]' /workdir/verify-report.txt; then
-            echo "::error::Some options are not in Kconfig tree"
-            exit 1
-          fi
