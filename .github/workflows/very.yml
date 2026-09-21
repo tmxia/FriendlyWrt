@@ -15,7 +15,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       OPENWRT_BRANCH: 'openwrt-25.12'
       OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
@@ -43,9 +43,19 @@ jobs:
             "$OPENWRT_REPO" /workdir/openwrt
           ln -sf /workdir/openwrt openwrt
 
+      - name: Update and install feeds
+        run: |
+          cd /workdir/openwrt
+          ./scripts/feeds update -a 2>&1 | tail -10
+          ./scripts/feeds install -a 2>&1 | tail -10
+
       - name: Prepare .config
         run: |
           cd /workdir/openwrt
+          if [ ! -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
+            echo "::error::config file not found: $CONFIG_FILE"
+            exit 1
+          fi
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
           echo "input lines: $(wc -l < .config)"
 
@@ -53,7 +63,7 @@ jobs:
         run: |
           cd /workdir/openwrt
           make defconfig > /tmp/defconfig.log 2>&1 || true
-          tail -5 /tmp/defconfig.log
+          tail -3 /tmp/defconfig.log
 
       - name: Check each option in final .config
         run: |
@@ -63,18 +73,16 @@ jobs:
           REPORT=/workdir/verify-report.txt
           : > "$REPORT"
 
-          # 只检查 KERNEL_* 和 PACKAGE_* ，其它(TARGET_/DEFAULT_)由构建系统管理，跳过
           grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key val; do
             [ -z "$key" ] && continue
             key=$(echo "$key" | tr -d ' ')
             val=$(echo "$val" | tr -d ' ')
 
             case "$key" in
-              CONFIG_KERNEL_*|CONFIG_PACKAGE_*) ;;
+              CONFIG_KERNEL_*|CONFIG_PACKAGE_*|CONFIG_DOCKER_*) ;;
               *) continue ;;
             esac
 
-            # 在最终 .config 里精确定位
             if grep -qE "^${key}=${val}$" "$FINAL"; then
               echo "[OK]       $key=$val" >> "$REPORT"
             elif grep -qE "^${key}=" "$FINAL"; then
@@ -83,7 +91,6 @@ jobs:
             elif grep -qE "^# ${key} is not set" "$FINAL"; then
               echo "[DISABLED] $key (explicitly off)" >> "$REPORT"
             else
-              # 完全没出现在最终 .config
               echo "[MISSING]  $key" >> "$REPORT"
             fi
           done
@@ -93,26 +100,25 @@ jobs:
           R=/workdir/verify-report.txt
           echo "================ SUMMARY ================"
           for tag in OK CHANGED DISABLED MISSING; do
-            n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null || echo 0)
+            n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null | head -1)
+            [ -z "$n" ] && n=0
             echo "$tag = $n"
           done
           echo ""
-          echo "--- MISSING (符号不存在，需要改名或删除) ---"
+          echo "--- MISSING ---"
           grep '^\[MISSING\]' "$R" || echo "(none)"
           echo ""
-          echo "--- DISABLED (依赖未满足，被显式关闭) ---"
+          echo "--- DISABLED ---"
           grep '^\[DISABLED\]' "$R" || echo "(none)"
           echo ""
-          echo "--- CHANGED (值被 defconfig 修改) ---"
+          echo "--- CHANGED ---"
           grep '^\[CHANGED\]' "$R" || echo "(none)"
-          echo ""
-          echo "--- 完整报告 (OK/CHANGED/DISABLED/MISSING) ---"
-          cat "$R"
           {
             echo "### Config verification"
             echo ""
             for tag in OK CHANGED DISABLED MISSING; do
-              n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null || echo 0)
+              n=$(grep -c "^\[$tag\]" "$R" 2>/dev/null | head -1)
+              [ -z "$n" ] && n=0
               echo "- $tag: $n"
             done
             echo ""
@@ -123,6 +129,10 @@ jobs:
             echo '**DISABLED:**'
             echo '```'
             grep '^\[DISABLED\]' "$R" || echo "(none)"
+            echo '```'
+            echo '**CHANGED:**'
+            echo '```'
+            grep '^\[CHANGED\]' "$R" || echo "(none)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
