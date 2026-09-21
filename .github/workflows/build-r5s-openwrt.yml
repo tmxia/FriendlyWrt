@@ -11,19 +11,6 @@ on:
         default: 'true'
         type: choice
         options: ['false', 'true']
-      kernel_track:
-        description: 'Kernel track'
-        required: false
-        default: 'linux-stable'
-        type: choice
-        options:
-          - 'openwrt'
-          - 'linux-stable'
-      kernel_version:
-        description: 'Pinned version (empty = auto)'
-        required: false
-        default: ''
-        type: string
 
 permissions:
   contents: write
@@ -42,9 +29,7 @@ env:
   OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
   CONFIG_FILE: 'scripts/r5s.config'
   DIY_SH: 'scripts/r5s_customize.sh'
-  PATCH_BRANCH: 'patches'
-  CACHE_KEEP_VERSIONS: '2'
-  PATCH_KEEP_VERSIONS: '2'
+  CACHE_KEEP_VERSIONS: '3'
 
 jobs:
   prepare_release:
@@ -92,7 +77,7 @@ jobs:
             fi
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
+          echo "release tag: $TAG"
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -109,9 +94,6 @@ jobs:
     name: Build r5s
     needs: prepare_release
     runs-on: ubuntu-latest
-    env:
-      KERNEL_TRACK: ${{ inputs.kernel_track || 'linux-stable' }}
-      KERNEL_VERSION: ${{ inputs.kernel_version }}
     steps:
       - uses: actions/checkout@v4
 
@@ -168,102 +150,45 @@ jobs:
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: Pin OpenWrt commit
-        if: env.KERNEL_TRACK == 'openwrt' && env.KERNEL_VERSION != ''
+      - name: Detect kernel version
+        id: detect_kv
         run: |
           cd /workdir/openwrt
-          git fetch origin "$KERNEL_VERSION" 2>/dev/null || git fetch origin
-          if git checkout "$KERNEL_VERSION" 2>/dev/null; then
-            echo "Pinned to $KERNEL_VERSION"
-            git log -1 --format='%H %s'
-          else
-            echo "::warning::Cannot checkout $KERNEL_VERSION, using branch HEAD"
+          KV=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
+               | head -1 | awk -F'= ' '{print $2}' | tr -d '.')
+          if [ -z "$KV" ]; then
+            SHORT=$(git rev-parse --short HEAD)
+            KV="commit-${SHORT}"
           fi
+          OW_HASH=$(git rev-parse --short=8 HEAD)
+          echo "kernel=$KV" >> "$GITHUB_OUTPUT"
+          echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
+          echo "detected: kernel=6.12.$KV openwrt=$OW_HASH"
 
-      - name: Switch to linux-stable kernel
-        if: env.KERNEL_TRACK == 'linux-stable'
+      - name: Alias cache tag
+        id: cache_alias
         run: |
-          cd /workdir/openwrt
-          if [ -n "$KERNEL_VERSION" ]; then
-            TARGET="${KERNEL_VERSION#6.12.}"
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          KV="${{ steps.detect_kv.outputs.kernel }}"
+          SPECIFIC="${BASE}:openwrt-25.12-linux-6.12.${KV}"
+          GENERIC="${BASE}:openwrt-25.12"
+
+          docker rmi "$GENERIC" 2>/dev/null || true
+          docker rmi "$SPECIFIC" 2>/dev/null || true
+
+          if docker pull "$SPECIFIC" 2>/dev/null; then
+            docker tag "$SPECIFIC" "$GENERIC"
+            docker push "$GENERIC" >/dev/null 2>&1 || true
+            echo "cache hit: $SPECIFIC"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
           else
-            TARGET=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/ \
-                     | grep -oE 'linux-6\.12\.[0-9]+\.tar\.xz' \
-                     | sort -uV | tail -1 \
-                     | grep -oE '6\.12\.[0-9]+' | cut -d. -f3)
-          fi
-          echo "$TARGET" > /workdir/target_version.txt
-          echo "Target: 6.12.$TARGET"
-
-          CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
-                | head -1 | awk -F'= ' '{print $2}' | tr -d '.')
-          echo "Builtin: 6.12.$CUR"
-
-          if [ "$CUR" = "$TARGET" ]; then
-            echo "Already up-to-date, skip version bump"
-            exit 0
+            echo "no cache for kernel 6.12.${KV}, cold build"
+            echo "hit=false" >> "$GITHUB_OUTPUT"
           fi
 
-          HASH=$(wget -qO- https://cdn.kernel.org/pub/linux/kernel/v6.x/sha256sums.asc \
-                 | grep "linux-6.12.$TARGET.tar.xz" | awk '{print $1}')
-          [ ${#HASH} -eq 64 ] || { echo "cannot fetch hash"; exit 1; }
-
-          MAP=$(grep -rln '^LINUX_VERSION-6\.12' include/ target/linux/ 2>/dev/null || true)
-          for FILE in $MAP; do
-            echo "Patching $FILE"
-            sed -i "s%^LINUX_VERSION-6.12 = .*%LINUX_VERSION-6.12 = .$TARGET%" "$FILE"
-            sed -i "s%^LINUX_KERNEL_HASH-6\.12\..*%LINUX_KERNEL_HASH-6.12.$TARGET = $HASH%" "$FILE"
-          done
-
-      - name: Restore adapted patches
-        id: restore_patches
-        if: env.KERNEL_TRACK == 'linux-stable'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "restored=false" >> "$GITHUB_OUTPUT"
-          [ -f /workdir/target_version.txt ] || { echo "no target_version"; exit 0; }
-          TARGET=$(cat /workdir/target_version.txt)
-          VERSION_DIR="6.12.$TARGET"
-          cd /workdir
-
-          set +e
-          git clone --branch "$PATCH_BRANCH" --single-branch \
-            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            patches-repo > /tmp/clone_patches.log 2>&1
-          CLONE_RC=$?
-          set -e
-
-          if [ "$CLONE_RC" -ne 0 ]; then
-            echo "patch branch not found, will create on publish"
-            rm -rf patches-repo && mkdir -p patches-repo && cd patches-repo
-            git init -q
-            git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-            git checkout -q -b "$PATCH_BRANCH"
-            exit 0
-          fi
-
-          if [ -f "/workdir/patches-repo/$VERSION_DIR/READY" ]; then
-            echo "restore patches for $VERSION_DIR"
-            cd /workdir/openwrt
-            for DIR in backport-6.12 pending-6.12 hack-6.12; do
-              SRC="/workdir/patches-repo/$VERSION_DIR/generic-$DIR"
-              DST="target/linux/generic/$DIR"
-              if [ -d "$SRC" ]; then
-                rm -rf "$DST"; mkdir -p "$DST"; cp -r "$SRC"/. "$DST"/
-                echo "restored $DIR: $(ls $DST | wc -l) files"
-              fi
-            done
-            SRC="/workdir/patches-repo/$VERSION_DIR/rockchip-patches-6.12"
-            DST="target/linux/rockchip/patches-6.12"
-            if [ -d "$SRC" ]; then
-              rm -rf "$DST"; mkdir -p "$DST"; cp -r "$SRC"/. "$DST"/
-              echo "restored rockchip-patches-6.12: $(ls $DST | wc -l) files"
-            fi
-            echo "restored=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "no adapted patches for $VERSION_DIR, will adapt"
-          fi
+          docker rmi "$GENERIC" 2>/dev/null || true
+          docker rmi "$SPECIFIC" 2>/dev/null || true
 
       - name: Prepare feeds
         run: |
@@ -291,510 +216,6 @@ jobs:
           done
           make defconfig
 
-      - name: Adapt kernel patches via OpenWrt
-        id: adapt_patches
-        if: |
-          env.KERNEL_TRACK == 'linux-stable'
-          && steps.restore_patches.outputs.restored != 'true'
-        run: |
-          set -e
-          cd /workdir/openwrt
-          TARGET=$(cat /workdir/target_version.txt)
-          echo "=== adapt patches for linux-6.12.$TARGET ==="
-
-          cat > /tmp/auto-fix-patch.py << 'PYEOF'
-          #!/usr/bin/env python3
-          import os
-          import re
-          import sys
-          from pathlib import Path
-
-
-          def parse_patch(text):
-              preamble = []
-              files = []
-              cur_file = None
-              cur_hunk = None
-              for line in text.split('\n'):
-                  if line.startswith('--- '):
-                      if cur_hunk is not None:
-                          cur_file['hunks'].append(cur_hunk)
-                          cur_hunk = None
-                      if cur_file is not None:
-                          files.append(cur_file)
-                      cur_file = {'header': [line], 'hunks': [], 'target': None}
-                  elif line.startswith('@@ '):
-                      if cur_hunk is not None:
-                          cur_file['hunks'].append(cur_hunk)
-                      cur_hunk = {'header': line, 'lines': []}
-                  else:
-                      if cur_hunk is not None:
-                          cur_hunk['lines'].append(line)
-                      elif cur_file is not None:
-                          cur_file['header'].append(line)
-                      else:
-                          preamble.append(line)
-              if cur_hunk is not None and cur_file is not None:
-                  cur_file['hunks'].append(cur_hunk)
-              if cur_file is not None:
-                  files.append(cur_file)
-
-              for f in files:
-                  for h in f['header']:
-                      m = re.match(r'\+\+\+ [ab]/(\S+)', h)
-                      if m:
-                          f['target'] = m.group(1)
-                          break
-              return preamble, files
-
-
-          def hunk_added(hunk):
-              return [l[1:] for l in hunk['lines']
-                      if l.startswith('+') and not l.startswith('+++')]
-
-
-          def hunk_is_redundant(hunk, target_lines):
-              added = hunk_added(hunk)
-              if not added:
-                  return False
-              tset = set(target_lines)
-              return all(a in tset for a in added)
-
-
-          def serialize(preamble, files):
-              parts = list(preamble)
-              for f in files:
-                  parts.extend(f['header'])
-                  for h in f['hunks']:
-                      parts.append(h['header'])
-                      parts.extend(h['lines'])
-              return '\n'.join(parts)
-
-
-          def basename_search(kernel_root, target_path):
-              base = os.path.basename(target_path)
-              candidates = []
-              for root, dirs, files in os.walk(kernel_root):
-                  dirs[:] = [d for d in dirs if not d.startswith('.')]
-                  if base in files:
-                      candidates.append(os.path.join(root, base))
-              return candidates
-
-
-          def main():
-              if len(sys.argv) != 3:
-                  print(f"Usage: {sys.argv[0]} <patch> <kernel_root>", file=sys.stderr)
-                  return 2
-
-              patch_path = Path(sys.argv[1])
-              kernel_root = Path(sys.argv[2])
-
-              if not patch_path.exists():
-                  print(f"patch not found: {patch_path}", file=sys.stderr)
-                  return 2
-
-              text = patch_path.read_text(errors='replace')
-              preamble, files = parse_patch(text)
-              if not files:
-                  print("no file diffs parsed")
-                  return 2
-
-              any_removed = False
-              total = 0
-              stale_count = 0
-              relocated_count = 0
-
-              for f in files:
-                  if not f['target']:
-                      continue
-
-                  tp = kernel_root / f['target']
-
-                  if not tp.exists():
-                      candidates = basename_search(str(kernel_root), f['target'])
-                      if len(candidates) == 1:
-                          print(f"  [RELOCATED] {f['target']} -> {candidates[0]}")
-                          tp = Path(candidates[0])
-                          relocated_count += 1
-                      else:
-                          print(f"  [STALE-FILE] {f['target']} not found in kernel tree")
-                          for h in f['hunks']:
-                              total += 1
-                              print(f"  [DROP-STALE] {f['target']}: {h['header'][:70]}")
-                              any_removed = True
-                          f['hunks'] = []
-                          stale_count += 1
-                          continue
-
-                  tlines = tp.read_text(errors='replace').split('\n')
-                  kept = []
-                  for h in f['hunks']:
-                      total += 1
-                      if hunk_is_redundant(h, tlines):
-                          print(f"  [REDUNDANT] {f['target']}: {h['header'][:70]}")
-                          any_removed = True
-                      else:
-                          kept.append(h)
-                  f['hunks'] = kept
-
-              if not any_removed:
-                  print(f"  no redundant hunk found in {patch_path.name}")
-                  return 1
-
-              remaining = sum(len(f['hunks']) for f in files)
-              if remaining == 0:
-                  print(f"  [DELETE] all hunks redundant/stale: {patch_path.name}")
-                  patch_path.unlink()
-                  return 0
-
-              patch_path.write_text(serialize(preamble, files))
-              print(f"  rewrote {patch_path.name}: kept {remaining}/{total} hunks")
-              return 0
-
-
-          if __name__ == '__main__':
-              sys.exit(main())
-          PYEOF
-          chmod +x /tmp/auto-fix-patch.py
-
-          mkdir -p dl
-          TAR="dl/linux-6.12.$TARGET.tar.xz"
-          if [ ! -s "$TAR" ]; then
-            echo "downloading kernel tarball via wget"
-            wget -q --tries=3 --timeout=60 \
-              "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.$TARGET.tar.xz" \
-              -O "$TAR" || true
-          fi
-          [ -s "$TAR" ] || { echo "::error::cannot obtain kernel tarball"; exit 1; }
-          echo "kernel tarball: $(ls -lh "$TAR" | awk '{print $5, $9}')"
-
-          echo ""
-          echo ">>> Phase 1: reverse-scan all patches for full-redundancy"
-
-          TMP_DIR=$(mktemp -d)
-          trap 'rm -rf "$TMP_DIR"' EXIT
-          xzcat "$TAR" | tar -C "$TMP_DIR" -xf -
-          KSCAN="$TMP_DIR/linux-6.12.$TARGET"
-          [ -d "$KSCAN" ] || { echo "::error::unexpected tarball layout"; exit 1; }
-
-          : > /tmp/redundant.txt
-          SCAN=0
-          cd "$KSCAN"
-          for PD in /workdir/openwrt/target/linux/generic/backport-6.12 \
-                    /workdir/openwrt/target/linux/generic/pending-6.12 \
-                    /workdir/openwrt/target/linux/generic/hack-6.12 \
-                    /workdir/openwrt/target/linux/rockchip/patches-6.12; do
-            [ -d "$PD" ] || continue
-            for P in "$PD"/*.patch; do
-              [ -f "$P" ] || continue
-              SCAN=$((SCAN + 1))
-              if patch -p1 --dry-run -R --fuzz=3 -i "$P" > /dev/null 2>&1; then
-                echo "  [FULL-REDUNDANT] $P"
-                echo "$P" >> /tmp/redundant.txt
-              fi
-            done
-          done
-          cd /workdir/openwrt
-
-          R_COUNT=$(wc -l < /tmp/redundant.txt | tr -d ' ')
-          echo "scanned=$SCAN full-redundant=$R_COUNT"
-
-          if [ "$R_COUNT" -gt 0 ]; then
-            echo ">>> removing $R_COUNT fully-redundant patches"
-            mkdir -p /workdir/disabled-patches
-            while read -r P; do
-              [ -z "$P" ] && continue
-              [ -f "$P" ] || continue
-              DEST="/workdir/disabled-patches/$(echo "$P" | sed 's|/workdir/openwrt/||; s|/|_|g')"
-              mv "$P" "$DEST"
-              echo "  removed: $P"
-            done < /tmp/redundant.txt
-          fi
-
-          MAX_ROUNDS=16
-          ROUND=0
-          AUTO_FIXED=0
-          : > /tmp/all_auto_fixed.txt
-
-          while [ $ROUND -lt $MAX_ROUNDS ]; do
-            ROUND=$((ROUND + 1))
-            echo ""
-            echo "========== Phase 2.$ROUND: make target/linux/prepare =========="
-
-            rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
-            rm -f staging_dir/target-*/.prepared 2>/dev/null || true
-
-            set +e
-            make target/linux/prepare V=s > /tmp/prepare.log 2>&1
-            RC=$?
-            set -e
-
-            if [ $RC -eq 0 ]; then
-              echo "prepare OK on round $ROUND"
-              if [ "$R_COUNT" -gt 0 ] || [ "$AUTO_FIXED" -gt 0 ]; then
-                echo "adapted=true" >> "$GITHUB_OUTPUT"
-              else
-                echo "adapted=false" >> "$GITHUB_OUTPUT"
-              fi
-              exit 0
-            fi
-
-            echo "prepare failed (rc=$RC)"
-
-            FP1=$(grep -oE 'Please fix [^ !]+\.patch' /tmp/prepare.log | awk '{print $3}' || true)
-            FP2=$(grep -oE 'Patch [^ ]+\.patch does not apply' /tmp/prepare.log | awk '{print $2}' || true)
-            FAILED_PATCHES=$(printf '%s\n%s\n' "$FP1" "$FP2" | grep -v '^$' | sort -u || true)
-
-            if [ -z "$FAILED_PATCHES" ]; then
-              echo "cannot parse failing patches from log; stopping auto-fix"
-              break
-            fi
-
-            echo "failing patches:"
-            echo "$FAILED_PATCHES" | sed 's/^/  /'
-
-            KDIR=$(ls -d build_dir/target-*/linux-*/linux-*/ 2>/dev/null | head -1 || true)
-            if [ -z "$KDIR" ]; then
-              echo "kernel dir not found, cannot auto-fix"
-              break
-            fi
-
-            FIXED_THIS_ROUND=0
-            while read -r P; do
-              [ -z "$P" ] && continue
-              [ -f "$P" ] || continue
-              echo ""
-              echo "--- auto-fix attempt: $P ---"
-              set +e
-              python3 /tmp/auto-fix-patch.py "$P" "$KDIR"
-              FIX_RC=$?
-              set -e
-              if [ $FIX_RC -eq 0 ]; then
-                echo "  [FIXED] $P"
-                echo "$P" >> /tmp/all_auto_fixed.txt
-                AUTO_FIXED=$((AUTO_FIXED + 1))
-                FIXED_THIS_ROUND=$((FIXED_THIS_ROUND + 1))
-              else
-                echo "  [CANNOT-FIX] $P (has real conflicts)"
-              fi
-            done <<< "$FAILED_PATCHES"
-
-            if [ $FIXED_THIS_ROUND -eq 0 ]; then
-              echo ""
-              echo "no patch could be auto-fixed in round $ROUND; stopping"
-              break
-            fi
-
-            echo ""
-            echo "round $ROUND fixed $FIXED_THIS_ROUND patch(es), retrying prepare..."
-          done
-
-          echo ""
-          echo "========== auto-fix exhausted, showing diagnosis =========="
-          echo ""
-
-          echo "=== last failure context ==="
-          grep -B 8 -A 25 -iE 'Patch failed|No file to patch|can.t find file|does not apply|Error [0-9]' \
-            /tmp/prepare.log | tail -120 || true
-
-          echo ""
-          echo "=== .rej contents ==="
-          KDIR=$(ls -d build_dir/target-*/linux-*/linux-*/ 2>/dev/null | head -1 || true)
-          if [ -n "$KDIR" ]; then
-            REJ_LIST=$(find "$KDIR" -name '*.rej' 2>/dev/null | head -30 || true)
-            if [ -n "$REJ_LIST" ]; then
-              echo "$REJ_LIST" | while read -r f; do
-                echo "--- $f ---"
-                head -100 "$f" 2>/dev/null || true
-                echo ""
-              done
-            else
-              echo "  (no .rej found)"
-            fi
-          fi
-
-          echo ""
-          echo "=== patches auto-fixed this run ($AUTO_FIXED) ==="
-          sort -u /tmp/all_auto_fixed.txt 2>/dev/null | sed 's/^/  /' || true
-
-          echo ""
-          echo "::error::patches need manual fix (real conflicts remain)"
-          echo "::notice::Automatic resolution summary:"
-          echo "::notice::  - full-redundant patches removed: $R_COUNT"
-          echo "::notice::  - patches auto-fixed (redundant hunks/stale files): $AUTO_FIXED"
-          echo "::notice::  - remaining failure: real conflict (needs human)"
-          echo "::notice::Fix steps:"
-          echo "::notice::  1. git clone -b $PATCH_BRANCH <repo> patches-repo"
-          echo "::notice::  2. mkdir -p patches-repo/6.12.$TARGET/generic-backport-6.12"
-          echo "::notice::  3. Fix the conflicting patches shown above"
-          echo "::notice::  4. touch patches-repo/6.12.$TARGET/READY"
-          echo "::notice::  5. git add . && git commit && git push"
-          echo "::notice::  6. Re-run this workflow"
-          exit 1
-
-      - name: Publish adapted patches
-        if: |
-          env.KERNEL_TRACK == 'linux-stable'
-          && steps.restore_patches.outputs.restored != 'true'
-          && steps.adapt_patches.outputs.adapted == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TARGET=$(cat /workdir/target_version.txt)
-          VERSION_DIR="6.12.$TARGET"
-          cd /workdir/patches-repo
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          set +e
-          git fetch origin "$PATCH_BRANCH" > /dev/null 2>&1
-          FETCH_RC=$?
-          set -e
-          if [ "$FETCH_RC" -eq 0 ]; then
-            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
-            git reset --hard "origin/$PATCH_BRANCH" || true
-          else
-            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
-          fi
-
-          mkdir -p "$VERSION_DIR"
-          for DIR in backport-6.12 pending-6.12 hack-6.12; do
-            SRC="/workdir/openwrt/target/linux/generic/$DIR"
-            DST="$VERSION_DIR/generic-$DIR"
-            if [ -d "$SRC" ]; then
-              rm -rf "$DST"; mkdir -p "$DST"
-              find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
-            fi
-          done
-          SRC="/workdir/openwrt/target/linux/rockchip/patches-6.12"
-          DST="$VERSION_DIR/rockchip-patches-6.12"
-          if [ -d "$SRC" ]; then
-            rm -rf "$DST"; mkdir -p "$DST"
-            find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
-          fi
-          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$VERSION_DIR/READY"
-
-          git add "$VERSION_DIR"
-          git diff --cached --quiet && { echo "no changes"; exit 0; }
-          git commit -q -m "patches: adapt for 6.12.$TARGET"
-          for attempt in 1 2 3; do
-            echo "push attempt $attempt"
-            git push origin "HEAD:$PATCH_BRANCH" && { echo "pushed"; exit 0; }
-            sleep 3
-          done
-          echo "::warning::push failed after 3 attempts"; exit 0
-
-      - name: Prune old patch versions
-        if: |
-          always()
-          && env.KERNEL_TRACK == 'linux-stable'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KEEP: ${{ env.PATCH_KEEP_VERSIONS }}
-        run: |
-          set -e
-
-          KEEP="${PATCH_KEEP_VERSIONS:-2}"
-          if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
-            KEEP=2
-          fi
-
-          cd /workdir
-          if [ ! -d patches-repo/.git ]; then
-            git clone --branch "$PATCH_BRANCH" --single-branch \
-              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-              patches-repo-prune > /tmp/clone_prune.log 2>&1 || {
-                echo "patch branch not found, nothing to prune"
-                exit 0
-              }
-            cd patches-repo-prune
-          else
-            cd patches-repo
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          set +e
-          git fetch origin "$PATCH_BRANCH" > /dev/null 2>&1
-          FETCH_RC=$?
-          set -e
-          if [ "$FETCH_RC" -eq 0 ]; then
-            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
-            git reset --hard "origin/$PATCH_BRANCH" >/dev/null 2>&1 || true
-          else
-            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
-          fi
-
-          ALL=$(ls -d 6.12.* 2>/dev/null | sed 's:/$::' \
-                | grep -E '^6\.12\.[0-9]+$' \
-                | sort -V || true)
-          COUNT=$(printf '%s\n' "$ALL" | grep -c . || echo 0)
-          echo "existing version dirs: $COUNT, keep: $KEEP"
-
-          if [ "$COUNT" -le "$KEEP" ]; then
-            echo "nothing to prune"
-            exit 0
-          fi
-
-          TO_DELETE=$(printf '%s\n' "$ALL" | head -n -"$KEEP")
-          echo "will delete:"
-          printf '%s\n' "$TO_DELETE" | sed 's/^/  - /'
-
-          while IFS= read -r v; do
-            [ -z "$v" ] && continue
-            git rm -r --ignore-unmatch "$v" >/dev/null 2>&1 || echo "  (rm failed: $v)"
-          done <<< "$TO_DELETE"
-
-          git add -A
-          if git diff --cached --quiet; then
-            echo "no changes to commit"
-            exit 0
-          fi
-
-          git commit -q -m "patches: prune old versions (keep $KEEP)"
-          for attempt in 1 2 3; do
-            echo "push attempt $attempt"
-            if git push origin "HEAD:$PATCH_BRANCH"; then
-              echo "pruned and pushed"
-              exit 0
-            fi
-            sleep 3
-          done
-          echo "::warning::prune push failed after 3 attempts"
-          exit 0
-
-      - name: Alias cache tag by track
-        run: |
-          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          TEMP="${BASE}:openwrt-25.12"
-
-          docker rmi "$TEMP" 2>/dev/null || true
-
-          if [ "${KERNEL_TRACK}" = "linux-stable" ]; then
-            if [ -f /workdir/target_version.txt ]; then
-              KV=$(cat /workdir/target_version.txt)
-              if docker pull "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null; then
-                docker tag "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" "$TEMP"
-                docker push "$TEMP" >/dev/null 2>&1 || true
-                echo "alias from openwrt-25.12-linux-stable-6.12.${KV}"
-              else
-                echo "no cache for 6.12.${KV}, full rebuild"
-              fi
-            fi
-          else
-            if docker pull "${BASE}:openwrt-25.12-openwrt" 2>/dev/null; then
-              docker tag "${BASE}:openwrt-25.12-openwrt" "$TEMP"
-              docker push "$TEMP" >/dev/null 2>&1 || true
-              echo "alias from openwrt-25.12-openwrt"
-            else
-              echo "no openwrt cache"
-            fi
-          fi
-
-          docker rmi "$TEMP" 2>/dev/null || true
-
       - name: Restore cache
         run: |
           cd /workdir
@@ -806,50 +227,35 @@ jobs:
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
 
-          MAX_ATTEMPTS=2
-          ATTEMPT=0
-          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            echo ""
-            echo "=========== compile-base attempt $ATTEMPT/$MAX_ATTEMPTS ==========="
-
-            FAILED=0
-            for STAGE in tools/download tools/compile toolchain/download toolchain/compile; do
-              echo "===== $STAGE ====="
-              set +e
-              make $STAGE -j$(nproc) > /tmp/stage.log 2>&1
-              RC=$?
-              set -e
-              if [ "$RC" -ne 0 ]; then
-                echo "===== $STAGE failed (rc=$RC), retry V=s ====="
-                make $STAGE -j1 V=s > /tmp/stage_verbose.log 2>&1 || true
-                echo ""
-                echo "===== error context ====="
-                grep -n -B 20 -A 60 -iE 'error|fail' /tmp/stage_verbose.log | tail -300
-                echo ""
-                echo "===== last 200 lines ====="
-                tail -200 /tmp/stage_verbose.log
-                FAILED=1
-                break
-              fi
-            done
-
-            if [ $FAILED -eq 0 ]; then
-              echo "===== compile-base OK on attempt $ATTEMPT ====="
-              exit 0
-            fi
-
-            if grep -qE 'Patch failed|No file to patch|can.t find file' /tmp/stage_verbose.log; then
-              echo ">>> patch issue detected in compile-base, cannot auto-recover"
-              exit 1
-            fi
-
-            echo ">>> cannot auto-recover, aborting"
+          echo "===== tools/download ====="
+          if ! make tools/download -j1 > /tmp/tools_dl.log 2>&1; then
+            echo "tools/download failed, showing verbose output"
+            make tools/download -j1 V=s 2>&1 | tail -100
             exit 1
-          done
+          fi
 
-          echo ">>> reached max attempts ($MAX_ATTEMPTS)"
-          exit 1
+          echo "===== tools/compile ====="
+          if ! make tools/compile -j$(nproc) > /tmp/tools_c.log 2>&1; then
+            echo "tools/compile failed, showing verbose output"
+            make tools/compile -j1 V=s 2>&1 | tail -200
+            exit 1
+          fi
+
+          echo "===== toolchain/download ====="
+          if ! make toolchain/download -j1 > /tmp/tc_dl.log 2>&1; then
+            echo "toolchain/download failed, showing verbose output"
+            make toolchain/download -j1 V=s 2>&1 | tail -100
+            exit 1
+          fi
+
+          echo "===== toolchain/compile ====="
+          if ! make toolchain/compile -j$(nproc) > /tmp/tc_c.log 2>&1; then
+            echo "toolchain/compile failed, showing verbose output"
+            make toolchain/compile -j1 V=s 2>&1 | tail -250
+            exit 1
+          fi
+
+          echo "===== compile base OK ====="
 
       - name: Checkpoint base cache
         if: steps.compile_base.outcome == 'success'
@@ -861,43 +267,41 @@ jobs:
           CHANGED=$(find build_dir staging_dir -type f -newer /workdir/base_compilation_marker -path "*/stamp/*" 2>/dev/null | \
                     grep -E -v "$IGNORE_PATTERN" | wc -l)
 
+          echo "changed stamp files: $CHANGED"
+
           if [ "$CHANGED" -eq 0 ]; then
-            echo "base cache up-to-date"
+            echo "base cache up-to-date, skip save"
             exit 0
           fi
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
 
-      - name: Publish cache tag by track
+      - name: Publish cache tag
         if: steps.compile_base.outcome == 'success'
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          TEMP="${BASE}:openwrt-25.12"
+          KV="${{ steps.detect_kv.outputs.kernel }}"
+          GENERIC="${BASE}:openwrt-25.12"
+          SPECIFIC="${BASE}:openwrt-25.12-linux-6.12.${KV}"
 
-          docker rmi "$TEMP" 2>/dev/null || true
+          docker rmi "$SPECIFIC" 2>/dev/null || true
+          docker rmi "$GENERIC" 2>/dev/null || true
 
-          if ! docker pull "$TEMP" 2>/dev/null; then
-            echo "no image pushed by cache_save, skip"
+          if ! docker pull "$GENERIC" 2>/dev/null; then
+            echo "no image pushed by cache_save, skip publish"
             exit 0
           fi
 
-          if [ "${KERNEL_TRACK}" = "linux-stable" ]; then
-            if [ -f /workdir/target_version.txt ]; then
-              KV=$(cat /workdir/target_version.txt)
-              docker tag "$TEMP" "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}"
-              docker push "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" >/dev/null 2>&1 || true
-              echo "pushed: openwrt-25.12-linux-stable-6.12.${KV}"
-              docker rmi "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null || true
-            fi
+          docker tag "$GENERIC" "$SPECIFIC"
+          if docker push "$SPECIFIC" >/dev/null 2>&1; then
+            echo "published: $SPECIFIC"
           else
-            docker tag "$TEMP" "${BASE}:openwrt-25.12-openwrt"
-            docker push "${BASE}:openwrt-25.12-openwrt" >/dev/null 2>&1 || true
-            echo "pushed: openwrt-25.12-openwrt"
-            docker rmi "${BASE}:openwrt-25.12-openwrt" 2>/dev/null || true
+            echo "::warning::publish failed for $SPECIFIC"
           fi
 
-          docker rmi "$TEMP" 2>/dev/null || true
+          docker rmi "$SPECIFIC" 2>/dev/null || true
+          docker rmi "$GENERIC" 2>/dev/null || true
 
       - name: Prune old cache versions
         if: steps.compile_base.outcome == 'success'
@@ -909,7 +313,7 @@ jobs:
           OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
           PKG="r5s-base-cache"
 
-          echo "=== Cache prune for $PKG (keep latest ${KEEP} per prefix) ==="
+          echo "=== prune cache: keep latest ${KEEP} per prefix ==="
 
           OWNER_TYPE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
                        "https://api.github.com/users/$OWNER" | jq -r .type 2>/dev/null || echo "User")
@@ -936,23 +340,20 @@ jobs:
           echo "total versions: $TOTAL"
           [ "$TOTAL" = "0" ] && { rm -f "$ALL"; exit 0; }
 
-          for PREFIX in "openwrt-25.12-linux-stable-6.12." "openwrt-25.12-6.12."; do
-            echo ""
-            echo "--- ${PREFIX}* keep latest ${KEEP} ---"
+          PREFIX="openwrt-25.12-linux-6.12."
+          echo ""
+          echo "--- ${PREFIX}* keep latest ${KEEP} ---"
 
-            PLAN=$(jq -r --arg p "$PREFIX" '
-              select((.metadata.container.tags // []) | any(startswith($p)))
-              | [.id, .created_at] | @tsv
-            ' "$ALL" | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}')
+          PLAN=$(jq -r --arg p "$PREFIX" '
+            select((.metadata.container.tags // []) | any(startswith($p)))
+            | [.id, .created_at] | @tsv
+          ' "$ALL" | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}')
 
-            if [ -z "$PLAN" ]; then
-              echo "  (nothing to prune)"
-              continue
-            fi
-
+          if [ -z "$PLAN" ]; then
+            echo "  (nothing to prune)"
+          else
             N=$(echo "$PLAN" | wc -l | tr -d ' ')
             echo "  pruning $N versions..."
-
             echo "$PLAN" | while read -r VID; do
               [ -z "$VID" ] && continue
               if curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
@@ -962,10 +363,9 @@ jobs:
                 echo "    failed  $VID"
               fi
             done
-          done
+          fi
 
           rm -f "$ALL"
-          echo ""
           echo "=== prune done ==="
 
       - name: Prepare kernel and clean
@@ -1010,9 +410,6 @@ jobs:
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
 
-          echo "===== kernel version ====="
-          grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null || true
-
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
           file "$IMG_EXT4_GZ" | grep -q "gzip compressed data" || exit 1
@@ -1027,7 +424,7 @@ jobs:
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
-          grep -E "^(kmod-r8125|kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
+          grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
 
           mkdir -p $GITHUB_WORKSPACE/artifact
           DATE=$(date +%Y-%m-%d)
@@ -1035,17 +432,14 @@ jobs:
 
           cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
           cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
-          cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
 
-          SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
-          [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
-          [ -f /workdir/patch_report.txt ] && cp /workdir/patch_report.txt "$GITHUB_WORKSPACE/artifact/${PREFIX}-patch-report.txt"
+          echo "===== kernel version ====="
+          grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null || true
+          echo "openwrt commit: $(git rev-parse HEAD)"
 
           cd $GITHUB_WORKSPACE/artifact
-          rm -f SHA256SUMS
-          for f in *; do
-            [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
-          done
+          echo ""
+          echo "===== artifacts ====="
           ls -lh
 
       - name: Upload to release
@@ -1055,22 +449,22 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE/artifact
           shopt -s nullglob
-          FILES=(*.gz *-manifest.txt *-sha256sums.txt *-patch-report.txt SHA256SUMS)
+          FILES=(*.gz)
           shopt -u nullglob
-          [ ${#FILES[@]} -eq 0 ] && { echo "no files"; exit 0; }
-          echo "upload ${#FILES[@]} files"
+          [ ${#FILES[@]} -eq 0 ] && { echo "no firmware files"; exit 1; }
+          echo "uploading ${#FILES[@]} firmware files to release"
           printf '  %s\n' "${FILES[@]}"
           gh release upload "${{ needs.prepare_release.outputs.release_tag }}" "${FILES[@]}" --clobber
 
       - uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: r5s-firmware-${{ env.KERNEL_TRACK }}
+          name: r5s-firmware-${{ needs.prepare_release.outputs.release_tag }}
           path: artifact/
-          retention-days: 3
+          retention-days: 30
 
   cleanup_self:
-    name: Cleanup runs and artifacts
+    name: Cleanup workflow history
     runs-on: ubuntu-latest
     needs: [prepare_release, build]
     if: ${{ always() }}
@@ -1078,45 +472,11 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Delete old runs and orphan artifacts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          KEEP=1
-          CURRENT_RUN="${{ github.run_id }}"
-
-          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
-                 --jq '.workflow_runs[] | select(.name == "Build OpenWrt for NanoPi R5S") | .id' || echo "")
-
-          IDX=0
-          for RID in $RUNS; do
-            IDX=$((IDX + 1))
-            if [ "$RID" = "$CURRENT_RUN" ]; then
-              echo "keep current: $RID"
-              continue
-            fi
-            if [ "$IDX" -le "$KEEP" ]; then
-              echo "keep recent: $RID"
-              continue
-            fi
-            echo "delete run: $RID"
-            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/$RID" 2>/dev/null || true
-          done
-
-          echo ""
-          echo "===== remaining artifacts ====="
-          LIVE_RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
-                      --jq '.workflow_runs[].id' 2>/dev/null || echo "")
-
-          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
-            --jq '.artifacts[] | "\(.id)\t\(.workflow_run.id)\t\(.name)\t\(.size_in_bytes)"' 2>/dev/null | \
-          while IFS=$'\t' read -r AID RUNID NAME SIZE; do
-            [ -z "$AID" ] && continue
-            if echo "$LIVE_RUNS" | grep -q "^${RUNID}$"; then
-              echo "  keep   $NAME  ${SIZE}B"
-              continue
-            fi
-            echo "  delete $NAME  ${SIZE}B"
-            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${AID}" 2>/dev/null || true
-          done
+      - name: Delete old runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 1
+          retain_days: 0
+          delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
+          repository: ${{ github.repository }}
