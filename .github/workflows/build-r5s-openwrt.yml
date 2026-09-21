@@ -43,6 +43,12 @@ env:
   CONFIG_FILE: 'scripts/r5s.config'
   DIY_SH: 'scripts/r5s_customize.sh'
   PATCH_BRANCH: 'patches'
+  CCACHE_DIR: /workdir/ccache
+  # cache retention
+  KEEP_TOOLS: '3'
+  KEEP_DL: '3'
+  KEEP_TARGET: '5'
+  KEEP_CCACHE: '5'
 
 jobs:
   prepare_release:
@@ -68,9 +74,7 @@ jobs:
           elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
             FORCE_BASE=true
           fi
-
           EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
-
           if [ "$FORCE_BASE" = "true" ]; then
             for tag in $EXISTING_TAGS; do
               gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
@@ -115,6 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # env prep: deps, swap, docker root, ccache
       - name: Setup environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -155,9 +160,13 @@ jobs:
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
+          sudo mkdir -p /workdir/ccache
+          sudo chown -R $USER:$GROUPS /workdir/ccache
+
           free -h
           df -hT
 
+      # clone src
       - name: Clone OpenWrt
         working-directory: /workdir
         run: |
@@ -165,6 +174,7 @@ jobs:
             ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
+      # pin openwrt commit (optional)
       - name: Pin OpenWrt commit
         if: env.KERNEL_TRACK == 'openwrt' && env.KERNEL_VERSION != ''
         run: |
@@ -177,11 +187,11 @@ jobs:
             echo "::warning::Cannot checkout $KERNEL_VERSION, using branch HEAD"
           fi
 
+      # switch to linux-stable kernel
       - name: Switch to linux-stable kernel
         if: env.KERNEL_TRACK == 'linux-stable'
         run: |
           cd /workdir/openwrt
-
           if [ -n "$KERNEL_VERSION" ]; then
             TARGET="${KERNEL_VERSION#6.12.}"
           else
@@ -193,7 +203,9 @@ jobs:
           echo "$TARGET" > /workdir/target_version.txt
           echo "Target: 6.12.$TARGET"
 
-          CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk | sed -E 's/.*\.([0-9]+).*/\1/')
+          # fixed awk parse (old sed returned empty on 25.12 branch)
+          CUR=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
+                | head -1 | awk -F'= ' '{print $2}' | tr -d '.')
           echo "Builtin: 6.12.$CUR"
 
           if [ "$CUR" = "$TARGET" ]; then
@@ -212,21 +224,17 @@ jobs:
             sed -i "s|^LINUX_KERNEL_HASH-6\.12\..*|LINUX_KERNEL_HASH-6.12.$TARGET = $HASH|" "$FILE"
           done
 
-      - name: Restore adapted patches from patch branch
+      # restore adapted patches
+      - name: Restore adapted patches
         id: restore_patches
         if: env.KERNEL_TRACK == 'linux-stable'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "restored=false" >> "$GITHUB_OUTPUT"
-
-          if [ ! -f /workdir/target_version.txt ]; then
-            echo "no target_version.txt, skipping"
-            exit 0
-          fi
+          [ -f /workdir/target_version.txt ] || { echo "no target_version"; exit 0; }
           TARGET=$(cat /workdir/target_version.txt)
           VERSION_DIR="6.12.$TARGET"
-
           cd /workdir
 
           set +e
@@ -237,75 +245,56 @@ jobs:
           set -e
 
           if [ "$CLONE_RC" -ne 0 ]; then
-            echo "patch branch '$PATCH_BRANCH' not found (rc=$CLONE_RC), will create on publish"
-            tail -3 /tmp/clone_patches.log
-            rm -rf patches-repo
-            mkdir -p patches-repo
-            cd patches-repo
+            echo "patch branch not found, will create on publish"
+            rm -rf patches-repo && mkdir -p patches-repo && cd patches-repo
             git init -q
             git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
             git checkout -q -b "$PATCH_BRANCH"
             exit 0
           fi
 
-          echo "patch branch cloned"
+          [ -f "/workdir/patches-repo/$VERSION_DIR/READY" ] || { echo "no adapted patches for $VERSION_DIR"; exit 0; }
 
-          if [ ! -f "/workdir/patches-repo/$VERSION_DIR/READY" ]; then
-            echo "$VERSION_DIR not found in patch branch, will adapt"
-            exit 0
-          fi
-
-          echo "found adapted patches for $VERSION_DIR"
+          echo "restore patches for $VERSION_DIR"
           cd /workdir/openwrt
           for DIR in backport-6.12 pending-6.12 hack-6.12; do
             SRC="/workdir/patches-repo/$VERSION_DIR/generic-$DIR"
             DST="target/linux/generic/$DIR"
             if [ -d "$SRC" ]; then
-              rm -rf "$DST"
-              mkdir -p "$DST"
-              cp -r "$SRC"/. "$DST"/
+              rm -rf "$DST"; mkdir -p "$DST"; cp -r "$SRC"/. "$DST"/
               echo "restored $DIR: $(ls $DST | wc -l) files"
             fi
           done
           SRC="/workdir/patches-repo/$VERSION_DIR/rockchip-patches-6.12"
           DST="target/linux/rockchip/patches-6.12"
           if [ -d "$SRC" ]; then
-            rm -rf "$DST"
-            mkdir -p "$DST"
-            cp -r "$SRC"/. "$DST"/
+            rm -rf "$DST"; mkdir -p "$DST"; cp -r "$SRC"/. "$DST"/
             echo "restored rockchip-patches-6.12: $(ls $DST | wc -l) files"
           fi
-
           echo "restored=true" >> "$GITHUB_OUTPUT"
 
-      - name: Adapt kernel patches via 3-way merge
+      # adapt patches via 3way
+      - name: Adapt kernel patches
         if: |
           env.KERNEL_TRACK == 'linux-stable' &&
           steps.restore_patches.outputs.restored != 'true'
         run: |
           cd /workdir/openwrt
-
           TARGET=$(cat /workdir/target_version.txt)
           LINUX_FULL="6.12.$TARGET"
-          echo "=== Adapt patches for linux-$LINUX_FULL ==="
+          echo "=== adapt patches for linux-$LINUX_FULL ==="
 
           cd /tmp
           wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_FULL.tar.xz" -O linux-src.tar.xz
           tar -xf linux-src.tar.xz
           cd "linux-$LINUX_FULL"
-
           git init -q
-          git config user.email "ci@local"
-          git config user.name "ci"
+          git config user.email "ci@local"; git config user.name "ci"
           git add -A
           git commit -q -m "base $LINUX_FULL" || true
 
           PATCH_DIRS="target/linux/generic/backport-6.12 target/linux/generic/pending-6.12 target/linux/generic/hack-6.12 target/linux/rockchip/patches-6.12"
-
-          REMOVED=0
-          DISABLED=0
-          FIXED=0
-          KEPT=0
+          REMOVED=0; DISABLED=0; FIXED=0; KEPT=0
           : > /workdir/patch_report.txt
           mkdir -p /workdir/disabled-patches
 
@@ -314,80 +303,52 @@ jobs:
             [ -d "$FULL_DIR" ] || continue
             for PATCH in "$FULL_DIR"/*.patch; do
               [ -f "$PATCH" ] || continue
-              NAME="$(basename "$PATCH")"
-              REL="$DIR/$NAME"
+              NAME="$(basename "$PATCH")"; REL="$DIR/$NAME"
 
               if git apply --check "$PATCH" 2>/dev/null; then
-                git apply "$PATCH" 2>/dev/null
-                git add -A
+                git apply "$PATCH" 2>/dev/null; git add -A
                 git commit -q -m "apply $REL" || true
                 echo "[OK]      $REL" >> /workdir/patch_report.txt
-                KEPT=$((KEPT+1))
-                continue
+                KEPT=$((KEPT+1)); continue
               fi
-
               if git apply -R --check "$PATCH" 2>/dev/null; then
                 rm -f "$PATCH"
-                echo "[REMOVE]  $REL (already upstream)" >> /workdir/patch_report.txt
-                REMOVED=$((REMOVED+1))
-                continue
+                echo "[REMOVE]  $REL (upstream)" >> /workdir/patch_report.txt
+                REMOVED=$((REMOVED+1)); continue
               fi
-
               if git apply --3way "$PATCH" 2>/dev/null; then
-                git add -A
-                git commit -q -m "3way $REL" || true
+                git add -A; git commit -q -m "3way $REL" || true
                 git diff --no-color "HEAD~1" HEAD -- > "$PATCH.new" 2>/dev/null || true
-                if [ -s "$PATCH.new" ]; then
-                  mv "$PATCH.new" "$PATCH"
-                  echo "[3WAY]    $REL" >> /workdir/patch_report.txt
-                  FIXED=$((FIXED+1))
-                else
-                  rm -f "$PATCH.new"
-                  echo "[OK-3WAY] $REL" >> /workdir/patch_report.txt
-                  FIXED=$((FIXED+1))
-                fi
-                continue
+                if [ -s "$PATCH.new" ]; then mv "$PATCH.new" "$PATCH"; echo "[3WAY]    $REL" >> /workdir/patch_report.txt;
+                else rm -f "$PATCH.new"; echo "[OK-3WAY] $REL" >> /workdir/patch_report.txt; fi
+                FIXED=$((FIXED+1)); continue
               fi
-
               BASE_COMMIT=$(git rev-parse HEAD)
-
               set +e
               patch -p1 --forward --merge --no-backup-if-mismatch < "$PATCH" > /tmp/patch_merge.log 2>&1
               PM_RC=$?
               set -e
-
               if ! git diff --quiet; then
                 git diff > "$PATCH.new"
-                if [ -s "$PATCH.new" ]; then
-                  mv "$PATCH.new" "$PATCH"
-                  echo "[MERGE]   $REL (partial, rc=$PM_RC)" >> /workdir/patch_report.txt
-                  FIXED=$((FIXED+1))
-                else
-                  rm -f "$PATCH.new"
-                  echo "[NOOP]    $REL (rc=$PM_RC)" >> /workdir/patch_report.txt
-                  KEPT=$((KEPT+1))
-                fi
-                git add -A
-                git commit -q -m "merge $REL" || true
+                if [ -s "$PATCH.new" ]; then mv "$PATCH.new" "$PATCH"; echo "[MERGE]   $REL rc=$PM_RC" >> /workdir/patch_report.txt; FIXED=$((FIXED+1));
+                else rm -f "$PATCH.new"; echo "[NOOP]    $REL rc=$PM_RC" >> /workdir/patch_report.txt; KEPT=$((KEPT+1)); fi
+                git add -A; git commit -q -m "merge $REL" || true
                 find . -name '*.rej' -delete 2>/dev/null || true
                 find . -name '*.orig' -delete 2>/dev/null || true
                 continue
               fi
-
               git reset --hard "$BASE_COMMIT" > /dev/null 2>&1 || true
               git clean -fdx > /dev/null 2>&1 || true
-
               mv "$PATCH" "/workdir/disabled-patches/$NAME"
               echo "[DISABLE] $REL" >> /workdir/patch_report.txt
               DISABLED=$((DISABLED+1))
             done
           done
-
-          echo "===== Patch adaptation summary ====="
+          echo "===== patch summary ====="
           echo "kept=$KEPT removed=$REMOVED 3way=$FIXED disabled=$DISABLED"
-          cat /workdir/patch_report.txt
 
-      - name: Publish adapted patches to patch branch
+      # publish patches
+      - name: Publish adapted patches
         if: |
           env.KERNEL_TRACK == 'linux-stable' &&
           steps.restore_patches.outputs.restored != 'true'
@@ -396,7 +357,6 @@ jobs:
         run: |
           TARGET=$(cat /workdir/target_version.txt)
           VERSION_DIR="6.12.$TARGET"
-
           cd /workdir/patches-repo
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -405,12 +365,10 @@ jobs:
           git fetch origin "$PATCH_BRANCH" > /dev/null 2>&1
           FETCH_RC=$?
           set -e
-
           if [ "$FETCH_RC" -eq 0 ]; then
             git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
             git reset --hard "origin/$PATCH_BRANCH" || true
           else
-            echo "remote $PATCH_BRANCH not found, using local orphan"
             git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
           fi
 
@@ -418,219 +376,192 @@ jobs:
           for DIR in backport-6.12 pending-6.12 hack-6.12; do
             SRC="/workdir/openwrt/target/linux/generic/$DIR"
             DST="$VERSION_DIR/generic-$DIR"
-            if [ -d "$SRC" ]; then
-              rm -rf "$DST"
-              mkdir -p "$DST"
-              find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
-            fi
+            if [ -d "$SRC" ]; then rm -rf "$DST"; mkdir -p "$DST";
+              find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \; ; fi
           done
           SRC="/workdir/openwrt/target/linux/rockchip/patches-6.12"
           DST="$VERSION_DIR/rockchip-patches-6.12"
-          if [ -d "$SRC" ]; then
-            rm -rf "$DST"
-            mkdir -p "$DST"
-            find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
-          fi
-
+          if [ -d "$SRC" ]; then rm -rf "$DST"; mkdir -p "$DST";
+            find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \; ; fi
           if [ -d /workdir/disabled-patches ] && [ "$(ls -A /workdir/disabled-patches 2>/dev/null)" ]; then
-            mkdir -p "$VERSION_DIR/disabled"
-            cp /workdir/disabled-patches/* "$VERSION_DIR/disabled/" 2>/dev/null || true
+            mkdir -p "$VERSION_DIR/disabled"; cp /workdir/disabled-patches/* "$VERSION_DIR/disabled/" 2>/dev/null || true
           fi
-
           cp /workdir/patch_report.txt "$VERSION_DIR/patch-report.txt" 2>/dev/null || true
           echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$VERSION_DIR/READY"
 
           git add "$VERSION_DIR"
-          if git diff --cached --quiet; then
-            echo "no changes to commit"
-            exit 0
-          fi
+          git diff --cached --quiet && { echo "no changes"; exit 0; }
           git commit -q -m "patches: adapt for 6.12.$TARGET"
-
           for attempt in 1 2 3; do
-            echo "== push attempt $attempt =="
-            if git push origin "HEAD:$PATCH_BRANCH"; then
-              echo "pushed to $PATCH_BRANCH"
-              exit 0
-            fi
-            echo "push failed, retrying"
+            echo "push attempt $attempt"
+            git push origin "HEAD:$PATCH_BRANCH" && { echo "pushed"; exit 0; }
             sleep 3
           done
-          echo "::warning::failed to push patches after 3 attempts"
-          exit 0
+          echo "::warning::push failed after 3 attempts"; exit 0
 
+      # feeds prep
       - name: Prepare feeds
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
           ./scripts/feeds update -a 2>&1 | tail -30
 
+      # apply customizations + install feeds
       - name: Apply customizations
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
 
+      # build config (do not modify r5s.config; append extras via sed)
       - name: Configure build
+        id: config
         run: |
           cd /workdir/openwrt
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
           make defconfig
 
+          # disable legacy iptables
           for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
             sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
             grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
               echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
           done
+
+          # enable ccache (runtime only)
+          grep -q '^CONFIG_CCACHE=' .config || echo 'CONFIG_CCACHE=y' >> .config
+          sed -i 's|^CONFIG_CCACHE_DIR=.*|CONFIG_CCACHE_DIR="/workdir/ccache"|' .config
+          grep -q '^CONFIG_CCACHE_DIR=' .config || echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+
+          # disable heavy video-feed pkgs (avoid accidental pull-in)
+          HEAVY="wpewebkit qt5base qt5quick qt5quick-controls qt5declarative qt5svg \
+                 qt5tools qt5graphicaleffects weston wlroots gzdoom sdl2 sdl2-doom \
+                 kmscube vkmark gstreamer1 gtk wpebackend-fdo libwpe cog \
+                 libepoxy harfbuzz pango gdk-pixbuf libdisplay-info"
+          for pkg in $HEAVY; do
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
+          done
+
           make defconfig
 
-      - name: Alias linux-stable cache tag
-        if: env.KERNEL_TRACK == 'linux-stable'
-        run: |
-          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          echo "===== verified disabled heavy pkgs ====="
+          for pkg in $HEAVY; do
+            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config && echo "  [off] $pkg"
+          done
 
-          docker rmi "${BASE}:openwrt-25.12" 2>/dev/null || true
+          HASH=$(sha256sum .config | cut -c1-12)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "Config hash: $HASH"
 
-          if [ -f /workdir/target_version.txt ]; then
-            KV=$(cat /workdir/target_version.txt)
-            if docker pull "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null; then
-              docker tag "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" "${BASE}:openwrt-25.12"
-              echo "★ alias from versioned: openwrt-25.12-linux-stable-6.12.${KV}"
-              exit 0
-            fi
-          fi
-
-          if docker pull "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null; then
-            docker tag "${BASE}:openwrt-25.12-linux-stable" "${BASE}:openwrt-25.12"
-            echo "★ alias from linux-stable base"
-            exit 0
-          fi
-
-          echo "no linux-stable cache → script will fall through to openwrt-25.12 tag"
-
-      - name: Restore cache
+      # restore caches (3 layers + ccache)
+      - name: Restore caches
         env:
-          OPENWRT_BRANCH: ${{ env.KERNEL_TRACK == 'linux-stable' && 'openwrt-25.12-linux-stable' || 'openwrt-25.12' }}
+          CONFIG_HASH: ${{ steps.config.outputs.hash }}
         run: |
-          cd /workdir
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_restore
+          cd /workdir/openwrt
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          REG="ghcr.io/${REPO_LOWER}/r5s-cache"
+          KV=""
+          [ -f /workdir/target_version.txt ] && KV=$(cat /workdir/target_version.txt)
 
+          restore_layer() {
+            local tag="$1"
+            docker pull "${REG}:${tag}" 2>/dev/null || { echo "  miss ${tag}"; return 0; }
+            CID=$(docker create "${REG}:${tag}")
+            echo "  restoring ${tag}"
+            docker export "$CID" | tar -C /workdir/openwrt -xf - 2>/dev/null || true
+            docker rm "$CID" >/dev/null
+            docker rmi "${REG}:${tag}" >/dev/null 2>&1 || true
+            echo "  ok ${tag}"
+          }
+
+          restore_layer "tools-${KERNEL_TRACK}"
+          restore_layer "dl-${KERNEL_TRACK}-${KV}"
+          restore_layer "target-${KERNEL_TRACK}-${KV}-${CONFIG_HASH}"
+
+          # ccache
+          if docker pull "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" 2>/dev/null; then
+            CID=$(docker create "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}")
+            docker export "$CID" | tar -C /workdir -xf - 2>/dev/null || true
+            docker rm "$CID" >/dev/null
+            docker rmi "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" >/dev/null 2>&1 || true
+            echo "  ok ccache"
+          else
+            echo "  miss ccache"
+          fi
+
+          df -hT /workdir
+
+      # build base
       - name: Compile base
         id: compile_base
         run: |
           cd /workdir/openwrt
-          touch /workdir/base_compilation_marker
+          for STAGE in tools/download tools/compile toolchain/download toolchain/compile; do
+            echo "=== $STAGE ==="
+            set +e
+            make $STAGE -j$(nproc) > /tmp/stage.log 2>&1
+            RC=$?
+            set -e
+            if [ "$RC" -ne 0 ]; then
+              echo "=== $STAGE failed, retry V=s ==="
+              make $STAGE -j1 V=s > /tmp/stage_verbose.log 2>&1 || true
+              grep -n -A 30 -B 10 -iE 'error|fail' /tmp/stage_verbose.log | tail -200
+              exit 1
+            fi
+          done
 
-          set +e
-          make tools/download -j1 > /tmp/tools_dl.log 2>&1
-          RC=$?
-          set -e
-          if [ "$RC" -ne 0 ]; then
-            echo "=== tools/download failed ==="
-            tail -150 /tmp/tools_dl.log
-            exit 1
-          fi
-
-          set +e
-          make tools/compile -j$(nproc) > /tmp/tools_build.log 2>&1
-          RC=$?
-          set -e
-          if [ "$RC" -ne 0 ]; then
-            echo "=== tools/compile failed ==="
-            make tools/compile -j1 V=s > /tmp/tools_verbose.log 2>&1 || true
-            grep -n -A 30 -B 10 -iE 'error|fail' /tmp/tools_verbose.log | tail -200
-            exit 1
-          fi
-
-          set +e
-          make toolchain/download -j1 > /tmp/tc_dl.log 2>&1
-          RC=$?
-          set -e
-          if [ "$RC" -ne 0 ]; then
-            echo "=== toolchain/download failed ==="
-            tail -150 /tmp/tc_dl.log
-            exit 1
-          fi
-
-          set +e
-          make toolchain/compile -j$(nproc) > /tmp/tc_build.log 2>&1
-          RC=$?
-          set -e
-          if [ "$RC" -ne 0 ]; then
-            echo "=== toolchain/compile failed, retry V=s ==="
-            make toolchain/compile -j1 V=s > /tmp/tc_verbose.log 2>&1 || true
-            grep -n -A 30 -B 10 -iE 'error|fail' /tmp/tc_verbose.log | tail -300
-            exit 1
-          fi
-
-      - name: Checkpoint base cache
+      # save tools + dl cache
+      - name: Save tools and dl cache
         if: steps.compile_base.outcome == 'success'
-        env:
-          OPENWRT_BRANCH: ${{ env.KERNEL_TRACK == 'linux-stable' && 'openwrt-25.12-linux-stable' || 'openwrt-25.12' }}
         run: |
           cd /workdir/openwrt
-
-          IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$"
-
-          CHANGED=$(find build_dir staging_dir -type f -newer /workdir/base_compilation_marker -path "*/stamp/*" 2>/dev/null | \
-                    grep -E -v "$IGNORE_PATTERN" | wc -l)
-
-          if [ "$CHANGED" -eq 0 ]; then
-            echo "base cache up-to-date"
-            exit 0
-          fi
-
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
-
-      - name: Publish linux-stable cache tag
-        if: |
-          steps.compile_base.outcome == 'success' &&
-          env.KERNEL_TRACK == 'linux-stable'
-        run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          REG="ghcr.io/${REPO_LOWER}/r5s-cache"
 
-          docker rmi "${BASE}:openwrt-25.12" 2>/dev/null || true
+          pack() {
+            local tag="$1"; shift
+            rm -rf /workdir/pack; mkdir -p /workdir/pack/layer1
+            for t in "$@"; do
+              [ -e "$t" ] || continue
+              mkdir -p "/workdir/pack/layer1/$(dirname "$t")"
+              cp -a "$t" "/workdir/pack/layer1/$(dirname "$t")/" 2>/dev/null || true
+            done
+            cat > /workdir/pack/Dockerfile <<'EOF'
+FROM scratch
+COPY layer1 /
+EOF
+            cd /workdir/pack
+            docker build -t "${REG}:${tag}" . >/dev/null
+            docker push "${REG}:${tag}" >/dev/null && echo "  pushed ${tag}"
+            docker rmi "${REG}:${tag}" >/dev/null 2>&1 || true
+            cd /workdir/openwrt
+          }
 
-          if docker pull "${BASE}:openwrt-25.12" 2>/dev/null; then
-            docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable"
-            docker push "${BASE}:openwrt-25.12-linux-stable" || true
-            echo "pushed: openwrt-25.12-linux-stable"
+          pack "tools-${KERNEL_TRACK}" \
+            staging_dir/host staging_dir/toolchain-aarch64_generic_musl \
+            build_dir/host build_dir/toolchain-aarch64_generic_musl
 
-            if [ -f /workdir/target_version.txt ]; then
-              KV=$(cat /workdir/target_version.txt)
-              docker tag "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}"
-              docker push "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" || true
-              echo "pushed: openwrt-25.12-linux-stable-6.12.${KV}"
-            fi
+          KV=$(cat /workdir/target_version.txt 2>/dev/null || echo unknown)
+          pack "dl-${KERNEL_TRACK}-${KV}" dl
 
-            docker rmi "${BASE}:openwrt-25.12" "${BASE}:openwrt-25.12-linux-stable" 2>/dev/null || true
-            if [ -f /workdir/target_version.txt ]; then
-              KV=$(cat /workdir/target_version.txt)
-              docker rmi "${BASE}:openwrt-25.12-linux-stable-6.12.${KV}" 2>/dev/null || true
-            fi
-          else
-            echo "no image pushed by cache_save (CHANGED=0), skip"
-          fi
-
-      - name: Prepare kernel and clean
+      # kernel prep (DTS inject, etc.)
+      - name: Prepare kernel
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
           rm -rf bin/targets/rockchip/armv8
 
+      # build firmware
       - name: Compile firmware
         run: |
           cd /workdir/openwrt
-
           set +e
           make download -j8 > /tmp/download.log 2>&1 || true
           make -j$(nproc) V=s > /tmp/build.log 2>&1
           BUILD_RESULT=$?
           set -e
-
           if [ "$BUILD_RESULT" -ne 0 ]; then
             echo "Build failed (exit: $BUILD_RESULT)"
             if [ "$BUILD_RESULT" -gt 128 ]; then
@@ -639,7 +570,6 @@ jobs:
               free -h
               sudo dmesg 2>/dev/null | grep -i -E "out of memory|oom-kill" | tail -20 || true
             fi
-
             FIRST_ERR=$(grep -n -m 1 -E "^make(\[[0-9]+\])?: \*\*\* .* Error [0-9]" /tmp/build.log | cut -d: -f1)
             if [ -n "$FIRST_ERR" ]; then
               START=$((FIRST_ERR > 150 ? FIRST_ERR - 150 : 1))
@@ -651,21 +581,61 @@ jobs:
             exit 1
           fi
 
+      # save target + ccache
+      - name: Save target and ccache
+        if: success()
+        env:
+          CONFIG_HASH: ${{ steps.config.outputs.hash }}
+        run: |
+          cd /workdir/openwrt
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          REG="ghcr.io/${REPO_LOWER}/r5s-cache"
+          KV=$(cat /workdir/target_version.txt 2>/dev/null || echo unknown)
+
+          pack() {
+            local tag="$1"; shift
+            rm -rf /workdir/pack; mkdir -p /workdir/pack/layer1
+            for t in "$@"; do
+              [ -e "$t" ] || continue
+              mkdir -p "/workdir/pack/layer1/$(dirname "$t")"
+              cp -a "$t" "/workdir/pack/layer1/$(dirname "$t")/" 2>/dev/null || true
+            done
+            cat > /workdir/pack/Dockerfile <<'EOF'
+FROM scratch
+COPY layer1 /
+EOF
+            cd /workdir/pack
+            docker build -t "${REG}:${tag}" . >/dev/null
+            docker push "${REG}:${tag}" >/dev/null && echo "  pushed ${tag}"
+            docker rmi "${REG}:${tag}" >/dev/null 2>&1 || true
+          }
+
+          pack "target-${KERNEL_TRACK}-${KV}-${CONFIG_HASH}" \
+            staging_dir/target-aarch64_generic_musl \
+            build_dir/target-aarch64_generic_musl \
+            bin
+
+          # ccache
+          rm -rf /workdir/pack; mkdir -p /workdir/pack/layer1/workdir
+          cp -a /workdir/ccache /workdir/pack/layer1/workdir/ 2>/dev/null || true
+          cat > /workdir/pack/Dockerfile <<'EOF'
+FROM scratch
+COPY layer1 /
+EOF
+          cd /workdir/pack
+          docker build -t "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" . >/dev/null
+          docker push "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" >/dev/null && echo "  pushed ccache"
+          docker rmi "${REG}:ccache-${KERNEL_TRACK}-${CONFIG_HASH}" >/dev/null 2>&1 || true
+
+      # verify artifacts
       - name: Verify and collect artifacts
         if: success()
         run: |
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
 
-          echo "===== Kernel version used ====="
+          echo "===== kernel version ====="
           grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null || true
-
-          if [ -f /workdir/patch_report.txt ]; then
-            echo "===== Patch adaptation report ====="
-            cat /workdir/patch_report.txt
-          else
-            echo "===== Patch source: restored from patches/$PATCH_BRANCH ====="
-          fi
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -677,11 +647,11 @@ jobs:
           file "$IMG_SQ_GZ" | grep -q "gzip compressed data" || exit 1
           python3 -c "import zlib;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_SQ_GZ','rb').read());exit(0 if d.eof else 1)" || exit 1
 
-          python3 -c "import gzip,sys;f=gzip.open(sys.argv[1],'rb');f.seek(446);e=f.read(64);t=e[32+4];assert t!=0,'p3 missing';print(f'p3 present in MBR, type=0x{t:02x}')" "$IMG_EXT4_GZ"
+          python3 -c "import gzip,sys;f=gzip.open(sys.argv[1],'rb');f.seek(446);e=f.read(64);t=e[32+4];assert t!=0,'p3 missing';print(f'p3 present MBR type=0x{t:02x}')" "$IMG_EXT4_GZ"
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
-          grep -E "^(kmod-r8125|kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
+          grep -E "^(kmod-r8125|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd) " "$MANIFEST" || true
 
           mkdir -p $GITHUB_WORKSPACE/artifact
           DATE=$(date +%Y-%m-%d)
@@ -690,13 +660,9 @@ jobs:
           cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
           cp "$IMG_SQ_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-squashfs-sysupgrade.img.gz"
           cp "$MANIFEST" "$GITHUB_WORKSPACE/artifact/${PREFIX}-manifest.txt"
-
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sha256sums.txt"
-
-          if [ -f /workdir/patch_report.txt ]; then
-            cp /workdir/patch_report.txt "$GITHUB_WORKSPACE/artifact/${PREFIX}-patch-report.txt"
-          fi
+          [ -f /workdir/patch_report.txt ] && cp /workdir/patch_report.txt "$GITHUB_WORKSPACE/artifact/${PREFIX}-patch-report.txt"
 
           cd $GITHUB_WORKSPACE/artifact
           rm -f SHA256SUMS
@@ -705,28 +671,20 @@ jobs:
           done
           ls -lh
 
+      # upload release
       - name: Upload to release
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd $GITHUB_WORKSPACE/artifact
-
           shopt -s nullglob
           FILES=(*.gz *-manifest.txt *-sha256sums.txt *-patch-report.txt SHA256SUMS)
           shopt -u nullglob
-
-          if [ ${#FILES[@]} -eq 0 ]; then
-            echo "no files to upload"
-            exit 0
-          fi
-
-          echo "uploading ${#FILES[@]} files to release:"
+          [ ${#FILES[@]} -eq 0 ] && { echo "no files"; exit 0; }
+          echo "upload ${#FILES[@]} files"
           printf '  %s\n' "${FILES[@]}"
-
-          gh release upload "${{ needs.prepare_release.outputs.release_tag }}" \
-            "${FILES[@]}" \
-            --clobber
+          gh release upload "${{ needs.prepare_release.outputs.release_tag }}" "${FILES[@]}" --clobber
 
       - uses: actions/upload-artifact@v4
         if: success()
@@ -736,15 +694,16 @@ jobs:
           retention-days: 30
 
   cleanup_self:
-    name: Cleanup workflow history
+    name: Cleanup runs and cache
     runs-on: ubuntu-latest
     needs: [prepare_release, build]
     if: ${{ always() }}
     permissions:
       actions: write
       contents: read
+      packages: write
     steps:
-      - name: Delete old runs
+      - name: Delete old workflow runs
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -752,3 +711,61 @@ jobs:
           retain_days: 0
           delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
           repository: ${{ github.repository }}
+
+      # prune stale GHCR tags per prefix
+      - name: Cleanup stale GHCR cache
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER="${{ github.repository_owner }}"
+          OWNER_TYPE="${{ github.event.repository.owner.type }}"
+          PKG="r5s-cache"
+
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            BASE="https://api.github.com/orgs/${OWNER}/packages/container/${PKG}/versions"
+          else
+            BASE="https://api.github.com/users/${OWNER}/packages/container/${PKG}/versions"
+          fi
+
+          echo "list versions: $BASE"
+          RESP=$(curl -sSL -H "Authorization: Bearer ${GH_TOKEN}" \
+                       -H "Accept: application/vnd.github+json" \
+                       "${BASE}?per_page=100")
+
+          if ! echo "$RESP" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            echo "no package or API error, skip"
+            echo "$RESP" | head -c 300
+            exit 0
+          fi
+
+          TMP=$(mktemp)
+          echo "$RESP" | jq -r '.[] | "\(.id)\t\(.updated_at)\t\(.metadata.container.tags[0] // "untagged")"' > "$TMP"
+          echo "total versions: $(wc -l < $TMP)"
+
+          prune() {
+            local prefix="$1"; local keep="$2"
+            echo "--- ${prefix}* keep=${keep} ---"
+            grep -P "^[0-9]+\t[^\t]+\t${prefix}" "$TMP" 2>/dev/null | \
+              sort -k2 -r > "/tmp/grp_${prefix}.txt" || true
+            local total
+            total=$(wc -l < "/tmp/grp_${prefix}.txt")
+            echo "  found ${total}"
+            [ "$total" -le "$keep" ] && { echo "  ok"; return 0; }
+            tail -n +$((keep + 1)) "/tmp/grp_${prefix}.txt" | while IFS=$'\t' read -r id updated tag; do
+              [ -z "$id" ] && continue
+              echo "  del id=$id tag=$tag"
+              curl -sS -X DELETE \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "${BASE}/${id}" >/dev/null || echo "    !! del fail id=$id"
+            done
+          }
+
+          prune "tools-"  "${KEEP_TOOLS}"
+          prune "dl-"     "${KEEP_DL}"
+          prune "target-" "${KEEP_TARGET}"
+          prune "ccache-" "${KEEP_CCACHE}"
+
+          rm -f "$TMP"
+          echo "cleanup done"
