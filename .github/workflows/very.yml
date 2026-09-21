@@ -12,15 +12,14 @@ on:
 permissions:
   contents: read
 
-env:
-  OPENWRT_BRANCH: 'openwrt-25.12'
-  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
-  CONFIG_FILE: ${{ inputs.config_file || 'scripts/r5s.config' }}
-
 jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      OPENWRT_BRANCH: 'openwrt-25.12'
+      OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+      CONFIG_FILE: ${{ github.event.inputs.config_file || 'scripts/r5s.config' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -82,7 +81,6 @@ jobs:
           REPORT=/workdir/verify-report.txt
           : > "$REPORT"
 
-          # 1) 选项在 Kconfig 中是否存在
           echo "########## 1) Kconfig existence check ##########" >> "$REPORT"
           grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key _; do
             [ -z "$key" ] && continue
@@ -96,7 +94,6 @@ jobs:
             fi
           done
 
-          # 2) 输入 vs 最终配置的差异
           echo "" >> "$REPORT"
           echo "########## 2) Kept / Dropped / Changed ##########" >> "$REPORT"
           grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key val; do
@@ -151,10 +148,11 @@ jobs:
             /workdir/final.config
             /tmp/defconfig.log
           retention-days: 14
+          if-no-files-found: warn
 
       - name: Fail if missing options
         run: |
-          if grep -q '^\[MISSING\]' /workdir/verify-report.txt; then
+          if [ -f /workdir/verify-report.txt ] && grep -q '^\[MISSING\]' /workdir/verify-report.txt; then
             echo "::error::Some options are not in Kconfig tree"
             exit 1
           fi
