@@ -61,7 +61,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          BASE_TAG="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-$(date +%Y.%m.%d)"
+          BASE_TAG="${MODEL_NAME}-OpenWrt-$(date +%Y-%m-%d)"
           FORCE_BASE=false
           if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
             FORCE_BASE=true
@@ -681,10 +681,10 @@ jobs:
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
-          grep -E "^(kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
+          grep -E "^(kmod-r8125|kmod-r8169|clashoo|luci-app-clashoo|luci-app-amlogic|docker|dockerd|containerd|runc|luci-app-dockerman|ttyd|openssh-sftp-server|parted) " "$MANIFEST" || true
 
           mkdir -p $GITHUB_WORKSPACE/artifact
-          DATE=$(date +%Y.%m.%d)
+          DATE=$(date +%Y-%m-%d)
           PREFIX="${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-${DATE}"
 
           cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${PREFIX}-sdcard.img.gz"
