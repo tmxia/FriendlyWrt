@@ -6,13 +6,13 @@ on:
       release_tag:
         description: 'Release tag (留空则用官方仓库最新 release)'
         required: false
-        default: ''
+        default: 'FriendlyWrt-2026-09-19'
 
 permissions:
   contents: read
 
 env:
-  # 官方固件镜像仓库（不是自编译仓库）
+  # 官方固件镜像仓库
   SOURCE_REPO: 'tmxia/FriendlyWrt'
 
 jobs:
