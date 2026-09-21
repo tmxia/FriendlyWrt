@@ -44,6 +44,7 @@ env:
   DIY_SH: 'scripts/r5s_customize.sh'
   PATCH_BRANCH: 'patches'
   CACHE_KEEP_VERSIONS: '2'
+  PATCH_KEEP_VERSIONS: '2'
 
 jobs:
   prepare_release:
@@ -242,119 +243,141 @@ jobs:
             exit 0
           fi
 
-          [ -f "/workdir/patches-repo/$VERSION_DIR/READY" ] || { echo "no adapted patches for $VERSION_DIR"; exit 0; }
-
-          echo "restore patches for $VERSION_DIR"
-          cd /workdir/openwrt
-          for DIR in backport-6.12 pending-6.12 hack-6.12; do
-            SRC="/workdir/patches-repo/$VERSION_DIR/generic-$DIR"
-            DST="target/linux/generic/$DIR"
+          if [ -f "/workdir/patches-repo/$VERSION_DIR/READY" ]; then
+            echo "restore patches for $VERSION_DIR"
+            cd /workdir/openwrt
+            for DIR in backport-6.12 pending-6.12 hack-6.12; do
+              SRC="/workdir/patches-repo/$VERSION_DIR/generic-$DIR"
+              DST="target/linux/generic/$DIR"
+              if [ -d "$SRC" ]; then
+                rm -rf "$DST"; mkdir -p "$DST"; cp -r "$SRC"/. "$DST"/
+                echo "restored $DIR: $(ls $DST | wc -l) files"
+              fi
+            done
+            SRC="/workdir/patches-repo/$VERSION_DIR/rockchip-patches-6.12"
+            DST="target/linux/rockchip/patches-6.12"
             if [ -d "$SRC" ]; then
               rm -rf "$DST"; mkdir -p "$DST"; cp -r "$SRC"/. "$DST"/
-              echo "restored $DIR: $(ls $DST | wc -l) files"
+              echo "restored rockchip-patches-6.12: $(ls $DST | wc -l) files"
             fi
-          done
-          SRC="/workdir/patches-repo/$VERSION_DIR/rockchip-patches-6.12"
-          DST="target/linux/rockchip/patches-6.12"
-          if [ -d "$SRC" ]; then
-            rm -rf "$DST"; mkdir -p "$DST"; cp -r "$SRC"/. "$DST"/
-            echo "restored rockchip-patches-6.12: $(ls $DST | wc -l) files"
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no adapted patches for $VERSION_DIR, will adapt"
           fi
-          echo "restored=true" >> "$GITHUB_OUTPUT"
 
-      - name: Adapt kernel patches
-        if: env.KERNEL_TRACK == 'linux-stable' && steps.restore_patches.outputs.restored != 'true'
+      - name: Prepare feeds
         run: |
           cd /workdir/openwrt
-          TARGET=$(cat /workdir/target_version.txt)
-          LINUX_FULL="6.12.$TARGET"
-          echo "=== adapt patches for linux-$LINUX_FULL ==="
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
+          ./scripts/feeds update -a 2>&1 | tail -30
 
-          cd /tmp
-          wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$LINUX_FULL.tar.xz" -O linux-src.tar.xz
-          tar -xf linux-src.tar.xz
-          cd "linux-$LINUX_FULL"
-          git init -q
-          git config user.email "ci@local"
-          git config user.name "ci"
-          git add -A
-          git commit -q -m "base $LINUX_FULL" || true
+      - name: Apply customizations
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
+          ./scripts/feeds install -a 2>&1 | tail -40
 
-          PATCH_DIRS="target/linux/generic/backport-6.12 target/linux/generic/pending-6.12 target/linux/generic/hack-6.12 target/linux/rockchip/patches-6.12"
-          REMOVED=0; DISABLED=0; FIXED=0; KEPT=0
-          : > /workdir/patch_report.txt
-          mkdir -p /workdir/disabled-patches
+      - name: Configure build
+        run: |
+          cd /workdir/openwrt
+          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
+          make defconfig
 
-          for DIR in $PATCH_DIRS; do
-            FULL_DIR="/workdir/openwrt/$DIR"
-            [ -d "$FULL_DIR" ] || continue
-            for PATCH in "$FULL_DIR"/*.patch; do
-              [ -f "$PATCH" ] || continue
-              NAME="$(basename "$PATCH")"
-              REL="$DIR/$NAME"
-
-              if git apply --check "$PATCH" 2>/dev/null; then
-                git apply "$PATCH" 2>/dev/null
-                git add -A
-                git commit -q -m "apply $REL" || true
-                echo "[OK]      $REL" >> /workdir/patch_report.txt
-                KEPT=$((KEPT+1))
-                continue
-              fi
-              if git apply -R --check "$PATCH" 2>/dev/null; then
-                rm -f "$PATCH"
-                echo "[REMOVE]  $REL (upstream)" >> /workdir/patch_report.txt
-                REMOVED=$((REMOVED+1))
-                continue
-              fi
-              if git apply --3way "$PATCH" 2>/dev/null; then
-                git add -A
-                git commit -q -m "3way $REL" || true
-                git diff --no-color "HEAD~1" HEAD -- > "$PATCH.new" 2>/dev/null || true
-                if [ -s "$PATCH.new" ]; then
-                  mv "$PATCH.new" "$PATCH"
-                  echo "[3WAY]    $REL" >> /workdir/patch_report.txt
-                else
-                  rm -f "$PATCH.new"
-                  echo "[OK-3WAY] $REL" >> /workdir/patch_report.txt
-                fi
-                FIXED=$((FIXED+1))
-                continue
-              fi
-              BASE_COMMIT=$(git rev-parse HEAD)
-              set +e
-              patch -p1 --forward --merge --no-backup-if-mismatch < "$PATCH" > /tmp/patch_merge.log 2>&1
-              PM_RC=$?
-              set -e
-              if ! git diff --quiet; then
-                git diff > "$PATCH.new"
-                if [ -s "$PATCH.new" ]; then
-                  mv "$PATCH.new" "$PATCH"
-                  echo "[MERGE]   $REL rc=$PM_RC" >> /workdir/patch_report.txt
-                  FIXED=$((FIXED+1))
-                else
-                  rm -f "$PATCH.new"
-                  echo "[NOOP]    $REL rc=$PM_RC" >> /workdir/patch_report.txt
-                  KEPT=$((KEPT+1))
-                fi
-                git add -A
-                git commit -q -m "merge $REL" || true
-                find . -name '*.rej' -delete 2>/dev/null || true
-                find . -name '*.orig' -delete 2>/dev/null || true
-                continue
-              fi
-              git reset --hard "$BASE_COMMIT" > /dev/null 2>&1 || true
-              git clean -fdx > /dev/null 2>&1 || true
-              mv "$PATCH" "/workdir/disabled-patches/$NAME"
-              echo "[DISABLE] $REL" >> /workdir/patch_report.txt
-              DISABLED=$((DISABLED+1))
-            done
+          for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
+            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+              echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
           done
-          echo "===== patch summary ====="
-          echo "kept=$KEPT removed=$REMOVED 3way=$FIXED disabled=$DISABLED"
+          make defconfig
+
+      - name: Adapt kernel patches via OpenWrt
+        id: adapt_patches
+        if: |
+          env.KERNEL_TRACK == 'linux-stable'
+          && steps.restore_patches.outputs.restored != 'true'
+        run: |
+          set -e
+          cd /workdir/openwrt
+          TARGET=$(cat /workdir/target_version.txt)
+          echo "=== adapt patches for linux-6.12.$TARGET via OpenWrt refresh ==="
+
+          rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
+          rm -f staging_dir/target-*/.prepared 2>/dev/null || true
+
+          echo ">>> Round 1: make target/linux/prepare"
+          set +e
+          make target/linux/prepare V=s > /tmp/prepare1.log 2>&1
+          RC=$?
+          set -e
+
+          if [ $RC -eq 0 ]; then
+            echo "prepare OK (patches already compatible)"
+            echo "adapted=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "prepare failed (rc=$RC)"
+          echo ""
+          echo "=== failure context ==="
+          grep -B 5 -A 30 -iE 'Patch failed|No file to patch|can.t find file|Error [0-9]' \
+            /tmp/prepare1.log | tail -150 || true
+
+          echo ""
+          echo ">>> Round 2: make target/linux/refresh (quilt refresh)"
+          set +e
+          make target/linux/refresh V=s > /tmp/refresh.log 2>&1
+          RC2=$?
+          set -e
+          echo "refresh rc=$RC2"
+          tail -120 /tmp/refresh.log || true
+
+          REJ=$(find build_dir -name '*.rej' 2>/dev/null | head -50 || true)
+          if [ -n "$REJ" ]; then
+            echo ""
+            echo "===== .rej files remain, manual fix required ====="
+            echo "$REJ" | while read -r f; do
+              echo ""
+              echo "--- $f ---"
+              head -120 "$f"
+            done
+            echo ""
+            echo "===== corresponding original patches ====="
+            git status --short target/linux/generic target/linux/rockchip || true
+            echo "::error::OpenWrt refresh could not resolve all patches, manual fix required"
+            exit 1
+          fi
+
+          echo ""
+          echo ">>> Round 3: retry make target/linux/prepare"
+          rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
+          rm -f staging_dir/target-*/.prepared 2>/dev/null || true
+          set +e
+          make target/linux/prepare V=s > /tmp/prepare2.log 2>&1
+          RC3=$?
+          set -e
+
+          if [ $RC3 -ne 0 ]; then
+            echo "prepare still failed after refresh"
+            grep -B 5 -A 30 -iE 'Patch failed|No file to patch|Error [0-9]' \
+              /tmp/prepare2.log | tail -150
+            echo "::error::patches need manual fix"
+            exit 1
+          fi
+
+          echo "prepare OK after refresh"
+          echo "adapted=true" >> "$GITHUB_OUTPUT"
+
+          echo ""
+          echo "===== patches modified by refresh ====="
+          git status --short target/linux/generic target/linux/rockchip || true
+          git diff --stat target/linux/generic target/linux/rockchip || true
 
       - name: Publish adapted patches
-        if: env.KERNEL_TRACK == 'linux-stable' && steps.restore_patches.outputs.restored != 'true'
+        if: |
+          env.KERNEL_TRACK == 'linux-stable'
+          && steps.restore_patches.outputs.restored != 'true'
+          && steps.adapt_patches.outputs.adapted == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -390,16 +413,11 @@ jobs:
             rm -rf "$DST"; mkdir -p "$DST"
             find "$SRC" -maxdepth 1 -name '*.patch' -exec cp {} "$DST"/ \;
           fi
-          if [ -d /workdir/disabled-patches ] && [ "$(ls -A /workdir/disabled-patches 2>/dev/null)" ]; then
-            mkdir -p "$VERSION_DIR/disabled"
-            cp /workdir/disabled-patches/* "$VERSION_DIR/disabled/" 2>/dev/null || true
-          fi
-          cp /workdir/patch_report.txt "$VERSION_DIR/patch-report.txt" 2>/dev/null || true
-          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$VERSION_DIR/READY"
+          echo "adapted at $(date -u +%Y-%m-%dT%H:%M:%SZ) via OpenWrt refresh" > "$VERSION_DIR/READY"
 
           git add "$VERSION_DIR"
           git diff --cached --quiet && { echo "no changes"; exit 0; }
-          git commit -q -m "patches: adapt for 6.12.$TARGET"
+          git commit -q -m "patches: adapt for 6.12.$TARGET via OpenWrt refresh"
           for attempt in 1 2 3; do
             echo "push attempt $attempt"
             git push origin "HEAD:$PATCH_BRANCH" && { echo "pushed"; exit 0; }
@@ -407,31 +425,94 @@ jobs:
           done
           echo "::warning::push failed after 3 attempts"; exit 0
 
-      - name: Prepare feeds
+      # =====================================================================
+      # 独立清理步骤：无论本次是否写了新版本，只要到了这里就清理一次
+      # - 保留最新 PATCH_KEEP_VERSIONS 个 6.12.<数字> 目录
+      # - 严格匹配目录名，disabled/ README 等不受影响
+      # - 无变化则直接退出，不产生空 commit
+      # =====================================================================
+      - name: Prune old patch versions
+        if: |
+          always()
+          && env.KERNEL_TRACK == 'linux-stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ env.PATCH_KEEP_VERSIONS }}
         run: |
-          cd /workdir/openwrt
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
-          ./scripts/feeds update -a 2>&1 | tail -30
+          set -e
 
-      - name: Apply customizations
-        run: |
-          cd /workdir/openwrt
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
-          ./scripts/feeds install -a 2>&1 | tail -40
+          KEEP="${PATCH_KEEP_VERSIONS:-2}"
+          if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
+            echo "invalid PATCH_KEEP_VERSIONS, fallback to 2"
+            KEEP=2
+          fi
 
-      - name: Configure build
-        run: |
-          cd /workdir/openwrt
-          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
-          make defconfig
+          cd /workdir
+          if [ ! -d patches-repo/.git ]; then
+            git clone --branch "$PATCH_BRANCH" --single-branch \
+              "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+              patches-repo-prune > /tmp/clone_prune.log 2>&1 || {
+                echo "patch branch not found, nothing to prune"
+                exit 0
+              }
+            cd patches-repo-prune
+          else
+            cd patches-repo
+          fi
 
-          for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
-            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
-            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
-              echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          set +e
+          git fetch origin "$PATCH_BRANCH" > /dev/null 2>&1
+          FETCH_RC=$?
+          set -e
+          if [ "$FETCH_RC" -eq 0 ]; then
+            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH" "origin/$PATCH_BRANCH"
+            git reset --hard "origin/$PATCH_BRANCH" >/dev/null 2>&1 || true
+          else
+            git checkout "$PATCH_BRANCH" 2>/dev/null || git checkout -b "$PATCH_BRANCH"
+          fi
+
+          echo "=== prune patch version dirs (keep latest $KEEP) ==="
+
+          ALL=$(ls -d 6.12.* 2>/dev/null | sed 's:/$::' \
+                | grep -E '^6\.12\.[0-9]+$' \
+                | sort -V || true)
+          COUNT=$(printf '%s\n' "$ALL" | grep -c . || echo 0)
+          echo "existing version dirs: $COUNT, keep: $KEEP"
+
+          if [ "$COUNT" -le "$KEEP" ]; then
+            echo "nothing to prune"
+            exit 0
+          fi
+
+          TO_DELETE=$(printf '%s\n' "$ALL" | head -n -"$KEEP")
+          echo "will delete:"
+          printf '%s\n' "$TO_DELETE" | sed 's/^/  - /'
+
+          while IFS= read -r v; do
+            [ -z "$v" ] && continue
+            git rm -r --ignore-unmatch "$v" >/dev/null 2>&1 || echo "  (rm failed: $v)"
+          done <<< "$TO_DELETE"
+
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+            exit 0
+          fi
+
+          git commit -q -m "patches: prune old versions (keep $KEEP)"
+          for attempt in 1 2 3; do
+            echo "push attempt $attempt"
+            if git push origin "HEAD:$PATCH_BRANCH"; then
+              echo "pruned and pushed"
+              exit 0
+            fi
+            sleep 3
           done
-          make defconfig
+          echo "::warning::prune push failed after 3 attempts"
+          exit 0
 
       - name: Alias cache tag by track
         run: |
@@ -475,24 +556,64 @@ jobs:
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
 
-          for STAGE in tools/download tools/compile toolchain/download toolchain/compile; do
-            echo "===== $STAGE ====="
-            set +e
-            make $STAGE -j$(nproc) > /tmp/stage.log 2>&1
-            RC=$?
-            set -e
-            if [ "$RC" -ne 0 ]; then
-              echo "===== $STAGE failed (rc=$RC), retry with V=s ====="
-              make $STAGE -j1 V=s > /tmp/stage_verbose.log 2>&1 || true
-              echo ""
-              echo "===== error context ====="
-              grep -n -B 20 -A 60 -iE 'error|fail' /tmp/stage_verbose.log | tail -300
-              echo ""
-              echo "===== last 400 lines ====="
-              tail -400 /tmp/stage_verbose.log
-              exit 1
+          MAX_ATTEMPTS=2
+          ATTEMPT=0
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo ""
+            echo "=========== compile-base attempt $ATTEMPT/$MAX_ATTEMPTS ==========="
+
+            FAILED=0
+            for STAGE in tools/download tools/compile toolchain/download toolchain/compile; do
+              echo "===== $STAGE ====="
+              set +e
+              make $STAGE -j$(nproc) > /tmp/stage.log 2>&1
+              RC=$?
+              set -e
+              if [ "$RC" -ne 0 ]; then
+                echo "===== $STAGE failed (rc=$RC), retry V=s ====="
+                make $STAGE -j1 V=s > /tmp/stage_verbose.log 2>&1 || true
+                echo ""
+                echo "===== error context ====="
+                grep -n -B 20 -A 60 -iE 'error|fail' /tmp/stage_verbose.log | tail -300
+                echo ""
+                echo "===== last 200 lines ====="
+                tail -200 /tmp/stage_verbose.log
+                FAILED=1
+                break
+              fi
+            done
+
+            if [ $FAILED -eq 0 ]; then
+              echo "===== compile-base OK on attempt $ATTEMPT ====="
+              exit 0
             fi
+
+            if grep -qE 'Patch failed|No file to patch|can.t find file' /tmp/stage_verbose.log; then
+              echo ""
+              echo ">>> patch issue detected, run refresh and retry once"
+              make target/linux/refresh V=s > /tmp/refresh_fallback.log 2>&1 || true
+              tail -60 /tmp/refresh_fallback.log || true
+
+              REJ=$(find build_dir -name '*.rej' 2>/dev/null | head -20 || true)
+              if [ -n "$REJ" ]; then
+                echo ">>> .rej remains, cannot auto-recover"
+                echo "$REJ" | while read -r f; do
+                  echo "--- $f ---"; head -80 "$f"
+                done
+                exit 1
+              fi
+              rm -rf build_dir/toolchain-*/linux-* build_dir/target-*/linux-* 2>/dev/null || true
+              rm -f staging_dir/target-*/.prepared 2>/dev/null || true
+              continue
+            fi
+
+            echo ">>> cannot auto-recover, aborting"
+            exit 1
           done
+
+          echo ">>> reached max attempts ($MAX_ATTEMPTS)"
+          exit 1
 
       - name: Checkpoint base cache
         if: steps.compile_base.outcome == 'success'
