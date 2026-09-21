@@ -33,6 +33,12 @@ jobs:
             zip zlib1g-dev libelf-dev subversion flex bison libtool \
             autoconf automake cmake rsync quilt time jq swig zstd
 
+      - name: Prepare workdir
+        run: |
+          sudo mkdir -p /workdir
+          sudo chown -R "$USER:$GROUPS" /workdir
+          df -hT /workdir
+
       - name: Clone OpenWrt
         run: |
           git clone -b "$OPENWRT_BRANCH" --single-branch --depth=1 \
@@ -42,6 +48,11 @@ jobs:
       - name: Prepare .config
         run: |
           cd /workdir/openwrt
+          if [ ! -f "$GITHUB_WORKSPACE/$CONFIG_FILE" ]; then
+            echo "::error::config file not found: $CONFIG_FILE"
+            ls -la "$GITHUB_WORKSPACE/scripts" || true
+            exit 1
+          fi
           cp "$GITHUB_WORKSPACE/$CONFIG_FILE" .config
           echo "=== input config lines: $(wc -l < .config) ==="
 
@@ -76,7 +87,6 @@ jobs:
           grep -vE '^\s*($|#)' "$INPUT" | while IFS='=' read -r key _; do
             [ -z "$key" ] && continue
             key=$(echo "$key" | tr -d ' ')
-            # 在源码树搜索 "config ${key#CONFIG_}"
             sym="${key#CONFIG_}"
             if grep -rqE "^\s*(menu)?config ${sym}\b" \
                  target/linux/ package/ include/ Config.in 2>/dev/null; then
@@ -109,14 +119,6 @@ jobs:
               fi
             fi
           done
-
-      - name: Focus on Docker / network options
-        run: |
-          REPORT=/workdir/verify-report.txt
-          FOCUS='CGROUP_PIDS|NETFILTER_XT_TARGET_REDIRECT|IP_NF_TARGET_MASQUERADE|OVERLAY_FS|NET_SCH_FQ_CODEL|TCP_CONG_BBR|RPS|RFS_ACCEL|CGROUP_SCHED|CFS_BANDWIDTH|CGROUP_NET_PRIO|CGROUP_HUGETLB|POSIX_MQUEUE|VETH|BRIDGE|BLK_DEV_LOOP|BPF_|DEBUG_INFO|CPU_FREQ|PROC_PAGE_MONITOR|MAGIC_SYSRQ|CPUSETS'
-          echo "" >> "$REPORT"
-          echo "########## 3) Focused options ##########" >> "$REPORT"
-          grep -E "$FOCUS" "$REPORT" >> /dev/null || true
 
       - name: Print report
         run: |
