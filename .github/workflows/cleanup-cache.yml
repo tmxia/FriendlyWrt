@@ -1,0 +1,152 @@
+name: Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Cleanup mode'
+        required: true
+        default: 'prune'
+        type: choice
+        options:
+          - 'prune'
+          - 'nuke'
+      keep:
+        description: 'Keep latest N kernel versions (prune mode)'
+        required: false
+        default: '3'
+        type: string
+  schedule:
+    - cron: '0 3 * * 0'
+
+permissions:
+  actions: write
+  contents: read
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune old GHCR cache tags
+        if: ${{ inputs.mode != 'nuke' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+          KEEP: ${{ inputs.keep || '3' }}
+        run: |
+          set -e
+          PKG="r5s-base-cache"
+
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            BASE="/orgs/${OWNER}/packages/container/${PKG}/versions"
+          else
+            BASE="/users/${OWNER}/packages/container/${PKG}/versions"
+          fi
+
+          ALL=$(mktemp)
+          PAGE=1
+          while :; do
+            BATCH=$(gh api "${BASE}?per_page=100&page=${PAGE}" 2>/dev/null || echo "[]")
+            COUNT=$(echo "$BATCH" | jq 'length')
+            [ "$COUNT" -eq 0 ] && break
+            echo "$BATCH" | jq -c '.[]' >> "$ALL"
+            [ "$COUNT" -lt 100 ] && break
+            PAGE=$((PAGE + 1))
+          done
+
+          echo "Total versions: $(wc -l < "$ALL")"
+
+          for PREFIX in "openwrt-25.12-linux-stable-6.12." "openwrt-25.12-6.12."; do
+            echo ""
+            echo "=== ${PREFIX}* (keep latest ${KEEP}) ==="
+
+            MATCH=$(jq -r --arg p "$PREFIX" '
+              select((.metadata.container.tags // []) | any(startswith($p)))
+              | [.id, (.metadata.container.tags | join(",")), .created_at] | @tsv
+            ' "$ALL" | sort -k3 -r)
+
+            [ -z "$MATCH" ] && { echo "  (none)"; continue; }
+
+            echo "$MATCH" | awk -v keep="$KEEP" '
+              {
+                cnt++
+                if (cnt <= keep) {
+                  printf "  KEEP    id=%s  %s\n", $1, $2
+                } else {
+                  printf "  DELETE  id=%s  %s\n", $1, $2
+                  print $1
+                }
+              }
+            ' > /tmp/plan.txt
+
+            grep -v '^  ' /tmp/plan.txt | while read -r VID; do
+              [ -z "$VID" ] && continue
+              gh api -X DELETE "${BASE}/${VID}" >/dev/null 2>&1 \
+                && echo "    ✓ deleted $VID" \
+                || echo "    ✗ failed  $VID"
+            done
+          done
+
+          rm -f "$ALL" /tmp/plan.txt
+
+      - name: Nuke all GHCR cache
+        if: ${{ inputs.mode == 'nuke' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_TYPE: ${{ github.event.repository.owner.type }}
+        run: |
+          set -e
+          for PKG in r5s-base-cache r5s-cache; do
+            echo ""
+            echo "===== NUKE $PKG ====="
+
+            if [ "$OWNER_TYPE" = "Organization" ]; then
+              BASE="/orgs/${OWNER}/packages/container/${PKG}/versions"
+              PKG_URL="/orgs/${OWNER}/packages/container/${PKG}"
+            else
+              BASE="/users/${OWNER}/packages/container/${PKG}/versions"
+              PKG_URL="/users/${OWNER}/packages/container/${PKG}"
+            fi
+
+            PAGE=1
+            while :; do
+              BATCH=$(gh api "${BASE}?per_page=100&page=${PAGE}" 2>/dev/null || echo "[]")
+              COUNT=$(echo "$BATCH" | jq 'length')
+              [ "$COUNT" -eq 0 ] && break
+              echo "  page $PAGE: $COUNT versions"
+              echo "$BATCH" | jq -r '.[].id' | while read -r VID; do
+                [ -z "$VID" ] && continue
+                gh api -X DELETE "${BASE}/${VID}" >/dev/null 2>&1 && echo "    ✓ $VID" || echo "    ✗ $VID"
+              done
+              [ "$COUNT" -lt 100 ] && break
+              PAGE=$((PAGE + 1))
+            done
+
+            gh api -X DELETE "$PKG_URL" >/dev/null 2>&1 && echo "  package deleted" || true
+          done
+
+      - name: Delete orphan artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          KEEP=2
+
+          LATEST=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?per_page=100" \
+                   --jq '.workflow_runs[] | select(.name == "Build OpenWrt for NanoPi R5S") | .id' \
+                   | head -n "$KEEP")
+
+          gh api "repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | "\(.id)\t\(.workflow_run.id)\t\(.name)\t\(.size_in_bytes)"' | \
+          while IFS=$'\t' read -r AID RUNID NAME SIZE; do
+            [ -z "$AID" ] && continue
+            if echo "$LATEST" | grep -q "^${RUNID}$"; then
+              echo "  keep   $NAME  ${SIZE}B"
+              continue
+            fi
+            echo "  delete $NAME  ${SIZE}B"
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${AID}" 2>/dev/null || true
+          done
