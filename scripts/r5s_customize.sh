@@ -518,7 +518,7 @@ config_stage() {
     done
 
     ENABLE_PKGS="
-    bc vsftpd sudo unzip file procd logrotate coreutils-stat wireguard-tools python3-light
+    bc vsftpd sudo unzip file procd logrotate coreutils-stat wireguard-tools python3-light wget-ssl
     bash perl parted curl dosfstools e2fsprogs resize2fs lsblk block-mount blkid
     python3-requests python3-paramiko python3-pytz python3-dateutil python3-bs4
     coreutils-timeout coreutils-date
