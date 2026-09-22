@@ -177,16 +177,44 @@ jobs:
           echo ""
           echo "===== detect kernel version ====="
           cd /workdir/openwrt
-          KV=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
-               | head -1 | awk -F'= ' '{print $2}' | tr -d '.')
+
+          KERNEL_MAJOR=""
+          KV=""
+
+          DETAILS_FILE=$(ls -t target/linux/generic/kernel-[0-9]*.[0-9]* 2>/dev/null | head -1 || true)
+          if [ -n "$DETAILS_FILE" ]; then
+            KERNEL_MAJOR=$(basename "$DETAILS_FILE" | sed 's/^kernel-//')
+            KV=$(grep -hE "^LINUX_VERSION-${KERNEL_MAJOR//./\\.}[[:space:]]*=" "$DETAILS_FILE" \
+                 | head -1 | awk -F'= ' '{print $2}' | tr -d '.' || true)
+            echo "  from $DETAILS_FILE: kernel-${KERNEL_MAJOR} suffix=${KV}"
+          fi
+
+          if [ -z "$KV" ] || [ -z "$KERNEL_MAJOR" ]; then
+            KERNEL_PATCHVER=$(grep -hE '^KERNEL_PATCHVER[[:space:]]*\??=' include/kernel-version.mk 2>/dev/null \
+                              | head -1 | awk -F'=' '{print $2}' | tr -d ' ' || true)
+            if [ -n "$KERNEL_PATCHVER" ]; then
+              KERNEL_MAJOR="$KERNEL_PATCHVER"
+              DETAILS_FILE="target/linux/generic/kernel-${KERNEL_MAJOR}"
+              if [ -f "$DETAILS_FILE" ]; then
+                KV=$(grep -hE "^LINUX_VERSION-${KERNEL_MAJOR//./\\.}[[:space:]]*=" "$DETAILS_FILE" \
+                     | head -1 | awk -F'= ' '{print $2}' | tr -d '.' || true)
+              fi
+              echo "  fallback via KERNEL_PATCHVER=${KERNEL_MAJOR} suffix=${KV}"
+            fi
+          fi
+
           if [ -z "$KV" ]; then
             SHORT=$(git rev-parse --short HEAD)
             KV="commit-${SHORT}"
+            [ -z "$KERNEL_MAJOR" ] && KERNEL_MAJOR="6.12"
+            echo "  fallback to commit: $KV"
           fi
+
           OW_HASH=$(git rev-parse --short=8 HEAD)
           echo "kernel=$KV" >> "$GITHUB_OUTPUT"
+          echo "kernel_major=$KERNEL_MAJOR" >> "$GITHUB_OUTPUT"
           echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
-          echo "detected: kernel=6.12.$KV openwrt=$OW_HASH"
+          echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=$OW_HASH"
 
           echo ""
           echo "===== compute config hash ====="
@@ -200,8 +228,8 @@ jobs:
           )
           echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
           echo "config hash: $CFG_HASH"
-          echo "base key:    openwrt-25.12-linux-6.12.${KV}"
-          echo "ccache key:  openwrt-25.12-linux-6.12.${KV}"
+          echo "base key:    openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
+          echo "ccache key:  openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
 
           sudo mkdir -p /workdir/ccache
           sudo chown -R $USER:$GROUPS /workdir/ccache
@@ -212,7 +240,9 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           KV="${{ steps.setup.outputs.kernel }}"
-          TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
+          KM="${{ steps.setup.outputs.kernel_major }}"
+          [ -z "$KM" ] && KM="6.12"
+          TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
 
@@ -269,7 +299,9 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
           KV="${{ steps.setup.outputs.kernel }}"
-          TAG="${BASE}:openwrt-25.12-linux-6.12.${KV}"
+          KM="${{ steps.setup.outputs.kernel_major }}"
+          [ -z "$KM" ] && KM="6.12"
+          TAG="${BASE}:openwrt-25.12-linux-${KM}.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           mkdir -p /workdir/ccache
@@ -389,10 +421,13 @@ jobs:
         if: success() && !cancelled()
         env:
           KV: ${{ steps.setup.outputs.kernel }}
+          KM: ${{ steps.setup.outputs.kernel_major }}
           RESTORE_HIT: ${{ steps.restore_base.outputs.hit }}
         run: |
           set -e -o pipefail
           cd /workdir/openwrt
+
+          [ -z "$KM" ] && KM="6.12"
 
           IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$|staging_dir/host/stamp/\.(zstd|flock|libdeflate|pkgconf|xz|tar|patch|m4)_"
           CHANGED=$(find build_dir staging_dir -type f -newer /workdir/base_compilation_marker -path "*/stamp/*" 2>/dev/null | \
@@ -453,7 +488,7 @@ jobs:
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
+          BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}.${KV}"
 
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
@@ -525,10 +560,13 @@ jobs:
         if: always() && !cancelled()
         env:
           KV: ${{ steps.setup.outputs.kernel }}
+          KM: ${{ steps.setup.outputs.kernel_major }}
           KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e -o pipefail
+
+          [ -z "$KM" ] && KM="6.12"
 
           echo ""
           echo "===== packing ccache ====="
@@ -559,7 +597,7 @@ jobs:
 
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
             CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
-            CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
+            CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-${KM}.${KV}"
 
             docker rmi "$CCACHE_TAG" 2>/dev/null || true
 
@@ -651,8 +689,8 @@ jobs:
             rm -f "$ALL"
           }
 
-          prune_prefix "r5s-base-cache" "openwrt-25.12-linux-6.12."
-          prune_prefix "r5s-ccache"     "openwrt-25.12-linux-6.12."
+          prune_prefix "r5s-base-cache" "openwrt-25.12-linux-"
+          prune_prefix "r5s-ccache"     "openwrt-25.12-linux-"
 
           echo ""
           echo "=== prune done ==="
@@ -666,10 +704,10 @@ jobs:
           OUT="bin/targets/rockchip/armv8"
           TAG="${{ needs.prepare_release.outputs.release_tag }}"
           ARTIFACT_PREFIX=$(echo "$TAG" | sed "s/^${MODEL_NAME}-OpenWrt-/${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-/")
-          KV=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk | head -1 | awk -F'= ' '{print $2}')
+          KV_RAW="${{ steps.setup.outputs.kernel_major }}.${{ steps.setup.outputs.kernel }}"
           echo "release tag:     $TAG"
           echo "artifact prefix: $ARTIFACT_PREFIX"
-          echo "kernel version:  6.12.${KV}"
+          echo "kernel version:  ${KV_RAW}"
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -697,7 +735,7 @@ jobs:
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sha256sums.txt"
 
           echo "kernel version:" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
-          grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt" || true
+          grep -rn '^LINUX_VERSION-' target/linux/generic/kernel-* include/kernel-version.mk 2>/dev/null >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt" || true
           echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
           echo "config hash: ${{ steps.setup.outputs.cfg_hash }}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
           echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
@@ -722,7 +760,7 @@ jobs:
 
           echo ""
           echo "===== update release notes ====="
-          gh release edit "$TAG" --notes "Kernel: 6.12.${KV}" || echo "::warning::failed to update release notes"
+          gh release edit "$TAG" --notes "Kernel: ${KV_RAW}" || echo "::warning::failed to update release notes"
 
           echo ""
           echo "===== all artifacts ====="
