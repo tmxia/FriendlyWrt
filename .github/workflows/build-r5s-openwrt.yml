@@ -203,7 +203,7 @@ jobs:
           docker rm -f r5s_tmp 2>/dev/null || true
           if docker pull "$TAG_FULL" 2>/dev/null; then
             echo "FULL CACHE HIT"
-            docker create --name r5s_tmp "$TAG_FULL" >/dev/null
+            docker create --name r5s_tmp "$TAG_FULL" /bin/true >/dev/null
             docker export r5s_tmp | tar -xf - -C /workdir/openwrt
             docker rm r5s_tmp >/dev/null
             echo "hit=full" >> "$GITHUB_OUTPUT"
@@ -222,7 +222,7 @@ jobs:
           docker rm -f r5s_tmp 2>/dev/null || true
           if docker pull "$TAG_BASE" 2>/dev/null; then
             echo "BASE CACHE HIT"
-            docker create --name r5s_tmp "$TAG_BASE" >/dev/null
+            docker create --name r5s_tmp "$TAG_BASE" /bin/true >/dev/null
             docker export r5s_tmp | tar -xf - -C /workdir/openwrt
             docker rm r5s_tmp >/dev/null
             echo "hit=base" >> "$GITHUB_OUTPUT"
@@ -259,7 +259,7 @@ jobs:
           fi
 
           echo "CCACHE HIT"
-          docker create --name r5s_ccache_tmp "$TAG" >/dev/null
+          docker create --name r5s_ccache_tmp "$TAG" /bin/true >/dev/null
           docker export r5s_ccache_tmp | tar -xf - -C /workdir
           docker rm r5s_ccache_tmp >/dev/null
 
