@@ -1,0 +1,89 @@
+name: Dump R5S Official .config
+
+on:
+  workflow_dispatch:
+
+jobs:
+  dump:
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install deps
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        sudo rm -rf /etc/apt/sources.list.d
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential subversion git-core libncurses5-dev \
+          zlib1g-dev gawk flex quilt libssl-dev xsltproc \
+          libxml-parser-perl mercurial unzip python3 python3-pip \
+          rsync file wget ca-certificates bc ccache \
+          device-tree-compiler cpio time
+        git config --global user.name 'CI'
+        git config --global user.email 'ci@example.com'
+
+    - name: Install repo tool
+      run: |
+        mkdir -p ~/bin
+        curl -sL https://raw.githubusercontent.com/friendlyarm/repo/master/repo -o ~/bin/repo
+        chmod +x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
+
+    - name: Download source
+      run: |
+        mkdir project && cd project
+        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests \
+          -b master-v25.12 -m rk3568.xml \
+          --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
+        repo sync -c friendlywrt --no-clone-bundle
+        repo sync -c configs --no-clone-bundle
+        repo sync -c device/common --no-clone-bundle
+        repo sync -c device/friendlyelec --no-clone-bundle
+        repo sync -c scripts --no-clone-bundle
+        repo sync -c scripts/sd-fuse --no-clone-bundle
+        repo sync -c toolchain --no-clone-bundle
+
+    - name: Generate .config
+      run: |
+        cd project
+        cat > .current_config.mk <<'EOL'
+        . device/friendlyelec/rk3568/base.mk
+        TARGET_IMAGE_DIRNAME=friendlywrt25
+        TARGET_FRIENDLYWRT_CONFIG=rockchip
+        EOL
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+
+    - name: Locate and export .config
+      run: |
+        cd project
+        echo "=== search .config ==="
+        find . -name '.config' -type f -not -path './.repo/*' | head -20
+        if [ -f friendlywrt/.config ]; then
+          cp friendlywrt/.config ../official-r5s.config
+        elif [ -f .config ]; then
+          cp .config ../official-r5s.config
+        else
+          f=$(find . -name '.config' -type f -not -path './.repo/*' | head -1)
+          [ -n "$f" ] && cp "$f" ../official-r5s.config
+        fi
+        echo "=== result ==="
+        wc -l ../official-r5s.config
+        head -30 ../official-r5s.config
+
+    - name: Upload .config
+      uses: actions/upload-artifact@v4
+      with:
+        name: official-r5s-config
+        path: official-r5s.config
+        if-no-files-found: error
+
+    - name: Upload build log (for debug)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: project/*.log
+        if-no-files-found: ignore
