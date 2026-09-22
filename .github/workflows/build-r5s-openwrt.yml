@@ -327,14 +327,14 @@ jobs:
               echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
           done
 
+          make defconfig
+
           if ! grep -q '^CONFIG_CCACHE=y' .config; then
             echo "CONFIG_CCACHE=y" >> .config
           fi
           sed -i 's|^CONFIG_CCACHE_DIR=.*|CONFIG_CCACHE_DIR="/workdir/ccache"|' .config
           grep -q '^CONFIG_CCACHE_DIR=' .config || \
             echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
-
-          make defconfig
 
           echo ""
           echo "=== ccache config ==="
