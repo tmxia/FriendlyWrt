@@ -165,6 +165,20 @@ jobs:
           echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
           echo "detected: kernel=6.12.$KV openwrt=$OW_HASH"
 
+          echo ""
+          echo "===== compute config hash ====="
+          CFG_HASH=$(
+            {
+              cat "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" 2>/dev/null || true
+              cat "$GITHUB_WORKSPACE/${{ env.DIY_SH }}" 2>/dev/null || true
+              find "$GITHUB_WORKSPACE/scripts" -type f -exec cat {} \; 2>/dev/null || true
+              git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || true
+            } | sha256sum | cut -c1-16
+          )
+          echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
+          echo "config hash: $CFG_HASH"
+          echo "cache suffix: openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG_HASH}"
+
           sudo mkdir -p /workdir/ccache
           sudo chown -R $USER:$GROUPS /workdir/ccache
 
@@ -176,9 +190,10 @@ jobs:
           BASE_BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           KV="${{ steps.setup.outputs.kernel }}"
           OW_HASH="${{ steps.setup.outputs.ow_hash }}"
+          CFG="${{ steps.setup.outputs.cfg_hash }}"
 
-          TAG_FULL="${BASE_FULL}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}"
-          TAG_BASE="${BASE_BASE}:openwrt-25.12-linux-6.12.${KV}"
+          TAG_FULL="${BASE_FULL}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG}"
+          TAG_BASE="${BASE_BASE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
 
           echo "hit=none" >> "$GITHUB_OUTPUT"
 
@@ -230,7 +245,8 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
           KV="${{ steps.setup.outputs.kernel }}"
-          TAG="${BASE}:openwrt-25.12-linux-6.12.${KV}"
+          CFG="${{ steps.setup.outputs.cfg_hash }}"
+          TAG="${BASE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           mkdir -p /workdir/ccache
@@ -332,6 +348,7 @@ jobs:
         if: success() && !cancelled()
         env:
           KV: ${{ steps.setup.outputs.kernel }}
+          CFG: ${{ steps.setup.outputs.cfg_hash }}
           RESTORE_HIT: ${{ steps.restore_build.outputs.hit }}
         run: |
           set -e -o pipefail
@@ -355,8 +372,8 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
-          BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
-          CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
+          BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
+          CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
 
           echo ""
           echo "===== packing base cache ====="
@@ -444,6 +461,7 @@ jobs:
         env:
           KV: ${{ steps.setup.outputs.kernel }}
           OW_HASH: ${{ steps.setup.outputs.ow_hash }}
+          CFG: ${{ steps.setup.outputs.cfg_hash }}
           RESTORE_HIT: ${{ steps.restore_build.outputs.hit }}
           KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -453,7 +471,7 @@ jobs:
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           FULL_BASE="ghcr.io/${REPO_LOWER}/r5s-full-cache"
-          FULL_TAG="${FULL_BASE}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}"
+          FULL_TAG="${FULL_BASE}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG}"
 
           if [ "$RESTORE_HIT" = "full" ]; then
             echo "full cache was used, skip save"
@@ -592,6 +610,7 @@ jobs:
           echo "kernel version:" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
           grep -rn '^LINUX_VERSION-6\.12' include/ target/linux/generic/kernel-6.12 2>/dev/null >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt" || true
           echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          echo "config hash: ${{ steps.setup.outputs.cfg_hash }}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
           echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
 
           cd $GITHUB_WORKSPACE/artifact
