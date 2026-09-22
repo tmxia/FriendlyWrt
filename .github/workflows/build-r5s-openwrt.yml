@@ -30,8 +30,6 @@ env:
   CONFIG_FILE: 'scripts/r5s.config'
   DIY_SH: 'scripts/r5s_customize.sh'
   CACHE_KEEP_VERSIONS: '3'
-  CACHE_CHUNK_SIZE: '5000M'
-  ZSTD_LEVEL: '10'
 
 jobs:
   prepare_release:
@@ -255,27 +253,10 @@ jobs:
 
           echo "BASE CACHE HIT"
           docker create --name r5s_tmp "$TAG" /bin/true >/dev/null
-          docker export r5s_tmp > /workdir/cache_exported.tar
+          docker export r5s_tmp | tar -xpf - -C /workdir/openwrt
           docker rm r5s_tmp >/dev/null
           docker rmi "$TAG" -f 2>/dev/null || true
-
-          cd /workdir
-          rm -rf op_cache_raw_*
-          tar -xf cache_exported.tar --wildcards --no-anchored "op_cache_raw_*" || true
-          rm -f cache_exported.tar
-
-          if ls op_cache_raw_* 1> /dev/null 2>&1; then
-            CHUNK_COUNT=$(ls op_cache_raw_* | wc -l)
-            TOTAL_SIZE=$(du -ch op_cache_raw_* | tail -1 | awk '{print $1}')
-            echo "  chunks: $CHUNK_COUNT, total: $TOTAL_SIZE"
-
-            cat op_cache_raw_* | tar -I "zstd -T0" -xpf - -C /workdir/openwrt/
-            rm -f op_cache_raw_*
-            echo "  extracted"
-            echo "hit=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "  no chunks found"
-          fi
+          echo "hit=true" >> "$GITHUB_OUTPUT"
 
           echo ""
           echo "=== restored sizes ==="
@@ -315,31 +296,14 @@ jobs:
 
           echo "CCACHE HIT"
           docker create --name r5s_ccache_tmp "$TAG" /bin/true >/dev/null
-          docker export r5s_ccache_tmp > /workdir/ccache_exported.tar
+          docker export r5s_ccache_tmp | tar -xpf - -C /workdir
           docker rm r5s_ccache_tmp >/dev/null
           docker rmi "$TAG" -f 2>/dev/null || true
-
-          cd /workdir
-          rm -rf op_ccache_raw_*
-          tar -xf ccache_exported.tar --wildcards --no-anchored "op_ccache_raw_*" || true
-          rm -f ccache_exported.tar
-
-          if ls op_ccache_raw_* 1> /dev/null 2>&1; then
-            CHUNK_COUNT=$(ls op_ccache_raw_* | wc -l)
-            TOTAL_SIZE=$(du -ch op_ccache_raw_* | tail -1 | awk '{print $1}')
-            echo "  chunks: $CHUNK_COUNT, total: $TOTAL_SIZE"
-
-            cat op_ccache_raw_* | tar -I "zstd -T0" -xpf - -C /workdir
-            rm -f op_ccache_raw_*
-            echo "  extracted"
-            echo "hit=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "  no chunks found"
-          fi
 
           CC_SIZE=$(du -sh /workdir/ccache 2>/dev/null | awk '{print $1}')
           CC_FILES=$(find /workdir/ccache -type f 2>/dev/null | wc -l)
           echo "  ccache: $CC_SIZE, files: $CC_FILES"
+          echo "hit=true" >> "$GITHUB_OUTPUT"
 
       - name: Prepare build configuration
         run: |
@@ -456,45 +420,21 @@ jobs:
             echo "  dl/ reverted: $(find dl -type f | wc -l) files"
           fi
 
-          echo ""
-          echo "===== packing (zstd level ${{ env.ZSTD_LEVEL }}) ====="
-          T0=$(date +%s)
-          cd /workdir/openwrt
-          rm -rf /workdir/op_cache_raw_*
-
-          tar -I "zstd -T0 -${{ env.ZSTD_LEVEL }}" -cf - \
-            --exclude='build_dir/toolchain-*/linux-*' \
-            --exclude='build_dir/target-*/linux-*' \
-            build_dir staging_dir dl | split -a 3 -d -b ${{ env.CACHE_CHUNK_SIZE }} - /workdir/op_cache_raw_
-
-          cd /workdir
-          CHUNK_COUNT=$(ls op_cache_raw_* 2>/dev/null | wc -l)
-          TOTAL_SIZE=$(du -ch op_cache_raw_* 2>/dev/null | tail -1 | awk '{print $1}')
-          echo "  packed in $(( $(date +%s) - T0 ))s"
-          echo "  chunks: $CHUNK_COUNT, total: $TOTAL_SIZE"
-
-          echo ""
-          echo "===== build multi-layer image ====="
-          echo "FROM scratch" > Dockerfile
-          count=1
-          for f in op_cache_raw_*; do
-            layer_dir="layer$count"
-            mkdir -p "$layer_dir"
-            mv "$f" "$layer_dir/"
-            echo "COPY $layer_dir /" >> Dockerfile
-            count=$((count + 1))
-          done
-          echo "  layers: $((count - 1))"
-
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}.${KV}"
 
+          echo ""
+          echo "===== packing base cache (gzip single-layer) ====="
+          cd /workdir/openwrt
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           T0=$(date +%s)
-          docker build -t "$BASE_TAG" .
-          echo "  built in $(( $(date +%s) - T0 ))s"
+          tar -czf - \
+            --exclude='build_dir/toolchain-*/linux-*' \
+            --exclude='build_dir/target-*/linux-*' \
+            build_dir staging_dir dl | docker import - "$BASE_TAG"
+          echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
           IMG_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  image size: $((IMG_SIZE / 1024 / 1024))MB"
@@ -513,11 +453,8 @@ jobs:
 
           echo ""
           echo "===== cleanup ====="
-          cd /workdir
-          rm -rf layer* Dockerfile op_cache_raw_*
           docker rmi "$BASE_TAG" -f 2>/dev/null || true
           docker builder prune -a -f 2>/dev/null || true
-          docker system prune -a -f 2>/dev/null || true
           echo "  cleaned"
 
           df -hT
@@ -569,32 +506,8 @@ jobs:
           [ -z "$KM" ] && KM="6.12"
 
           echo ""
-          echo "===== packing ccache ====="
+          echo "===== packing ccache (gzip single-layer) ====="
           if [ -d /workdir/ccache ] && [ "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
-            cd /workdir
-            rm -rf op_ccache_raw_*
-
-            T0=$(date +%s)
-            tar -I "zstd -T0 -${{ env.ZSTD_LEVEL }}" -cf - -C /workdir ccache | \
-              split -a 3 -d -b ${{ env.CACHE_CHUNK_SIZE }} - /workdir/op_ccache_raw_
-
-            CHUNK_COUNT=$(ls op_ccache_raw_* 2>/dev/null | wc -l)
-            TOTAL_SIZE=$(du -ch op_ccache_raw_* 2>/dev/null | tail -1 | awk '{print $1}')
-            echo "  packed in $(( $(date +%s) - T0 ))s"
-            echo "  chunks: $CHUNK_COUNT, total: $TOTAL_SIZE"
-
-            echo "===== build multi-layer image ====="
-            echo "FROM scratch" > Dockerfile
-            count=1
-            for f in op_ccache_raw_*; do
-              layer_dir="ccache_layer$count"
-              mkdir -p "$layer_dir"
-              mv "$f" "$layer_dir/"
-              echo "COPY $layer_dir /" >> Dockerfile
-              count=$((count + 1))
-            done
-            echo "  layers: $((count - 1))"
-
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
             CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
             CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-${KM}.${KV}"
@@ -602,12 +515,13 @@ jobs:
             docker rmi "$CCACHE_TAG" 2>/dev/null || true
 
             T0=$(date +%s)
-            docker build -t "$CCACHE_TAG" .
-            echo "  built in $(( $(date +%s) - T0 ))s"
+            tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"
+            echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
             IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
             echo "  image size: $((IMG_SIZE / 1024 / 1024))MB"
 
+            echo ""
             echo "===== pushing ====="
             T0=$(date +%s)
             for attempt in 1 2 3; do
@@ -619,12 +533,10 @@ jobs:
               sleep 5
             done
 
+            echo ""
             echo "===== cleanup ====="
-            cd /workdir
-            rm -rf ccache_layer* Dockerfile op_ccache_raw_*
             docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
             docker builder prune -a -f 2>/dev/null || true
-            docker system prune -a -f 2>/dev/null || true
             echo "  cleaned"
           else
             echo "  ccache empty, skip"
