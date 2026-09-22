@@ -389,8 +389,10 @@ jobs:
           OUT="bin/targets/rockchip/armv8"
           TAG="${{ needs.prepare_release.outputs.release_tag }}"
           ARTIFACT_PREFIX=$(echo "$TAG" | sed "s/^${MODEL_NAME}-OpenWrt-/${MODEL_NAME}-OpenWrt-${OPENWRT_VER}-/")
+          KV=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk | head -1 | awk -F'= ' '{print $2}')
           echo "release tag:     $TAG"
           echo "artifact prefix: $ARTIFACT_PREFIX"
+          echo "kernel version:  6.12.${KV}"
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -439,6 +441,10 @@ jobs:
           echo "uploading ${#RELEASE_FILES[@]} firmware files to release"
           printf '  %s\n' "${RELEASE_FILES[@]}"
           gh release upload "$TAG" "${RELEASE_FILES[@]}" --clobber
+
+          echo ""
+          echo "===== update release notes ====="
+          gh release edit "$TAG" --notes "Kernel: 6.12.${KV}" || echo "::warning::failed to update release notes"
 
           echo ""
           echo "===== all artifacts ====="
