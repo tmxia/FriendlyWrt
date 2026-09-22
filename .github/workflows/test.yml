@@ -25,19 +25,20 @@ jobs:
         git config --global user.name 'CI'
         git config --global user.email 'ci@example.com'
 
-    - name: Install repo tool
+    - name: Install repo tool (Python 3 compatible)
       run: |
         mkdir -p ~/bin
-        curl -sL https://raw.githubusercontent.com/friendlyarm/repo/master/repo -o ~/bin/repo
+        curl -sL https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod +x ~/bin/repo
         echo "$HOME/bin" >> $GITHUB_PATH
+        ~/bin/repo --version
 
     - name: Download source
       run: |
         mkdir project && cd project
         repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests \
           -b master-v25.12 -m rk3568.xml \
-          --repo-url=https://github.com/friendlyarm/repo --no-clone-bundle
+          --no-clone-bundle
         repo sync -c friendlywrt --no-clone-bundle
         repo sync -c configs --no-clone-bundle
         repo sync -c device/common --no-clone-bundle
@@ -74,16 +75,9 @@ jobs:
         head -30 ../official-r5s.config
 
     - name: Upload .config
+      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: official-r5s-config
         path: official-r5s.config
-        if-no-files-found: error
-
-    - name: Upload build log (for debug)
-      if: always()
-      uses: actions/upload-artifact@v4
-      with:
-        name: build-log
-        path: project/*.log
-        if-no-files-found: ignore
+        if-no-files-found: warn
