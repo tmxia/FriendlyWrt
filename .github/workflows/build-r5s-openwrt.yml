@@ -165,26 +165,103 @@ jobs:
           echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
           echo "detected: kernel=6.12.$KV openwrt=$OW_HASH"
 
-          echo ""
-          echo "===== alias cache tag ====="
+          sudo mkdir -p /workdir/ccache
+          sudo chown -R $USER:$GROUPS /workdir/ccache
+
+      - name: Restore build cache
+        id: restore_build
+        run: |
+          set -e
+          cd /workdir/openwrt
+
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          SPECIFIC="${BASE}:openwrt-25.12-linux-6.12.${KV}"
-          GENERIC="${BASE}:openwrt-25.12"
+          BASE="ghcr.io/${REPO_LOWER}/r5s-buildcache"
+          KV="${{ steps.setup.outputs.kernel }}"
+          TAG="${BASE}:openwrt-25.12-linux-6.12.${KV}"
 
-          docker rmi "$GENERIC" 2>/dev/null || true
-          docker rmi "$SPECIFIC" 2>/dev/null || true
+          echo "=== build cache: $TAG ==="
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          echo "complete=false" >> "$GITHUB_OUTPUT"
 
-          if docker pull "$SPECIFIC" 2>/dev/null; then
-            docker tag "$SPECIFIC" "$GENERIC"
-            docker push "$GENERIC" >/dev/null 2>&1 || true
-            echo "cache hit: $SPECIFIC"
-          else
-            echo "no cache for kernel 6.12.${KV}, cold build"
+          docker rmi "$TAG" 2>/dev/null || true
+
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "CACHE MISS"
+            exit 0
           fi
 
-          docker rmi "$GENERIC" 2>/dev/null || true
-          docker rmi "$SPECIFIC" 2>/dev/null || true
+          echo "CACHE HIT, extracting..."
+          docker create --name r5s_build_tmp "$TAG" >/dev/null
+          docker export r5s_build_tmp | tar -xf - -C /workdir/openwrt
+          docker rm r5s_build_tmp >/dev/null
+
+          echo ""
+          echo "=== restored directory sizes ==="
+          for d in staging_dir/host staging_dir/toolchain-* staging_dir/target-* \
+                   build_dir/host build_dir/toolchain-*; do
+            [ -e "$d" ] || continue
+            echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
+          done
+
+          echo ""
+          echo "=== key stamps ==="
+          COMPLETE=true
+
+          HOST_STAMPS=$(ls staging_dir/host/stamp/.tools_compile_* 2>/dev/null || true)
+          if [ -z "$HOST_STAMPS" ]; then
+            echo "  [MISS] staging_dir/host/stamp/.tools_compile_*"
+            COMPLETE=false
+          else
+            echo "$HOST_STAMPS" | while read -r s; do
+              echo "  [OK]   $s ($(stat -c '%y' "$s" | cut -d. -f1))"
+            done
+          fi
+
+          TC_STAMPS=$(ls staging_dir/toolchain-*/stamp/.toolchain_compile_* 2>/dev/null || true)
+          if [ -z "$TC_STAMPS" ]; then
+            echo "  [MISS] staging_dir/toolchain-*/stamp/.toolchain_compile_*"
+            COMPLETE=false
+          else
+            echo "$TC_STAMPS" | while read -r s; do
+              echo "  [OK]   $s ($(stat -c '%y' "$s" | cut -d. -f1))"
+            done
+          fi
+
+          echo ""
+          echo "complete=$COMPLETE"
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+          echo "complete=$COMPLETE" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        id: restore_ccache
+        run: |
+          set -e
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
+          KV="${{ steps.setup.outputs.kernel }}"
+          TAG="${BASE}:openwrt-25.12-linux-6.12.${KV}"
+
+          echo "=== ccache: $TAG ==="
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+
+          mkdir -p /workdir/ccache
+          docker rmi "$TAG" 2>/dev/null || true
+
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "CCACHE MISS"
+            exit 0
+          fi
+
+          echo "CCACHE HIT, extracting..."
+          docker create --name r5s_ccache_tmp "$TAG" >/dev/null
+          docker export r5s_ccache_tmp | tar -xf - -C /workdir
+          docker rm r5s_ccache_tmp >/dev/null
+
+          CCACHE_STATS=$(du -sh /workdir/ccache 2>/dev/null | awk '{print $1}')
+          CCACHE_FILES=$(find /workdir/ccache -type f 2>/dev/null | wc -l)
+          echo "  size: $CCACHE_STATS, files: $CCACHE_FILES"
+
+          echo "hit=true" >> "$GITHUB_OUTPUT"
 
       - name: Prepare build configuration
         run: |
@@ -197,17 +274,25 @@ jobs:
 
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
-          make defconfig
 
           for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
             sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
             grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
               echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
           done
+
+          if ! grep -q '^CONFIG_CCACHE=y' .config; then
+            echo "CONFIG_CCACHE=y" >> .config
+          fi
+          sed -i 's|^CONFIG_CCACHE_DIR=.*|CONFIG_CCACHE_DIR="/workdir/ccache"|' .config
+          grep -q '^CONFIG_CCACHE_DIR=' .config || \
+            echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+
           make defconfig
 
-          cd /workdir
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_restore
+          echo ""
+          echo "=== ccache config ==="
+          grep -E '^CONFIG_CCACHE' .config || true
 
       - name: Compile base
         id: compile_base
@@ -216,43 +301,65 @@ jobs:
           touch /workdir/base_compilation_marker
 
           echo "===== tools/download ====="
+          T0=$(date +%s)
           if ! make tools/download -j1 > /tmp/tools_dl.log 2>&1; then
             echo "tools/download failed, showing verbose output"
             make tools/download -j1 V=s 2>&1 | tail -100
             exit 1
           fi
+          echo "  took $(( $(date +%s) - T0 ))s"
 
           echo "===== tools/compile ====="
+          T0=$(date +%s)
           if ! make tools/compile -j$(nproc) > /tmp/tools_c.log 2>&1; then
             echo "tools/compile failed, showing verbose output"
             make tools/compile -j1 V=s 2>&1 | tail -200
             exit 1
           fi
+          echo "  took $(( $(date +%s) - T0 ))s"
 
           echo "===== toolchain/download ====="
+          T0=$(date +%s)
           if ! make toolchain/download -j1 > /tmp/tc_dl.log 2>&1; then
             echo "toolchain/download failed, showing verbose output"
             make toolchain/download -j1 V=s 2>&1 | tail -100
             exit 1
           fi
+          echo "  took $(( $(date +%s) - T0 ))s"
 
           echo "===== toolchain/compile ====="
+          T0=$(date +%s)
           if ! make toolchain/compile -j$(nproc) > /tmp/tc_c.log 2>&1; then
             echo "toolchain/compile failed, showing verbose output"
             make toolchain/compile -j1 V=s 2>&1 | tail -250
             exit 1
           fi
+          echo "  took $(( $(date +%s) - T0 ))s"
 
+          echo ""
           echo "===== compile base OK ====="
+          echo ""
+          echo "=== post-compile stamps ==="
+          ls -la staging_dir/host/stamp/ 2>/dev/null | tail -20 || true
+          ls -la staging_dir/toolchain-*/stamp/ 2>/dev/null | tail -20 || true
 
       - name: Save and publish cache
-        if: steps.compile_base.outcome == 'success'
+        if: success() && !cancelled()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
           KV: ${{ steps.setup.outputs.kernel }}
+          CACHE_HIT: ${{ steps.restore_build.outputs.hit }}
+          CACHE_COMPLETE: ${{ steps.restore_build.outputs.complete }}
         run: |
+          set -e
           cd /workdir/openwrt
+
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BUILD_BASE="ghcr.io/${REPO_LOWER}/r5s-buildcache"
+          CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
+          BUILD_TAG="${BUILD_BASE}:openwrt-25.12-linux-6.12.${KV}"
+          CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
           IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$"
 
@@ -260,92 +367,132 @@ jobs:
                     grep -E -v "$IGNORE_PATTERN" | wc -l)
 
           echo "changed stamp files: $CHANGED"
+          echo "cache hit: $CACHE_HIT, complete: $CACHE_COMPLETE"
 
-          if [ "$CHANGED" -eq 0 ]; then
-            echo "base cache up-to-date, skip save and publish"
+          if [ "$CACHE_HIT" = "true" ] && [ "$CACHE_COMPLETE" = "true" ] && [ "$CHANGED" -eq 0 ]; then
+            echo "cache is complete and up-to-date, skip save"
             exit 0
           fi
 
           echo ""
-          echo "===== save cache ====="
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} cache_save
+          echo "===== build cache: packing ====="
+          T0=$(date +%s)
+          docker rmi "$BUILD_TAG" 2>/dev/null || true
+
+          tar -cf - \
+            --exclude='build_dir/target-*/linux-*' \
+            --exclude='build_dir/toolchain-*/linux-*' \
+            -C /workdir/openwrt \
+            staging_dir build_dir | docker import - "$BUILD_TAG"
+
+          TAR_SIZE=$(docker image inspect "$BUILD_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
+          echo "  packed in $(( $(date +%s) - T0 ))s, size: $((TAR_SIZE / 1024 / 1024 ))MB"
+
+          echo "===== build cache: pushing ====="
+          T0=$(date +%s)
+          for attempt in 1 2 3; do
+            if docker push "$BUILD_TAG" >/dev/null 2>&1; then
+              echo "  pushed in $(( $(date +%s) - T0 ))s"
+              break
+            fi
+            echo "  attempt $attempt failed, retrying..."
+            sleep 5
+          done
+
+          docker rmi "$BUILD_TAG" 2>/dev/null || true
 
           echo ""
-          echo "===== publish cache tag ====="
-          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          GENERIC="${BASE}:openwrt-25.12"
-          SPECIFIC="${BASE}:openwrt-25.12-linux-6.12.${KV}"
+          echo "===== ccache: packing ====="
+          if [ -d /workdir/ccache ] && [ "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
+            T0=$(date +%s)
+            docker rmi "$CCACHE_TAG" 2>/dev/null || true
 
-          docker rmi "$SPECIFIC" 2>/dev/null || true
-          docker rmi "$GENERIC" 2>/dev/null || true
+            tar -cf - -C /workdir ccache | docker import - "$CCACHE_TAG"
 
-          if ! docker pull "$GENERIC" 2>/dev/null; then
-            echo "no image pushed by cache_save, skip publish"
+            CC_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
+            echo "  packed in $(( $(date +%s) - T0 ))s, size: $((CC_SIZE / 1024 / 1024 ))MB"
+
+            echo "===== ccache: pushing ====="
+            T0=$(date +%s)
+            for attempt in 1 2 3; do
+              if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
+                echo "  pushed in $(( $(date +%s) - T0 ))s"
+                break
+              fi
+              echo "  attempt $attempt failed, retrying..."
+              sleep 5
+            done
+
+            docker rmi "$CCACHE_TAG" 2>/dev/null || true
           else
-            docker tag "$GENERIC" "$SPECIFIC"
-            if docker push "$SPECIFIC" >/dev/null 2>&1; then
-              echo "published: $SPECIFIC"
-            else
-              echo "::warning::publish failed for $SPECIFIC"
-            fi
-            docker rmi "$SPECIFIC" 2>/dev/null || true
-            docker rmi "$GENERIC" 2>/dev/null || true
+            echo "  ccache empty, skip"
           fi
 
           echo ""
           echo "===== prune old cache versions ====="
           OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
-          PKG="r5s-base-cache"
 
           OWNER_TYPE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
                        "https://api.github.com/users/$OWNER" | jq -r .type 2>/dev/null || echo "User")
           if [ "$OWNER_TYPE" = "Organization" ]; then
-            BASE_API="/orgs/$OWNER/packages/container/$PKG/versions"
+            API_PREFIX="/orgs/$OWNER/packages/container"
           else
-            BASE_API="/users/$OWNER/packages/container/$PKG/versions"
+            API_PREFIX="/users/$OWNER/packages/container"
           fi
           echo "owner type: $OWNER_TYPE"
 
-          ALL=$(mktemp)
-          PAGE=1
-          while :; do
-            RESP=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-                   "https://api.github.com${BASE_API}?per_page=100&page=$PAGE")
-            COUNT=$(echo "$RESP" | jq 'if type=="array" then length else 0 end')
-            [ "$COUNT" = "0" ] && break
-            echo "$RESP" | jq -c '.[]' >> "$ALL"
-            [ "$COUNT" -lt 100 ] && break
-            PAGE=$((PAGE + 1))
-          done
+          prune_prefix() {
+            local PKG="$1"
+            local PREFIX="$2"
 
-          TOTAL=$(wc -l < "$ALL" | tr -d ' ')
-          echo "total versions: $TOTAL"
+            echo ""
+            echo "--- prune ${PKG}:* prefix=${PREFIX} keep=${KEEP} ---"
 
-          if [ "$TOTAL" != "0" ]; then
-            PREFIX="openwrt-25.12-linux-6.12."
-            PLAN=$(jq -r --arg p "$PREFIX" '
-              select((.metadata.container.tags // []) | any(startswith($p)))
-              | [.id, .created_at] | @tsv
-            ' "$ALL" | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}')
+            local ALL=$(mktemp)
+            local PAGE=1
+            while :; do
+              local RESP=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                     "https://api.github.com${API_PREFIX}/${PKG}/versions?per_page=100&page=$PAGE")
+              local COUNT=$(echo "$RESP" | jq 'if type=="array" then length else 0 end')
+              [ "$COUNT" = "0" ] && break
+              echo "$RESP" | jq -c '.[]' >> "$ALL"
+              [ "$COUNT" -lt 100 ] && break
+              PAGE=$((PAGE + 1))
+            done
 
-            if [ -z "$PLAN" ]; then
-              echo "  (nothing to prune)"
-            else
-              N=$(echo "$PLAN" | wc -l | tr -d ' ')
-              echo "  pruning $N versions (keep $KEEP)..."
-              echo "$PLAN" | while read -r VID; do
-                [ -z "$VID" ] && continue
-                if curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
-                   "https://api.github.com${BASE_API}/$VID" >/dev/null 2>&1; then
-                  echo "    deleted $VID"
-                else
-                  echo "    failed  $VID"
-                fi
-              done
+            local TOTAL=$(wc -l < "$ALL" | tr -d ' ')
+            echo "  total versions: $TOTAL"
+
+            if [ "$TOTAL" != "0" ]; then
+              local PLAN=$(jq -r --arg p "$PREFIX" '
+                select((.metadata.container.tags // []) | any(startswith($p)))
+                | [.id, .created_at] | @tsv
+              ' "$ALL" | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}')
+
+              if [ -z "$PLAN" ]; then
+                echo "  (nothing to prune)"
+              else
+                local N=$(echo "$PLAN" | wc -l | tr -d ' ')
+                echo "  pruning $N versions..."
+                echo "$PLAN" | while read -r VID; do
+                  [ -z "$VID" ] && continue
+                  if curl -sS -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+                     "https://api.github.com${API_PREFIX}/${PKG}/versions/$VID" >/dev/null 2>&1; then
+                    echo "    deleted $VID"
+                  else
+                    echo "    failed  $VID"
+                  fi
+                done
+              fi
             fi
-          fi
-          rm -f "$ALL"
+
+            rm -f "$ALL"
+          }
+
+          prune_prefix "r5s-buildcache" "openwrt-25.12-linux-6.12."
+          prune_prefix "r5s-ccache"     "openwrt-25.12-linux-6.12."
+
+          echo ""
           echo "=== prune done ==="
 
       - name: Compile firmware
@@ -379,6 +526,10 @@ jobs:
             fi
             exit 1
           fi
+
+          echo ""
+          echo "=== ccache stats ==="
+          ccache -s -d /workdir/ccache 2>/dev/null || ccache -s 2>/dev/null || true
 
       - name: Collect and upload artifacts
         if: success()
