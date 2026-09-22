@@ -36,7 +36,8 @@ jobs:
     - name: Download source
       run: |
         mkdir project && cd project
-        repo init --depth=1 -u https://github.com/friendlyarm/friendlywrt_manifests \
+        repo init --depth=1 \
+          -u https://github.com/friendlyarm/friendlywrt_manifests \
           -b master-v25.12 -m rk3568.xml \
           --no-clone-bundle
         repo sync -c friendlywrt --no-clone-bundle
@@ -47,7 +48,19 @@ jobs:
         repo sync -c scripts/sd-fuse --no-clone-bundle
         repo sync -c toolchain --no-clone-bundle
 
-    - name: Generate .config
+    - name: Inspect device config
+      run: |
+        cd project
+        echo "=== device/friendlyelec/rk3568 ==="
+        ls -la device/friendlyelec/rk3568/ 2>/dev/null || true
+        echo "=== base.mk ==="
+        cat device/friendlyelec/rk3568/base.mk 2>/dev/null || true
+        echo "=== find configs/rockchip ==="
+        find . -path ./.repo -prune -o -type f -name 'rockchip*' -print 2>/dev/null | head
+        echo "=== configs dir ==="
+        ls -la configs/ 2>/dev/null || echo "no configs dir"
+
+    - name: Generate .config (default)
       run: |
         cd project
         cat > .current_config.mk <<'EOL'
@@ -55,29 +68,76 @@ jobs:
         TARGET_IMAGE_DIRNAME=friendlywrt25
         TARGET_FRIENDLYWRT_CONFIG=rockchip
         EOL
-        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt
+        DEBUG_DOT_CONFIG=1 ./build.sh friendlywrt || true
+        echo "=== locate generated .config ==="
+        find . -name '.config' -type f -not -path './.repo/*' | head
 
-    - name: Locate and export .config
+    - name: Force target device to R5S
       run: |
         cd project
-        echo "=== search .config ==="
-        find . -name '.config' -type f -not -path './.repo/*' | head -20
-        if [ -f friendlywrt/.config ]; then
-          cp friendlywrt/.config ../official-r5s.config
-        elif [ -f .config ]; then
-          cp .config ../official-r5s.config
-        else
-          f=$(find . -name '.config' -type f -not -path './.repo/*' | head -1)
-          [ -n "$f" ] && cp "$f" ../official-r5s.config
+        CFG=""
+        for c in friendlywrt/.config .config configs/rockchip configs/rockchip.config; do
+          [ -f "$c" ] && CFG="$c" && break
+        done
+        if [ -z "$CFG" ]; then
+          CFG=$(find . -name '.config' -type f -not -path './.repo/*' | head -1)
         fi
+        echo "Using config: $CFG"
+        if [ -z "$CFG" ]; then
+          echo "ERROR: no .config found"
+          exit 1
+        fi
+
+        # 切换默认设备 R2S -> R5S
+        sed -i \
+          -e 's/^CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r2s=y/# CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r2s is not set/' \
+          -e 's/^# CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s is not set/CONFIG_TARGET_rockchip_armv8_DEVICE_friendlyarm_nanopi-r5s=y/' \
+          -e 's/^CONFIG_TARGET_PROFILE="DEVICE_friendlyarm_nanopi-r2s"/CONFIG_TARGET_PROFILE="DEVICE_friendlyarm_nanopi-r5s"/' \
+          "$CFG"
+
+        # 删除 profile 缓存，触发重新计算
+        rm -f friendlywrt/tmp/.config* 2>/dev/null || true
+
+        echo "=== after sed ==="
+        grep -nE 'nanopi-r2s|nanopi-r5s|TARGET_PROFILE' "$CFG" || true
+
+    - name: Rebuild .config (make defconfig)
+      run: |
+        cd project/friendlywrt
+        make defconfig
+        echo "=== R5S check ==="
+        grep -nE 'DEVICE_friendlyarm_nanopi-r5s|DEVICE_friendlyarm_nanopi-r2s|TARGET_PROFILE|CPU_TYPE|TARGET_OPTIMIZATION|CONFIG_TARGET_ROOTFS_SQUASHFS|CONFIG_TARGET_ROOTFS_PARTSIZE' .config || true
+        wc -l .config
+
+    - name: Export .config
+      run: |
+        cd project
+        mkdir -p ../out
+        for c in friendlywrt/.config .config; do
+          if [ -f "$c" ]; then
+            cp "$c" ../out/official-r5s.config
+            break
+          fi
+        done
         echo "=== result ==="
-        wc -l ../official-r5s.config
-        head -30 ../official-r5s.config
+        wc -l ../out/official-r5s.config
+        head -40 ../out/official-r5s.config
 
     - name: Upload .config
-      if: always()
       uses: actions/upload-artifact@v4
       with:
         name: official-r5s-config
-        path: official-r5s.config
+        path: out/official-r5s.config
+        if-no-files-found: error
+
+    - name: Upload all configs (debug fallback)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: all-configs-debug
+        path: |
+          project/**/.config
+          project/**/config.buildinfo
+          project/**/config.seed
+          out/official-r5s.config
         if-no-files-found: warn
