@@ -229,6 +229,7 @@ net.netfilter.nf_conntrack_tcp_timeout_established=7440
 net.netfilter.nf_conntrack_udp_timeout=60
 net.netfilter.nf_conntrack_udp_timeout_stream=180
 net.netfilter.nf_conntrack_helper=1
+net.core.default_qdisc = fq_codel
 EOF
 
     # First-boot config
