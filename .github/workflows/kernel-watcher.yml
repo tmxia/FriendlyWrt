@@ -21,7 +21,7 @@ jobs:
       nanopi_sha: ${{ steps.nanopi.outputs.sha }}
       nanopi_msg: ${{ steps.nanopi_msg.outputs.msg }}
       openwrt_changed: ${{ steps.openwrt.outputs.changed }}
-      openwrt_sha: ${{ steps.openwrt.outputs.sha }}
+      openwrt_version: ${{ steps.openwrt.outputs.version }}
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -71,19 +71,31 @@ jobs:
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Fetch openwrt-25.12 SHA
+      - name: Fetch openwrt-25.12 kernel version
         id: openwrt
         run: |
           RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
             -H "User-Agent: kernel-watcher" \
-            "https://api.github.com/repos/openwrt/openwrt/commits/openwrt-25.12" || true)
-          SHA=$(printf '%s' "$RESP" | jq -r '.sha // empty' 2>/dev/null || true)
-          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
-            echo "::warning::Cannot fetch openwrt-25.12 SHA"
+            "https://api.github.com/repos/openwrt/openwrt/contents/target/linux/generic/kernel-6.12?ref=openwrt-25.12" || true)
+          CONTENT=$(printf '%s' "$RESP" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
+          SUFFIX=$(printf '%s' "$CONTENT" | grep -E '^LINUX_VERSION-6\.12' | head -1 | awk -F'=' '{print $2}' | tr -d ' \r' || true)
+
+          if [ -n "$SUFFIX" ]; then
+            VERSION="6.12${SUFFIX}"
+          else
+            echo "::warning::cannot parse kernel version, falling back to SHA"
+            SHA_RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: kernel-watcher" \
+              "https://api.github.com/repos/openwrt/openwrt/commits/openwrt-25.12" || true)
+            VERSION=$(printf '%s' "$SHA_RESP" | jq -r '.sha // empty' 2>/dev/null || true)
+          fi
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::warning::Cannot fetch openwrt-25.12 version"
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
           git fetch origin master || true
           RECORDED=""
@@ -92,8 +104,8 @@ jobs:
           fi
 
           echo "recorded=$RECORDED"
-          echo "current=$SHA"
-          if [ "$RECORDED" = "$SHA" ]; then
+          echo "current=$VERSION"
+          if [ "$RECORDED" = "$VERSION" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -125,8 +137,7 @@ jobs:
       - name: Trigger R5S build
         if: needs.check.outputs.openwrt_changed == 'true'
         run: |
-          echo "Triggering build-r5s-openwrt.yml (openwrt-25.12 updated)"
-          echo "openwrt SHA: ${{ needs.check.outputs.openwrt_sha }}"
+          echo "Triggering build-r5s-openwrt.yml (openwrt-25.12 kernel: ${{ needs.check.outputs.openwrt_version }})"
           gh workflow run build-r5s-openwrt.yml \
             -f replace_existing=false \
             --repo "$GITHUB_REPOSITORY"
@@ -137,7 +148,7 @@ jobs:
           NANOPI_SHA: ${{ needs.check.outputs.nanopi_sha }}
           NANOPI_MSG: ${{ needs.check.outputs.nanopi_msg }}
           OPENWRT_CHANGED: ${{ needs.check.outputs.openwrt_changed }}
-          OPENWRT_SHA: ${{ needs.check.outputs.openwrt_sha }}
+          OPENWRT_VERSION: ${{ needs.check.outputs.openwrt_version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -156,8 +167,8 @@ jobs:
             } > .kernel-version
           fi
 
-          if [ "$OPENWRT_CHANGED" = "true" ] && [ -n "$OPENWRT_SHA" ]; then
-            echo "$OPENWRT_SHA" > .openwrt-25.12-version
+          if [ "$OPENWRT_CHANGED" = "true" ] && [ -n "$OPENWRT_VERSION" ]; then
+            echo "$OPENWRT_VERSION" > .openwrt-25.12-version
           fi
 
           git add .kernel-version .openwrt-25.12-version 2>/dev/null || git add -A
