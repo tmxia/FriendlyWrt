@@ -177,7 +177,8 @@ jobs:
           )
           echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
           echo "config hash: $CFG_HASH"
-          echo "cache suffix: openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG_HASH}"
+          echo "base/ccache key: openwrt-25.12-linux-6.12.${KV}"
+          echo "full cache key:  openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG_HASH}"
 
           sudo mkdir -p /workdir/ccache
           sudo chown -R $USER:$GROUPS /workdir/ccache
@@ -193,11 +194,11 @@ jobs:
           CFG="${{ steps.setup.outputs.cfg_hash }}"
 
           TAG_FULL="${BASE_FULL}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG}"
-          TAG_BASE="${BASE_BASE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
+          TAG_BASE="${BASE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
           echo "hit=none" >> "$GITHUB_OUTPUT"
 
-          echo "=== try full cache (firmware stage) ==="
+          echo "=== try full cache (firmware stage, per-config) ==="
           echo "  tag: $TAG_FULL"
           docker rm -f r5s_tmp 2>/dev/null || true
           if docker pull "$TAG_FULL" 2>/dev/null; then
@@ -216,7 +217,7 @@ jobs:
           fi
 
           echo ""
-          echo "=== try base cache (compile base stage) ==="
+          echo "=== try base cache (compile base stage, kernel-agnostic to config) ==="
           echo "  tag: $TAG_BASE"
           docker rm -f r5s_tmp 2>/dev/null || true
           if docker pull "$TAG_BASE" 2>/dev/null; then
@@ -245,8 +246,7 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
           KV="${{ steps.setup.outputs.kernel }}"
-          CFG="${{ steps.setup.outputs.cfg_hash }}"
-          TAG="${BASE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
+          TAG="${BASE}:openwrt-25.12-linux-6.12.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           mkdir -p /workdir/ccache
@@ -348,7 +348,6 @@ jobs:
         if: success() && !cancelled()
         env:
           KV: ${{ steps.setup.outputs.kernel }}
-          CFG: ${{ steps.setup.outputs.cfg_hash }}
           RESTORE_HIT: ${{ steps.restore_build.outputs.hit }}
         run: |
           set -e -o pipefail
@@ -372,8 +371,8 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
-          BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
-          CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}-cfg${CFG}"
+          BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
+          CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
           echo ""
           echo "===== packing base cache ====="
