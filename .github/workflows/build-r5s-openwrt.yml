@@ -152,6 +152,27 @@ jobs:
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
           echo ""
+          echo "===== restore git mtime ====="
+          cd /workdir/openwrt
+          find . -name ".git" -type d | while read -r gitdir; do
+            repo_dir=$(dirname "$gitdir")
+            echo "-> $repo_dir"
+            cd "/workdir/openwrt/$repo_dir"
+            git log --format=%at --name-only | perl -ane '
+              if (/^(\d+)$/) { $t = $1; }
+              elsif (/^(\S+)$/) {
+                $f = $1;
+                if (-e $f && !-d $f && !$seen{$f}) {
+                  utime($t, $t, $f);
+                  $seen{$f} = 1;
+                }
+              }
+            '
+            cd /workdir/openwrt
+          done
+          echo "git mtime restored"
+
+          echo ""
           echo "===== detect kernel version ====="
           cd /workdir/openwrt
           KV=$(grep -h '^LINUX_VERSION-6\.12 = ' include/kernel-version.mk \
@@ -204,15 +225,21 @@ jobs:
           if docker pull "$TAG_FULL" 2>/dev/null; then
             echo "FULL CACHE HIT"
             docker create --name r5s_tmp "$TAG_FULL" /bin/true >/dev/null
-            docker export r5s_tmp | tar -xf - -C /workdir/openwrt
+            docker export r5s_tmp | tar -xpf - -C /workdir/openwrt
             docker rm r5s_tmp >/dev/null
             echo "hit=full" >> "$GITHUB_OUTPUT"
             echo ""
             echo "=== restored sizes ==="
             cd /workdir/openwrt
-            for d in staging_dir build_dir bin; do
+            for d in staging_dir build_dir bin dl; do
               [ -e "$d" ] && echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
             done
+            echo ""
+            echo "=== revert dl/ mtime ==="
+            if [ -d /workdir/openwrt/dl ]; then
+              find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
+              echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
+            fi
             exit 0
           fi
 
@@ -223,17 +250,23 @@ jobs:
           if docker pull "$TAG_BASE" 2>/dev/null; then
             echo "BASE CACHE HIT"
             docker create --name r5s_tmp "$TAG_BASE" /bin/true >/dev/null
-            docker export r5s_tmp | tar -xf - -C /workdir/openwrt
+            docker export r5s_tmp | tar -xpf - -C /workdir/openwrt
             docker rm r5s_tmp >/dev/null
             echo "hit=base" >> "$GITHUB_OUTPUT"
             echo ""
             echo "=== restored sizes ==="
             cd /workdir/openwrt
             for d in staging_dir/host staging_dir/toolchain-* staging_dir/target-* \
-                     build_dir/host build_dir/toolchain-*; do
+                     build_dir/host build_dir/toolchain-* dl; do
               [ -e "$d" ] || continue
               echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
             done
+            echo ""
+            echo "=== revert dl/ mtime ==="
+            if [ -d /workdir/openwrt/dl ]; then
+              find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
+              echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
+            fi
             exit 0
           fi
 
@@ -260,7 +293,7 @@ jobs:
 
           echo "CCACHE HIT"
           docker create --name r5s_ccache_tmp "$TAG" /bin/true >/dev/null
-          docker export r5s_ccache_tmp | tar -xf - -C /workdir
+          docker export r5s_ccache_tmp | tar -xpf - -C /workdir
           docker rm r5s_ccache_tmp >/dev/null
 
           CC_SIZE=$(du -sh /workdir/ccache 2>/dev/null | awk '{print $1}')
@@ -368,20 +401,31 @@ jobs:
             exit 0
           fi
 
+          echo ""
+          echo "===== revert dl/ mtime ====="
+          if [ -d dl ]; then
+            find dl -type f | xargs -r touch -t 200001010000
+            echo "  dl/ reverted: $(find dl -type f | wc -l) files"
+          fi
+
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
           BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
           CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
+          TAR_INPUTS=(build_dir staging_dir)
+          [ -d dl ] && TAR_INPUTS+=(dl)
+
           echo ""
           echo "===== packing base cache ====="
+          echo "  inputs: ${TAR_INPUTS[*]}"
           T0=$(date +%s)
           docker rmi "$BASE_TAG" 2>/dev/null || true
           tar -cf - \
             --exclude='build_dir/toolchain-*/linux-*' \
             --exclude='build_dir/target-*/linux-*' \
-            build_dir staging_dir | docker import - "$BASE_TAG"
+            "${TAR_INPUTS[@]}" | docker import - "$BASE_TAG"
           B_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  packed in $(( $(date +%s) - T0 ))s, size: $((B_SIZE / 1024 / 1024))MB"
 
@@ -476,14 +520,25 @@ jobs:
             echo "full cache was used, skip save"
           else
             echo ""
+            echo "===== revert dl/ mtime ====="
+            if [ -d dl ]; then
+              find dl -type f | xargs -r touch -t 200001010000
+              echo "  dl/ reverted: $(find dl -type f | wc -l) files"
+            fi
+
+            TAR_INPUTS=(build_dir staging_dir bin)
+            [ -d dl ] && TAR_INPUTS+=(dl)
+
+            echo ""
             echo "===== packing full cache (firmware stage) ====="
+            echo "  inputs: ${TAR_INPUTS[*]}"
             T0=$(date +%s)
             docker rmi "$FULL_TAG" 2>/dev/null || true
 
             tar -cf - \
               --exclude='build_dir/toolchain-*/linux-*' \
               --exclude='build_dir/target-*/linux-*' \
-              build_dir staging_dir bin | docker import - "$FULL_TAG"
+              "${TAR_INPUTS[@]}" | docker import - "$FULL_TAG"
 
             F_SIZE=$(docker image inspect "$FULL_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
             echo "  packed in $(( $(date +%s) - T0 ))s, size: $((F_SIZE / 1024 / 1024))MB"
