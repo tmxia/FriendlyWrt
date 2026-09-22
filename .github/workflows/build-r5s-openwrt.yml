@@ -393,7 +393,8 @@ jobs:
 
           [ -z "$KM" ] && KM="6.12"
 
-          IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$|staging_dir/host/stamp/\.(zstd|flock|libdeflate|pkgconf|xz|tar|patch|m4)_"
+          IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$|staging_dir/host/stamp/\.(zstd|flock|libdeflate|pkgconf|xz|tar|patch|m4|gmp|mpfr|mpc|isl|flex|bison|m4|autoconf|automake|libtool|cmake|ninja|meson|pkg-config|python3|perl|coreutils|findutils|sed|grep|gawk|bash|make|diffutils|makedepend|bc|bzip2|gzip|zlib|libressl|openssl|ca-certificates|rsync|unzip|zip|wget|curl|git|svn|quilt)_"
+
           CHANGED=$(find build_dir staging_dir -type f -newer /workdir/base_compilation_marker -path "*/stamp/*" 2>/dev/null | \
                     grep -E -v "$IGNORE_PATTERN" | wc -l)
           echo "changed stamp files: $CHANGED"
@@ -433,11 +434,18 @@ jobs:
           tar -czf - \
             --exclude='build_dir/toolchain-*/linux-*' \
             --exclude='build_dir/target-*/linux-*' \
+            --exclude='*/linux-6.12.*' \
+            --exclude='*/linux-6.13.*' \
+            --exclude='*/linux-6.14.*' \
+            --exclude='*/linux-6.15.*' \
+            --exclude='*/linux-6.16.*' \
+            --exclude='*/linux-6.17.*' \
+            --exclude='*/linux-6.18.*' \
             build_dir staging_dir dl | docker import - "$BASE_TAG"
           echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
           IMG_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-          echo "  image size: $((IMG_SIZE / 1024 / 1024))MB"
+          echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
 
           echo ""
           echo "===== pushing ====="
@@ -471,7 +479,7 @@ jobs:
 
           echo "===== make (no V=s) ====="
           T0=$(date +%s)
-          make -j$(nproc) > /tmp/build.log 2>&1
+          timeout 4h make -j$(nproc) > /tmp/build.log 2>&1
           BUILD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
           set -e
@@ -482,10 +490,11 @@ jobs:
             if [ "$BUILD_RESULT" -gt 128 ]; then
               SIG=$((BUILD_RESULT - 128))
               [ "$SIG" = "9" ] && echo "SIGKILL (likely OOM)"
+              [ "$SIG" = "15" ] && echo "SIGTERM (timeout 4h)"
               free -h
               sudo dmesg 2>/dev/null | grep -i -E "out of memory|oom-kill" | tail -20 || true
             fi
-            make -j1 V=s 2>&1 | tail -500
+            timeout 10m make -j1 V=s 2>&1 | tail -500
             exit 1
           fi
 
@@ -519,7 +528,7 @@ jobs:
             echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
             IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-            echo "  image size: $((IMG_SIZE / 1024 / 1024))MB"
+            echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
 
             echo ""
             echo "===== pushing ====="
