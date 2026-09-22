@@ -172,13 +172,13 @@ jobs:
         id: restore_build
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE_FULL="ghcr.io/${REPO_LOWER}/r5s-fullcache"
-          BASE_BUILD="ghcr.io/${REPO_LOWER}/r5s-buildcache"
+          BASE_FULL="ghcr.io/${REPO_LOWER}/r5s-full-cache"
+          BASE_BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           KV="${{ steps.setup.outputs.kernel }}"
           OW_HASH="${{ steps.setup.outputs.ow_hash }}"
 
           TAG_FULL="${BASE_FULL}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}"
-          TAG_BUILD="${BASE_BUILD}:openwrt-25.12-linux-6.12.${KV}"
+          TAG_BASE="${BASE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
           echo "hit=none" >> "$GITHUB_OUTPUT"
 
@@ -202,11 +202,11 @@ jobs:
 
           echo ""
           echo "=== try base cache (compile base stage) ==="
-          echo "  tag: $TAG_BUILD"
+          echo "  tag: $TAG_BASE"
           docker rm -f r5s_tmp 2>/dev/null || true
-          if docker pull "$TAG_BUILD" 2>/dev/null; then
+          if docker pull "$TAG_BASE" 2>/dev/null; then
             echo "BASE CACHE HIT"
-            docker create --name r5s_tmp "$TAG_BUILD" >/dev/null
+            docker create --name r5s_tmp "$TAG_BASE" >/dev/null
             docker export r5s_tmp | tar -xf - -C /workdir/openwrt
             docker rm r5s_tmp >/dev/null
             echo "hit=base" >> "$GITHUB_OUTPUT"
@@ -353,33 +353,33 @@ jobs:
           fi
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BUILD_BASE="ghcr.io/${REPO_LOWER}/r5s-buildcache"
+          BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
-          BUILD_TAG="${BUILD_BASE}:openwrt-25.12-linux-6.12.${KV}"
+          BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
           CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
           echo ""
-          echo "===== packing build cache ====="
+          echo "===== packing base cache ====="
           T0=$(date +%s)
-          docker rmi "$BUILD_TAG" 2>/dev/null || true
+          docker rmi "$BASE_TAG" 2>/dev/null || true
           tar -cf - \
             --exclude='build_dir/toolchain-*/linux-*' \
             --exclude='build_dir/target-*/linux-*' \
-            build_dir staging_dir | docker import - "$BUILD_TAG"
-          B_SIZE=$(docker image inspect "$BUILD_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
+            build_dir staging_dir | docker import - "$BASE_TAG"
+          B_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  packed in $(( $(date +%s) - T0 ))s, size: $((B_SIZE / 1024 / 1024))MB"
 
-          echo "===== pushing build cache ====="
+          echo "===== pushing base cache ====="
           T0=$(date +%s)
           for attempt in 1 2 3; do
-            if docker push "$BUILD_TAG" >/dev/null 2>&1; then
+            if docker push "$BASE_TAG" >/dev/null 2>&1; then
               echo "  pushed in $(( $(date +%s) - T0 ))s"
               break
             fi
             echo "  attempt $attempt failed, retrying..."
             sleep 5
           done
-          docker rmi "$BUILD_TAG" 2>/dev/null || true
+          docker rmi "$BASE_TAG" 2>/dev/null || true
 
           echo ""
           echo "===== packing ccache ====="
@@ -452,7 +452,7 @@ jobs:
           cd /workdir/openwrt
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          FULL_BASE="ghcr.io/${REPO_LOWER}/r5s-fullcache"
+          FULL_BASE="ghcr.io/${REPO_LOWER}/r5s-full-cache"
           FULL_TAG="${FULL_BASE}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}"
 
           if [ "$RESTORE_HIT" = "full" ]; then
@@ -543,8 +543,8 @@ jobs:
             rm -f "$ALL"
           }
 
-          prune_prefix "r5s-fullcache" "openwrt-25.12-"
-          prune_prefix "r5s-buildcache" "openwrt-25.12-linux-6.12."
+          prune_prefix "r5s-full-cache" "openwrt-25.12-"
+          prune_prefix "r5s-base-cache" "openwrt-25.12-linux-6.12."
           prune_prefix "r5s-ccache"     "openwrt-25.12-linux-6.12."
 
           echo ""
