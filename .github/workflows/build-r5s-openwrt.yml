@@ -198,80 +198,50 @@ jobs:
           )
           echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
           echo "config hash: $CFG_HASH"
-          echo "base/ccache key: openwrt-25.12-linux-6.12.${KV}"
-          echo "full cache key:  openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG_HASH}"
+          echo "base key:    openwrt-25.12-linux-6.12.${KV}"
+          echo "ccache key:  openwrt-25.12-linux-6.12.${KV}"
 
           sudo mkdir -p /workdir/ccache
           sudo chown -R $USER:$GROUPS /workdir/ccache
 
-      - name: Restore build cache
-        id: restore_build
+      - name: Restore base cache
+        id: restore_base
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE_FULL="ghcr.io/${REPO_LOWER}/r5s-full-cache"
-          BASE_BASE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           KV="${{ steps.setup.outputs.kernel }}"
-          OW_HASH="${{ steps.setup.outputs.ow_hash }}"
-          CFG="${{ steps.setup.outputs.cfg_hash }}"
+          TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
 
-          TAG_FULL="${BASE_FULL}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG}"
-          TAG_BASE="${BASE_BASE}:openwrt-25.12-linux-6.12.${KV}"
+          echo "hit=false" >> "$GITHUB_OUTPUT"
 
-          echo "hit=none" >> "$GITHUB_OUTPUT"
-
-          echo "=== try full cache (firmware stage, per-config) ==="
-          echo "  tag: $TAG_FULL"
+          echo "=== base cache: $TAG ==="
           docker rm -f r5s_tmp 2>/dev/null || true
-          if docker pull "$TAG_FULL" 2>/dev/null; then
-            echo "FULL CACHE HIT"
-            docker create --name r5s_tmp "$TAG_FULL" /bin/true >/dev/null
-            docker export r5s_tmp | tar -xpf - -C /workdir/openwrt
-            docker rm r5s_tmp >/dev/null
-            echo "hit=full" >> "$GITHUB_OUTPUT"
-            echo ""
-            echo "=== restored sizes ==="
-            cd /workdir/openwrt
-            for d in staging_dir build_dir bin dl; do
-              [ -e "$d" ] && echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
-            done
-            echo ""
-            echo "=== revert dl/ mtime ==="
-            if [ -d /workdir/openwrt/dl ]; then
-              find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
-              echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
-            fi
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "BASE CACHE MISS"
             exit 0
           fi
 
-          echo ""
-          echo "=== try base cache (compile base stage, kernel-agnostic to config) ==="
-          echo "  tag: $TAG_BASE"
-          docker rm -f r5s_tmp 2>/dev/null || true
-          if docker pull "$TAG_BASE" 2>/dev/null; then
-            echo "BASE CACHE HIT"
-            docker create --name r5s_tmp "$TAG_BASE" /bin/true >/dev/null
-            docker export r5s_tmp | tar -xpf - -C /workdir/openwrt
-            docker rm r5s_tmp >/dev/null
-            echo "hit=base" >> "$GITHUB_OUTPUT"
-            echo ""
-            echo "=== restored sizes ==="
-            cd /workdir/openwrt
-            for d in staging_dir/host staging_dir/toolchain-* staging_dir/target-* \
-                     build_dir/host build_dir/toolchain-* dl; do
-              [ -e "$d" ] || continue
-              echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
-            done
-            echo ""
-            echo "=== revert dl/ mtime ==="
-            if [ -d /workdir/openwrt/dl ]; then
-              find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
-              echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
-            fi
-            exit 0
-          fi
+          echo "BASE CACHE HIT"
+          docker create --name r5s_tmp "$TAG" /bin/true >/dev/null
+          docker export r5s_tmp | tar -xpf - -C /workdir/openwrt
+          docker rm r5s_tmp >/dev/null
+          echo "hit=true" >> "$GITHUB_OUTPUT"
 
           echo ""
-          echo "=== CACHE MISS (cold start) ==="
+          echo "=== restored sizes ==="
+          cd /workdir/openwrt
+          for d in staging_dir/host staging_dir/toolchain-* staging_dir/target-* \
+                   build_dir/host build_dir/toolchain-* dl; do
+            [ -e "$d" ] || continue
+            echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
+          done
+
+          echo ""
+          echo "=== revert dl/ mtime ==="
+          if [ -d /workdir/openwrt/dl ]; then
+            find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
+            echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
+          fi
 
       - name: Restore ccache
         id: restore_ccache
@@ -381,22 +351,17 @@ jobs:
         if: success() && !cancelled()
         env:
           KV: ${{ steps.setup.outputs.kernel }}
-          RESTORE_HIT: ${{ steps.restore_build.outputs.hit }}
+          RESTORE_HIT: ${{ steps.restore_base.outputs.hit }}
         run: |
           set -e -o pipefail
           cd /workdir/openwrt
-
-          if [ "$RESTORE_HIT" = "full" ]; then
-            echo "full cache was used, skip base save"
-            exit 0
-          fi
 
           IGNORE_PATTERN="staging_dir/host/stamp/\.tools_compile_|staging_dir/target-[^/]+/stamp/\.target_prereq$"
           CHANGED=$(find build_dir staging_dir -type f -newer /workdir/base_compilation_marker -path "*/stamp/*" 2>/dev/null | \
                     grep -E -v "$IGNORE_PATTERN" | wc -l)
           echo "changed stamp files: $CHANGED"
 
-          if [ "$RESTORE_HIT" = "base" ] && [ "$CHANGED" -eq 0 ]; then
+          if [ "$RESTORE_HIT" = "true" ] && [ "$CHANGED" -eq 0 ]; then
             echo "base cache is complete and up-to-date, skip save"
             exit 0
           fi
@@ -410,9 +375,7 @@ jobs:
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
-          CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
           BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-6.12.${KV}"
-          CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
           TAR_INPUTS=(build_dir staging_dir)
           [ -d dl ] && TAR_INPUTS+=(dl)
@@ -440,30 +403,6 @@ jobs:
             sleep 5
           done
           docker rmi "$BASE_TAG" 2>/dev/null || true
-
-          echo ""
-          echo "===== packing ccache ====="
-          if [ -d /workdir/ccache ] && [ "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
-            T0=$(date +%s)
-            docker rmi "$CCACHE_TAG" 2>/dev/null || true
-            tar -cf - -C /workdir ccache | docker import - "$CCACHE_TAG"
-            C_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-            echo "  packed in $(( $(date +%s) - T0 ))s, size: $((C_SIZE / 1024 / 1024))MB"
-
-            echo "===== pushing ccache ====="
-            T0=$(date +%s)
-            for attempt in 1 2 3; do
-              if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
-                echo "  pushed in $(( $(date +%s) - T0 ))s"
-                break
-              fi
-              echo "  attempt $attempt failed, retrying..."
-              sleep 5
-            done
-            docker rmi "$CCACHE_TAG" 2>/dev/null || true
-          else
-            echo "  ccache empty, skip"
-          fi
 
       - name: Compile firmware
         id: compile_firmware
@@ -499,61 +438,41 @@ jobs:
           echo "=== ccache stats ==="
           ccache -s -d /workdir/ccache 2>/dev/null || ccache -s 2>/dev/null || true
 
-      - name: Save firmware-stage cache
-        if: success() && !cancelled()
+      - name: Save ccache and prune
+        if: always() && !cancelled()
         env:
           KV: ${{ steps.setup.outputs.kernel }}
-          OW_HASH: ${{ steps.setup.outputs.ow_hash }}
-          CFG: ${{ steps.setup.outputs.cfg_hash }}
-          RESTORE_HIT: ${{ steps.restore_build.outputs.hit }}
           KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e -o pipefail
-          cd /workdir/openwrt
 
-          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          FULL_BASE="ghcr.io/${REPO_LOWER}/r5s-full-cache"
-          FULL_TAG="${FULL_BASE}:openwrt-25.12-${OW_HASH}-linux-6.12.${KV}-cfg${CFG}"
+          echo ""
+          echo "===== packing ccache ====="
+          if [ -d /workdir/ccache ] && [ "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
+            REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+            CCACHE_BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
+            CCACHE_TAG="${CCACHE_BASE}:openwrt-25.12-linux-6.12.${KV}"
 
-          if [ "$RESTORE_HIT" = "full" ]; then
-            echo "full cache was used, skip save"
-          else
-            echo ""
-            echo "===== revert dl/ mtime ====="
-            if [ -d dl ]; then
-              find dl -type f | xargs -r touch -t 200001010000
-              echo "  dl/ reverted: $(find dl -type f | wc -l) files"
-            fi
-
-            TAR_INPUTS=(build_dir staging_dir bin)
-            [ -d dl ] && TAR_INPUTS+=(dl)
-
-            echo ""
-            echo "===== packing full cache (firmware stage) ====="
-            echo "  inputs: ${TAR_INPUTS[*]}"
             T0=$(date +%s)
-            docker rmi "$FULL_TAG" 2>/dev/null || true
+            docker rmi "$CCACHE_TAG" 2>/dev/null || true
+            tar -cf - -C /workdir ccache | docker import - "$CCACHE_TAG"
+            C_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
+            echo "  packed in $(( $(date +%s) - T0 ))s, size: $((C_SIZE / 1024 / 1024))MB"
 
-            tar -cf - \
-              --exclude='build_dir/toolchain-*/linux-*' \
-              --exclude='build_dir/target-*/linux-*' \
-              "${TAR_INPUTS[@]}" | docker import - "$FULL_TAG"
-
-            F_SIZE=$(docker image inspect "$FULL_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-            echo "  packed in $(( $(date +%s) - T0 ))s, size: $((F_SIZE / 1024 / 1024))MB"
-
-            echo "===== pushing full cache ====="
+            echo "===== pushing ccache ====="
             T0=$(date +%s)
             for attempt in 1 2 3; do
-              if docker push "$FULL_TAG" >/dev/null 2>&1; then
+              if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
                 echo "  pushed in $(( $(date +%s) - T0 ))s"
                 break
               fi
               echo "  attempt $attempt failed, retrying..."
               sleep 5
             done
-            docker rmi "$FULL_TAG" 2>/dev/null || true
+            docker rmi "$CCACHE_TAG" 2>/dev/null || true
+          else
+            echo "  ccache empty, skip"
           fi
 
           echo ""
@@ -615,7 +534,6 @@ jobs:
             rm -f "$ALL"
           }
 
-          prune_prefix "r5s-full-cache" "openwrt-25.12-"
           prune_prefix "r5s-base-cache" "openwrt-25.12-linux-6.12."
           prune_prefix "r5s-ccache"     "openwrt-25.12-linux-6.12."
 
