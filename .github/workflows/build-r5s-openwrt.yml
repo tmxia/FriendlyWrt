@@ -344,12 +344,14 @@ jobs:
           fi
 
           echo ""
-          echo "=== ccache tuning ==="
-          ccache --max-size=10G || true
-          ccache --set-config=compression=true || true
-          ccache --set-config=hash_dir=false || true
-          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime || true
-          ccache --zero-stats || true
+          echo "=== ccache tuning (target dir: /workdir/ccache) ==="
+          export CCACHE_DIR=/workdir/ccache
+          ccache --max-size=10G
+          ccache --set-config=compression=true
+          ccache --set-config=hash_dir=false
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          ccache --zero-stats
+          echo "--- effective config ---"
           ccache -p 2>/dev/null | grep -E 'max_size|compression|hash_dir|sloppiness' || true
 
       - name: Prepare build configuration
@@ -529,7 +531,7 @@ jobs:
 
           echo ""
           echo "=== ccache stats ==="
-          ccache -s -d /workdir/ccache 2>/dev/null || ccache -s 2>/dev/null || true
+          CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
 
       - name: Save target cache
         if: success() && !cancelled() && steps.restore_target.outputs.hit != 'true'
@@ -632,6 +634,9 @@ jobs:
             CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
 
             docker rmi "$CCACHE_TAG" 2>/dev/null || true
+
+            echo "  ccache stats before pack:"
+            CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
 
             T0=$(date +%s)
             if tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
