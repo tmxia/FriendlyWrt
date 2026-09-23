@@ -334,7 +334,6 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
 
-          # ---------- 定位内核与 DTB ----------
           KERNEL_IMAGE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 1 -name "Image" 2>/dev/null | head -1))
           DTB_FILE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1))
 
@@ -355,7 +354,6 @@ jobs:
           KCONFIG_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
           [ -n "$KCONFIG_REL" ] && cp "$KCONFIG_REL" "$OUT/boot/config-${KERNEL_RELEASE}"
 
-          # ---------- 生成 FIT kernel.img (LZMA, 与原厂字节级一致) ----------
           echo ""
           echo "===== generate FIT kernel.img (lzma, dict=8MiB, lc=1,lp=2,pb=2) ====="
           cd "$OUT/boot"
@@ -363,19 +361,7 @@ jobs:
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
-          # Python lzma.compress 默认把 uncompressed size 写为 ff ff ..（未知）
-          # U-Boot 需要这个字段来分配输出缓冲区，必须手动改成真实大小
-          python3 -c "
-import lzma, struct
-d = open('Image','rb').read()
-flt = [{'id': lzma.FILTER_LZMA1, 'dict_size': 8*1024*1024, 'lc': 1, 'lp': 2, 'pb': 2}]
-o = bytearray(lzma.compress(d, format=lzma.FORMAT_ALONE, filters=flt))
-# LZMA alone 头部 13 字节: 1 (prop) + 4 (dict_size) + 8 (uncompressed_size)
-o[5:13] = struct.pack('<Q', len(d))
-open('Image.lzma','wb').write(bytes(o))
-print(f'compressed: {len(o)} bytes ({len(o)/1024/1024:.2f} MiB)')
-print(f'uncompressed: {len(d)} bytes')
-"
+          python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
 
           echo "----- sizes -----"
           ls -lh Image Image.lzma rk3568-nanopi-r5s.dtb
@@ -443,7 +429,6 @@ print(f'uncompressed: {len(d)} bytes')
           cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
 
-          # ---------- dtb ----------
           find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
           find "$PWD"/staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
 
@@ -454,7 +439,6 @@ print(f'uncompressed: {len(d)} bytes')
 
           tar -czf "$OUT/dtb-rockchip-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/dtb" .
 
-          # ---------- modules ----------
           MODULES_DIR=$(find "$PWD"/staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
           if [ -n "$MODULES_DIR" ]; then
             echo "Using modules from $MODULES_DIR"
