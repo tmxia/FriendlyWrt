@@ -314,10 +314,6 @@ jobs:
           make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
 
           echo ""
-          echo "===== 检查 build_dir 里的 Image 文件 ====="
-          find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 2 -name "Image" 2>/dev/null -exec ls -lh {} \;
-          echo ""
-
           echo "===== ccache stats ====="
           ccache -s -d /workdir/ccache 2>/dev/null || true
 
@@ -338,22 +334,11 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
 
-          # ---------- 优先用 strip 后的 Image ----------
-          STRIPPED_IMAGE=$(find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 1 -name "Image" 2>/dev/null | head -1)
-          FALLBACK_IMAGE=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 -name "Image" 2>/dev/null | head -1)
-
-          if [ -n "$STRIPPED_IMAGE" ]; then
-            KERNEL_IMAGE_ABS=$(readlink -f "$STRIPPED_IMAGE")
-            echo "使用 strip 后的 Image: $KERNEL_IMAGE_ABS"
-          elif [ -n "$FALLBACK_IMAGE" ]; then
-            KERNEL_IMAGE_ABS=$(readlink -f "$FALLBACK_IMAGE")
-            echo "回退到未 strip 的 Image: $KERNEL_IMAGE_ABS"
-          else
-            echo "Kernel Image not found"
-            exit 1
-          fi
-
+          # ---------- 定位内核与 DTB ----------
+          KERNEL_IMAGE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 1 -name "Image" 2>/dev/null | head -1))
           DTB_FILE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1))
+
+          [ -z "$KERNEL_IMAGE_ABS" ] && { echo "Kernel Image not found"; exit 1; }
           [ -z "$DTB_FILE_ABS" ] && { echo "R5S DTB not found"; exit 1; }
 
           echo "KERNEL_IMAGE=$KERNEL_IMAGE_ABS"
@@ -370,14 +355,23 @@ jobs:
           KCONFIG_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
           [ -n "$KCONFIG_REL" ] && cp "$KCONFIG_REL" "$OUT/boot/config-${KERNEL_RELEASE}"
 
-          # ---------- 生成 FIT kernel.img (raw + hash) ----------
+          # ---------- 生成 FIT kernel.img (LZMA 压缩) ----------
           echo ""
-          echo "===== generate FIT kernel.img (raw Image + hash) ====="
+          echo "===== generate FIT kernel.img (lzma compressed) ====="
           cd "$OUT/boot"
 
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
-          ls -lh Image rk3568-nanopi-r5s.dtb
+
+          # LZMA 压缩 Image，与原厂 kernel.img 一致
+          xz --format=lzma -9 -c Image > Image.lzma
+
+          echo "----- sizes -----"
+          ls -lh Image Image.lzma rk3568-nanopi-r5s.dtb
+          echo ""
+          echo "----- Image.lzma header (should start with 6d 00 00 80) -----"
+          hexdump -C Image.lzma | head -2
+          echo "------------------"
 
           : > kernel.its
           printf '%s\n' '/dts-v1/;' >> kernel.its
@@ -389,11 +383,11 @@ jobs:
           printf '%s\n' '    images {' >> kernel.its
           printf '%s\n' '        kernel-1 {' >> kernel.its
           printf '%s\n' '            description = "ARM64 OpenWrt Linux";' >> kernel.its
-          printf '%s\n' '            data = /incbin/("Image");' >> kernel.its
+          printf '%s\n' '            data = /incbin/("Image.lzma");' >> kernel.its
           printf '%s\n' '            type = "kernel";' >> kernel.its
           printf '%s\n' '            arch = "arm64";' >> kernel.its
           printf '%s\n' '            os = "linux";' >> kernel.its
-          printf '%s\n' '            compression = "none";' >> kernel.its
+          printf '%s\n' '            compression = "lzma";' >> kernel.its
           printf '%s\n' '            load = <0x02080000>;' >> kernel.its
           printf '%s\n' '            entry = <0x02080000>;' >> kernel.its
           printf '%s\n' '            hash-1 {' >> kernel.its
@@ -427,13 +421,13 @@ jobs:
           echo "----------------------"
 
           mkimage -f kernel.its kernel.img
-          rm -f kernel.its rk3568-nanopi-r5s.dtb
+          rm -f kernel.its rk3568-nanopi-r5s.dtb Image.lzma
 
           echo ""
           echo "kernel.img generated:"
           ls -lh kernel.img
           file kernel.img
-          strings kernel.img | head -10
+          strings kernel.img | head -5
 
           cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
