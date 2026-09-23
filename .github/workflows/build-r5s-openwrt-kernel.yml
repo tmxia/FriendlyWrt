@@ -212,7 +212,7 @@ jobs:
           echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=${OW_HASH}"
 
           echo ""
-          echo "===== cache tags (与固件流程对齐) ====="
+          echo "===== cache tags (与固件流程共享) ====="
           echo "base cache:   openwrt-25.12-linux-${KERNEL_MAJOR}"
           echo "target cache: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
           echo "ccache:       openwrt-25.12-linux-${KERNEL_MAJOR}"
@@ -261,7 +261,7 @@ jobs:
             echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
           fi
 
-      - name: Restore kernel target cache
+      - name: Restore target cache
         id: restore_target
         env:
           KV: ${{ steps.setup.outputs.kernel }}
@@ -269,23 +269,23 @@ jobs:
           OW: ${{ steps.setup.outputs.ow_hash }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          TARGET_CACHE="ghcr.io/${REPO_LOWER}/r5s-kernel-target-cache"
+          TARGET_CACHE="ghcr.io/${REPO_LOWER}/r5s-target-cache"
           [ -z "$KM" ] && KM="6.12"
           TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
-          echo "=== kernel target cache: $TAG ==="
+          echo "=== target cache: $TAG ==="
 
-          docker rm -f r5s_ktgt_tmp 2>/dev/null || true
+          docker rm -f r5s_tgt_tmp 2>/dev/null || true
           if ! docker pull "$TAG" 2>/dev/null; then
-            echo "KERNEL TARGET CACHE MISS"
+            echo "TARGET CACHE MISS"
             exit 0
           fi
 
-          echo "KERNEL TARGET CACHE HIT"
-          docker create --name r5s_ktgt_tmp "$TAG" /bin/true >/dev/null
-          docker export r5s_ktgt_tmp | tar -xpf - -C /workdir/openwrt
-          docker rm r5s_ktgt_tmp >/dev/null
+          echo "TARGET CACHE HIT"
+          docker create --name r5s_tgt_tmp "$TAG" /bin/true >/dev/null
+          docker export r5s_tgt_tmp | tar -xpf - -C /workdir/openwrt
+          docker rm r5s_tgt_tmp >/dev/null
           docker rmi "$TAG" -f 2>/dev/null || true
           echo "hit=true" >> "$GITHUB_OUTPUT"
 
@@ -293,7 +293,8 @@ jobs:
           echo "=== restored target sizes ==="
           cd /workdir/openwrt
           for d in build_dir/target-aarch64_generic_musl \
-                   staging_dir/target-aarch64_generic_musl; do
+                   staging_dir/target-aarch64_generic_musl \
+                   bin/targets/rockchip/armv8; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -328,12 +329,14 @@ jobs:
           fi
 
           echo ""
-          echo "=== ccache tuning ==="
-          ccache --max-size=10G || true
-          ccache --set-config=compression=true || true
-          ccache --set-config=hash_dir=false || true
-          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime || true
-          ccache --zero-stats || true
+          echo "=== ccache tuning (target dir: /workdir/ccache) ==="
+          export CCACHE_DIR=/workdir/ccache
+          ccache --max-size=10G
+          ccache --set-config=compression=true
+          ccache --set-config=hash_dir=false
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          ccache --zero-stats
+          echo "--- effective config ---"
           ccache -p 2>/dev/null | grep -E 'max_size|compression|hash_dir|sloppiness' || true
 
       - name: Prepare build configuration
@@ -409,6 +412,13 @@ jobs:
             exit 1
           fi
           echo "  took $(( $(date +%s) - T0 ))s"
+
+          echo "===== make download (full, prefetch for target) ====="
+          T0=$(date +%s)
+          timeout 50m make download -j8 > /tmp/full_dl.log 2>&1 || {
+            echo "  partial download, will retry in compile stage"
+          }
+          echo "  took $(( $(date +%s) - T0 ))s, dl files: $(find dl -maxdepth 1 -type f | wc -l)"
 
           echo ""
           echo "===== compile base OK ====="
@@ -499,9 +509,9 @@ jobs:
 
           echo ""
           echo "=== ccache stats ==="
-          ccache -s -d /workdir/ccache 2>/dev/null || true
+          CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
 
-      - name: Save kernel target cache
+      - name: Save target cache
         if: success() && !cancelled() && steps.restore_target.outputs.hit != 'true'
         env:
           KV: ${{ steps.setup.outputs.kernel }}
@@ -513,7 +523,7 @@ jobs:
           [ -z "$KM" ] && KM="6.12"
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-kernel-target-cache:ow${OW}-linux-${KM}.${KV}"
+          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}"
 
           echo "===== clean redundant kernel versions (target) ====="
           shopt -s nullglob
@@ -539,12 +549,13 @@ jobs:
           echo "  done"
 
           echo ""
-          echo "===== packing kernel target cache ====="
+          echo "===== packing target cache ====="
           docker rmi "$TARGET_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
           for d in build_dir/target-aarch64_generic_musl \
-                   staging_dir/target-aarch64_generic_musl; do
+                   staging_dir/target-aarch64_generic_musl \
+                   bin/targets/rockchip/armv8; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
@@ -552,7 +563,7 @@ jobs:
 
           T0=$(date +%s)
           if ! tar -czf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
-            echo "::warning::kernel target cache pack/import failed"
+            echo "::warning::target cache pack/import failed"
             exit 0
           fi
           echo "  packed+imported in $(( $(date +%s) - T0 ))s"
@@ -572,7 +583,7 @@ jobs:
             echo "  attempt $attempt failed, retrying..."
             sleep 10
           done
-          [ "$PUSHED" = "true" ] || echo "::warning::kernel target cache push failed"
+          [ "$PUSHED" = "true" ] || echo "::warning::target cache push failed"
 
           docker rmi "$TARGET_TAG" -f 2>/dev/null || true
           docker builder prune -a -f 2>/dev/null || true
@@ -605,23 +616,18 @@ jobs:
           echo "DTB_FILE=$DTB_FILE_ABS"
           ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
 
-          # ============================================================
-          # 生成 FIT kernel.img（对齐固件流程 mkimage -f auto）
-          # ============================================================
           echo ""
           echo "===== generate FIT kernel.img (mkimage -f auto) ====="
           cd "$OUT/boot"
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
-          # 1) LZMA 压缩（dict=8MiB, lc=1, lp=2, pb=2）
           python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
 
           echo "----- Image.lzma header -----"
           hexdump -C Image.lzma | head -2
           echo "-------------------------------"
 
-          # 2) mkimage -f auto 生成 FIT（自动带 hash-1 crc32 + hash-2 sha1）
           mkimage -f auto \
             -A arm64 -O linux -T kernel -C lzma \
             -a 0x02080000 -e 0x02080000 \
@@ -647,7 +653,6 @@ jobs:
           cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
 
-          # ---------- dtb ----------
           find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
           find "$PWD"/staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
 
@@ -658,7 +663,6 @@ jobs:
 
           tar -czf "$OUT/dtb-rockchip-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/dtb" .
 
-          # ---------- modules ----------
           MODULES_DIR=$(find "$PWD"/staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
           if [ -n "$MODULES_DIR" ]; then
             echo "Using modules from $MODULES_DIR"
@@ -730,6 +734,9 @@ jobs:
             CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
 
             docker rmi "$CCACHE_TAG" 2>/dev/null || true
+
+            echo "  ccache stats before pack:"
+            CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
 
             T0=$(date +%s)
             if tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
@@ -870,9 +877,9 @@ jobs:
             rm -f "$ALL"
           }
 
-          prune_package "r5s-base-cache"          "openwrt-25.12-linux-" 3
-          prune_package "r5s-kernel-target-cache" "ow"                   3
-          prune_package "r5s-ccache"              "openwrt-25.12-linux-" 3
+          prune_package "r5s-base-cache"   "openwrt-25.12-linux-" 3
+          prune_package "r5s-target-cache" "ow"                   3
+          prune_package "r5s-ccache"       "openwrt-25.12-linux-" 3
 
           echo ""
           echo "=== prune done ==="
