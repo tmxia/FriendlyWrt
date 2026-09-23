@@ -210,19 +210,6 @@ jobs:
           echo "kernel_major=$KERNEL_MAJOR" >> "$GITHUB_OUTPUT"
           echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
           echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=${OW_HASH}"
-
-          echo ""
-          echo "===== compute config hash ====="
-          CFG_HASH=$(
-            {
-              cat "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" 2>/dev/null || true
-              cat "$GITHUB_WORKSPACE/${{ env.DIY_SH }}" 2>/dev/null || true
-              find "$GITHUB_WORKSPACE/scripts" -type f -exec cat {} \; 2>/dev/null || true
-              git -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null || true
-            } | sha256sum | cut -c1-16
-          )
-          echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
-          echo "config hash: $CFG_HASH"
           echo ""
           echo "base cache tag:          openwrt-25.12-linux-${KERNEL_MAJOR}"
           echo "kernel target cache tag: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
@@ -422,6 +409,13 @@ jobs:
           fi
           echo "  took $(( $(date +%s) - T0 ))s"
 
+          echo "===== make download (full, prefetch for target) ====="
+          T0=$(date +%s)
+          timeout 50m make download -j8 > /tmp/full_dl.log 2>&1 || {
+            echo "  partial download, will retry in firmware stage"
+          }
+          echo "  took $(( $(date +%s) - T0 ))s, dl files: $(find dl -maxdepth 1 -type f | wc -l)"
+
           echo ""
           echo "===== compile base OK ====="
 
@@ -486,7 +480,7 @@ jobs:
           docker rmi "$BASE_TAG" -f 2>/dev/null || true
           echo "  cleaned"
 
-      - name: Compile kernel modules and generate official kernel.bin
+      - name: Compile kernel and generate kernel.img
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
@@ -514,39 +508,6 @@ jobs:
           echo "===== install kernel/modules to staging ====="
           make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
           make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
-
-          echo ""
-          echo "===== 为官方 image 生成准备 rootfs 占位目录 ====="
-          TARGET_DIR="$PWD/build_dir/target-aarch64_generic_musl"
-          ROOTFS_DIR="$TARGET_DIR/root-rockchip"
-          mkdir -p "$ROOTFS_DIR"
-          if [ -z "$(ls -A "$ROOTFS_DIR" 2>/dev/null)" ]; then
-            echo "placeholder" > "$ROOTFS_DIR/.placeholder"
-            echo "  created placeholder in $ROOTFS_DIR"
-          else
-            echo "  rootfs dir already has content: $(ls -A "$ROOTFS_DIR" | wc -l) entries"
-          fi
-
-          echo ""
-          echo "===== make target/install (生成官方 kernel.bin) ====="
-          T0=$(date +%s)
-          make target/install -j$(nproc) -k > /tmp/target_install.log 2>&1 || true
-          echo "  took $(( $(date +%s) - T0 ))s"
-          tail -60 /tmp/target_install.log || true
-
-          echo ""
-          echo "===== 查找官方生成的 kernel.bin ====="
-          FOUND=0
-          for f in $(find "$PWD"/bin/targets -maxdepth 4 -name "*kernel.bin" -type f 2>/dev/null); do
-            echo "  $f"
-            ls -lh "$f"
-            file "$f" || true
-            strings "$f" | head -8 || true
-            FOUND=1
-          done
-          if [ "$FOUND" = "0" ]; then
-            echo "::warning::kernel.bin not generated; will fallback to manual FIT"
-          fi
 
           echo ""
           echo "=== ccache stats ==="
@@ -652,108 +613,107 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
 
-          OFFICIAL_KERNEL=$(find "$PWD"/bin/targets -maxdepth 4 -name "*nanopi-r5s-kernel.bin" -type f 2>/dev/null | head -1)
-          if [ -z "$OFFICIAL_KERNEL" ]; then
-            OFFICIAL_KERNEL=$(find "$PWD"/bin/targets -maxdepth 4 -name "*kernel.bin" -type f 2>/dev/null | head -1)
-          fi
-
+          KERNEL_IMAGE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 1 -name "Image" 2>/dev/null | head -1))
           DTB_FILE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1))
+
+          [ -z "$KERNEL_IMAGE_ABS" ] && { echo "Kernel Image not found"; exit 1; }
           [ -z "$DTB_FILE_ABS" ] && { echo "R5S DTB not found"; exit 1; }
 
-          if [ -n "$OFFICIAL_KERNEL" ]; then
-            echo ""
-            echo "============================================================"
-            echo "使用 OpenWrt 官方生成的 kernel.bin（与固件流程完全一致）"
-            echo "  source: $OFFICIAL_KERNEL"
-            echo "============================================================"
-            ls -lh "$OFFICIAL_KERNEL"
-            file "$OFFICIAL_KERNEL" || true
-            strings "$OFFICIAL_KERNEL" | head -10 || true
+          echo "KERNEL_IMAGE=$KERNEL_IMAGE_ABS"
+          echo "DTB_FILE=$DTB_FILE_ABS"
+          ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
 
-            cp "$OFFICIAL_KERNEL" "$OUT/boot/kernel.img"
-          else
-            echo ""
-            echo "============================================================"
-            echo "官方 kernel.bin 未生成，回退到手动 FIT 打包"
-            echo "  ITS 结构对齐原厂：hash-1(crc32)+hash-2(sha1)，fdt-1，config-1"
-            echo "============================================================"
-
-            KERNEL_IMAGE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 1 -name "Image" 2>/dev/null | head -1))
-            [ -z "$KERNEL_IMAGE_ABS" ] && { echo "Kernel Image not found"; exit 1; }
-            echo "KERNEL_IMAGE=$KERNEL_IMAGE_ABS"
-            ls -lh "$KERNEL_IMAGE_ABS"
-
-            cd "$OUT/boot"
-            cp "$KERNEL_IMAGE_ABS" Image
-            cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
-
-            python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
-
-            : > kernel.its
-            printf '%s\n' '/dts-v1/;' >> kernel.its
-            printf '%s\n' '' >> kernel.its
-            printf '%s\n' '/ {' >> kernel.its
-            printf '%s\n' '    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";' >> kernel.its
-            printf '%s\n' '    #address-cells = <1>;' >> kernel.its
-            printf '%s\n' '' >> kernel.its
-            printf '%s\n' '    images {' >> kernel.its
-            printf '%s\n' '        kernel-1 {' >> kernel.its
-            printf '%s\n' '            description = "ARM64 OpenWrt Linux";' >> kernel.its
-            printf '%s\n' '            data = /incbin/("Image.lzma");' >> kernel.its
-            printf '%s\n' '            type = "kernel";' >> kernel.its
-            printf '%s\n' '            arch = "arm64";' >> kernel.its
-            printf '%s\n' '            os = "linux";' >> kernel.its
-            printf '%s\n' '            compression = "lzma";' >> kernel.its
-            printf '%s\n' '            load = <0x02080000>;' >> kernel.its
-            printf '%s\n' '            entry = <0x02080000>;' >> kernel.its
-            printf '%s\n' '            hash-1 {' >> kernel.its
-            printf '%s\n' '                algo = "crc32";' >> kernel.its
-            printf '%s\n' '            };' >> kernel.its
-            printf '%s\n' '            hash-2 {' >> kernel.its
-            printf '%s\n' '                algo = "sha1";' >> kernel.its
-            printf '%s\n' '            };' >> kernel.its
-            printf '%s\n' '        };' >> kernel.its
-            printf '%s\n' '        fdt-1 {' >> kernel.its
-            printf '%s\n' '            description = "Rockchip RK3568 NanoPi R5S";' >> kernel.its
-            printf '%s\n' '            data = /incbin/("rk3568-nanopi-r5s.dtb");' >> kernel.its
-            printf '%s\n' '            type = "flat_dt";' >> kernel.its
-            printf '%s\n' '            arch = "arm64";' >> kernel.its
-            printf '%s\n' '            compression = "none";' >> kernel.its
-            printf '%s\n' '            hash-1 {' >> kernel.its
-            printf '%s\n' '                algo = "crc32";' >> kernel.its
-            printf '%s\n' '            };' >> kernel.its
-            printf '%s\n' '            hash-2 {' >> kernel.its
-            printf '%s\n' '                algo = "sha1";' >> kernel.its
-            printf '%s\n' '            };' >> kernel.its
-            printf '%s\n' '        };' >> kernel.its
-            printf '%s\n' '    };' >> kernel.its
-            printf '%s\n' '' >> kernel.its
-            printf '%s\n' '    configurations {' >> kernel.its
-            printf '%s\n' '        default = "config-1";' >> kernel.its
-            printf '%s\n' '        config-1 {' >> kernel.its
-            printf '%s\n' '            description = "OpenWrt friendlyarm_nanopi_r5s";' >> kernel.its
-            printf '%s\n' '            kernel = "kernel-1";' >> kernel.its
-            printf '%s\n' '            fdt = "fdt-1";' >> kernel.its
-            printf '%s\n' '        };' >> kernel.its
-            printf '%s\n' '    };' >> kernel.its
-            printf '%s\n' '};' >> kernel.its
-
-            mkimage -f kernel.its kernel.img
-            rm -f kernel.its rk3568-nanopi-r5s.dtb Image Image.lzma
-
-            echo "kernel.img (fallback):"
-            ls -lh kernel.img
-            file kernel.img
-            strings kernel.img | head -8
-          fi
-
+          # ============================================================
+          # 生成 FIT kernel.img —— 结构对齐 OpenWrt 官方 mkits.sh
+          #   - kernel-1 + fdt-1 两个 image 节点，每个都有 hash-1(crc32) + hash-2(sha1)
+          #   - configuration 名 config-1，description "OpenWrt friendlyarm_nanopi_r5s"
+          #   - 根节点带 timestamp
+          # ============================================================
+          echo ""
+          echo "===== generate FIT kernel.img (lzma, sha1+crc32) ====="
           cd "$OUT/boot"
-          rm -f Image Image.lzma Image.gz vmlinuz-* System.map-* config-* rk3568-nanopi-r5s.dtb 2>/dev/null || true
-          ls -lh
+
+          cp "$KERNEL_IMAGE_ABS" Image
+          cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
+
+          # LZMA 压缩，参数与原厂 kernel.img 一致
+          python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
+
+          echo "----- sizes -----"
+          ls -lh Image Image.lzma rk3568-nanopi-r5s.dtb
+
+          : > kernel.its
+          printf '%s\n' '/dts-v1/;' >> kernel.its
+          printf '%s\n' '' >> kernel.its
+          printf '%s\n' '/ {' >> kernel.its
+          printf '%s\n' '    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";' >> kernel.its
+          printf '%s\n' '    #address-cells = <1>;' >> kernel.its
+          printf '%s\n' '' >> kernel.its
+          printf '%s\n' '    images {' >> kernel.its
+          printf '%s\n' '        kernel-1 {' >> kernel.its
+          printf '%s\n' '            description = "ARM64 OpenWrt Linux";' >> kernel.its
+          printf '%s\n' '            data = /incbin/("Image.lzma");' >> kernel.its
+          printf '%s\n' '            type = "kernel";' >> kernel.its
+          printf '%s\n' '            arch = "arm64";' >> kernel.its
+          printf '%s\n' '            os = "linux";' >> kernel.its
+          printf '%s\n' '            compression = "lzma";' >> kernel.its
+          printf '%s\n' '            load = <0x02080000>;' >> kernel.its
+          printf '%s\n' '            entry = <0x02080000>;' >> kernel.its
+          printf '%s\n' '            hash-1 {' >> kernel.its
+          printf '%s\n' '                algo = "crc32";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '            hash-2 {' >> kernel.its
+          printf '%s\n' '                algo = "sha1";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '        };' >> kernel.its
+          printf '%s\n' '        fdt-1 {' >> kernel.its
+          printf '%s\n' '            description = "Rockchip RK3568 NanoPi R5S";' >> kernel.its
+          printf '%s\n' '            data = /incbin/("rk3568-nanopi-r5s.dtb");' >> kernel.its
+          printf '%s\n' '            type = "flat_dt";' >> kernel.its
+          printf '%s\n' '            arch = "arm64";' >> kernel.its
+          printf '%s\n' '            compression = "none";' >> kernel.its
+          printf '%s\n' '            hash-1 {' >> kernel.its
+          printf '%s\n' '                algo = "crc32";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '            hash-2 {' >> kernel.its
+          printf '%s\n' '                algo = "sha1";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '        };' >> kernel.its
+          printf '%s\n' '    };' >> kernel.its
+          printf '%s\n' '' >> kernel.its
+          printf '%s\n' '    configurations {' >> kernel.its
+          printf '%s\n' '        default = "config-1";' >> kernel.its
+          printf '%s\n' '        config-1 {' >> kernel.its
+          printf '%s\n' '            description = "OpenWrt friendlyarm_nanopi_r5s";' >> kernel.its
+          printf '%s\n' '            kernel = "kernel-1";' >> kernel.its
+          printf '%s\n' '            fdt = "fdt-1";' >> kernel.its
+          printf '%s\n' '        };' >> kernel.its
+          printf '%s\n' '    };' >> kernel.its
+          printf '%s\n' '};' >> kernel.its
+
+          echo "----- kernel.its -----"
+          cat kernel.its
+          echo "----------------------"
+
+          mkimage -f kernel.its kernel.img
+          rm -f kernel.its rk3568-nanopi-r5s.dtb Image Image.lzma
+
+          echo ""
+          echo "kernel.img generated:"
+          ls -lh kernel.img
+          file kernel.img
+          strings kernel.img | head -5
+
+          # 校验 FIT 里是否含 hash-2 和 sha1
+          echo ""
+          echo "=== FIT verification ==="
+          strings kernel.img | grep -c 'hash-2' && echo "  hash-2 present" || echo "  WARN: hash-2 missing"
+          strings kernel.img | grep -c 'sha1'    && echo "  sha1 present"   || echo "  WARN: sha1 missing"
 
           cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
 
+          # ---------- dtb ----------
           find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
           find "$PWD"/staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
 
@@ -764,6 +724,7 @@ jobs:
 
           tar -czf "$OUT/dtb-rockchip-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/dtb" .
 
+          # ---------- modules ----------
           MODULES_DIR=$(find "$PWD"/staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
           if [ -n "$MODULES_DIR" ]; then
             echo "Using modules from $MODULES_DIR"
@@ -984,6 +945,15 @@ jobs:
 
           echo ""
           echo "=== prune done ==="
+
+          echo ""
+          echo "===== final cache inventory ====="
+          for pkg in r5s-base-cache r5s-kernel-target-cache r5s-ccache; do
+            RESP=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                   "https://api.github.com${API_PREFIX}/${pkg}/versions?per_page=100" 2>/dev/null || echo "[]")
+            N=$(echo "$RESP" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "0")
+            echo "  ${pkg}: ${N} versions remaining"
+          done
 
   cleanup_self:
     name: Cleanup workflow history
