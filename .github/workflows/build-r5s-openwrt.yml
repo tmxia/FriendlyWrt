@@ -288,7 +288,6 @@ jobs:
           TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG"    >> "$GITHUB_OUTPUT"
           echo "=== target cache: $TAG ==="
 
           docker rm -f r5s_tgt_tmp 2>/dev/null || true
@@ -569,6 +568,47 @@ jobs:
           done
           shopt -u nullglob
           echo "  done"
+
+          echo ""
+          echo "===== slim target cache (L1+L2) ====="
+          BEFORE=$(du -sb build_dir/target-* staging_dir/target-* 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          echo "  before: $((BEFORE / 1024 / 1024))MB"
+
+          shopt -s nullglob
+
+          for tdir in build_dir/target-*/; do
+            [ -d "$tdir" ] || continue
+
+            echo "  slimming $tdir"
+
+            find "$tdir" -type d \( -name '.git' -o -name '.github' -o -name '.svn' -o -name '.hg' \) \
+              -prune -exec rm -rf {} + 2>/dev/null || true
+
+            find "$tdir" -type d -name '__pycache__' \
+              -prune -exec rm -rf {} + 2>/dev/null || true
+
+            find "$tdir" -type f \( -name '*.pyc' -o -name '*.pyo' \) \
+              -delete 2>/dev/null || true
+
+            find "$tdir" -type f \( -name '*.orig' -o -name '*.rej' \) \
+              -delete 2>/dev/null || true
+
+            for kdir in "$tdir"linux-*/linux-*/; do
+              [ -d "$kdir" ] || continue
+              rm -rf "$kdir/.git"     2>/dev/null || true
+              rm -rf "$kdir/Documentation" 2>/dev/null || true
+              rm -rf "$kdir/tools/perf"    2>/dev/null || true
+              rm -rf "$kdir/tools/testing" 2>/dev/null || true
+              rm -rf "$kdir/samples"       2>/dev/null || true
+              echo "    kernel slimmed: $kdir"
+            done
+          done
+
+          shopt -u nullglob
+
+          AFTER=$(du -sb build_dir/target-* staging_dir/target-* 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          echo "  after:  $((AFTER / 1024 / 1024))MB"
+          echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
 
           echo ""
           echo "===== packing target cache ====="
