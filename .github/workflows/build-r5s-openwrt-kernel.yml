@@ -1,0 +1,365 @@
+name: Build R5S Kernel Upgrade Package
+
+on:
+  watch:
+    types: started
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+  packages: read
+
+concurrency:
+  group: build-r5s-kernel
+  cancel-in-progress: false
+
+env:
+  OPENWRT_VER: '25.12'
+  MODEL_NAME: 'R5S'
+  OPENWRT_BRANCH: 'openwrt-25.12'
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  CONFIG_FILE: 'scripts/r5s.config'
+  DIY_SH: 'scripts/r5s_customize.sh'
+
+jobs:
+  build_kernel:
+    name: Build R5S kernel package
+    runs-on: ubuntu-latest
+    if: github.event.repository.owner.id == github.event.sender.id
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        id: setup
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo mkdir -p /workdir
+          sudo chown -R $USER:$GROUPS /workdir
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/local/.ghcup /opt/az \
+                      /usr/local/share/powershell /opt/microsoft /opt/google \
+                      /opt/pipx /usr/lib/jvm /usr/local/sdkman /usr/local/go \
+                      /usr/local/share/chromium /opt/conda || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile > /dev/null
+          sudo swapon /swapfile
+
+          sudo systemctl stop docker || true
+          sudo mkdir -p /workdir/docker
+          echo '{"data-root": "/workdir/docker"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker || sudo service docker start
+          sleep 3
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache file g++ gawk \
+            gettext git libncurses-dev libssl-dev \
+            python3 python3-dev python3-pip python3-setuptools python3-pyelftools \
+            unzip wget zip zlib1g-dev libelf-dev \
+            subversion flex bison libtool autoconf automake cmake \
+            rsync quilt time jq swig zstd \
+            device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
+            android-sdk-libsparse-utils btrfs-progs
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          echo "===== clone OpenWrt ====="
+          cd /workdir
+          git clone -b ${{ env.OPENWRT_BRANCH }} --single-branch \
+            ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+          echo "===== restore git mtime ====="
+          cd /workdir/openwrt
+          find . -name ".git" -type d | while read -r gitdir; do
+            repo_dir=$(dirname "$gitdir")
+            cd "/workdir/openwrt/$repo_dir"
+            git log --format=%at --name-only | perl -ane '
+              if (/^(\d+)$/) { $t = $1; }
+              elsif (/^(\S+)$/) {
+                $f = $1;
+                if (-e $f && !-d $f && !$seen{$f}) {
+                  utime($t, $t, $f);
+                  $seen{$f} = 1;
+                }
+              }
+            '
+            cd /workdir/openwrt
+          done
+          echo "git mtime restored"
+
+          echo "===== detect kernel version ====="
+          cd /workdir/openwrt
+
+          KERNEL_MAJOR=""
+          KV=""
+
+          DETAILS_FILE=$(ls -t target/linux/generic/kernel-[0-9]*.[0-9]* 2>/dev/null | head -1 || true)
+          if [ -n "$DETAILS_FILE" ]; then
+            KERNEL_MAJOR=$(basename "$DETAILS_FILE" | sed 's/^kernel-//')
+            KV=$(grep -hE "^LINUX_VERSION-${KERNEL_MAJOR//./\\.}[[:space:]]*=" "$DETAILS_FILE" \
+                 | head -1 | awk -F'= ' '{print $2}' | tr -d '.' || true)
+          fi
+
+          if [ -z "$KV" ] || [ -z "$KERNEL_MAJOR" ]; then
+            KERNEL_PATCHVER=$(grep -hE '^KERNEL_PATCHVER[[:space:]]*\??=' include/kernel-version.mk 2>/dev/null \
+                              | head -1 | awk -F'=' '{print $2}' | tr -d ' ' || true)
+            if [ -n "$KERNEL_PATCHVER" ]; then
+              KERNEL_MAJOR="$KERNEL_PATCHVER"
+              DETAILS_FILE="target/linux/generic/kernel-${KERNEL_MAJOR}"
+              if [ -f "$DETAILS_FILE" ]; then
+                KV=$(grep -hE "^LINUX_VERSION-${KERNEL_MAJOR//./\\.}[[:space:]]*=" "$DETAILS_FILE" \
+                     | head -1 | awk -F'= ' '{print $2}' | tr -d '.' || true)
+              fi
+            fi
+          fi
+
+          if [ -z "$KV" ]; then
+            SHORT=$(git rev-parse --short HEAD)
+            KV="commit-${SHORT}"
+            [ -z "$KERNEL_MAJOR" ] && KERNEL_MAJOR="6.12"
+          fi
+
+          echo "kernel_major=$KERNEL_MAJOR" >> "$GITHUB_OUTPUT"
+          echo "kernel_suffix=$KV" >> "$GITHUB_OUTPUT"
+          echo "detected: kernel=${KERNEL_MAJOR}.${KV}"
+
+          sudo mkdir -p /workdir/ccache
+          sudo chown -R $USER:$GROUPS /workdir/ccache
+
+      - name: Restore base cache
+        id: restore_base
+        run: |
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          KV="${{ steps.setup.outputs.kernel_suffix }}"
+          KM="${{ steps.setup.outputs.kernel_major }}"
+          [ -z "$KM" ] && KM="6.12"
+          TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}.${KV}"
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          echo "=== base cache: $TAG ==="
+
+          docker rm -f r5s_kernel_tmp 2>/dev/null || true
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "BASE CACHE MISS"
+            exit 0
+          fi
+
+          echo "BASE CACHE HIT"
+          docker create --name r5s_kernel_tmp "$TAG" /bin/true >/dev/null
+          docker export r5s_kernel_tmp | tar -xpf - -C /workdir/openwrt
+          docker rm r5s_kernel_tmp >/dev/null
+          docker rmi "$TAG" -f 2>/dev/null || true
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+
+          if [ -d /workdir/openwrt/dl ]; then
+            find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
+          fi
+
+      - name: Restore ccache
+        id: restore_ccache
+        run: |
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
+          KV="${{ steps.setup.outputs.kernel_suffix }}"
+          KM="${{ steps.setup.outputs.kernel_major }}"
+          [ -z "$KM" ] && KM="6.12"
+          TAG="${BASE}:openwrt-25.12-linux-${KM}.${KV}"
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          mkdir -p /workdir/ccache
+
+          docker rm -f r5s_kernel_ccache_tmp 2>/dev/null || true
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "CCACHE MISS"
+            exit 0
+          fi
+
+          echo "CCACHE HIT"
+          docker create --name r5s_kernel_ccache_tmp "$TAG" /bin/true >/dev/null
+          docker export r5s_kernel_ccache_tmp | tar -xpf - -C /workdir
+          docker rm r5s_kernel_ccache_tmp >/dev/null
+          docker rmi "$TAG" -f 2>/dev/null || true
+          echo "hit=true" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare build configuration
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
+          ./scripts/feeds update -a 2>&1 | tail -30
+
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
+          ./scripts/feeds install -a 2>&1 | tail -40
+
+          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
+
+          for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
+            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+              echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+          done
+
+          make defconfig
+
+          if ! grep -q '^CONFIG_CCACHE=y' .config; then
+            echo "CONFIG_CCACHE=y" >> .config
+          fi
+          sed -i 's|^CONFIG_CCACHE_DIR=.*|CONFIG_CCACHE_DIR="/workdir/ccache"|' .config
+          grep -q '^CONFIG_CCACHE_DIR=' .config || \
+            echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+
+      - name: Compile kernel and kernel modules
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
+
+          echo "===== make target/linux/compile ====="
+          make target/linux/compile -j$(nproc) > /tmp/kernel_compile.log 2>&1 || {
+            echo "kernel compile failed, retry with V=s"
+            make target/linux/compile -j1 V=s 2>&1 | tail -300
+            exit 1
+          }
+          tail -50 /tmp/kernel_compile.log
+
+          echo "===== make package/kernel/compile ====="
+          make package/kernel/compile -j$(nproc) > /tmp/kmod_compile.log 2>&1 || {
+            echo "kmod compile failed, retry with V=s"
+            make package/kernel/compile -j1 V=s 2>&1 | tail -300
+            exit 1
+          }
+          tail -50 /tmp/kmod_compile.log
+
+          echo "===== install kernel/modules to staging ====="
+          make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
+          make package/kernel/install -j1 > /tmp/kmod_install.log 2>&1 || true
+
+          echo "===== ccache stats ====="
+          ccache -s -d /workdir/ccache 2>/dev/null || true
+
+      - name: Package kernel upgrade files
+        id: package
+        run: |
+          set -e
+          cd /workdir/openwrt
+
+          KERNEL_RELEASE=$(cat build_dir/target-*/linux-*/linux-*/include/config/kernel.release 2>/dev/null | head -1)
+          [ -z "$KERNEL_RELEASE" ] && KERNEL_RELEASE=$(ls staging_dir/target-*/root-*/lib/modules/ 2>/dev/null | head -1)
+          [ -z "$KERNEL_RELEASE" ] && { echo "Cannot determine kernel release"; exit 1; }
+
+          echo "KERNEL_RELEASE=$KERNEL_RELEASE"
+          echo "kernel_release=$KERNEL_RELEASE" >> "$GITHUB_OUTPUT"
+
+          OUT=/workdir/kernel-packages
+          rm -rf "$OUT"
+          mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
+
+          # ---------- boot ----------
+          KERNEL_IMAGE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 \( -name "Image" -o -name "Image.gz" \) 2>/dev/null | head -1)
+          if [ -n "$KERNEL_IMAGE" ]; then
+            cp "$KERNEL_IMAGE" "$OUT/boot/"
+            cp "$KERNEL_IMAGE" "$OUT/boot/vmlinuz-${KERNEL_RELEASE}"
+          fi
+
+          SYSTEM_MAP=$(find build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name "System.map" 2>/dev/null | head -1)
+          [ -n "$SYSTEM_MAP" ] && cp "$SYSTEM_MAP" "$OUT/boot/System.map-${KERNEL_RELEASE}"
+
+          KCONFIG=$(find build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
+          [ -n "$KCONFIG" ] && cp "$KCONFIG" "$OUT/boot/config-${KERNEL_RELEASE}"
+
+          tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" -C "$OUT/boot" .
+
+          # ---------- dtb ----------
+          find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
+          find staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
+
+          if [ -z "$(ls -A "$OUT/dtb")" ]; then
+            echo "No R5S DTB found"
+            exit 1
+          fi
+
+          tar -czf "$OUT/dtb-rockchip-${KERNEL_RELEASE}.tar.gz" -C "$OUT/dtb" .
+
+          # ---------- modules ----------
+          MODULES_DIR=$(find staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
+          if [ -n "$MODULES_DIR" ]; then
+            echo "Using modules from $MODULES_DIR"
+            mkdir -p "$OUT/modules/lib/modules"
+            cp -a "$MODULES_DIR" "$OUT/modules/lib/modules/"
+          else
+            echo "staging modules not found, collecting .ko from build_dir"
+            mkdir -p "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel"
+            find build_dir/target-*/linux-*/linux-*/ -name "*.ko" | while read -r ko; do
+              rel="${ko#*linux-*/}"
+              rel=$(echo "$rel" | sed 's|^linux-[^/]*/||')
+              mkdir -p "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel/$(dirname "$rel")"
+              cp "$ko" "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel/$rel"
+            done
+            depmod -a -b "$OUT/modules" "${KERNEL_RELEASE}" 2>/dev/null || true
+          fi
+
+          tar -czf "$OUT/modules-${KERNEL_RELEASE}.tar.gz" -C "$OUT/modules" .
+
+          echo "===== packages ====="
+          ls -lh "$OUT"/*.tar.gz
+
+      - name: Create Release and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd /workdir/kernel-packages
+          KREL="${{ steps.package.outputs.kernel_release }}"
+          BASE_TAG="R5S-Kernel-OpenWrt-25.12-${KREL}-$(date +%Y%m%d)"
+          TAG="$BASE_TAG"
+          N=1
+          while gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; do
+            TAG="${BASE_TAG}-${N}"
+            N=$((N+1))
+          done
+
+          gh release create "$TAG" *.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "R5S kernel upgrade package. Kernel: ${KREL}"
+
+          echo "Release created: $TAG"
+          echo "下载地址："
+          echo "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/"
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r5s-kernel-${{ steps.package.outputs.kernel_release }}
+          path: /workdir/kernel-packages/*.tar.gz
+          retention-days: 30
+
+  cleanup_self:
+    name: Cleanup workflow history
+    runs-on: ubuntu-latest
+    needs: [build_kernel]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 0
+          retain_days: 0
+          delete_workflow_pattern: "Build R5S Kernel Upgrade Package"
+          repository: ${{ github.repository }}
