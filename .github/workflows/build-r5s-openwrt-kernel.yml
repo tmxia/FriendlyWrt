@@ -605,81 +605,44 @@ jobs:
           echo "DTB_FILE=$DTB_FILE_ABS"
           ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
 
+          # ============================================================
+          # 生成 FIT kernel.img（对齐固件流程 mkimage -f auto）
+          # ============================================================
+          echo ""
+          echo "===== generate FIT kernel.img (mkimage -f auto) ====="
           cd "$OUT/boot"
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
-          # LZMA 压缩（dict=8MiB, lc=1, lp=2, pb=2，与 OpenWrt 官方 mkits.sh 一致）
+          # 1) LZMA 压缩（dict=8MiB, lc=1, lp=2, pb=2）
           python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
 
           echo "----- Image.lzma header -----"
           hexdump -C Image.lzma | head -2
           echo "-------------------------------"
 
-          # 生成 FIT ITS（对齐 OpenWrt 官方 mkits.sh 结构：每个 image 带 hash-1 crc32 + hash-2 sha1）
-          : > kernel.its
-          printf '%s\n' '/dts-v1/;' >> kernel.its
-          printf '%s\n' '' >> kernel.its
-          printf '%s\n' '/ {' >> kernel.its
-          printf '%s\n' '    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";' >> kernel.its
-          printf '%s\n' '    #address-cells = <1>;' >> kernel.its
-          printf '%s\n' '' >> kernel.its
-          printf '%s\n' '    images {' >> kernel.its
-          printf '%s\n' '        kernel-1 {' >> kernel.its
-          printf '%s\n' "            description = \"ARM64 OpenWrt Linux-${KERNEL_RELEASE}\";" >> kernel.its
-          printf '%s\n' '            data = /incbin/("Image.lzma");' >> kernel.its
-          printf '%s\n' '            type = "kernel";' >> kernel.its
-          printf '%s\n' '            arch = "arm64";' >> kernel.its
-          printf '%s\n' '            os = "linux";' >> kernel.its
-          printf '%s\n' '            compression = "lzma";' >> kernel.its
-          printf '%s\n' '            load = <0x02080000>;' >> kernel.its
-          printf '%s\n' '            entry = <0x02080000>;' >> kernel.its
-          printf '%s\n' '            hash-1 {' >> kernel.its
-          printf '%s\n' '                algo = "crc32";' >> kernel.its
-          printf '%s\n' '            };' >> kernel.its
-          printf '%s\n' '            hash-2 {' >> kernel.its
-          printf '%s\n' '                algo = "sha1";' >> kernel.its
-          printf '%s\n' '            };' >> kernel.its
-          printf '%s\n' '        };' >> kernel.its
-          printf '%s\n' '        fdt-1 {' >> kernel.its
-          printf '%s\n' '            description = "Rockchip RK3568 NanoPi R5S";' >> kernel.its
-          printf '%s\n' '            data = /incbin/("rk3568-nanopi-r5s.dtb");' >> kernel.its
-          printf '%s\n' '            type = "flat_dt";' >> kernel.its
-          printf '%s\n' '            arch = "arm64";' >> kernel.its
-          printf '%s\n' '            compression = "none";' >> kernel.its
-          printf '%s\n' '            hash-1 {' >> kernel.its
-          printf '%s\n' '                algo = "crc32";' >> kernel.its
-          printf '%s\n' '            };' >> kernel.its
-          printf '%s\n' '            hash-2 {' >> kernel.its
-          printf '%s\n' '                algo = "sha1";' >> kernel.its
-          printf '%s\n' '            };' >> kernel.its
-          printf '%s\n' '        };' >> kernel.its
-          printf '%s\n' '    };' >> kernel.its
-          printf '%s\n' '' >> kernel.its
-          printf '%s\n' '    configurations {' >> kernel.its
-          printf '%s\n' '        default = "config-1";' >> kernel.its
-          printf '%s\n' '        config-1 {' >> kernel.its
-          printf '%s\n' '            description = "OpenWrt friendlyarm_nanopi_r5s";' >> kernel.its
-          printf '%s\n' '            kernel = "kernel-1";' >> kernel.its
-          printf '%s\n' '            fdt = "fdt-1";' >> kernel.its
-          printf '%s\n' '        };' >> kernel.its
-          printf '%s\n' '    };' >> kernel.its
-          printf '%s\n' '};' >> kernel.its
+          # 2) mkimage -f auto 生成 FIT（自动带 hash-1 crc32 + hash-2 sha1）
+          mkimage -f auto \
+            -A arm64 -O linux -T kernel -C lzma \
+            -a 0x02080000 -e 0x02080000 \
+            -d Image.lzma \
+            -b rk3568-nanopi-r5s.dtb \
+            kernel.img
 
-          echo "----- kernel.its -----"
-          cat kernel.its
-          echo "----------------------"
-
-          mkimage -f kernel.its kernel.img
-          rm -f kernel.its Image.lzma rk3568-nanopi-r5s.dtb Image
+          rm -f Image Image.lzma rk3568-nanopi-r5s.dtb
 
           echo ""
           echo "kernel.img generated:"
-          ls -lh
+          ls -lh kernel.img
           file kernel.img
           echo ""
-          echo "=== 检查 hash-2 与 sha1 是否写入 ==="
-          strings kernel.img | grep -E 'hash-2|sha1' || echo "WARNING: hash-2 / sha1 not found!"
+          echo "=== 关键校验：必须找到 hash-2 和 sha1 ==="
+          if strings kernel.img | grep -q 'hash-2' && strings kernel.img | grep -q 'sha1'; then
+            echo "OK: hash-2 / sha1 均存在"
+          else
+            echo "FAIL: 缺少 hash-2 或 sha1"
+            exit 1
+          fi
 
           cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
