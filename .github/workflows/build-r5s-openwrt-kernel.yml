@@ -355,22 +355,23 @@ jobs:
           KCONFIG_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
           [ -n "$KCONFIG_REL" ] && cp "$KCONFIG_REL" "$OUT/boot/config-${KERNEL_RELEASE}"
 
-          # ---------- 生成 FIT kernel.img (LZMA 压缩) ----------
+          # ---------- 生成 FIT kernel.img (LZMA, 参数与原厂一致) ----------
           echo ""
-          echo "===== generate FIT kernel.img (lzma compressed) ====="
+          echo "===== generate FIT kernel.img (lzma, dict=8MiB, lc=1,lp=2,pb=2) ====="
           cd "$OUT/boot"
 
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
-          # LZMA 压缩 Image，与原厂 kernel.img 一致
-          xz --format=lzma -9 -c Image > Image.lzma
+          # 用 Python lzma 模块压缩：FORMAT_ALONE + dict=8MiB + lc=1/lp=2/pb=2
+          # 与原厂 kernel.img 内的 LZMA 完全一致（首字节 6d，字典 8MB，含 uncompressed size）
+          python3 -c "import lzma; d=open('Image','rb').read(); flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}]; o=lzma.compress(d, format=lzma.FORMAT_ALONE, filters=flt); open('Image.lzma','wb').write(o); print(f'compressed: {len(o)} bytes ({len(o)/1024/1024:.2f} MiB)')"
 
           echo "----- sizes -----"
           ls -lh Image Image.lzma rk3568-nanopi-r5s.dtb
           echo ""
-          echo "----- Image.lzma header (should start with 6d 00 00 80) -----"
-          hexdump -C Image.lzma | head -2
+          echo "----- Image.lzma header (expect: 6d 00 00 80 00 08 c8 14) -----"
+          hexdump -C Image.lzma | head -2 || true
           echo "------------------"
 
           : > kernel.its
