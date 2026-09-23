@@ -313,20 +313,13 @@ jobs:
           make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
           make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
 
-          echo "===== make target/install (generate official kernel.bin) ====="
-          make target/install -j$(nproc) > /tmp/target_install.log 2>&1 || {
-            echo "target/install failed, showing verbose output"
-            make target/install -j1 V=s 2>&1 | tail -300
-          }
-          tail -80 /tmp/target_install.log || true
-
           echo ""
-          echo "===== generated kernel.bin ====="
-          find bin/targets -type f -name "*kernel.bin" 2>/dev/null | sed 's/^/  /' || true
-          for f in $(find bin/targets -type f -name "*kernel.bin" 2>/dev/null); do
-            ls -lh "$f"
-            file "$f"
-          done
+          echo "===== verify stripped Image ====="
+          STRIPPED_IMAGE=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 -name "Image" | head -1)
+          if [ -n "$STRIPPED_IMAGE" ]; then
+            ls -lh "$STRIPPED_IMAGE"
+            file "$STRIPPED_IMAGE"
+          fi
 
           echo ""
           echo "===== ccache stats ====="
@@ -349,103 +342,21 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
 
-          # ---------- 优先使用 OpenWrt 官方生成的 kernel.bin ----------
-          OFFICIAL_KERNEL=$(find "$PWD"/bin/targets -type f -name "*nanopi-r5s-kernel.bin" 2>/dev/null | head -1)
-          [ -z "$OFFICIAL_KERNEL" ] && OFFICIAL_KERNEL=$(find "$PWD"/bin/targets -type f -name "*kernel.bin" 2>/dev/null | head -1)
+          # ---------- 定位内核与 DTB ----------
+          KERNEL_IMAGE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 -name "Image" 2>/dev/null | head -1))
+          DTB_FILE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1))
 
-          if [ -n "$OFFICIAL_KERNEL" ]; then
-            echo ""
-            echo "===== Using official kernel.bin ====="
-            echo "Path: $OFFICIAL_KERNEL"
-            ls -lh "$OFFICIAL_KERNEL"
-            file "$OFFICIAL_KERNEL"
-            strings "$OFFICIAL_KERNEL" | head -10
-            cp "$OFFICIAL_KERNEL" "$OUT/boot/kernel.img"
-          else
-            echo ""
-            echo "===== Official kernel.bin not found, fallback to mkimage ====="
+          [ -z "$KERNEL_IMAGE_ABS" ] && { echo "Kernel Image not found"; exit 1; }
+          [ -z "$DTB_FILE_ABS" ] && { echo "R5S DTB not found"; exit 1; }
 
-            KERNEL_IMAGE_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 -name "Image" 2>/dev/null | head -1)
-            DTB_FILE_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
-            [ -z "$KERNEL_IMAGE_REL" ] && { echo "Kernel Image not found"; exit 1; }
-            [ -z "$DTB_FILE_REL" ] && { echo "R5S DTB not found"; exit 1; }
+          echo "KERNEL_IMAGE=$KERNEL_IMAGE_ABS"
+          echo "DTB_FILE=$DTB_FILE_ABS"
+          ls -lh "$KERNEL_IMAGE_ABS"
 
-            KERNEL_IMAGE_ABS=$(readlink -f "$KERNEL_IMAGE_REL")
-            DTB_FILE_ABS=$(readlink -f "$DTB_FILE_REL")
-            echo "KERNEL_IMAGE=$KERNEL_IMAGE_ABS"
-            echo "DTB_FILE=$DTB_FILE_ABS"
-
-            cd "$OUT/boot"
-
-            gzip -9 -c "$KERNEL_IMAGE_ABS" > Image.gz
-            cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
-            ls -lh Image.gz
-
-            cat > kernel.its <<'ITS_EOF'
-          /dts-v1/;
-
-          / {
-              description = "ARM64 OpenWrt FIT (Flattened Image Tree)";
-              #address-cells = <1>;
-
-              images {
-                  kernel-1 {
-                      description = "ARM64 OpenWrt Linux";
-                      data = /incbin/("Image.gz");
-                      type = "kernel";
-                      arch = "arm64";
-                      os = "linux";
-                      compression = "gzip";
-                      load = <0x02080000>;
-                      entry = <0x02080000>;
-                      hash-1 { algo = "crc32"; };
-                  };
-                  fdt-rockchip-rk3568-nanopi-r5s {
-                      description = "Rockchip RK3568 NanoPi R5S";
-                      data = /incbin/("rk3568-nanopi-r5s.dtb");
-                      type = "flat_dt";
-                      arch = "arm64";
-                      compression = "none";
-                      hash-1 { algo = "crc32"; };
-                  };
-              };
-
-              configurations {
-                  default = "conf-1";
-                  conf-1 {
-                      description = "OpenWrt NanoPi R5S";
-                      kernel = "kernel-1";
-                      fdt = "fdt-rockchip-rk3568-nanopi-r5s";
-                  };
-              };
-          };
-          ITS_EOF
-
-            sed -i 's/^          //' kernel.its
-            echo "----- kernel.its -----"
-            cat kernel.its
-            echo "----------------------"
-
-            mkimage -f kernel.its kernel.img
-            rm -f kernel.its Image.gz rk3568-nanopi-r5s.dtb
-
-            echo ""
-            echo "kernel.img generated (fallback):"
-            ls -lh kernel.img
-            file kernel.img
-
-            cd /workdir/openwrt
-          fi
-
-          # ---------- 其余辅助文件（Image / dtb / System.map / config） ----------
-          KERNEL_IMAGE_REL2=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 -name "Image" 2>/dev/null | head -1)
-          if [ -n "$KERNEL_IMAGE_REL2" ]; then
-            cp "$KERNEL_IMAGE_REL2" "$OUT/boot/Image"
-            cp "$KERNEL_IMAGE_REL2" "$OUT/boot/vmlinuz-${KERNEL_RELEASE}"
-          fi
-
-          DTB_FILE_REL2=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
-          [ -n "$DTB_FILE_REL2" ] && cp "$DTB_FILE_REL2" "$OUT/boot/"
+          # 复制 Image / dtb 到 boot 目录（供 extlinux 回退 / 调试）
+          cp "$KERNEL_IMAGE_ABS" "$OUT/boot/Image"
+          cp "$KERNEL_IMAGE_ABS" "$OUT/boot/vmlinuz-${KERNEL_RELEASE}"
+          cp "$DTB_FILE_ABS" "$OUT/boot/"
 
           SYSTEM_MAP_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name "System.map" 2>/dev/null | head -1)
           [ -n "$SYSTEM_MAP_REL" ] && cp "$SYSTEM_MAP_REL" "$OUT/boot/System.map-${KERNEL_RELEASE}"
@@ -453,10 +364,75 @@ jobs:
           KCONFIG_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
           [ -n "$KCONFIG_REL" ] && cp "$KCONFIG_REL" "$OUT/boot/config-${KERNEL_RELEASE}"
 
+          # ---------- 生成 FIT kernel.img ----------
+          # 关键: kernel 数据必须 gzip 压缩，compression = "gzip"
+          # 与原厂 kernel.img (5MB) 保持一致
           echo ""
-          echo "===== boot/ contents ====="
-          ls -lh "$OUT/boot/"
+          echo "===== generate FIT kernel.img ====="
+          cd "$OUT/boot"
 
+          gzip -9 -c Image > Image.gz
+          cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
+          ls -lh Image Image.gz rk3568-nanopi-r5s.dtb
+
+          cat > kernel.its <<'ITS_EOF'
+/dts-v1/;
+
+/ {
+    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";
+    #address-cells = <1>;
+
+    images {
+        kernel-1 {
+            description = "ARM64 OpenWrt Linux";
+            data = /incbin/("Image.gz");
+            type = "kernel";
+            arch = "arm64";
+            os = "linux";
+            compression = "gzip";
+            load = <0x02080000>;
+            entry = <0x02080000>;
+            hash-1 {
+                algo = "crc32";
+            };
+        };
+        fdt-rockchip-rk3568-nanopi-r5s {
+            description = "Rockchip RK3568 NanoPi R5S";
+            data = /incbin/("rk3568-nanopi-r5s.dtb");
+            type = "flat_dt";
+            arch = "arm64";
+            compression = "none";
+            hash-1 {
+                algo = "crc32";
+            };
+        };
+    };
+
+    configurations {
+        default = "conf-1";
+        conf-1 {
+            description = "OpenWrt NanoPi R5S";
+            kernel = "kernel-1";
+            fdt = "fdt-rockchip-rk3568-nanopi-r5s";
+        };
+    };
+};
+ITS_EOF
+
+          echo "----- kernel.its -----"
+          cat kernel.its
+          echo "----------------------"
+
+          mkimage -f kernel.its kernel.img
+          rm -f kernel.its Image.gz rk3568-nanopi-r5s.dtb
+
+          echo ""
+          echo "kernel.img generated:"
+          ls -lh kernel.img
+          file kernel.img
+          strings kernel.img | head -10
+
+          cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
 
           # ---------- dtb ----------
