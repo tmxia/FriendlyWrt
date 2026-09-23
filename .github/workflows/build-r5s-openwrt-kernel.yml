@@ -224,9 +224,9 @@ jobs:
           echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
           echo "config hash: $CFG_HASH"
           echo ""
-          echo "base cache tag:          openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
-          echo "kernel target cache tag: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}-cfg${CFG_HASH}"
-          echo "ccache tag:              openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
+          echo "base cache tag:          openwrt-25.12-linux-${KERNEL_MAJOR}"
+          echo "kernel target cache tag: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
+          echo "ccache tag:              openwrt-25.12-linux-${KERNEL_MAJOR}"
 
           sudo mkdir -p /workdir/ccache
           sudo chown -R $USER:$GROUPS /workdir/ccache
@@ -234,13 +234,12 @@ jobs:
       - name: Restore base cache
         id: restore_base
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           [ -z "$KM" ] && KM="6.12"
-          TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}.${KV}"
+          TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           echo "=== base cache: $TAG ==="
@@ -279,12 +278,11 @@ jobs:
           KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
           OW: ${{ steps.setup.outputs.ow_hash }}
-          CFG: ${{ steps.setup.outputs.cfg_hash }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           TARGET_CACHE="ghcr.io/${REPO_LOWER}/r5s-kernel-target-cache"
           [ -z "$KM" ] && KM="6.12"
-          TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}-cfg${CFG}"
+          TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           echo "=== kernel target cache: $TAG ==="
@@ -315,13 +313,12 @@ jobs:
       - name: Restore ccache
         id: restore_ccache
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
           [ -z "$KM" ] && KM="6.12"
-          TAG="${BASE}:openwrt-25.12-linux-${KM}.${KV}"
+          TAG="${BASE}:openwrt-25.12-linux-${KM}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           mkdir -p /workdir/ccache
@@ -431,7 +428,6 @@ jobs:
       - name: Save base cache
         if: success() && !cancelled() && steps.restore_base.outputs.hit != 'true'
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
         run: |
           set -e -o pipefail
@@ -445,7 +441,7 @@ jobs:
           fi
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}.${KV}"
+          BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}"
 
           echo ""
           echo "===== packing base cache ====="
@@ -521,9 +517,6 @@ jobs:
 
           echo ""
           echo "===== 为官方 image 生成准备 rootfs 占位目录 ====="
-          # 内核流程只编内核，没有跑 rootfs；OpenWrt 的 image 生成会试图打包 root.squashfs，
-          # 我们需要给 rootfs 目录一个占位，让 root.squashfs 能生成（即使是空的），
-          # 这样才能继续走到 kernel.bin 的生成步骤。
           TARGET_DIR="$PWD/build_dir/target-aarch64_generic_musl"
           ROOTFS_DIR="$TARGET_DIR/root-rockchip"
           mkdir -p "$ROOTFS_DIR"
@@ -565,14 +558,13 @@ jobs:
           KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
           OW: ${{ steps.setup.outputs.ow_hash }}
-          CFG: ${{ steps.setup.outputs.cfg_hash }}
         run: |
           set -e -o pipefail
           cd /workdir/openwrt
           [ -z "$KM" ] && KM="6.12"
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-kernel-target-cache:ow${OW}-linux-${KM}.${KV}-cfg${CFG}"
+          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-kernel-target-cache:ow${OW}-linux-${KM}.${KV}"
 
           echo "===== clean redundant kernel versions (target) ====="
           shopt -s nullglob
@@ -660,9 +652,6 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
 
-          # ============================================================
-          # 优先使用 OpenWrt 官方生成的 kernel.bin（与固件流程完全一致）
-          # ============================================================
           OFFICIAL_KERNEL=$(find "$PWD"/bin/targets -maxdepth 4 -name "*nanopi-r5s-kernel.bin" -type f 2>/dev/null | head -1)
           if [ -z "$OFFICIAL_KERNEL" ]; then
             OFFICIAL_KERNEL=$(find "$PWD"/bin/targets -maxdepth 4 -name "*kernel.bin" -type f 2>/dev/null | head -1)
@@ -685,7 +674,8 @@ jobs:
           else
             echo ""
             echo "============================================================"
-            echo "官方 kernel.bin 未生成，回退到手动 mkits.sh + LZMA"
+            echo "官方 kernel.bin 未生成，回退到手动 FIT 打包"
+            echo "  ITS 结构对齐原厂：hash-1(crc32)+hash-2(sha1)，fdt-1，config-1"
             echo "============================================================"
 
             KERNEL_IMAGE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 1 -name "Image" 2>/dev/null | head -1))
@@ -719,8 +709,11 @@ jobs:
             printf '%s\n' '            hash-1 {' >> kernel.its
             printf '%s\n' '                algo = "crc32";' >> kernel.its
             printf '%s\n' '            };' >> kernel.its
+            printf '%s\n' '            hash-2 {' >> kernel.its
+            printf '%s\n' '                algo = "sha1";' >> kernel.its
+            printf '%s\n' '            };' >> kernel.its
             printf '%s\n' '        };' >> kernel.its
-            printf '%s\n' '        fdt-rockchip-rk3568-nanopi-r5s {' >> kernel.its
+            printf '%s\n' '        fdt-1 {' >> kernel.its
             printf '%s\n' '            description = "Rockchip RK3568 NanoPi R5S";' >> kernel.its
             printf '%s\n' '            data = /incbin/("rk3568-nanopi-r5s.dtb");' >> kernel.its
             printf '%s\n' '            type = "flat_dt";' >> kernel.its
@@ -729,15 +722,18 @@ jobs:
             printf '%s\n' '            hash-1 {' >> kernel.its
             printf '%s\n' '                algo = "crc32";' >> kernel.its
             printf '%s\n' '            };' >> kernel.its
+            printf '%s\n' '            hash-2 {' >> kernel.its
+            printf '%s\n' '                algo = "sha1";' >> kernel.its
+            printf '%s\n' '            };' >> kernel.its
             printf '%s\n' '        };' >> kernel.its
             printf '%s\n' '    };' >> kernel.its
             printf '%s\n' '' >> kernel.its
             printf '%s\n' '    configurations {' >> kernel.its
-            printf '%s\n' '        default = "conf-1";' >> kernel.its
-            printf '%s\n' '        conf-1 {' >> kernel.its
-            printf '%s\n' '            description = "OpenWrt NanoPi R5S";' >> kernel.its
+            printf '%s\n' '        default = "config-1";' >> kernel.its
+            printf '%s\n' '        config-1 {' >> kernel.its
+            printf '%s\n' '            description = "OpenWrt friendlyarm_nanopi_r5s";' >> kernel.its
             printf '%s\n' '            kernel = "kernel-1";' >> kernel.its
-            printf '%s\n' '            fdt = "fdt-rockchip-rk3568-nanopi-r5s";' >> kernel.its
+            printf '%s\n' '            fdt = "fdt-1";' >> kernel.its
             printf '%s\n' '        };' >> kernel.its
             printf '%s\n' '    };' >> kernel.its
             printf '%s\n' '};' >> kernel.its
@@ -748,10 +744,9 @@ jobs:
             echo "kernel.img (fallback):"
             ls -lh kernel.img
             file kernel.img
-            strings kernel.img | head -5
+            strings kernel.img | head -8
           fi
 
-          # ---------- boot 包瘦身：只保留 kernel.img ----------
           cd "$OUT/boot"
           rm -f Image Image.lzma Image.gz vmlinuz-* System.map-* config-* rk3568-nanopi-r5s.dtb 2>/dev/null || true
           ls -lh
@@ -759,7 +754,6 @@ jobs:
           cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
 
-          # ---------- dtb ----------
           find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
           find "$PWD"/staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
 
@@ -770,7 +764,6 @@ jobs:
 
           tar -czf "$OUT/dtb-rockchip-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/dtb" .
 
-          # ---------- modules ----------
           MODULES_DIR=$(find "$PWD"/staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
           if [ -n "$MODULES_DIR" ]; then
             echo "Using modules from $MODULES_DIR"
@@ -827,7 +820,6 @@ jobs:
       - name: Save ccache and prune
         if: always() && !cancelled()
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
           KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -840,7 +832,7 @@ jobs:
           echo "===== packing ccache ====="
           if [ -d /workdir/ccache ] && [ -n "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-            CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}.${KV}"
+            CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
 
             docker rmi "$CCACHE_TAG" 2>/dev/null || true
 
