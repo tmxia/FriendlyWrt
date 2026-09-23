@@ -227,9 +227,9 @@ jobs:
           echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
           echo "config hash: $CFG_HASH"
           echo ""
-          echo "base cache tag:   openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
+          echo "base cache tag:   openwrt-25.12-linux-${KERNEL_MAJOR}"
           echo "target cache tag: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}-cfg${CFG_HASH}"
-          echo "ccache tag:       openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
+          echo "ccache tag:       openwrt-25.12-linux-${KERNEL_MAJOR}"
 
           sudo mkdir -p /workdir/ccache
           sudo chown -R $USER:$GROUPS /workdir/ccache
@@ -237,13 +237,12 @@ jobs:
       - name: Restore base cache
         id: restore_base
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
           [ -z "$KM" ] && KM="6.12"
-          TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}.${KV}"
+          TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           echo "=== base cache: $TAG ==="
@@ -319,13 +318,12 @@ jobs:
       - name: Restore ccache
         id: restore_ccache
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
           [ -z "$KM" ] && KM="6.12"
-          TAG="${BASE}:openwrt-25.12-linux-${KM}.${KV}"
+          TAG="${BASE}:openwrt-25.12-linux-${KM}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           mkdir -p /workdir/ccache
@@ -442,7 +440,6 @@ jobs:
       - name: Save base cache
         if: success() && !cancelled() && steps.restore_base.outputs.hit != 'true'
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
         run: |
           set -e -o pipefail
@@ -456,7 +453,7 @@ jobs:
           fi
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}.${KV}"
+          BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}"
 
           echo ""
           echo "===== packing base cache ====="
@@ -622,7 +619,6 @@ jobs:
       - name: Save ccache and prune
         if: always() && !cancelled()
         env:
-          KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
           KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -635,7 +631,7 @@ jobs:
           echo "===== packing ccache ====="
           if [ -d /workdir/ccache ] && [ -n "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-            CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}.${KV}"
+            CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
 
             docker rmi "$CCACHE_TAG" 2>/dev/null || true
 
