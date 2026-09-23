@@ -333,18 +333,15 @@ jobs:
           rm -rf "$OUT"
           mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
 
-          # ---------- boot ----------
-          KERNEL_IMAGE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 \( -name "Image" -o -name "Image.gz" \) 2>/dev/null | head -1)
-          DTB_FILE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
+          # ---------- 定位内核与 DTB（绝对路径） ----------
+          KERNEL_IMAGE_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 \( -name "Image" -o -name "Image.gz" \) 2>/dev/null | head -1)
+          DTB_FILE_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
 
-          if [ -z "$KERNEL_IMAGE" ]; then
-            echo "Kernel Image not found"
-            exit 1
-          fi
-          if [ -z "$DTB_FILE" ]; then
-            echo "R5S DTB not found"
-            exit 1
-          fi
+          [ -z "$KERNEL_IMAGE_REL" ] && { echo "Kernel Image not found"; exit 1; }
+          [ -z "$DTB_FILE_REL" ] && { echo "R5S DTB not found"; exit 1; }
+
+          KERNEL_IMAGE=$(readlink -f "$KERNEL_IMAGE_REL")
+          DTB_FILE=$(readlink -f "$DTB_FILE_REL")
 
           echo "KERNEL_IMAGE=$KERNEL_IMAGE"
           echo "DTB_FILE=$DTB_FILE"
@@ -353,20 +350,18 @@ jobs:
           cp "$KERNEL_IMAGE" "$OUT/boot/vmlinuz-${KERNEL_RELEASE}"
           cp "$DTB_FILE" "$OUT/boot/"
 
-          SYSTEM_MAP=$(find build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name "System.map" 2>/dev/null | head -1)
-          [ -n "$SYSTEM_MAP" ] && cp "$SYSTEM_MAP" "$OUT/boot/System.map-${KERNEL_RELEASE}"
+          SYSTEM_MAP_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name "System.map" 2>/dev/null | head -1)
+          [ -n "$SYSTEM_MAP_REL" ] && cp "$SYSTEM_MAP_REL" "$OUT/boot/System.map-${KERNEL_RELEASE}"
 
-          KCONFIG=$(find build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
-          [ -n "$KCONFIG" ] && cp "$KCONFIG" "$OUT/boot/config-${KERNEL_RELEASE}"
+          KCONFIG_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
+          [ -n "$KCONFIG_REL" ] && cp "$KCONFIG_REL" "$OUT/boot/config-${KERNEL_RELEASE}"
 
-          # ---------- generate FIT kernel.img ----------
+          # ---------- 生成 FIT kernel.img ----------
           echo ""
           echo "===== generate FIT kernel.img ====="
           cd "$OUT/boot"
-          cp "$KERNEL_IMAGE" Image
-          cp "$DTB_FILE" rk3568-nanopi-r5s.dtb
 
-          cat > kernel.its <<'ITS_EOF'
+          cat > kernel.its <<ITS_EOF
           /dts-v1/;
 
           / {
@@ -376,7 +371,7 @@ jobs:
               images {
                   kernel-1 {
                       description = "ARM64 OpenWrt Linux";
-                      data = /incbin/("Image");
+                      data = /incbin/("${KERNEL_IMAGE}");
                       type = "kernel";
                       arch = "arm64";
                       os = "linux";
@@ -387,7 +382,7 @@ jobs:
                   };
                   fdt-rockchip-rk3568-nanopi-r5s {
                       description = "Rockchip RK3568 NanoPi R5S";
-                      data = /incbin/("rk3568-nanopi-r5s.dtb");
+                      data = /incbin/("${DTB_FILE}");
                       type = "flat_dt";
                       arch = "arm64";
                       compression = "none";
@@ -408,9 +403,13 @@ jobs:
 
           # 去掉 heredoc 缩进
           sed -i 's/^          //' kernel.its
+          echo "----- kernel.its -----"
+          cat kernel.its
+          echo "----------------------"
 
           mkimage -f kernel.its kernel.img
           rm -f kernel.its
+          echo ""
           echo "kernel.img generated:"
           ls -lh kernel.img
           file kernel.img
@@ -419,8 +418,8 @@ jobs:
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" -C "$OUT/boot" .
 
           # ---------- dtb ----------
-          find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
-          find staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
+          find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
+          find "$PWD"/staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
 
           if [ -z "$(ls -A "$OUT/dtb")" ]; then
             echo "No R5S DTB found"
@@ -430,7 +429,7 @@ jobs:
           tar -czf "$OUT/dtb-rockchip-${KERNEL_RELEASE}.tar.gz" -C "$OUT/dtb" .
 
           # ---------- modules ----------
-          MODULES_DIR=$(find staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
+          MODULES_DIR=$(find "$PWD"/staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
           if [ -n "$MODULES_DIR" ]; then
             echo "Using modules from $MODULES_DIR"
             mkdir -p "$OUT/modules/lib/modules"
@@ -438,7 +437,7 @@ jobs:
           else
             echo "staging modules not found, collecting .ko from build_dir"
             mkdir -p "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel"
-            find build_dir/target-*/linux-*/linux-*/ -name "*.ko" | while read -r ko; do
+            find "$PWD"/build_dir/target-*/linux-*/linux-*/ -name "*.ko" | while read -r ko; do
               rel="${ko#*linux-*/}"
               rel=$(echo "$rel" | sed 's|^linux-[^/]*/||')
               mkdir -p "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel/$(dirname "$rel")"
