@@ -313,15 +313,6 @@ jobs:
           make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
           make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
 
-          echo ""
-          echo "===== verify stripped Image ====="
-          STRIPPED_IMAGE=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 -name "Image" | head -1)
-          if [ -n "$STRIPPED_IMAGE" ]; then
-            ls -lh "$STRIPPED_IMAGE"
-            file "$STRIPPED_IMAGE"
-          fi
-
-          echo ""
           echo "===== ccache stats ====="
           ccache -s -d /workdir/ccache 2>/dev/null || true
 
@@ -353,7 +344,6 @@ jobs:
           echo "DTB_FILE=$DTB_FILE_ABS"
           ls -lh "$KERNEL_IMAGE_ABS"
 
-          # 复制 Image / dtb 到 boot 目录（供 extlinux 回退 / 调试）
           cp "$KERNEL_IMAGE_ABS" "$OUT/boot/Image"
           cp "$KERNEL_IMAGE_ABS" "$OUT/boot/vmlinuz-${KERNEL_RELEASE}"
           cp "$DTB_FILE_ABS" "$OUT/boot/"
@@ -365,8 +355,6 @@ jobs:
           [ -n "$KCONFIG_REL" ] && cp "$KCONFIG_REL" "$OUT/boot/config-${KERNEL_RELEASE}"
 
           # ---------- 生成 FIT kernel.img ----------
-          # 关键: kernel 数据必须 gzip 压缩，compression = "gzip"
-          # 与原厂 kernel.img (5MB) 保持一致
           echo ""
           echo "===== generate FIT kernel.img ====="
           cd "$OUT/boot"
@@ -375,49 +363,43 @@ jobs:
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
           ls -lh Image Image.gz rk3568-nanopi-r5s.dtb
 
-          cat > kernel.its <<'ITS_EOF'
-/dts-v1/;
-
-/ {
-    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";
-    #address-cells = <1>;
-
-    images {
-        kernel-1 {
-            description = "ARM64 OpenWrt Linux";
-            data = /incbin/("Image.gz");
-            type = "kernel";
-            arch = "arm64";
-            os = "linux";
-            compression = "gzip";
-            load = <0x02080000>;
-            entry = <0x02080000>;
-            hash-1 {
-                algo = "crc32";
-            };
-        };
-        fdt-rockchip-rk3568-nanopi-r5s {
-            description = "Rockchip RK3568 NanoPi R5S";
-            data = /incbin/("rk3568-nanopi-r5s.dtb");
-            type = "flat_dt";
-            arch = "arm64";
-            compression = "none";
-            hash-1 {
-                algo = "crc32";
-            };
-        };
-    };
-
-    configurations {
-        default = "conf-1";
-        conf-1 {
-            description = "OpenWrt NanoPi R5S";
-            kernel = "kernel-1";
-            fdt = "fdt-rockchip-rk3568-nanopi-r5s";
-        };
-    };
-};
-ITS_EOF
+          # 用 printf 逐行写入 ITS，避免 heredoc 缩进问题
+          : > kernel.its
+          printf '%s\n' '/dts-v1/;'                                              >> kernel.its
+          printf '%s\n' ''                                                       >> kernel.its
+          printf '%s\n' '/ {'                                                    >> kernel.its
+          printf '%s\n' '    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";' >> kernel.its
+          printf '%s\n' '    #address-cells = <1>;'                              >> kernel.its
+          printf '%s\n' ''                                                       >> kernel.its
+          printf '%s\n' '    images {'                                           >> kernel.its
+          printf '%s\n' '        kernel-1 {'                                     >> kernel.its
+          printf '%s\n' '            description = "ARM64 OpenWrt Linux";'       >> kernel.its
+          printf '%s\n' '            data = /incbin/("Image.gz");'               >> kernel.its
+          printf '%s\n' '            type = "kernel";'                           >> kernel.its
+          printf '%s\n' '            arch = "arm64";'                            >> kernel.its
+          printf '%s\n' '            os = "linux";'                              >> kernel.its
+          printf '%s\n' '            compression = "gzip";'                      >> kernel.its
+          printf '%s\n' '            load = <0x02080000>;'                       >> kernel.its
+          printf '%s\n' '            entry = <0x02080000>;'                      >> kernel.its
+          printf '%s\n' '        };'                                             >> kernel.its
+          printf '%s\n' '        fdt-rockchip-rk3568-nanopi-r5s {'               >> kernel.its
+          printf '%s\n' '            description = "Rockchip RK3568 NanoPi R5S";' >> kernel.its
+          printf '%s\n' '            data = /incbin/("rk3568-nanopi-r5s.dtb");'  >> kernel.its
+          printf '%s\n' '            type = "flat_dt";'                          >> kernel.its
+          printf '%s\n' '            arch = "arm64";'                            >> kernel.its
+          printf '%s\n' '            compression = "none";'                      >> kernel.its
+          printf '%s\n' '        };'                                             >> kernel.its
+          printf '%s\n' '    };'                                                 >> kernel.its
+          printf '%s\n' ''                                                       >> kernel.its
+          printf '%s\n' '    configurations {'                                   >> kernel.its
+          printf '%s\n' '        default = "conf-1";'                            >> kernel.its
+          printf '%s\n' '        conf-1 {'                                       >> kernel.its
+          printf '%s\n' '            description = "OpenWrt NanoPi R5S";'        >> kernel.its
+          printf '%s\n' '            kernel = "kernel-1";'                       >> kernel.its
+          printf '%s\n' '            fdt = "fdt-rockchip-rk3568-nanopi-r5s";'    >> kernel.its
+          printf '%s\n' '        };'                                             >> kernel.its
+          printf '%s\n' '    };'                                                 >> kernel.its
+          printf '%s\n' '};'                                                     >> kernel.its
 
           echo "----- kernel.its -----"
           cat kernel.its
