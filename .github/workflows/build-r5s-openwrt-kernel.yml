@@ -335,10 +335,23 @@ jobs:
 
           # ---------- boot ----------
           KERNEL_IMAGE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 \( -name "Image" -o -name "Image.gz" \) 2>/dev/null | head -1)
-          if [ -n "$KERNEL_IMAGE" ]; then
-            cp "$KERNEL_IMAGE" "$OUT/boot/"
-            cp "$KERNEL_IMAGE" "$OUT/boot/vmlinuz-${KERNEL_RELEASE}"
+          DTB_FILE=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
+
+          if [ -z "$KERNEL_IMAGE" ]; then
+            echo "Kernel Image not found"
+            exit 1
           fi
+          if [ -z "$DTB_FILE" ]; then
+            echo "R5S DTB not found"
+            exit 1
+          fi
+
+          echo "KERNEL_IMAGE=$KERNEL_IMAGE"
+          echo "DTB_FILE=$DTB_FILE"
+
+          cp "$KERNEL_IMAGE" "$OUT/boot/"
+          cp "$KERNEL_IMAGE" "$OUT/boot/vmlinuz-${KERNEL_RELEASE}"
+          cp "$DTB_FILE" "$OUT/boot/"
 
           SYSTEM_MAP=$(find build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name "System.map" 2>/dev/null | head -1)
           [ -n "$SYSTEM_MAP" ] && cp "$SYSTEM_MAP" "$OUT/boot/System.map-${KERNEL_RELEASE}"
@@ -346,6 +359,63 @@ jobs:
           KCONFIG=$(find build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
           [ -n "$KCONFIG" ] && cp "$KCONFIG" "$OUT/boot/config-${KERNEL_RELEASE}"
 
+          # ---------- generate FIT kernel.img ----------
+          echo ""
+          echo "===== generate FIT kernel.img ====="
+          cd "$OUT/boot"
+          cp "$KERNEL_IMAGE" Image
+          cp "$DTB_FILE" rk3568-nanopi-r5s.dtb
+
+          cat > kernel.its <<'ITS_EOF'
+          /dts-v1/;
+
+          / {
+              description = "ARM64 OpenWrt FIT (Flattened Image Tree)";
+              #address-cells = <1>;
+
+              images {
+                  kernel-1 {
+                      description = "ARM64 OpenWrt Linux";
+                      data = /incbin/("Image");
+                      type = "kernel";
+                      arch = "arm64";
+                      os = "linux";
+                      compression = "none";
+                      load = <0x02080000>;
+                      entry = <0x02080000>;
+                      hash-1 { algo = "crc32"; };
+                  };
+                  fdt-rockchip-rk3568-nanopi-r5s {
+                      description = "Rockchip RK3568 NanoPi R5S";
+                      data = /incbin/("rk3568-nanopi-r5s.dtb");
+                      type = "flat_dt";
+                      arch = "arm64";
+                      compression = "none";
+                      hash-1 { algo = "crc32"; };
+                  };
+              };
+
+              configurations {
+                  default = "conf-rockchip-rk3568-nanopi-r5s";
+                  conf-rockchip-rk3568-nanopi-r5s {
+                      description = "OpenWrt NanoPi R5S";
+                      kernel = "kernel-1";
+                      fdt = "fdt-rockchip-rk3568-nanopi-r5s";
+                  };
+              };
+          };
+          ITS_EOF
+
+          # 去掉 heredoc 缩进
+          sed -i 's/^          //' kernel.its
+
+          mkimage -f kernel.its kernel.img
+          rm -f kernel.its
+          echo "kernel.img generated:"
+          ls -lh kernel.img
+          file kernel.img
+
+          cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" -C "$OUT/boot" .
 
           # ---------- dtb ----------
@@ -379,6 +449,7 @@ jobs:
 
           tar -czf "$OUT/modules-${KERNEL_RELEASE}.tar.gz" -C "$OUT/modules" .
 
+          echo ""
           echo "===== packages ====="
           ls -lh "$OUT"/*.tar.gz
 
