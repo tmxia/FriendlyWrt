@@ -355,7 +355,7 @@ jobs:
           KCONFIG_REL=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/ -maxdepth 2 -name ".config" 2>/dev/null | head -1)
           [ -n "$KCONFIG_REL" ] && cp "$KCONFIG_REL" "$OUT/boot/config-${KERNEL_RELEASE}"
 
-          # ---------- 生成 FIT kernel.img (LZMA, 参数与原厂一致) ----------
+          # ---------- 生成 FIT kernel.img (LZMA, 与原厂字节级一致) ----------
           echo ""
           echo "===== generate FIT kernel.img (lzma, dict=8MiB, lc=1,lp=2,pb=2) ====="
           cd "$OUT/boot"
@@ -363,9 +363,19 @@ jobs:
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
-          # 用 Python lzma 模块压缩：FORMAT_ALONE + dict=8MiB + lc=1/lp=2/pb=2
-          # 与原厂 kernel.img 内的 LZMA 完全一致（首字节 6d，字典 8MB，含 uncompressed size）
-          python3 -c "import lzma; d=open('Image','rb').read(); flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}]; o=lzma.compress(d, format=lzma.FORMAT_ALONE, filters=flt); open('Image.lzma','wb').write(o); print(f'compressed: {len(o)} bytes ({len(o)/1024/1024:.2f} MiB)')"
+          # Python lzma.compress 默认把 uncompressed size 写为 ff ff ..（未知）
+          # U-Boot 需要这个字段来分配输出缓冲区，必须手动改成真实大小
+          python3 -c "
+import lzma, struct
+d = open('Image','rb').read()
+flt = [{'id': lzma.FILTER_LZMA1, 'dict_size': 8*1024*1024, 'lc': 1, 'lp': 2, 'pb': 2}]
+o = bytearray(lzma.compress(d, format=lzma.FORMAT_ALONE, filters=flt))
+# LZMA alone 头部 13 字节: 1 (prop) + 4 (dict_size) + 8 (uncompressed_size)
+o[5:13] = struct.pack('<Q', len(d))
+open('Image.lzma','wb').write(bytes(o))
+print(f'compressed: {len(o)} bytes ({len(o)/1024/1024:.2f} MiB)')
+print(f'uncompressed: {len(d)} bytes')
+"
 
           echo "----- sizes -----"
           ls -lh Image Image.lzma rk3568-nanopi-r5s.dtb
