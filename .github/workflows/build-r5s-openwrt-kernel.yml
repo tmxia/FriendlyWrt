@@ -377,50 +377,54 @@ jobs:
 
             cd "$OUT/boot"
 
-            # gzip 压缩内核
             gzip -9 -c "$KERNEL_IMAGE_ABS" > Image.gz
             cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
             ls -lh Image.gz
 
             cat > kernel.its <<'ITS_EOF'
-/dts-v1/;
+          /dts-v1/;
 
-/ {
-    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";
-    #address-cells = <1>;
+          / {
+              description = "ARM64 OpenWrt FIT (Flattened Image Tree)";
+              #address-cells = <1>;
 
-    images {
-        kernel-1 {
-            description = "ARM64 OpenWrt Linux";
-            data = /incbin/("Image.gz");
-            type = "kernel";
-            arch = "arm64";
-            os = "linux";
-            compression = "gzip";
-            load = <0x02080000>;
-            entry = <0x02080000>;
-            hash-1 { algo = "crc32"; };
-        };
-        fdt-rockchip-rk3568-nanopi-r5s {
-            description = "Rockchip RK3568 NanoPi R5S";
-            data = /incbin/("rk3568-nanopi-r5s.dtb");
-            type = "flat_dt";
-            arch = "arm64";
-            compression = "none";
-            hash-1 { algo = "crc32"; };
-        };
-    };
+              images {
+                  kernel-1 {
+                      description = "ARM64 OpenWrt Linux";
+                      data = /incbin/("Image.gz");
+                      type = "kernel";
+                      arch = "arm64";
+                      os = "linux";
+                      compression = "gzip";
+                      load = <0x02080000>;
+                      entry = <0x02080000>;
+                      hash-1 { algo = "crc32"; };
+                  };
+                  fdt-rockchip-rk3568-nanopi-r5s {
+                      description = "Rockchip RK3568 NanoPi R5S";
+                      data = /incbin/("rk3568-nanopi-r5s.dtb");
+                      type = "flat_dt";
+                      arch = "arm64";
+                      compression = "none";
+                      hash-1 { algo = "crc32"; };
+                  };
+              };
 
-    configurations {
-        default = "conf-1";
-        conf-1 {
-            description = "OpenWrt NanoPi R5S";
-            kernel = "kernel-1";
-            fdt = "fdt-rockchip-rk3568-nanopi-r5s";
-        };
-    };
-};
-ITS_EOF
+              configurations {
+                  default = "conf-1";
+                  conf-1 {
+                      description = "OpenWrt NanoPi R5S";
+                      kernel = "kernel-1";
+                      fdt = "fdt-rockchip-rk3568-nanopi-r5s";
+                  };
+              };
+          };
+          ITS_EOF
+
+            sed -i 's/^          //' kernel.its
+            echo "----- kernel.its -----"
+            cat kernel.its
+            echo "----------------------"
 
             mkimage -f kernel.its kernel.img
             rm -f kernel.its Image.gz rk3568-nanopi-r5s.dtb
@@ -433,7 +437,7 @@ ITS_EOF
             cd /workdir/openwrt
           fi
 
-          # ---------- 其余辅助文件（Image / dtb / System.map / config）----------
+          # ---------- 其余辅助文件（Image / dtb / System.map / config） ----------
           KERNEL_IMAGE_REL2=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot -maxdepth 1 -name "Image" 2>/dev/null | head -1)
           if [ -n "$KERNEL_IMAGE_REL2" ]; then
             cp "$KERNEL_IMAGE_REL2" "$OUT/boot/Image"
