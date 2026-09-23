@@ -210,10 +210,12 @@ jobs:
           echo "kernel_major=$KERNEL_MAJOR" >> "$GITHUB_OUTPUT"
           echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
           echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=${OW_HASH}"
+
           echo ""
-          echo "base cache tag:          openwrt-25.12-linux-${KERNEL_MAJOR}"
-          echo "kernel target cache tag: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
-          echo "ccache tag:              openwrt-25.12-linux-${KERNEL_MAJOR}"
+          echo "===== cache tags (与固件流程对齐) ====="
+          echo "base cache:   openwrt-25.12-linux-${KERNEL_MAJOR}"
+          echo "target cache: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
+          echo "ccache:       openwrt-25.12-linux-${KERNEL_MAJOR}"
 
           sudo mkdir -p /workdir/ccache
           sudo chown -R $USER:$GROUPS /workdir/ccache
@@ -291,8 +293,7 @@ jobs:
           echo "=== restored target sizes ==="
           cd /workdir/openwrt
           for d in build_dir/target-aarch64_generic_musl \
-                   staging_dir/target-aarch64_generic_musl \
-                   bin/targets/rockchip/armv8; do
+                   staging_dir/target-aarch64_generic_musl; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -409,13 +410,6 @@ jobs:
           fi
           echo "  took $(( $(date +%s) - T0 ))s"
 
-          echo "===== make download (full, prefetch for target) ====="
-          T0=$(date +%s)
-          timeout 50m make download -j8 > /tmp/full_dl.log 2>&1 || {
-            echo "  partial download, will retry in firmware stage"
-          }
-          echo "  took $(( $(date +%s) - T0 ))s, dl files: $(find dl -maxdepth 1 -type f | wc -l)"
-
           echo ""
           echo "===== compile base OK ====="
 
@@ -428,7 +422,6 @@ jobs:
           cd /workdir/openwrt
           [ -z "$KM" ] && KM="6.12"
 
-          echo "===== revert dl/ mtime ====="
           if [ -d dl ]; then
             find dl -type f | xargs -r touch -t 200001010000
             echo "  dl/ reverted: $(find dl -type f | wc -l) files"
@@ -446,11 +439,7 @@ jobs:
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
-
-          if [ ${#PACK_DIRS[@]} -eq 0 ]; then
-            echo "::warning::no dirs to pack, skip base cache"
-            exit 0
-          fi
+          [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
 
           T0=$(date +%s)
           if ! tar -czf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
@@ -464,11 +453,10 @@ jobs:
 
           echo ""
           echo "===== pushing ====="
-          T0=$(date +%s)
           PUSHED=false
           for attempt in 1 2 3; do
             if docker push "$BASE_TAG" >/dev/null 2>&1; then
-              echo "  pushed in $(( $(date +%s) - T0 ))s"
+              echo "  pushed"
               PUSHED=true
               break
             fi
@@ -480,7 +468,7 @@ jobs:
           docker rmi "$BASE_TAG" -f 2>/dev/null || true
           echo "  cleaned"
 
-      - name: Compile kernel and generate kernel.img
+      - name: Compile kernel and kernel modules
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
@@ -556,16 +544,11 @@ jobs:
 
           PACK_DIRS=()
           for d in build_dir/target-aarch64_generic_musl \
-                   staging_dir/target-aarch64_generic_musl \
-                   bin/targets/rockchip/armv8; do
+                   staging_dir/target-aarch64_generic_musl; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
-
-          if [ ${#PACK_DIRS[@]} -eq 0 ]; then
-            echo "::warning::no dirs to pack, skip kernel target cache"
-            exit 0
-          fi
+          [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
 
           T0=$(date +%s)
           if ! tar -czf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
@@ -579,11 +562,10 @@ jobs:
 
           echo ""
           echo "===== pushing ====="
-          T0=$(date +%s)
           PUSHED=false
           for attempt in 1 2 3; do
             if docker push "$TARGET_TAG" >/dev/null 2>&1; then
-              echo "  pushed in $(( $(date +%s) - T0 ))s"
+              echo "  pushed"
               PUSHED=true
               break
             fi
@@ -623,25 +605,18 @@ jobs:
           echo "DTB_FILE=$DTB_FILE_ABS"
           ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
 
-          # ============================================================
-          # 生成 FIT kernel.img —— 结构对齐 OpenWrt 官方 mkits.sh
-          #   - kernel-1 + fdt-1 两个 image 节点，每个都有 hash-1(crc32) + hash-2(sha1)
-          #   - configuration 名 config-1，description "OpenWrt friendlyarm_nanopi_r5s"
-          #   - 根节点带 timestamp
-          # ============================================================
-          echo ""
-          echo "===== generate FIT kernel.img (lzma, sha1+crc32) ====="
           cd "$OUT/boot"
-
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
-          # LZMA 压缩，参数与原厂 kernel.img 一致
+          # LZMA 压缩（dict=8MiB, lc=1, lp=2, pb=2，与 OpenWrt 官方 mkits.sh 一致）
           python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
 
-          echo "----- sizes -----"
-          ls -lh Image Image.lzma rk3568-nanopi-r5s.dtb
+          echo "----- Image.lzma header -----"
+          hexdump -C Image.lzma | head -2
+          echo "-------------------------------"
 
+          # 生成 FIT ITS（对齐 OpenWrt 官方 mkits.sh 结构：每个 image 带 hash-1 crc32 + hash-2 sha1）
           : > kernel.its
           printf '%s\n' '/dts-v1/;' >> kernel.its
           printf '%s\n' '' >> kernel.its
@@ -651,7 +626,7 @@ jobs:
           printf '%s\n' '' >> kernel.its
           printf '%s\n' '    images {' >> kernel.its
           printf '%s\n' '        kernel-1 {' >> kernel.its
-          printf '%s\n' '            description = "ARM64 OpenWrt Linux";' >> kernel.its
+          printf '%s\n' "            description = \"ARM64 OpenWrt Linux-${KERNEL_RELEASE}\";" >> kernel.its
           printf '%s\n' '            data = /incbin/("Image.lzma");' >> kernel.its
           printf '%s\n' '            type = "kernel";' >> kernel.its
           printf '%s\n' '            arch = "arm64";' >> kernel.its
@@ -696,19 +671,15 @@ jobs:
           echo "----------------------"
 
           mkimage -f kernel.its kernel.img
-          rm -f kernel.its rk3568-nanopi-r5s.dtb Image Image.lzma
+          rm -f kernel.its Image.lzma rk3568-nanopi-r5s.dtb Image
 
           echo ""
           echo "kernel.img generated:"
-          ls -lh kernel.img
+          ls -lh
           file kernel.img
-          strings kernel.img | head -5
-
-          # 校验 FIT 里是否含 hash-2 和 sha1
           echo ""
-          echo "=== FIT verification ==="
-          strings kernel.img | grep -c 'hash-2' && echo "  hash-2 present" || echo "  WARN: hash-2 missing"
-          strings kernel.img | grep -c 'sha1'    && echo "  sha1 present"   || echo "  WARN: sha1 missing"
+          echo "=== 检查 hash-2 与 sha1 是否写入 ==="
+          strings kernel.img | grep -E 'hash-2|sha1' || echo "WARNING: hash-2 / sha1 not found!"
 
           cd /workdir/openwrt
           tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
@@ -800,30 +771,27 @@ jobs:
             T0=$(date +%s)
             if tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
               echo "  packed+imported in $(( $(date +%s) - T0 ))s"
-
               IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
               echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
 
               echo ""
               echo "===== pushing ccache ====="
-              T0=$(date +%s)
               PUSHED=false
               for attempt in 1 2 3; do
                 if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
-                  echo "  pushed in $(( $(date +%s) - T0 ))s"
+                  echo "  pushed"
                   PUSHED=true
                   break
                 fi
                 echo "  attempt $attempt failed, retrying..."
                 sleep 10
               done
-              [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed after 3 attempts"
+              [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed"
 
               docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
               docker builder prune -a -f 2>/dev/null || true
-              echo "  cleaned"
             else
-              echo "::warning::ccache pack/import failed, skipping push"
+              echo "::warning::ccache pack/import failed"
             fi
           else
             echo "  ccache empty, skip"
@@ -945,15 +913,6 @@ jobs:
 
           echo ""
           echo "=== prune done ==="
-
-          echo ""
-          echo "===== final cache inventory ====="
-          for pkg in r5s-base-cache r5s-kernel-target-cache r5s-ccache; do
-            RESP=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
-                   "https://api.github.com${API_PREFIX}/${pkg}/versions?per_page=100" 2>/dev/null || echo "[]")
-            N=$(echo "$RESP" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "0")
-            echo "  ${pkg}: ${N} versions remaining"
-          done
 
   cleanup_self:
     name: Cleanup workflow history
