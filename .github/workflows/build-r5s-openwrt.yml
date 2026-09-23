@@ -94,6 +94,16 @@ jobs:
     name: Build r5s
     needs: prepare_release
     runs-on: ubuntu-latest
+    # [优化] ccache 配置放在 job 级别，所有步骤共享；供 OpenWrt 编译在编译期直接读取
+    env:
+      CCACHE_DIR: /workdir/ccache
+      CCACHE_MAXSIZE: 20G
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros,include_file_ctime,include_file_mtime,file_stat_matches,locale,pch_defines,system_headers
+      CCACHE_BASEDIR: /workdir/openwrt
+      CCACHE_HARDLINK: "true"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_UMASK: "002"
     steps:
       - uses: actions/checkout@v4
 
@@ -140,6 +150,17 @@ jobs:
             android-sdk-libsparse-utils btrfs-progs
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          # [优化] 预置 ccache 目录并写入配置（环境变量优先级更高，这里双保险）
+          sudo mkdir -p /workdir/ccache
+          sudo chown -R $USER:$GROUPS /workdir/ccache
+          mkdir -p /workdir/ccache
+          ccache --set-config=max_size=20G 2>/dev/null || true
+          ccache --set-config=compiler_check=content 2>/dev/null || true
+          ccache --set-config=sloppiness=time_macros,include_file_ctime,include_file_mtime,file_stat_matches,locale,pch_defines,system_headers 2>/dev/null || true
+          ccache --set-config=base_dir=/workdir/openwrt 2>/dev/null || true
+          ccache --set-config=hard_link=true 2>/dev/null || true
+          ccache --set-config=hash_dir=false 2>/dev/null || true
 
           free -h
           df -hT
@@ -229,9 +250,6 @@ jobs:
           echo "base key:    openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
           echo "ccache key:  openwrt-25.12-linux-${KERNEL_MAJOR}.${KV}"
 
-          sudo mkdir -p /workdir/ccache
-          sudo chown -R $USER:$GROUPS /workdir/ccache
-
       - name: Restore base cache
         id: restore_base
         run: |
@@ -262,7 +280,7 @@ jobs:
           echo "=== restored sizes ==="
           cd /workdir/openwrt
           for d in staging_dir/host staging_dir/toolchain-* staging_dir/target-* \
-                   build_dir/host build_dir/toolchain-* dl; do
+                   build_dir/host build_dir/toolchain-* build_dir/target-* dl; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -270,7 +288,7 @@ jobs:
           echo ""
           echo "=== revert dl/ mtime ==="
           if [ -d /workdir/openwrt/dl ]; then
-            find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
+            find /workdir/openwrt/dl -type f -exec touch -t 200001010000 {} + 2>/dev/null || true
             echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
           fi
 
@@ -333,8 +351,50 @@ jobs:
             echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
 
           echo ""
-          echo "=== ccache config ==="
+          echo "=== ccache config in .config ==="
           grep -E '^CONFIG_CCACHE' .config || true
+
+          echo ""
+          echo "=== ccache env check ==="
+          echo "CCACHE_DIR=$CCACHE_DIR"
+          echo "CCACHE_MAXSIZE=$CCACHE_MAXSIZE"
+          ccache --version | head -1 || true
+
+      # [优化] 在编译前统一修复时间戳，避免 make 因 mtime 误判而全量重编
+      - name: Fix timestamps
+        run: |
+          cd /workdir/openwrt
+
+          # 1) 让源码/feeds 目录的 mtime 远早于 stamp
+          echo "=== aging source tree ==="
+          find . -type f \
+            -not -path './build_dir/*' \
+            -not -path './staging_dir/*' \
+            -not -path './.git/*' \
+            -not -path './tmp/*' \
+            -not -path './bin/*' \
+            -exec touch -t 200001010000 {} + 2>/dev/null || true
+          echo "  aged: $(find . -type f -not -path './build_dir/*' -not -path './staging_dir/*' -not -path './.git/*' | wc -l) files"
+
+          # 2) 让所有 stamp 文件变成当前时间（比源码新）
+          echo "=== refreshing stamps ==="
+          find build_dir staging_dir -type f -path '*/stamp/*' -exec touch {} + 2>/dev/null || true
+          find build_dir staging_dir -type f \
+            \( -name '.built' -o -name '.prepared' -o -name '.configured' \
+               -o -name '.installed' -o -name '.patched' -o -name '.depends' \
+               -o -name '.prepared_*' -o -name '.built_*' \) \
+            -exec touch {} + 2>/dev/null || true
+
+          # 3) dl/ 保持远古（防止触发重新下载）
+          if [ -d dl ]; then
+            find dl -type f -exec touch -t 200001010000 {} + 2>/dev/null || true
+          fi
+
+          echo "  stamps refreshed"
+          echo "  dl files: $(find dl -type f 2>/dev/null | wc -l)"
+          echo "  build_dir files: $(find build_dir -type f 2>/dev/null | wc -l)"
+          echo "  staging_dir files: $(find staging_dir -type f 2>/dev/null | wc -l)"
+          df -hT
 
       - name: Compile base
         id: compile_base
@@ -405,19 +465,17 @@ jobs:
           fi
 
           echo ""
-          echo "===== clean redundant versions ====="
-          for linux_dir in /workdir/openwrt/build_dir/target-*/linux-*/; do
-            [ -d "$linux_dir" ] && (cd "$linux_dir" && ls -dt linux-* 2>/dev/null | tail -n +2 | xargs -r -I {} rm -rf "{}")
-          done
+          echo "===== clean redundant non-kernel versions ====="
+          # [优化] 不再删除 linux-* 目录，只清掉多余的非内核版本
           [ -d "/workdir/openwrt/build_dir" ] && (cd /workdir/openwrt/build_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -r -I {} rm -rf "{}")
           [ -d "/workdir/openwrt/staging_dir" ] && (cd /workdir/openwrt/staging_dir && ls -dt target-* 2>/dev/null | tail -n +2 | xargs -r -I {} rm -rf "{}")
           [ -d "/workdir/openwrt/staging_dir" ] && (cd /workdir/openwrt/staging_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -r -I {} rm -rf "{}")
-          echo "  redundant versions cleaned"
+          echo "  redundant versions cleaned (kernel kept)"
 
           echo ""
           echo "===== revert dl/ mtime ====="
           if [ -d dl ]; then
-            find dl -type f | xargs -r touch -t 200001010000
+            find dl -type f -exec touch -t 200001010000 {} + 2>/dev/null || true
             echo "  dl/ reverted: $(find dl -type f | wc -l) files"
           fi
 
@@ -426,22 +484,13 @@ jobs:
           BASE_TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}.${KV}"
 
           echo ""
-          echo "===== packing base cache (gzip single-layer) ====="
+          echo "===== packing base cache (kernel included, gzip single-layer) ====="
           cd /workdir/openwrt
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           T0=$(date +%s)
-          tar -czf - \
-            --exclude='build_dir/toolchain-*/linux-*' \
-            --exclude='build_dir/target-*/linux-*' \
-            --exclude='*/linux-6.12.*' \
-            --exclude='*/linux-6.13.*' \
-            --exclude='*/linux-6.14.*' \
-            --exclude='*/linux-6.15.*' \
-            --exclude='*/linux-6.16.*' \
-            --exclude='*/linux-6.17.*' \
-            --exclude='*/linux-6.18.*' \
-            build_dir staging_dir dl | docker import - "$BASE_TAG"
+          # [优化] 不再排除 linux-* / toolchain linux 目录，让内核编译产物一并缓存
+          tar -czf - build_dir staging_dir dl | docker import - "$BASE_TAG"
           echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
           IMG_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
@@ -472,7 +521,12 @@ jobs:
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
-          rm -rf bin/targets/rockchip/armv8
+          # [优化] 只删 r5s 相关产物，保留其他 target 让 make 依赖判断接手
+          rm -f bin/targets/rockchip/armv8/*nanopi-r5s* 2>/dev/null || true
+          rm -f bin/targets/rockchip/armv8/sha256sums 2>/dev/null || true
+
+          # [优化] 重置 ccache 统计，便于观察本次命中率
+          CCACHE_DIR=/workdir/ccache ccache --zero-stats 2>/dev/null || true
 
           set +e
           timeout 20m make download -j8 > /tmp/download.log 2>&1 || true
@@ -483,6 +537,12 @@ jobs:
           BUILD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
           set -e
+
+          # [优化] 打印 ccache 命中率
+          echo ""
+          echo "===== ccache stats (after build) ====="
+          CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
+          CCACHE_DIR=/workdir/ccache ccache -s -v 2>/dev/null | head -40 || true
 
           if [ "$BUILD_RESULT" -ne 0 ]; then
             echo ""
@@ -499,8 +559,8 @@ jobs:
           fi
 
           echo ""
-          echo "=== ccache stats ==="
-          ccache -s -d /workdir/ccache 2>/dev/null || ccache -s 2>/dev/null || true
+          echo "=== ccache stats (final) ==="
+          CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
 
       - name: Save ccache and prune
         if: always() && !cancelled()
