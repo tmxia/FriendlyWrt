@@ -301,17 +301,17 @@ jobs:
           }
           tail -50 /tmp/kernel_compile.log
 
-          echo "===== make package/kernel/compile ====="
-          make package/kernel/compile -j$(nproc) > /tmp/kmod_compile.log 2>&1 || {
+          echo "===== make package/kernel/linux/compile ====="
+          make package/kernel/linux/compile -j$(nproc) > /tmp/kmod_compile.log 2>&1 || {
             echo "kmod compile failed, retry with V=s"
-            make package/kernel/compile -j1 V=s 2>&1 | tail -300
+            make package/kernel/linux/compile -j1 V=s 2>&1 | tail -300
             exit 1
           }
           tail -50 /tmp/kmod_compile.log
 
           echo "===== install kernel/modules to staging ====="
           make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
-          make package/kernel/install -j1 > /tmp/kmod_install.log 2>&1 || true
+          make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
 
           echo "===== ccache stats ====="
           ccache -s -d /workdir/ccache 2>/dev/null || true
