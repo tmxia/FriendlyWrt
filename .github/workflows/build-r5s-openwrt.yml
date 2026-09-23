@@ -228,7 +228,7 @@ jobs:
           echo "config hash: $CFG_HASH"
           echo ""
           echo "base cache tag:   openwrt-25.12-linux-${KERNEL_MAJOR}"
-          echo "target cache tag: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}-cfg${CFG_HASH}"
+          echo "target cache tag: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
           echo "ccache tag:       openwrt-25.12-linux-${KERNEL_MAJOR}"
 
           sudo mkdir -p /workdir/ccache
@@ -281,12 +281,11 @@ jobs:
           KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
           OW: ${{ steps.setup.outputs.ow_hash }}
-          CFG: ${{ steps.setup.outputs.cfg_hash }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           TARGET_CACHE="ghcr.io/${REPO_LOWER}/r5s-target-cache"
           [ -z "$KM" ] && KM="6.12"
-          TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}-cfg${CFG}"
+          TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG"    >> "$GITHUB_OUTPUT"
@@ -538,14 +537,13 @@ jobs:
           KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
           OW: ${{ steps.setup.outputs.ow_hash }}
-          CFG: ${{ steps.setup.outputs.cfg_hash }}
         run: |
           set -e -o pipefail
           cd /workdir/openwrt
           [ -z "$KM" ] && KM="6.12"
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}-cfg${CFG}"
+          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}"
 
           echo "===== clean redundant kernel versions (target) ====="
           shopt -s nullglob
