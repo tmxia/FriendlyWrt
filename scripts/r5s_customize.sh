@@ -20,54 +20,32 @@ pre_feeds() {
 post_feeds() {
     sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
-    # ===== BusyBox: 关闭 ash 交互式启动横幅 (FEATURE_SH_EXTRA_QUIET) =====
     python3 - << 'PYEOF'
 import os, re, sys
 
-base = "package/utils/busybox"
-if not os.path.isdir(base):
-    print("busybox pkg not found, skip"); sys.exit(0)
+path = "package/utils/busybox/Config-defaults.in"
+if not os.path.exists(path):
+    print(f"ERROR: {path} not found"); sys.exit(1)
 
-targets = []
-for root, dirs, files in os.walk(base):
-    for fn in files:
-        if fn.endswith('.in'):
-            p = os.path.join(root, fn)
-            try:
-                with open(p) as f:
-                    c = f.read()
-            except Exception:
-                continue
-            if 'FEATURE_SH_EXTRA_QUIET' in c:
-                targets.append(p)
+with open(path) as f:
+    content = f.read()
 
-if not targets:
-    print("FEATURE_SH_EXTRA_QUIET not found, skip"); sys.exit(0)
+if "BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET" not in content:
+    print("ERROR: variable not found"); sys.exit(1)
 
-patched = 0
-for p in targets:
-    with open(p) as f:
-        lines = f.readlines()
-    in_block = False
-    changed = False
-    for i, line in enumerate(lines):
-        if re.match(r'\s*config\s+BUSYBOX_(?:CONFIG|DEFAULT)_FEATURE_SH_EXTRA_QUIET\b', line):
-            in_block = True
-            continue
-        if in_block and re.match(r'\s*config\s+', line):
-            in_block = False
-            continue
-        if in_block and re.match(r'\s*default\s+n\s*$', line):
-            lines[i] = line.replace('default n', 'default y')
-            changed = True
-            in_block = False
-    if changed:
-        with open(p, 'w') as f:
-            f.writelines(lines)
-        print(f"  patched: {p}")
-        patched += 1
+pattern = re.compile(
+    r'(config\s+BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET\s*\n'
+    r'\s+bool\s*\n'
+    r'\s+default\s+)n(\s*\n)'
+)
+new_content, count = pattern.subn(r'\1y\2', content)
 
-print(f"  busybox FEATURE_SH_EXTRA_QUIET: {patched} file(s) patched")
+if count == 0:
+    print("ERROR: pattern not matched (already patched?)"); sys.exit(1)
+
+with open(path, "w") as f:
+    f.write(new_content)
+print(f"patched {path}: {count} replacement")
 PYEOF
 
     KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
@@ -697,9 +675,9 @@ config_stage() {
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
-    sed -i "/^# CONFIG_BUSYBOX_CONFIG_FEATURE_SH_EXTRA_QUIET is not set/d" .config
-    sed -i "/^CONFIG_BUSYBOX_CONFIG_FEATURE_SH_EXTRA_QUIET=/d" .config
-    echo "CONFIG_BUSYBOX_CONFIG_FEATURE_SH_EXTRA_QUIET=y" >> .config
+    sed -i "/^# CONFIG_BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET is not set/d" .config
+    sed -i "/^CONFIG_BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET=/d" .config
+    echo "CONFIG_BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET=y" >> .config
 
     local MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
