@@ -297,7 +297,6 @@ jobs:
           fi
 
           echo "TARGET CACHE HIT"
-
           LAYERS=$(docker image inspect "$TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
           echo "  layers: $LAYERS"
 
@@ -310,8 +309,7 @@ jobs:
           docker rmi "$TAG" -f 2>/dev/null || true
 
           if [ ! -d /workdir/cache_parts/cache ]; then
-            echo "::warning::no /cache dir in image, trying legacy export path"
-            # fallback: 老格式的单 layer 镜像
+            echo "::warning::no /cache dir, trying legacy export"
             if docker image inspect "$TAG" >/dev/null 2>&1; then
               docker create --name r5s_tgt_tmp2 "$TAG" /bin/true >/dev/null
               docker export r5s_tgt_tmp2 | tar -xpf - -C /workdir/openwrt
@@ -326,7 +324,7 @@ jobs:
               done
               exit 0
             fi
-            echo "::warning::no cache in image, treat as miss"
+            echo "::warning::treat as miss"
             exit 0
           fi
 
@@ -355,7 +353,9 @@ jobs:
                    build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
                    staging_dir/hostpkg \
-                   bin/targets/rockchip/armv8; do
+                   bin/targets/rockchip/armv8 \
+                   feeds \
+                   package; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -390,24 +390,44 @@ jobs:
           fi
 
           echo ""
-          echo "=== ccache tuning (target dir: /workdir/ccache) ==="
+          echo "=== ccache tuning ==="
           export CCACHE_DIR=/workdir/ccache
           ccache --max-size=10G
           ccache --set-config=compression=true
           ccache --set-config=hash_dir=false
           ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
           ccache --zero-stats
-          echo "--- effective config ---"
           ccache -p 2>/dev/null | grep -E 'max_size|compression|hash_dir|sloppiness' || true
 
       - name: Prepare build configuration
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
-          ./scripts/feeds update -a 2>&1 | tail -30
+
+          FEEDS_CONF_HASH=$(md5sum feeds.conf.default feeds.conf 2>/dev/null | md5sum | cut -d' ' -f1)
+          CACHED_FEEDS_HASH=""
+          [ -f /workdir/.feeds_conf_hash ] && CACHED_FEEDS_HASH=$(cat /workdir/.feeds_conf_hash)
+
+          if [ -d feeds/packages ] && [ -d feeds/luci ] && [ "$FEEDS_CONF_HASH" = "$CACHED_FEEDS_HASH" ]; then
+            echo "feeds/ already present and feeds.conf unchanged, skip feeds update"
+          else
+            echo "feeds/ missing or feeds.conf changed, running feeds update"
+            ./scripts/feeds update -a 2>&1 | tail -30
+            echo "$FEEDS_CONF_HASH" > /workdir/.feeds_conf_hash
+          fi
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
+
+          echo ""
+          echo "=== normalize feeds/package mtime ==="
+          find feeds -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
+          find feeds -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
+          find package/feeds -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
+          find package/feeds -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
+          find package/custom -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
+          find package/custom -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
+          echo "  mtime reverted to 2020-01-01"
 
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
@@ -532,11 +552,10 @@ jobs:
 
           echo ""
           echo "===== pushing ====="
-          T0=$(date +%s)
           PUSHED=false
           for attempt in 1 2 3; do
             if docker push "$BASE_TAG" >/dev/null 2>&1; then
-              echo "  pushed in $(( $(date +%s) - T0 ))s"
+              echo "  pushed"
               PUSHED=true
               break
             fi
@@ -627,15 +646,20 @@ jobs:
 
           echo ""
           echo "===== deep slim target cache ====="
-          BEFORE=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          BEFORE=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  before: $((BEFORE / 1024 / 1024))MB"
 
-          for tdir in build_dir/target-*/ build_dir/hostpkg/; do
+          for tdir in build_dir/target-*/ build_dir/hostpkg/ feeds/; do
             [ -d "$tdir" ] || continue
             echo "  slimming $tdir"
 
-            find "$tdir" -type d \( -name '.git' -o -name '.github' -o -name '.gitlab' -o -name '.svn' -o -name '.hg' \) \
-              -prune -exec rm -rf {} + 2>/dev/null || true
+            if [ "$tdir" = "feeds/" ]; then
+              find "$tdir" -type d \( -name '.github' -o -name '.gitlab' -o -name '.svn' -o -name '.hg' \) \
+                -prune -exec rm -rf {} + 2>/dev/null || true
+            else
+              find "$tdir" -type d \( -name '.git' -o -name '.github' -o -name '.gitlab' -o -name '.svn' -o -name '.hg' \) \
+                -prune -exec rm -rf {} + 2>/dev/null || true
+            fi
 
             find "$tdir" -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.eggs' \) \
               -prune -exec rm -rf {} + 2>/dev/null || true
@@ -662,7 +686,7 @@ jobs:
             find "$sdir" -type f -name '*.la' -delete 2>/dev/null || true
           done
 
-          AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  after:  $((AFTER / 1024 / 1024))MB"
           echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
 
@@ -675,7 +699,9 @@ jobs:
                    build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
                    staging_dir/hostpkg \
-                   bin/targets/rockchip/armv8; do
+                   bin/targets/rockchip/armv8 \
+                   feeds \
+                   package; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
@@ -727,11 +753,10 @@ jobs:
 
           echo ""
           echo "===== pushing ====="
-          T0=$(date +%s)
           PUSHED=false
           for attempt in 1 2 3; do
             if docker push "$TARGET_TAG" >/dev/null 2>&1; then
-              echo "  pushed in $(( $(date +%s) - T0 ))s"
+              echo "  pushed"
               PUSHED=true
               break
             fi
@@ -782,22 +807,20 @@ jobs:
 
               echo ""
               echo "===== pushing ccache ====="
-              T0=$(date +%s)
               PUSHED=false
               for attempt in 1 2 3; do
                 if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
-                  echo "  pushed in $(( $(date +%s) - T0 ))s"
+                  echo "  pushed"
                   PUSHED=true
                   break
                 fi
                 echo "  attempt $attempt failed, retrying..."
                 sleep 10
               done
-              [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed after 3 attempts"
+              [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed"
 
               docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
               docker builder prune -a -f 2>/dev/null || true
-              echo "  cleaned"
             else
               echo "::warning::ccache pack/import failed"
             fi
