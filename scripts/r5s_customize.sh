@@ -372,7 +372,6 @@ esac
 [ -n "$SSH_TTY" ] || [ -t 0 ] || return 0
 
 . /etc/openwrt_release 2>/dev/null
-OS_NAME="${DISTRIB_ID:-OpenWrt}"
 OS_VER="${DISTRIB_RELEASE:-unknown}"
 
 HOST=$(uname -n 2>/dev/null)
@@ -393,46 +392,51 @@ command -v uci >/dev/null 2>&1 && {
 if [ -r /proc/uptime ]; then
     US=$(awk '{print int($1)}' /proc/uptime)
     D=$((US/86400)); H=$((US%86400/3600)); M=$((US%3600/60))
-    if [ $D -gt 0 ]; then
-        UPTIME="${D}d ${H}h ${M}m"
-    elif [ $H -gt 0 ]; then
-        UPTIME="${H}h ${M}m"
-    else
-        UPTIME="${M}m"
-    fi
-else
-    UPTIME="-"
-fi
+    if [ $D -gt 0 ]; then UPTIME="${D}d ${H}h ${M}m"
+    elif [ $H -gt 0 ]; then UPTIME="${H}h ${M}m"
+    else UPTIME="${M}m"; fi
+else UPTIME="-"; fi
 
 if [ -r /proc/meminfo ]; then
     MT=$(awk '/MemTotal/{print $2}' /proc/meminfo)
     MA=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
-    MEM="$(( (MT-MA)/1024 ))M / $((MT/1024))M"
+    MU=$(( (MT-MA)/1024 )); MTM=$((MT/1024))
+    MEM="${MU}M/${MTM}M"
+else MEM="-"; fi
+
+if [ -t 1 ]; then
+    D='\033[0;90m'
+    C='\033[0;36m'
+    K='\033[0;33m'
+    V='\033[0;37m'
+    R='\033[0m'
 else
-    MEM="-"
+    D=''; C=''; K=''; V=''; R=''
 fi
 
-cat << EOF
+SEP_LEN=49
+SEP=$(printf '%.0s─' $(seq 1 $SEP_LEN))
 
-  NanoPi R5S  ·  ${OS_NAME} ${OS_VER}
-  ------------------------------------------
-  Host     ${HOST}
-  LAN IP   http://${LAN_IP}
-  Kernel   ${KVER}
-  Docker   ${DOCKER_PATH}
-  Uptime   ${UPTIME}
-  Memory   ${MEM}
-  ------------------------------------------
-
-  apk add <pkg>                  install
-  apk del <pkg>                  remove
-  apk update && apk upgrade      upgrade all
-  /etc/init.d/dockerd restart    restart docker
-  df -h ${DOCKER_PATH}           docker disk
-
-EOF
+printf "\n"
+printf "  ${C}NanoPi R5S${R}  ${D}·${R}  ${V}${HOST}${R}\n"
+printf "${D}%s${R}\n" "$SEP"
+printf "  ${K}%-6s${R} ${V}%-24s${R} ${K}%-6s${R} ${V}%s${R}\n" \
+    "OS"     "OpenWrt ${OS_VER}" "Kernel" "${KVER}"
+printf "  ${K}%-6s${R} ${V}%-24s${R} ${K}%-6s${R} ${V}%s${R}\n" \
+    "LAN"    "${LAN_IP}" "Uptime" "${UPTIME}"
+printf "  ${K}%-6s${R} ${V}%-24s${R} ${K}%-6s${R} ${V}%s${R}\n" \
+    "Docker" "${DOCKER_PATH}" "Memory" "${MEM}"
+printf "${D}%s${R}\n" "$SEP"
+printf "  ${C}%-30s${R} ${D}%s${R}\n" "apk add <pkg>"               "安装软件包"
+printf "  ${C}%-30s${R} ${D}%s${R}\n" "apk del <pkg>"               "卸载软件包"
+printf "  ${C}%-30s${R} ${D}%s${R}\n" "apk update && apk upgrade"   "更新全部软件包"
+printf "  ${C}%-30s${R} ${D}%s${R}\n" "/etc/init.d/dockerd restart" "重启 Docker 服务"
+printf "  ${C}%-30s${R} ${D}%s${R}\n" "df -h ${DOCKER_PATH}"        "查看磁盘占用"
+printf "\n"
 WELCOME_EOF
     chmod +x files/etc/profile.d/apk-cheatsheet.sh
+
+    : > files/etc/banner
 }
 
 pre_build() {
