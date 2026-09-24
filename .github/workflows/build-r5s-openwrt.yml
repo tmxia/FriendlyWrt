@@ -263,7 +263,8 @@ jobs:
           echo ""
           echo "=== restored base sizes ==="
           cd /workdir/openwrt
-          for d in build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-* dl; do
+          for d in build_dir/host build_dir/hostpkg build_dir/toolchain-* \
+                   staging_dir/host staging_dir/hostpkg staging_dir/toolchain-* dl; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -307,7 +308,9 @@ jobs:
           echo "=== restored target sizes ==="
           cd /workdir/openwrt
           for d in build_dir/target-aarch64_generic_musl \
+                   build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
+                   staging_dir/hostpkg \
                    bin/targets/rockchip/armv8; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
@@ -460,7 +463,8 @@ jobs:
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
-          for d in build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-* dl; do
+          for d in build_dir/host build_dir/toolchain-* \
+                   staging_dir/host staging_dir/toolchain-* dl; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
@@ -512,8 +516,8 @@ jobs:
 
           echo "===== pre-compile perl (serial, avoid OOM) ====="
           T0=$(date +%s)
-          if ! timeout 30m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1; then
-            echo "  perl pre-compile failed, retry with V=s tail"
+          if ! timeout 45m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1; then
+            echo "  perl pre-compile failed, tail of log:"
             tail -100 /tmp/perl_build.log
             echo "  continuing, main make will retry"
           fi
@@ -521,7 +525,7 @@ jobs:
 
           echo "===== make -j3 (no V=s) ====="
           T0=$(date +%s)
-          timeout 4h make -j3 > /tmp/build.log 2>&1
+          timeout 5h make -j3 > /tmp/build.log 2>&1
           BUILD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
           set -e
@@ -532,7 +536,7 @@ jobs:
             if [ "$BUILD_RESULT" -gt 128 ]; then
               SIG=$((BUILD_RESULT - 128))
               [ "$SIG" = "9" ] && echo "SIGKILL (likely OOM)"
-              [ "$SIG" = "15" ] && echo "SIGTERM (timeout 4h)"
+              [ "$SIG" = "15" ] && echo "SIGTERM (timeout 5h)"
               free -h
               sudo dmesg 2>/dev/null | grep -i -E "out of memory|oom-kill" | tail -20 || true
             fi
@@ -580,10 +584,10 @@ jobs:
 
           echo ""
           echo "===== deep slim target cache ====="
-          BEFORE=$(du -sb build_dir/target-* staging_dir/target-* bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          BEFORE=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  before: $((BEFORE / 1024 / 1024))MB"
 
-          for tdir in build_dir/target-*/; do
+          for tdir in build_dir/target-*/ build_dir/hostpkg/; do
             [ -d "$tdir" ] || continue
             echo "  slimming $tdir"
 
@@ -608,7 +612,7 @@ jobs:
             done
           done
 
-          AFTER=$(du -sb build_dir/target-* staging_dir/target-* bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  after:  $((AFTER / 1024 / 1024))MB"
           echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
 
@@ -618,7 +622,9 @@ jobs:
 
           PACK_DIRS=()
           for d in build_dir/target-aarch64_generic_musl \
+                   build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
+                   staging_dir/hostpkg \
                    bin/targets/rockchip/armv8; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
