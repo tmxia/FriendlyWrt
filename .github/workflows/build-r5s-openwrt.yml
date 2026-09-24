@@ -116,7 +116,7 @@ jobs:
 
           sudo swapoff -a || true
           sudo rm -f /swapfile
-          sudo fallocate -l 8G /swapfile
+          sudo fallocate -l 16G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile > /dev/null
           sudo swapon /swapfile
@@ -510,9 +510,18 @@ jobs:
           set +e
           timeout 20m make download -j8 > /tmp/download.log 2>&1 || true
 
-          echo "===== make (no V=s) ====="
+          echo "===== pre-compile perl (serial, avoid OOM) ====="
           T0=$(date +%s)
-          timeout 4h make -j$(nproc) > /tmp/build.log 2>&1
+          if ! timeout 30m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1; then
+            echo "  perl pre-compile failed, retry with V=s tail"
+            tail -100 /tmp/perl_build.log
+            echo "  continuing, main make will retry"
+          fi
+          echo "  took $(( $(date +%s) - T0 ))s"
+
+          echo "===== make -j3 (no V=s) ====="
+          T0=$(date +%s)
+          timeout 4h make -j3 > /tmp/build.log 2>&1
           BUILD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
           set -e
