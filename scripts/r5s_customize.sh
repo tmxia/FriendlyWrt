@@ -25,7 +25,6 @@ post_feeds() {
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
     touch "$KERNEL_CONFIG_FILE"
 
-    # Kernel options (non-Docker)
     for opt in INET_DIAG INET_TCP_DIAG INET_UDP_DIAG INET_RAW_DIAG \
                NF_IP_VS NETFILTER_XT_MATCH_PHYSDEV NF_NAT \
                CGROUP_SCHED CGROUP_BPF CGROUP_PIDS CGROUP_RDMA CGROUP_NET_CLASSID \
@@ -38,7 +37,6 @@ post_feeds() {
         echo "CONFIG_${opt}=y" >> "$KERNEL_CONFIG_FILE"
     done
 
-    # Patch ptgen: add p3 placeholder 256M (no truncate -> keep fwtool metadata intact)
     python3 - << 'PYEOF'
 import sys, os
 path = "scripts/gen_image_generic.sh"
@@ -69,9 +67,9 @@ PYEOF
     rm -rf package/custom/luci-app-amlogic/.git
 
     mkdir -p files/sbin files/usr/bin files/etc/init.d files/etc/rc.d \
-             files/etc/uci-defaults files/etc/docker files/etc/sysctl.d files/etc/hotplug.d/net
+             files/etc/uci-defaults files/etc/docker files/etc/sysctl.d \
+             files/etc/hotplug.d/net files/etc/profile.d
 
-    # /sbin/mountpoint shim
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
 QUIET=0; DEV=0
@@ -105,7 +103,6 @@ exit 1
 MP_EOF
     chmod +x files/sbin/mountpoint
 
-    # rc.local init service (missing in some base-files)
     cat > files/etc/init.d/rc.local << 'INITEOF'
 #!/bin/sh /etc/rc.common
 START=95
@@ -117,14 +114,12 @@ INITEOF
     chmod +x files/etc/init.d/rc.local
     ln -sf ../init.d/rc.local files/etc/rc.d/S95rc.local
 
-    # rc.local: /opt init (mount p3, resize on first boot)
     cat > files/etc/rc.local << 'RCEOF'
 #!/bin/sh
 LOG=/tmp/opt-init.log
 exec >>"$LOG" 2>&1
 echo "=== $(date +%FT%T) opt-init ==="
 
-# Resolve real root block device (squashfs+overlay: real root in /rom)
 ROOT_DEV=$(findmnt -n -o SOURCE /rom 2>/dev/null | head -1)
 [ ! -b "$ROOT_DEV" ] && {
     PARTUUID=$(sed -n 's/.*root=PARTUUID=\([^ ]*\).*/\1/p' /proc/cmdline)
@@ -190,7 +185,6 @@ exit 0
 RCEOF
     chmod +x files/etc/rc.local
 
-    # LED hotplug: re-apply netdev trigger after NICs ready
     cat > files/etc/hotplug.d/net/99-led-netdev << 'HOTPLUG_EOF'
 #!/bin/sh
 [ "$ACTION" = "add" ] || exit 0
@@ -208,7 +202,6 @@ RCEOF
 HOTPLUG_EOF
     chmod +x files/etc/hotplug.d/net/99-led-netdev
 
-    # sysctl tuning (proxy/network)
     cat > files/etc/sysctl.d/99-r5s.conf << 'EOF'
 net.core.rmem_max = 67108864
 net.core.wmem_max = 67108864
@@ -232,18 +225,15 @@ net.netfilter.nf_conntrack_helper=1
 net.core.default_qdisc = fq_codel
 EOF
 
-    # First-boot config
     cat > files/etc/uci-defaults/99-custom << 'EOF'
 #!/bin/sh
 
-# docker0 device declaration
 if ! uci show network 2>/dev/null | grep -qE "\.name=['\"]?docker0['\"]?"; then
     uci add network device >/dev/null
     uci set network.@device[-1].type='bridge'
     uci set network.@device[-1].name='docker0'
 fi
 
-# LAN / WAN
 uci set network.lan.ipaddr='192.168.3.3/24'
 uci set network.lan.gateway='192.168.3.1'
 uci set network.lan.dns='192.168.3.1'
@@ -256,14 +246,12 @@ uci commit network
 uci set dhcp.lan.ignore='1'
 uci commit dhcp
 
-# Firewall: LAN zone
 uci set firewall.@zone[0].name='lan'
 uci set firewall.@zone[0].input='ACCEPT'
 uci set firewall.@zone[0].output='ACCEPT'
 uci set firewall.@zone[0].forward='ACCEPT'
 uci set firewall.@zone[0].network='lan'
 
-# Firewall: docker zone (docker0)
 uci set firewall.docker=zone
 uci set firewall.docker.name='docker'
 uci set firewall.docker.input='ACCEPT'
@@ -285,7 +273,6 @@ uci set firewall.fwd_lan_docker=forwarding
 uci set firewall.fwd_lan_docker.src='lan'
 uci set firewall.fwd_lan_docker.dest='docker'
 
-# Firewall: dockernet zone (br-* wildcard, all custom Docker networks)
 uci set firewall.dockernet=zone
 uci set firewall.dockernet.name='dockernet'
 uci set firewall.dockernet.input='ACCEPT'
@@ -309,7 +296,6 @@ uci set firewall.fwd_lan_dockernet.dest='dockernet'
 
 uci commit firewall
 
-# Docker: alt_config_file -> /etc/docker/daemon.json
 uci set dockerd.globals.data_root='/opt/docker'
 uci -q delete dockerd.globals.registry_mirrors
 uci add_list dockerd.globals.registry_mirrors='https://docker.1ms.run'
@@ -335,7 +321,6 @@ if [ -f "$SSHD_CONFIG" ] && [ -x /etc/init.d/sshd ]; then
     /etc/init.d/sshd restart
 fi
 
-# LED: netdev trigger
 uci -q delete system.wan_led 2>/dev/null
 uci -q delete system.lan1_led 2>/dev/null
 uci -q delete system.lan2_led 2>/dev/null
@@ -365,7 +350,6 @@ exit 0
 EOF
     chmod +x files/etc/uci-defaults/99-custom
 
-    # Docker daemon.json
     cat > files/etc/docker/daemon.json << 'EOF'
 {
   "data-root": "/opt/docker",
@@ -378,6 +362,77 @@ EOF
   "ip-masq": true
 }
 EOF
+
+    cat > files/etc/profile.d/apk-cheatsheet.sh << 'WELCOME_EOF'
+#!/bin/sh
+case "$-" in
+    *i*) ;;
+    *) return 0 ;;
+esac
+[ -n "$SSH_TTY" ] || [ -t 0 ] || return 0
+
+. /etc/openwrt_release 2>/dev/null
+OS_NAME="${DISTRIB_ID:-OpenWrt}"
+OS_VER="${DISTRIB_RELEASE:-unknown}"
+
+HOST=$(uname -n 2>/dev/null)
+KVER=$(uname -r)
+
+LAN_IP=""
+command -v uci >/dev/null 2>&1 && LAN_IP=$(uci -q get network.lan.ipaddr 2>/dev/null)
+[ -n "$LAN_IP" ] && LAN_IP=${LAN_IP%%/*}
+[ -z "$LAN_IP" ] && LAN_IP=$(ip -4 addr show br-lan 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1)
+[ -z "$LAN_IP" ] && LAN_IP="192.168.3.3"
+
+DOCKER_PATH="/opt/docker"
+command -v uci >/dev/null 2>&1 && {
+    DR=$(uci -q get dockerd.globals.data_root 2>/dev/null)
+    [ -n "$DR" ] && DOCKER_PATH="$DR"
+}
+
+if [ -r /proc/uptime ]; then
+    US=$(awk '{print int($1)}' /proc/uptime)
+    D=$((US/86400)); H=$((US%86400/3600)); M=$((US%3600/60))
+    if [ $D -gt 0 ]; then
+        UPTIME="${D}d ${H}h ${M}m"
+    elif [ $H -gt 0 ]; then
+        UPTIME="${H}h ${M}m"
+    else
+        UPTIME="${M}m"
+    fi
+else
+    UPTIME="-"
+fi
+
+if [ -r /proc/meminfo ]; then
+    MT=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+    MA=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
+    MEM="$(( (MT-MA)/1024 ))M / $((MT/1024))M"
+else
+    MEM="-"
+fi
+
+cat << EOF
+
+  NanoPi R5S  ·  ${OS_NAME} ${OS_VER}
+  ------------------------------------------
+  Host     ${HOST}
+  LAN IP   http://${LAN_IP}
+  Kernel   ${KVER}
+  Docker   ${DOCKER_PATH}
+  Uptime   ${UPTIME}
+  Memory   ${MEM}
+  ------------------------------------------
+
+  apk add <pkg>                  install
+  apk del <pkg>                  remove
+  apk update && apk upgrade      upgrade all
+  /etc/init.d/dockerd restart    restart docker
+  df -h ${DOCKER_PATH}           docker disk
+
+EOF
+WELCOME_EOF
+    chmod +x files/etc/profile.d/apk-cheatsheet.sh
 }
 
 pre_build() {
@@ -394,7 +449,6 @@ pre_build() {
         echo "dts already patched (v2)"; return 0
     fi
 
-    # Restore clean or strip old injection
     if [ -f "${DTS}.clean" ]; then
         echo "restore DTS from .clean"
         cp "${DTS}.clean" "$DTS"
@@ -412,7 +466,6 @@ pre_build() {
         ' "$DTS" > "$DTS.tmp" && mv "$DTS.tmp" "$DTS"
     fi
 
-    # Official R5S fan: pwm0 (GPIO0_B7 pin 15), 20kHz, 5-level, fan-supply=vcc5v0_sys
     cat >> "$DTS" << 'DTS_EOF'
 
 // ===== R5S_FAN_V2 =====
@@ -561,7 +614,6 @@ config_stage() {
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
-    # NIC driver: force r8125 (2.5G), disable r8169 (1G) - virtual package conflict
     sed -i "/^# CONFIG_PACKAGE_kmod-r8125 is not set/d" .config
     sed -i "/^CONFIG_PACKAGE_kmod-r8125=/d" .config
     echo "CONFIG_PACKAGE_kmod-r8125=y" >> .config
@@ -588,7 +640,8 @@ config_stage() {
              files/etc/init.d/rc.local files/etc/rc.d/S95rc.local \
              files/etc/hotplug.d/net/99-led-netdev \
              files/etc/docker/daemon.json files/etc/uci-defaults/99-custom \
-             files/etc/sysctl.d/99-r5s.conf; do
+             files/etc/sysctl.d/99-r5s.conf \
+             files/etc/profile.d/apk-cheatsheet.sh; do
         [ -e "$f" ] || { echo "missing: $f"; exit 1; }
     done
 }
