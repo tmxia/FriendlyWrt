@@ -20,6 +20,56 @@ pre_feeds() {
 post_feeds() {
     sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
+    # ===== BusyBox: 关闭 ash 交互式启动横幅 (FEATURE_SH_EXTRA_QUIET) =====
+    python3 - << 'PYEOF'
+import os, re, sys
+
+base = "package/utils/busybox"
+if not os.path.isdir(base):
+    print("busybox pkg not found, skip"); sys.exit(0)
+
+targets = []
+for root, dirs, files in os.walk(base):
+    for fn in files:
+        if fn.endswith('.in'):
+            p = os.path.join(root, fn)
+            try:
+                with open(p) as f:
+                    c = f.read()
+            except Exception:
+                continue
+            if 'FEATURE_SH_EXTRA_QUIET' in c:
+                targets.append(p)
+
+if not targets:
+    print("FEATURE_SH_EXTRA_QUIET not found, skip"); sys.exit(0)
+
+patched = 0
+for p in targets:
+    with open(p) as f:
+        lines = f.readlines()
+    in_block = False
+    changed = False
+    for i, line in enumerate(lines):
+        if re.match(r'\s*config\s+BUSYBOX_(?:CONFIG|DEFAULT)_FEATURE_SH_EXTRA_QUIET\b', line):
+            in_block = True
+            continue
+        if in_block and re.match(r'\s*config\s+', line):
+            in_block = False
+            continue
+        if in_block and re.match(r'\s*default\s+n\s*$', line):
+            lines[i] = line.replace('default n', 'default y')
+            changed = True
+            in_block = False
+    if changed:
+        with open(p, 'w') as f:
+            f.writelines(lines)
+        print(f"  patched: {p}")
+        patched += 1
+
+print(f"  busybox FEATURE_SH_EXTRA_QUIET: {patched} file(s) patched")
+PYEOF
+
     KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
     [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.12"
     KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
@@ -646,6 +696,10 @@ config_stage() {
         grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
+
+    sed -i "/^# CONFIG_BUSYBOX_CONFIG_FEATURE_SH_EXTRA_QUIET is not set/d" .config
+    sed -i "/^CONFIG_BUSYBOX_CONFIG_FEATURE_SH_EXTRA_QUIET=/d" .config
+    echo "CONFIG_BUSYBOX_CONFIG_FEATURE_SH_EXTRA_QUIET=y" >> .config
 
     local MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
