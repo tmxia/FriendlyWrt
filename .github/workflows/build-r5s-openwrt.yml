@@ -263,8 +263,7 @@ jobs:
           echo ""
           echo "=== restored base sizes ==="
           cd /workdir/openwrt
-          for d in build_dir/host build_dir/hostpkg build_dir/toolchain-* \
-                   staging_dir/host staging_dir/hostpkg staging_dir/toolchain-* dl; do
+          for d in build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-* dl; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -298,10 +297,55 @@ jobs:
           fi
 
           echo "TARGET CACHE HIT"
+
+          LAYERS=$(docker image inspect "$TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
+          echo "  layers: $LAYERS"
+
+          rm -rf /workdir/cache_parts
+          mkdir -p /workdir/cache_parts
+
           docker create --name r5s_tgt_tmp "$TAG" /bin/true >/dev/null
-          docker export r5s_tgt_tmp | tar -xpf - -C /workdir/openwrt
+          docker cp r5s_tgt_tmp:/cache /workdir/cache_parts/ >/dev/null 2>&1 || true
           docker rm r5s_tgt_tmp >/dev/null
           docker rmi "$TAG" -f 2>/dev/null || true
+
+          if [ ! -d /workdir/cache_parts/cache ]; then
+            echo "::warning::no /cache dir in image, trying legacy export path"
+            # fallback: 老格式的单 layer 镜像
+            if docker image inspect "$TAG" >/dev/null 2>&1; then
+              docker create --name r5s_tgt_tmp2 "$TAG" /bin/true >/dev/null
+              docker export r5s_tgt_tmp2 | tar -xpf - -C /workdir/openwrt
+              docker rm r5s_tgt_tmp2 >/dev/null
+              docker rmi "$TAG" -f 2>/dev/null || true
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+              echo "=== restored target sizes (legacy) ==="
+              cd /workdir/openwrt
+              for d in build_dir/target-aarch64_generic_musl staging_dir/target-aarch64_generic_musl bin/targets/rockchip/armv8; do
+                [ -e "$d" ] || continue
+                echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
+              done
+              exit 0
+            fi
+            echo "::warning::no cache in image, treat as miss"
+            exit 0
+          fi
+
+          PARTS=$(ls /workdir/cache_parts/cache/p_* 2>/dev/null | wc -l)
+          echo "  parts extracted: $PARTS"
+          [ "$PARTS" -eq 0 ] && { echo "::warning::no parts"; exit 1; }
+
+          echo ""
+          echo "=== merging parts and extracting ==="
+          cd /workdir/cache_parts/cache
+          if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
+            echo "::warning::zstd extract failed; trying raw tar"
+            if ! cat p_* | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
+              echo "::warning::both extract failed"
+              rm -rf /workdir/cache_parts
+              exit 1
+            fi
+          fi
+          rm -rf /workdir/cache_parts
           echo "hit=true" >> "$GITHUB_OUTPUT"
 
           echo ""
@@ -463,8 +507,7 @@ jobs:
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
-          for d in build_dir/host build_dir/toolchain-* \
-                   staging_dir/host staging_dir/toolchain-* dl; do
+          for d in build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-* dl; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
@@ -612,12 +655,19 @@ jobs:
             done
           done
 
+          echo "  L4: removing staging static libs"
+          for sdir in staging_dir/target-*/ staging_dir/hostpkg/; do
+            [ -d "$sdir" ] || continue
+            find "$sdir" -type f -name '*.a' -delete 2>/dev/null || true
+            find "$sdir" -type f -name '*.la' -delete 2>/dev/null || true
+          done
+
           AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  after:  $((AFTER / 1024 / 1024))MB"
           echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
 
           echo ""
-          echo "===== packing target cache (zstd) ====="
+          echo "===== packing target cache (multi-layer zstd) ====="
           docker rmi "$TARGET_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -636,17 +686,44 @@ jobs:
           fi
 
           T0=$(date +%s)
-          if tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
-            echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
-          elif tar -czf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
-            echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
-          else
-            echo "::warning::target cache pack/import failed"
+
+          rm -rf /workdir/cache_parts
+          mkdir -p /workdir/cache_parts
+
+          cd /workdir/openwrt
+          if ! tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
+               | split -a 2 -d -b 4G - /workdir/cache_parts/p_ 2>/dev/null; then
+            echo "::warning::tar/split failed"
+            rm -rf /workdir/cache_parts
             exit 0
           fi
 
+          cd /workdir/cache_parts
+          echo "FROM scratch" > Dockerfile
+          i=0
+          for f in p_*; do
+            d="l$i"
+            mkdir -p "$d"
+            mv "$f" "$d/"
+            echo "COPY $d /cache/" >> Dockerfile
+            i=$((i+1))
+          done
+          echo "  parts: $i"
+
+          if ! docker build -t "$TARGET_TAG" . > /tmp/tc_build.log 2>&1; then
+            echo "::warning::docker build failed"
+            tail -30 /tmp/tc_build.log
+            rm -rf /workdir/cache_parts
+            exit 0
+          fi
+
+          echo "  packed (multi-layer) + imported in $(( $(date +%s) - T0 ))s"
+          rm -rf /workdir/cache_parts
+
           IMG_SIZE=$(docker image inspect "$TARGET_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
+          LAYERS=$(docker image inspect "$TARGET_TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
+          echo "  layers: $LAYERS"
 
           echo ""
           echo "===== pushing ====="
