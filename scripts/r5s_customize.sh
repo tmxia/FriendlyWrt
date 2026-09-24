@@ -20,33 +20,33 @@ pre_feeds() {
 post_feeds() {
     sed -i 's/192.168.1.1/192.168.3.3/g' package/base-files/files/bin/config_generate
 
-    python3 - << 'PYEOF'
-import os, re, sys
+    PROFILE_FILE="package/base-files/files/etc/profile"
+    if [ -f "$PROFILE_FILE" ] && ! grep -q 'PATH="\$PATH:\."' "$PROFILE_FILE"; then
+        sed -i '/^export PATH=/a export PATH="$PATH:."' "$PROFILE_FILE"
+        echo "profile: PATH appended with ."
+    fi
 
-path = "package/utils/busybox/Config-defaults.in"
-if not os.path.exists(path):
-    print(f"ERROR: {path} not found"); sys.exit(1)
-
-with open(path) as f:
-    content = f.read()
-
-if "BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET" not in content:
-    print("ERROR: variable not found"); sys.exit(1)
-
-pattern = re.compile(
+    BUSYBOX_DEFAULTS="package/utils/busybox/Config-defaults.in"
+    if [ -f "$BUSYBOX_DEFAULTS" ] && grep -q '^config BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET$' "$BUSYBOX_DEFAULTS"; then
+        python3 - << 'PYEOF'
+import re
+p = "package/utils/busybox/Config-defaults.in"
+with open(p) as f:
+    c = f.read()
+pat = re.compile(
     r'(config\s+BUSYBOX_DEFAULT_FEATURE_SH_EXTRA_QUIET\s*\n'
     r'\s+bool\s*\n'
     r'\s+default\s+)n(\s*\n)'
 )
-new_content, count = pattern.subn(r'\1y\2', content)
-
-if count == 0:
-    print("ERROR: pattern not matched (already patched?)"); sys.exit(1)
-
-with open(path, "w") as f:
-    f.write(new_content)
-print(f"patched {path}: {count} replacement")
+c2, n = pat.subn(r'\1y\2', c)
+if n == 0:
+    print("busybox banner: already patched or pattern miss")
+else:
+    with open(p, "w") as f:
+        f.write(c2)
+    print(f"busybox banner: patched {n}")
 PYEOF
+    fi
 
     KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | cut -d= -f2 | tr -d ' ')
     [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.12"
@@ -96,7 +96,9 @@ PYEOF
 
     mkdir -p files/sbin files/usr/bin files/etc/init.d files/etc/rc.d \
              files/etc/uci-defaults files/etc/docker files/etc/sysctl.d \
-             files/etc/hotplug.d/net files/etc/profile.d
+             files/etc/hotplug.d/net
+
+    mkdir -p package/base-files/files/etc/profile.d
 
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
@@ -391,7 +393,7 @@ EOF
 }
 EOF
 
-    cat > files/etc/profile.d/apk-cheatsheet.sh << 'WELCOME_EOF'
+    cat > package/base-files/files/etc/profile.d/apk-cheatsheet.sh << 'WELCOME_EOF'
 #!/bin/sh
 case "$-" in
     *i*) ;;
@@ -481,9 +483,9 @@ printf "  ${C}%-30s${R} ${D}%s${R}\n" "/etc/init.d/dockerd restart" "重启 Dock
 printf "  ${C}%-30s${R} ${D}%s${R}\n" "df -h ${DOCKER_PATH}"        "查看磁盘占用"
 printf "\n"
 WELCOME_EOF
-    chmod +x files/etc/profile.d/apk-cheatsheet.sh
+    chmod +x package/base-files/files/etc/profile.d/apk-cheatsheet.sh
 
-    : > files/etc/banner
+    : > package/base-files/files/etc/banner
 }
 
 pre_build() {
@@ -696,7 +698,7 @@ config_stage() {
              files/etc/hotplug.d/net/99-led-netdev \
              files/etc/docker/daemon.json files/etc/uci-defaults/99-custom \
              files/etc/sysctl.d/99-r5s.conf \
-             files/etc/profile.d/apk-cheatsheet.sh; do
+             package/base-files/files/etc/profile.d/apk-cheatsheet.sh; do
         [ -e "$f" ] || { echo "missing: $f"; exit 1; }
     done
 }
