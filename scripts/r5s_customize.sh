@@ -397,12 +397,31 @@ if [ -r /proc/uptime ]; then
     else UPTIME="${M}m"; fi
 else UPTIME="-"; fi
 
-if [ -r /proc/meminfo ]; then
-    MT=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-    MA=$(awk '/MemAvailable/{print $2}' /proc/meminfo)
-    MU=$(( (MT-MA)/1024 )); MTM=$((MT/1024))
-    MEM="${MU}M/${MTM}M"
-else MEM="-"; fi
+TEMP="-"
+for z in /sys/class/thermal/thermal_zone*/temp; do
+    [ -r "$z" ] || continue
+    T=$(cat "$z" 2>/dev/null)
+    case "$T" in
+        ''|*[!0-9-]*) continue ;;
+    esac
+    if [ "$T" -gt 0 ]; then
+        TEMP="$((T/1000)).$(( (T%1000)/100 ))°C"
+        break
+    fi
+done
+if [ "$TEMP" = "-" ]; then
+    for h in /sys/class/hwmon/hwmon*/temp1_input; do
+        [ -r "$h" ] || continue
+        T=$(cat "$h" 2>/dev/null)
+        case "$T" in
+            ''|*[!0-9-]*) continue ;;
+        esac
+        if [ "$T" -gt 0 ]; then
+            TEMP="$((T/1000)).$(( (T%1000)/100 ))°C"
+            break
+        fi
+    done
+fi
 
 if [ -t 1 ]; then
     D='\033[0;90m'
@@ -425,7 +444,7 @@ printf "  ${K}%-6s${R} ${V}%-24s${R} ${K}%-6s${R} ${V}%s${R}\n" \
 printf "  ${K}%-6s${R} ${V}%-24s${R} ${K}%-6s${R} ${V}%s${R}\n" \
     "LAN"    "${LAN_IP}" "Uptime" "${UPTIME}"
 printf "  ${K}%-6s${R} ${V}%-24s${R} ${K}%-6s${R} ${V}%s${R}\n" \
-    "Docker" "${DOCKER_PATH}" "Memory" "${MEM}"
+    "Docker" "${DOCKER_PATH}" "CPU" "${TEMP}"
 printf "${D}%s${R}\n" "$SEP"
 printf "  ${C}%-30s${R} ${D}%s${R}\n" "apk add <pkg>"               "安装软件包"
 printf "  ${C}%-30s${R} ${D}%s${R}\n" "apk del <pkg>"               "卸载软件包"
