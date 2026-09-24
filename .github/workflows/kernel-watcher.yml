@@ -114,6 +114,7 @@ jobs:
   trigger:
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 240
     if: |
       needs.check.outputs.nanopi_changed == 'true' ||
       needs.check.outputs.openwrt_changed == 'true'
@@ -134,15 +135,61 @@ jobs:
             -f set=both \
             --repo "$GITHUB_REPOSITORY"
 
-      - name: Trigger R5S build
+      - name: Trigger R5S firmware, wait, then trigger kernel
         if: needs.check.outputs.openwrt_changed == 'true'
         run: |
-          echo "Triggering build-r5s-openwrt.yml (openwrt-25.12 kernel: ${{ needs.check.outputs.openwrt_version }})"
+          echo "Triggering build-r5s-openwrt.yml (kernel: ${{ needs.check.outputs.openwrt_version }})..."
           gh workflow run build-r5s-openwrt.yml \
             -f replace_existing=false \
             --repo "$GITHUB_REPOSITORY"
 
+          RUN_ID=""
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 10
+            RUN_ID=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow=build-r5s-openwrt.yml \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty' 2>/dev/null || true)
+            if [ -n "$RUN_ID" ]; then
+              break
+            fi
+            echo "waiting for firmware run to appear... (${i}/10)"
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::warning::Cannot locate firmware run id; kernel build skipped"
+            exit 0
+          fi
+          echo "Firmware run id: $RUN_ID"
+
+          echo ""
+          echo "===== waiting for firmware run to complete ====="
+          FIRMWARE_RESULT=0
+          gh run watch "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --exit-status \
+            --interval 60 > /tmp/fw_watch.log 2>&1 || FIRMWARE_RESULT=$?
+          tail -50 /tmp/fw_watch.log || true
+
+          echo ""
+          echo "Firmware finished with exit code: $FIRMWARE_RESULT"
+
+          if [ "$FIRMWARE_RESULT" -ne 0 ]; then
+            echo "::warning::Firmware build did not succeed (exit=$FIRMWARE_RESULT); kernel build skipped"
+            exit 0
+          fi
+
+          echo ""
+          echo "===== firmware succeeded, triggering kernel build ====="
+          gh workflow run build-r5s-openwrt-kernel.yml \
+            -f replace_existing=false \
+            --repo "$GITHUB_REPOSITORY"
+          echo "Triggered build-r5s-openwrt-kernel.yml"
+
       - name: Commit updated records
+        if: always() && (needs.check.outputs.nanopi_changed == 'true' || needs.check.outputs.openwrt_changed == 'true')
         env:
           NANOPI_CHANGED: ${{ needs.check.outputs.nanopi_changed }}
           NANOPI_SHA: ${{ needs.check.outputs.nanopi_sha }}
