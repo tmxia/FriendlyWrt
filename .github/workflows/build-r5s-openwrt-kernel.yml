@@ -118,7 +118,7 @@ jobs:
 
           sudo swapoff -a || true
           sudo rm -f /swapfile
-          sudo fallocate -l 8G /swapfile
+          sudo fallocate -l 16G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile > /dev/null
           sudo swapon /swapfile
@@ -249,7 +249,8 @@ jobs:
           echo ""
           echo "=== restored base sizes ==="
           cd /workdir/openwrt
-          for d in build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-* dl; do
+          for d in build_dir/host build_dir/hostpkg build_dir/toolchain-* \
+                   staging_dir/host staging_dir/hostpkg staging_dir/toolchain-* dl; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -293,7 +294,9 @@ jobs:
           echo "=== restored target sizes ==="
           cd /workdir/openwrt
           for d in build_dir/target-aarch64_generic_musl \
+                   build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
+                   staging_dir/hostpkg \
                    bin/targets/rockchip/armv8; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
@@ -441,7 +444,7 @@ jobs:
           BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}"
 
           echo ""
-          echo "===== packing base cache ====="
+          echo "===== packing base cache (zstd) ====="
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -452,11 +455,14 @@ jobs:
           [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
 
           T0=$(date +%s)
-          if ! tar -czf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
+          if tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
+            echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
+          elif tar -czf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
+            echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
+          else
             echo "::warning::base cache pack/import failed"
             exit 0
           fi
-          echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
           IMG_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
@@ -525,7 +531,7 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}"
 
-          echo "===== clean redundant kernel versions (target) ====="
+          echo "===== clean redundant kernel versions ====="
           shopt -s nullglob
           for linux_base in /workdir/openwrt/build_dir/target-*/linux-*/; do
             [ -d "$linux_base" ] || continue
@@ -533,28 +539,61 @@ jobs:
               cd "$linux_base" || exit 0
               mapfile -t all_dirs < <(
                 find . -maxdepth 1 -mindepth 1 -type d -name 'linux-*' \
-                  -printf '%T@ %p\n' 2>/dev/null \
-                  | sort -rn | awk '{print $2}'
+                  -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}'
               )
               if [ "${#all_dirs[@]}" -gt 1 ]; then
                 echo "  keeping:  ${all_dirs[0]}"
                 for ((i=1; i<${#all_dirs[@]}; i++)); do
-                  echo "  removing: ${all_dirs[$i]}"
                   rm -rf -- "${all_dirs[$i]}"
                 done
               fi
             ) || true
           done
           shopt -u nullglob
-          echo "  done"
 
           echo ""
-          echo "===== packing target cache ====="
+          echo "===== deep slim target cache ====="
+          BEFORE=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          echo "  before: $((BEFORE / 1024 / 1024))MB"
+
+          for tdir in build_dir/target-*/ build_dir/hostpkg/; do
+            [ -d "$tdir" ] || continue
+            echo "  slimming $tdir"
+
+            find "$tdir" -type d \( -name '.git' -o -name '.github' -o -name '.gitlab' -o -name '.svn' -o -name '.hg' \) \
+              -prune -exec rm -rf {} + 2>/dev/null || true
+
+            find "$tdir" -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.eggs' \) \
+              -prune -exec rm -rf {} + 2>/dev/null || true
+            find "$tdir" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
+            find "$tdir" -type d -name '*.egg-info' -prune -exec rm -rf {} + 2>/dev/null || true
+
+            find "$tdir" -type f \( -name '*.orig' -o -name '*.rej' \) -delete 2>/dev/null || true
+
+            for kdir in "$tdir"linux-*/linux-*/; do
+              [ -d "$kdir" ] || continue
+              rm -rf "$kdir/.git"           2>/dev/null || true
+              rm -rf "$kdir/Documentation"  2>/dev/null || true
+              rm -rf "$kdir/tools/perf"     2>/dev/null || true
+              rm -rf "$kdir/tools/testing"  2>/dev/null || true
+              rm -rf "$kdir/samples"        2>/dev/null || true
+              echo "    kernel slimmed: $kdir"
+            done
+          done
+
+          AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          echo "  after:  $((AFTER / 1024 / 1024))MB"
+          echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
+
+          echo ""
+          echo "===== packing target cache (zstd) ====="
           docker rmi "$TARGET_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
           for d in build_dir/target-aarch64_generic_musl \
+                   build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
+                   staging_dir/hostpkg \
                    bin/targets/rockchip/armv8; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
@@ -562,11 +601,14 @@ jobs:
           [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
 
           T0=$(date +%s)
-          if ! tar -czf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
+          if tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
+            echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
+          elif tar -czf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
+            echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
+          else
             echo "::warning::target cache pack/import failed"
             exit 0
           fi
-          echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
           IMG_SIZE=$(docker image inspect "$TARGET_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
@@ -616,9 +658,6 @@ jobs:
           echo "DTB_FILE=$DTB_FILE_ABS"
           ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
 
-          # ============================================================
-          # 定位 OpenWrt 自带的 mkimage（与固件流程使用同一个）
-          # ============================================================
           MKIMAGE=""
           for cand in \
             "$PWD/staging_dir/host/bin/mkimage" \
@@ -634,23 +673,18 @@ jobs:
           echo "Using mkimage: $MKIMAGE"
           "$MKIMAGE" -V 2>&1 | head -1 || true
 
-          # ============================================================
-          # 生成 FIT kernel.img
-          # ============================================================
           echo ""
           echo "===== generate FIT kernel.img (mkimage + explicit hash-1/hash-2) ====="
           cd "$OUT/boot"
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
-          # LZMA 压缩：dict=8MiB, lc=1, lp=2, pb=2
           python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
 
           echo "----- Image.lzma header -----"
           hexdump -C Image.lzma | head -2
           echo "-------------------------------"
 
-          # 手写 ITS，显式声明两个 hash（crc32 + sha1）
           : > kernel.its
           printf '%s\n' '/dts-v1/;' >> kernel.its
           printf '%s\n' '' >> kernel.its
@@ -666,8 +700,8 @@ jobs:
           printf '%s\n' '            arch = "arm64";' >> kernel.its
           printf '%s\n' '            os = "linux";' >> kernel.its
           printf '%s\n' '            compression = "lzma";' >> kernel.its
-          printf '%s\n' '            load = <0x02080000>;' >> kernel.its
-          printf '%s\n' '            entry = <0x02080000>;' >> kernel.its
+          printf '%s\n' '            load = <0x03000000>;' >> kernel.its
+          printf '%s\n' '            entry = <0x03000000>;' >> kernel.its
           printf '%s\n' '            hash-1 {' >> kernel.its
           printf '%s\n' '                algo = "crc32";' >> kernel.its
           printf '%s\n' '            };' >> kernel.its
@@ -693,7 +727,7 @@ jobs:
           printf '%s\n' '    configurations {' >> kernel.its
           printf '%s\n' '        default = "config-1";' >> kernel.its
           printf '%s\n' '        config-1 {' >> kernel.its
-          printf '%s\n' '            description = "OpenWrt friendlyarm_nanopi_r5s";' >> kernel.its
+          printf '%s\n' '            description = "OpenWrt friendlyarm_nanopi-r5s";' >> kernel.its
           printf '%s\n' '            kernel = "kernel-1";' >> kernel.its
           printf '%s\n' '            fdt = "fdt-1";' >> kernel.its
           printf '%s\n' '        };' >> kernel.its
@@ -713,7 +747,7 @@ jobs:
           file kernel.img
 
           echo ""
-          echo "===== dumpimage 校验 hash 节点 ====="
+          echo "===== dumpimage 校验 hash / load / entry ====="
           DUMPIMAGE="$(dirname "$MKIMAGE")/dumpimage"
           if [ -x "$DUMPIMAGE" ]; then
             "$DUMPIMAGE" -l kernel.img || true
@@ -722,7 +756,7 @@ jobs:
           fi
 
           echo ""
-          echo "=== 关键校验：必须同时找到 hash-2 和 sha1 ==="
+          echo "=== 关键校验 ==="
           if strings kernel.img | grep -q 'hash-2' && strings kernel.img | grep -q 'sha1'; then
             echo "OK: hash-2 / sha1 均存在"
           else
@@ -808,7 +842,7 @@ jobs:
           KEEP="${KEEP:-1}"
 
           echo ""
-          echo "===== packing ccache ====="
+          echo "===== packing ccache (zstd) ====="
           if [ -d /workdir/ccache ] && [ -n "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
             CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
@@ -819,8 +853,16 @@ jobs:
             CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
 
             T0=$(date +%s)
-            if tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
-              echo "  packed+imported in $(( $(date +%s) - T0 ))s"
+            PACK_OK=false
+            if tar -I 'zstd -6 -T0' -cf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
+              PACK_OK=true
+              echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
+            elif tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
+              PACK_OK=true
+              echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
+            fi
+
+            if [ "$PACK_OK" = "true" ]; then
               IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
               echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
 
