@@ -456,7 +456,7 @@ jobs:
           BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}"
 
           echo ""
-          echo "===== packing base cache ====="
+          echo "===== packing base cache (zstd) ====="
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -471,11 +471,14 @@ jobs:
           fi
 
           T0=$(date +%s)
-          if ! tar -czf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
+          if tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
+            echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
+          elif tar -czf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
+            echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
+          else
             echo "::warning::base cache pack/import failed"
             exit 0
           fi
-          echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
           IMG_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
@@ -546,7 +549,7 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}"
 
-          echo "===== clean redundant kernel versions (target) ====="
+          echo "===== clean redundant kernel versions ====="
           shopt -s nullglob
           for linux_base in /workdir/openwrt/build_dir/target-*/linux-*/; do
             [ -d "$linux_base" ] || continue
@@ -554,64 +557,54 @@ jobs:
               cd "$linux_base" || exit 0
               mapfile -t all_dirs < <(
                 find . -maxdepth 1 -mindepth 1 -type d -name 'linux-*' \
-                  -printf '%T@ %p\n' 2>/dev/null \
-                  | sort -rn | awk '{print $2}'
+                  -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}'
               )
               if [ "${#all_dirs[@]}" -gt 1 ]; then
                 echo "  keeping:  ${all_dirs[0]}"
                 for ((i=1; i<${#all_dirs[@]}; i++)); do
-                  echo "  removing: ${all_dirs[$i]}"
                   rm -rf -- "${all_dirs[$i]}"
                 done
               fi
             ) || true
           done
           shopt -u nullglob
-          echo "  done"
 
           echo ""
-          echo "===== slim target cache (L1+L2) ====="
-          BEFORE=$(du -sb build_dir/target-* staging_dir/target-* 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          echo "===== deep slim target cache ====="
+          BEFORE=$(du -sb build_dir/target-* staging_dir/target-* bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  before: $((BEFORE / 1024 / 1024))MB"
-
-          shopt -s nullglob
 
           for tdir in build_dir/target-*/; do
             [ -d "$tdir" ] || continue
-
             echo "  slimming $tdir"
 
-            find "$tdir" -type d \( -name '.git' -o -name '.github' -o -name '.svn' -o -name '.hg' \) \
+            find "$tdir" -type d \( -name '.git' -o -name '.github' -o -name '.gitlab' -o -name '.svn' -o -name '.hg' \) \
               -prune -exec rm -rf {} + 2>/dev/null || true
 
-            find "$tdir" -type d -name '__pycache__' \
+            find "$tdir" -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.eggs' \) \
               -prune -exec rm -rf {} + 2>/dev/null || true
+            find "$tdir" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
+            find "$tdir" -type d -name '*.egg-info' -prune -exec rm -rf {} + 2>/dev/null || true
 
-            find "$tdir" -type f \( -name '*.pyc' -o -name '*.pyo' \) \
-              -delete 2>/dev/null || true
-
-            find "$tdir" -type f \( -name '*.orig' -o -name '*.rej' \) \
-              -delete 2>/dev/null || true
+            find "$tdir" -type f \( -name '*.orig' -o -name '*.rej' \) -delete 2>/dev/null || true
 
             for kdir in "$tdir"linux-*/linux-*/; do
               [ -d "$kdir" ] || continue
-              rm -rf "$kdir/.git"     2>/dev/null || true
-              rm -rf "$kdir/Documentation" 2>/dev/null || true
-              rm -rf "$kdir/tools/perf"    2>/dev/null || true
-              rm -rf "$kdir/tools/testing" 2>/dev/null || true
-              rm -rf "$kdir/samples"       2>/dev/null || true
+              rm -rf "$kdir/.git"           2>/dev/null || true
+              rm -rf "$kdir/Documentation"  2>/dev/null || true
+              rm -rf "$kdir/tools/perf"     2>/dev/null || true
+              rm -rf "$kdir/tools/testing"  2>/dev/null || true
+              rm -rf "$kdir/samples"        2>/dev/null || true
               echo "    kernel slimmed: $kdir"
             done
           done
 
-          shopt -u nullglob
-
-          AFTER=$(du -sb build_dir/target-* staging_dir/target-* 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          AFTER=$(du -sb build_dir/target-* staging_dir/target-* bin/targets 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  after:  $((AFTER / 1024 / 1024))MB"
           echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
 
           echo ""
-          echo "===== packing target cache ====="
+          echo "===== packing target cache (zstd) ====="
           docker rmi "$TARGET_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -628,11 +621,14 @@ jobs:
           fi
 
           T0=$(date +%s)
-          if ! tar -czf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
+          if tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
+            echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
+          elif tar -czf - "${PACK_DIRS[@]}" | docker import - "$TARGET_TAG"; then
+            echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
+          else
             echo "::warning::target cache pack/import failed"
             exit 0
           fi
-          echo "  packed+imported in $(( $(date +%s) - T0 ))s"
 
           IMG_SIZE=$(docker image inspect "$TARGET_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
@@ -668,7 +664,7 @@ jobs:
           KEEP="${KEEP:-1}"
 
           echo ""
-          echo "===== packing ccache ====="
+          echo "===== packing ccache (zstd) ====="
           if [ -d /workdir/ccache ] && [ -n "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
             CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
@@ -679,9 +675,16 @@ jobs:
             CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
 
             T0=$(date +%s)
-            if tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
-              echo "  packed+imported in $(( $(date +%s) - T0 ))s"
+            PACK_OK=false
+            if tar -I 'zstd -6 -T0' -cf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
+              PACK_OK=true
+              echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
+            elif tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
+              PACK_OK=true
+              echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
+            fi
 
+            if [ "$PACK_OK" = "true" ]; then
               IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
               echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
 
@@ -704,7 +707,7 @@ jobs:
               docker builder prune -a -f 2>/dev/null || true
               echo "  cleaned"
             else
-              echo "::warning::ccache pack/import failed, skipping push"
+              echo "::warning::ccache pack/import failed"
             fi
           else
             echo "  ccache empty, skip"
