@@ -542,64 +542,52 @@ jobs:
 
           set +e
 
-          run_make_hb() {
-            local NAME="$1" TIMEOUT="$2" LOG="$3"; shift 3
-            echo ""
-            echo "===== [$NAME] make $* (timeout=${TIMEOUT}) ====="
-            local T0=$(date +%s)
-            timeout "$TIMEOUT" make "$@" > "$LOG" 2>&1 &
-            local MPID=$!
-
-            local LAST=0 ITER=0
-            while kill -0 $MPID 2>/dev/null; do
-              if [ $ITER -eq 0 ]; then sleep 15; else sleep 60; fi
-              ITER=$((ITER+1))
-              kill -0 $MPID 2>/dev/null || break
-              local EL=$(( $(date +%s) - T0 ))
-              local CL=$(wc -l < "$LOG" 2>/dev/null || echo 0)
-              local D=$((CL - LAST)); LAST=$CL
-              local LL=$(tail -1 "$LOG" 2>/dev/null | head -c 180)
-
-              local CPU_BUSY=0
-              if ps -eo pcpu,comm --no-headers 2>/dev/null \
-                 | awk '$1 > 40 && ($2 ~ /^(cc1|cc1plus|rustc|gcc|g\+\+|ld|as|go|clang|cmake|ninja)$/)' \
-                 | grep -q . ; then
-                CPU_BUSY=1
-              fi
-
-              if [ "$CPU_BUSY" -eq 1 ] && [ "$D" -eq 0 ]; then
-                echo "[$NAME +${EL}s +0L cpu-busy] $LL"
-              else
-                echo "[$NAME +${EL}s +${D}L] $LL"
-              fi
-            done
-            wait $MPID
-            local RC=$?
-            if [ $RC -ne 0 ]; then
-              echo "[$NAME][!] rc=$RC, log tail (last 40 lines):"
-              tail -40 "$LOG" 2>/dev/null | sed 's/^/    /'
+          echo "===== make target/linux/compile ====="
+          T0=$(date +%s)
+          timeout 90m make target/linux/compile -j$(nproc) > /tmp/kernel_compile.log 2>&1 &
+          KERNEL_PID=$!
+          LAST_LINES=0
+          while kill -0 $KERNEL_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $KERNEL_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/kernel_compile.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              echo "[kernel +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/kernel_compile.log 2>/dev/null | head -c 150)"
             fi
-            echo "[$NAME] done: $(( $(date +%s) - T0 ))s, exit=$RC"
-            return $RC
-          }
-
-          NPROC=$(nproc)
-          echo "nproc = $NPROC"
-
-          run_make_hb kernel 90m /tmp/kernel_compile.log \
-            "target/linux/compile" -j$NPROC V=s
-          KERNEL_RC=$?
-          if [ $KERNEL_RC -ne 0 ]; then
-            echo "kernel compile failed (rc=$KERNEL_RC)"
+          done
+          wait $KERNEL_PID
+          KERNEL_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$KERNEL_RESULT"
+          if [ "$KERNEL_RESULT" -ne 0 ]; then
+            echo "kernel compile failed, last 100 lines:"
+            tail -100 /tmp/kernel_compile.log
             timeout 10m make target/linux/compile -j1 V=s 2>&1 | tail -300
             exit 1
           fi
 
-          run_make_hb kmod 60m /tmp/kmod_compile.log \
-            "package/kernel/linux/compile" -j$NPROC V=s
-          KMOD_RC=$?
-          if [ $KMOD_RC -ne 0 ]; then
-            echo "kmod compile failed (rc=$KMOD_RC)"
+          echo "===== make package/kernel/linux/compile ====="
+          T0=$(date +%s)
+          timeout 60m make package/kernel/linux/compile -j$(nproc) > /tmp/kmod_compile.log 2>&1 &
+          KMOD_PID=$!
+          LAST_LINES=0
+          while kill -0 $KMOD_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $KMOD_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/kmod_compile.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              echo "[kmod +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/kmod_compile.log 2>/dev/null | head -c 150)"
+            fi
+          done
+          wait $KMOD_PID
+          KMOD_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$KMOD_RESULT"
+          if [ "$KMOD_RESULT" -ne 0 ]; then
+            echo "kmod compile failed, last 100 lines:"
+            tail -100 /tmp/kmod_compile.log
             timeout 10m make package/kernel/linux/compile -j1 V=s 2>&1 | tail -300
             exit 1
           fi
