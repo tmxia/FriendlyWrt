@@ -398,7 +398,6 @@ jobs:
           ccache -p 2>/dev/null | grep -E 'max_size|compression|hash_dir|sloppiness' || true
 
       - name: Prepare build configuration
-        id: prepare_config
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
@@ -435,12 +434,6 @@ jobs:
         run: |
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
-
-          export PIP_DEFAULT_TIMEOUT=30
-          export PIP_RETRIES=3
-          export GIT_HTTP_LOW_SPEED_LIMIT=1000
-          export GIT_HTTP_LOW_SPEED_TIME=30
-          export GIT_TERMINAL_PROMPT=0
 
           echo "===== tools/download ====="
           T0=$(date +%s)
@@ -546,99 +539,48 @@ jobs:
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
-          export PIP_DEFAULT_TIMEOUT=30
-          export PIP_RETRIES=3
-          export GIT_HTTP_LOW_SPEED_LIMIT=1000
-          export GIT_HTTP_LOW_SPEED_TIME=30
-          export GIT_TERMINAL_PROMPT=0
-
           set +e
 
-          run_make_hb() {
-            local NAME="$1" TIMEOUT="$2" LOG="$3" STALL_LIMIT="$4"; shift 4
-            echo ""
-            echo "===== [$NAME] make $* (timeout=${TIMEOUT}, stall-limit=${STALL_LIMIT}m) ====="
-            local T0=$(date +%s)
-            timeout "$TIMEOUT" make "$@" > "$LOG" 2>&1 &
-            local MPID=$!
-
-            local LAST=0 STALL=0 PREV="" ITER=0
-            while kill -0 $MPID 2>/dev/null; do
-              if [ $ITER -eq 0 ]; then sleep 15; else sleep 60; fi
-              ITER=$((ITER+1))
-              kill -0 $MPID 2>/dev/null || break
-              local EL=$(( $(date +%s) - T0 ))
-              local CL=$(wc -l < "$LOG" 2>/dev/null || echo 0)
-              local D=$((CL - LAST)); LAST=$CL
-              local LL=$(tail -1 "$LOG" 2>/dev/null | head -c 180)
-              local H=$(printf '%s' "$LL" | md5sum | awk '{print $1}')
-
-              local CPU_BUSY=0
-              if ps -eo pcpu,comm --no-headers 2>/dev/null \
-                 | awk '$1 > 40 && ($2 ~ /^(cc1|cc1plus|rustc|gcc|g\+\+|ld|as|go|clang|cmake|ninja)$/)' \
-                 | grep -q . ; then
-                CPU_BUSY=1
-              fi
-
-              if [ "$H" = "$PREV" ] && [ "$D" -eq 0 ] && [ "$CPU_BUSY" -eq 0 ]; then
-                STALL=$((STALL + 1))
-              else
-                STALL=0
-              fi
-              PREV="$H"
-
-              if [ "$CPU_BUSY" -eq 1 ] && [ "$D" -eq 0 ]; then
-                echo "[$NAME +${EL}s +0L cpu-busy] $LL"
-              else
-                echo "[$NAME +${EL}s +${D}L stall=${STALL}m] $LL"
-              fi
-
-              if [ $STALL -ge 10 ] && [ $((STALL % 5)) -eq 0 ]; then
-                echo "[$NAME][!] STALL ${STALL}m, diagnostics:"
-                ps -eo pid,ppid,etime,%cpu,%mem,comm,args --sort=-%cpu 2>/dev/null \
-                  | head -12 | sed 's/^/    /'
-                ss -tanp 2>/dev/null | head -10 | sed 's/^/    /'
-                find /workdir/openwrt/logs -type f -newermt "-20 minutes" 2>/dev/null \
-                  | head -3 | while read f; do
-                    echo "    >> $f"; tail -5 "$f" 2>/dev/null | sed 's/^/      /'
-                  done
-              fi
-
-              if [ $STALL -ge $STALL_LIMIT ]; then
-                echo "[$NAME][!] killing after ${STALL}m stall"
-                kill -TERM $MPID 2>/dev/null; sleep 10
-                kill -KILL $MPID 2>/dev/null
-                break
-              fi
-            done
-            wait $MPID
-            local RC=$?
-            if [ $RC -ne 0 ]; then
-              echo "[$NAME][!] rc=$RC, log tail (last 40 lines):"
-              tail -40 "$LOG" 2>/dev/null | sed 's/^/    /'
+          echo "===== pre-compile perl ====="
+          T0=$(date +%s)
+          timeout 45m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1 &
+          PERL_PID=$!
+          while kill -0 $PERL_PID 2>/dev/null; do
+            sleep 30
+            if kill -0 $PERL_PID 2>/dev/null; then
+              echo "[perl +$(( $(date +%s) - T0 ))s] $(tail -1 /tmp/perl_build.log 2>/dev/null | head -c 150)"
             fi
-            echo "[$NAME] done: $(( $(date +%s) - T0 ))s, exit=$RC"
-            return $RC
-          }
+          done
+          wait $PERL_PID
+          PERL_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$PERL_RESULT"
 
-          NPROC=$(nproc)
-          echo "nproc = $NPROC"
+          echo ""
+          echo "===== make -j3 ====="
+          T0=$(date +%s)
+          timeout 5h make -j3 > /tmp/build.log 2>&1 &
+          MAKE_PID=$!
 
-          run_make_hb perl 45m /tmp/perl_build.log 15 \
-            "package/perl/compile" -j1 V=s
-          echo "perl exit=$?"
-
-          run_make_hb main 5h /tmp/build.log 20 -j$NPROC
-          BUILD_RC=$?
-
+          LAST_LINES=0
+          while kill -0 $MAKE_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $MAKE_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/build.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              echo "[make +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/build.log 2>/dev/null | head -c 150)"
+            fi
+          done
+          wait $MAKE_PID
+          BUILD_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
           set -e
 
-          if [ "$BUILD_RC" -ne 0 ]; then
-            echo "Build failed (rc=$BUILD_RC), last 100 lines:"
+          if [ "$BUILD_RESULT" -ne 0 ]; then
+            echo "Build failed, last 100 lines:"
             tail -100 /tmp/build.log
-            echo ""
-            echo "Retrying with -j1 V=s to surface the real error..."
-            timeout 60m make -j1 V=s 2>&1 | tail -500 || true
+            timeout 10m make -j1 V=s 2>&1 | tail -500
             exit 1
           fi
 
