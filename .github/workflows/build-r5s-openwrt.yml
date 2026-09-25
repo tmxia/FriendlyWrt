@@ -562,9 +562,10 @@ jobs:
             timeout "$TIMEOUT" make "$@" > "$LOG" 2>&1 &
             local MPID=$!
 
-            local LAST=0 STALL=0 PREV=""
+            local LAST=0 STALL=0 PREV="" ITER=0
             while kill -0 $MPID 2>/dev/null; do
-              sleep 60
+              if [ $ITER -eq 0 ]; then sleep 15; else sleep 60; fi
+              ITER=$((ITER+1))
               kill -0 $MPID 2>/dev/null || break
               local EL=$(( $(date +%s) - T0 ))
               local CL=$(wc -l < "$LOG" 2>/dev/null || echo 0)
@@ -601,21 +602,25 @@ jobs:
             done
             wait $MPID
             local RC=$?
+            if [ $RC -ne 0 ]; then
+              echo "[$NAME][!] rc=$RC, log tail (last 40 lines):"
+              tail -40 "$LOG" 2>/dev/null | sed 's/^/    /'
+            fi
             echo "[$NAME] done: $(( $(date +%s) - T0 ))s, exit=$RC"
             return $RC
           }
 
-          run_make_hb py3-host 30m /tmp/py3_host_build.log 15 \
-            "package/feeds/packages/lang/python/python3/host-compile" -j1 V=s \
-            || echo "::warning::python3 host-compile failed (continue)"
+          run_make_hb py3 30m /tmp/py3_build.log 15 \
+            "package/feeds/packages/python3/compile" -j1 V=s \
+            || echo "::warning::python3 pre-compile failed"
 
-          run_make_hb maturin-host 30m /tmp/maturin_build.log 15 \
-            "package/feeds/packages/lang/python/python-maturin/host-compile" -j1 V=s \
-            || echo "::warning::maturin host-compile failed (continue)"
+          run_make_hb maturin 30m /tmp/maturin_build.log 15 \
+            "package/feeds/packages/python-maturin/compile" -j1 V=s \
+            || echo "::warning::python-maturin pre-compile failed"
 
           run_make_hb pyreq 30m /tmp/pyreq_build.log 15 \
-            "package/feeds/packages/lang/python/python-requests/compile" -j1 V=s \
-            || echo "::warning::python-requests pre-compile failed (continue)"
+            "package/feeds/packages/python-requests/compile" -j1 V=s \
+            || echo "::warning::python-requests pre-compile failed"
 
           run_make_hb perl 45m /tmp/perl_build.log 15 \
             "package/perl/compile" -j1 V=s
