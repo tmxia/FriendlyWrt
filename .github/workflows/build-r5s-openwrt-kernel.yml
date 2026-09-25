@@ -240,8 +240,6 @@ jobs:
           fi
 
           echo "BASE CACHE HIT"
-          LAYERS=$(docker image inspect "$TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
-          echo "  layers: $LAYERS"
 
           rm -rf /workdir/base_parts
           mkdir -p /workdir/base_parts
@@ -253,32 +251,20 @@ jobs:
           if [ -d /workdir/base_parts/cache ]; then
             PARTS=$(ls /workdir/base_parts/cache/p_* 2>/dev/null | wc -l)
             echo "  parts extracted: $PARTS"
-            if [ "$PARTS" -gt 0 ]; then
-              cd /workdir/base_parts/cache
-              if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-                if ! cat p_* | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-                  rm -rf /workdir/base_parts
-                  docker rmi "$TAG" -f 2>/dev/null || true
-                  exit 1
-                fi
-              fi
-              rm -rf /workdir/base_parts
-              docker rmi "$TAG" -f 2>/dev/null || true
-              echo "hit=true" >> "$GITHUB_OUTPUT"
-            else
-              rm -rf /workdir/base_parts
-              docker rmi "$TAG" -f 2>/dev/null || true
-              exit 1
-            fi
+            cd /workdir/base_parts/cache
+            cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null
+            rm -rf /workdir/base_parts
+            echo "hit=true" >> "$GITHUB_OUTPUT"
           else
-            echo "  no /cache dir, legacy export"
+            echo "  legacy export"
             docker create --name r5s_base_tmp2 "$TAG" /bin/true >/dev/null
             docker export r5s_base_tmp2 | tar -xpf - -C /workdir/openwrt
             docker rm r5s_base_tmp2 >/dev/null
-            docker rmi "$TAG" -f 2>/dev/null || true
             rm -rf /workdir/base_parts
             echo "hit=true" >> "$GITHUB_OUTPUT"
           fi
+
+          docker rmi "$TAG" -f 2>/dev/null || true
 
           echo ""
           echo "=== restored base sizes ==="
@@ -288,11 +274,8 @@ jobs:
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
 
-          echo ""
-          echo "=== revert dl/ mtime ==="
           if [ -d /workdir/openwrt/dl ]; then
             find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
-            echo "  dl/ reverted: $(find /workdir/openwrt/dl -type f | wc -l) files"
           fi
 
       - name: Restore target cache
@@ -317,8 +300,6 @@ jobs:
           fi
 
           echo "TARGET CACHE HIT"
-          LAYERS=$(docker image inspect "$TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
-          echo "  layers: $LAYERS"
 
           rm -rf /workdir/cache_parts
           mkdir -p /workdir/cache_parts
@@ -330,34 +311,20 @@ jobs:
           if [ -d /workdir/cache_parts/cache ]; then
             PARTS=$(ls /workdir/cache_parts/cache/p_* 2>/dev/null | wc -l)
             echo "  parts extracted: $PARTS"
-            if [ "$PARTS" -gt 0 ]; then
-              echo ""
-              echo "=== merging parts and extracting ==="
-              cd /workdir/cache_parts/cache
-              if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-                if ! cat p_* | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-                  rm -rf /workdir/cache_parts
-                  docker rmi "$TAG" -f 2>/dev/null || true
-                  exit 1
-                fi
-              fi
-              rm -rf /workdir/cache_parts
-              docker rmi "$TAG" -f 2>/dev/null || true
-              echo "hit=true" >> "$GITHUB_OUTPUT"
-            else
-              rm -rf /workdir/cache_parts
-              docker rmi "$TAG" -f 2>/dev/null || true
-              exit 1
-            fi
+            cd /workdir/cache_parts/cache
+            cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null
+            rm -rf /workdir/cache_parts
+            echo "hit=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::no /cache dir, trying legacy export"
+            echo "  legacy export"
             docker create --name r5s_tgt_tmp2 "$TAG" /bin/true >/dev/null
             docker export r5s_tgt_tmp2 | tar -xpf - -C /workdir/openwrt
             docker rm r5s_tgt_tmp2 >/dev/null
-            docker rmi "$TAG" -f 2>/dev/null || true
             rm -rf /workdir/cache_parts
             echo "hit=true" >> "$GITHUB_OUTPUT"
           fi
+
+          docker rmi "$TAG" -f 2>/dev/null || true
 
           echo ""
           echo "=== restored target sizes ==="
@@ -366,10 +333,7 @@ jobs:
                    build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
                    staging_dir/hostpkg \
-                   bin/targets/rockchip/armv8 \
-                   feeds \
-                   package \
-                   tmp; do
+                   bin/targets/rockchip/armv8; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -384,7 +348,6 @@ jobs:
           [ -z "$KM" ] && KM="6.12"
           TAG="${BASE}:openwrt-25.12-linux-${KM}"
 
-          echo "hit=false" >> "$GITHUB_OUTPUT"
           mkdir -p /workdir/ccache
           echo "=== ccache: $TAG ==="
 
@@ -393,8 +356,6 @@ jobs:
             echo "CCACHE MISS"
           else
             echo "CCACHE HIT"
-            LAYERS=$(docker image inspect "$TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
-            echo "  layers: $LAYERS"
 
             rm -rf /workdir/ccache_parts
             mkdir -p /workdir/ccache_parts
@@ -404,30 +365,17 @@ jobs:
             docker rm r5s_ccache_tmp >/dev/null
 
             if [ -d /workdir/ccache_parts/cache ]; then
-              PARTS=$(ls /workdir/ccache_parts/cache/p_* 2>/dev/null | wc -l)
-              echo "  parts extracted: $PARTS"
-              if [ "$PARTS" -gt 0 ]; then
-                cd /workdir/ccache_parts/cache
-                if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir 2>/dev/null; then
-                  if ! cat p_* | tar -xpf - -C /workdir 2>/dev/null; then
-                    echo "::warning::ccache extract failed"
-                    rm -rf /workdir/ccache_parts
-                    docker rmi "$TAG" -f 2>/dev/null || true
-                  fi
-                fi
-                echo "hit=true" >> "$GITHUB_OUTPUT"
-              fi
+              cd /workdir/ccache_parts/cache
+              cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir 2>/dev/null
               rm -rf /workdir/ccache_parts
-              docker rmi "$TAG" -f 2>/dev/null || true
             else
-              echo "  no /cache dir, legacy export"
               docker create --name r5s_ccache_tmp2 "$TAG" /bin/true >/dev/null
               docker export r5s_ccache_tmp2 | tar -xpf - -C /workdir
               docker rm r5s_ccache_tmp2 >/dev/null
-              docker rmi "$TAG" -f 2>/dev/null || true
               rm -rf /workdir/ccache_parts
-              echo "hit=true" >> "$GITHUB_OUTPUT"
             fi
+
+            docker rmi "$TAG" -f 2>/dev/null || true
 
             CC_SIZE=$(du -sh /workdir/ccache 2>/dev/null | awk '{print $1}')
             CC_FILES=$(find /workdir/ccache -type f 2>/dev/null | wc -l)
@@ -448,33 +396,10 @@ jobs:
         run: |
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
-
-          mkdir -p tmp
-
-          FEEDS_CONF_HASH=$(md5sum feeds.conf.default feeds.conf 2>/dev/null | md5sum | cut -d' ' -f1)
-          CACHED_FEEDS_HASH=""
-          [ -f tmp/.feeds_conf_hash ] && CACHED_FEEDS_HASH=$(cat tmp/.feeds_conf_hash)
-
-          if [ -d feeds/packages ] && [ -d feeds/luci ] && [ "$FEEDS_CONF_HASH" = "$CACHED_FEEDS_HASH" ]; then
-            echo "feeds/ already present and feeds.conf unchanged, skip feeds update"
-          else
-            echo "feeds/ missing or feeds.conf changed, running feeds update"
-            ./scripts/feeds update -a 2>&1 | tail -30
-            echo "$FEEDS_CONF_HASH" > tmp/.feeds_conf_hash
-          fi
+          ./scripts/feeds update -a 2>&1 | tail -30
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
-
-          echo ""
-          echo "=== normalize feeds/package mtime ==="
-          find feeds -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
-          find feeds -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
-          find package/feeds -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
-          find package/feeds -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
-          find package/custom -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
-          find package/custom -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
-          echo "  mtime reverted to 2020-01-01"
 
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
@@ -495,18 +420,8 @@ jobs:
             echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
 
           echo ""
-          echo "=== revert .config and tmp/ mtime ==="
-          [ -f .config ] && touch -t 202001010000 .config
-          if [ -d tmp ]; then
-            find tmp -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
-            find tmp -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
-            echo "  tmp/ files: $(find tmp -type f 2>/dev/null | wc -l)"
-          fi
-          echo "  .config and tmp/ mtime reverted to 2020-01-01"
-
-          echo ""
-          echo "=== ccache config ==="
-          grep -E '^CONFIG_CCACHE' .config || true
+          echo "=== .config md5 ==="
+          md5sum .config
 
       - name: Compile base
         id: compile_base
@@ -547,11 +462,9 @@ jobs:
           fi
           echo "  took $(( $(date +%s) - T0 ))s"
 
-          echo "===== make download (full, prefetch for target) ====="
+          echo "===== make download (full) ====="
           T0=$(date +%s)
-          timeout 50m make download -j8 > /tmp/full_dl.log 2>&1 || {
-            echo "  partial download, will retry in compile stage"
-          }
+          timeout 50m make download -j8 > /tmp/full_dl.log 2>&1 || true
           echo "  took $(( $(date +%s) - T0 ))s, dl files: $(find dl -maxdepth 1 -type f | wc -l)"
 
           echo ""
@@ -568,14 +481,12 @@ jobs:
 
           if [ -d dl ]; then
             find dl -type f | xargs -r touch -t 200001010000
-            echo "  dl/ reverted: $(find dl -type f | wc -l) files"
           fi
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}"
 
-          echo ""
-          echo "===== packing base cache (multi-layer zstd) ====="
+          echo "===== packing base cache ====="
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -585,17 +496,12 @@ jobs:
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
           [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
 
-          T0=$(date +%s)
-
           rm -rf /workdir/base_parts
           mkdir -p /workdir/base_parts
 
           cd /workdir/openwrt
-          if ! tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
-               | split -a 2 -d -b 512M - /workdir/base_parts/p_ 2>/dev/null; then
-            rm -rf /workdir/base_parts
-            exit 0
-          fi
+          tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
+            | split -a 2 -d -b 512M - /workdir/base_parts/p_ 2>/dev/null
 
           cd /workdir/base_parts
           echo "FROM scratch" > Dockerfile
@@ -609,36 +515,18 @@ jobs:
           done
           echo "  parts: $i"
 
-          if ! docker build -t "$BASE_TAG" . > /tmp/bc_build.log 2>&1; then
-            tail -30 /tmp/bc_build.log
-            rm -rf /workdir/base_parts
-            exit 0
-          fi
-
-          echo "  packed (multi-layer) + imported in $(( $(date +%s) - T0 ))s"
+          docker build -t "$BASE_TAG" . > /tmp/bc_build.log 2>&1 || { tail -30 /tmp/bc_build.log; exit 1; }
           rm -rf /workdir/base_parts
 
-          IMG_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-          echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
-          LAYERS=$(docker image inspect "$BASE_TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
-          echo "  layers: $LAYERS"
-
-          echo ""
-          echo "===== pushing ====="
+          echo "  pushing..."
           PUSHED=false
           for attempt in 1 2 3; do
-            if docker push "$BASE_TAG" >/dev/null 2>&1; then
-              echo "  pushed"
-              PUSHED=true
-              break
-            fi
-            echo "  attempt $attempt failed, retrying..."
+            if docker push "$BASE_TAG" >/dev/null 2>&1; then PUSHED=true; break; fi
             sleep 10
           done
           [ "$PUSHED" = "true" ] || echo "::warning::base cache push failed"
 
           docker rmi "$BASE_TAG" -f 2>/dev/null || true
-          echo "  cleaned"
 
       - name: Compile kernel and kernel modules
         run: |
@@ -659,19 +547,18 @@ jobs:
               CURRENT_LINES=$(wc -l < /tmp/kernel_compile.log 2>/dev/null || echo 0)
               DELTA=$((CURRENT_LINES - LAST_LINES))
               LAST_LINES=$CURRENT_LINES
-              LAST_MSG=$(tail -1 /tmp/kernel_compile.log 2>/dev/null | head -c 150)
-              echo "[kernel +${ELAPSED}s +${DELTA}L] ${LAST_MSG}"
+              echo "[kernel +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/kernel_compile.log 2>/dev/null | head -c 150)"
             fi
           done
           wait $KERNEL_PID
           KERNEL_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$KERNEL_RESULT"
           if [ "$KERNEL_RESULT" -ne 0 ]; then
-            echo "kernel compile failed, retry with V=s"
+            echo "kernel compile failed, last 100 lines:"
+            tail -100 /tmp/kernel_compile.log
             timeout 10m make target/linux/compile -j1 V=s 2>&1 | tail -300
             exit 1
           fi
-          tail -20 /tmp/kernel_compile.log
 
           echo "===== make package/kernel/linux/compile ====="
           T0=$(date +%s)
@@ -685,19 +572,18 @@ jobs:
               CURRENT_LINES=$(wc -l < /tmp/kmod_compile.log 2>/dev/null || echo 0)
               DELTA=$((CURRENT_LINES - LAST_LINES))
               LAST_LINES=$CURRENT_LINES
-              LAST_MSG=$(tail -1 /tmp/kmod_compile.log 2>/dev/null | head -c 150)
-              echo "[kmod +${ELAPSED}s +${DELTA}L] ${LAST_MSG}"
+              echo "[kmod +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/kmod_compile.log 2>/dev/null | head -c 150)"
             fi
           done
           wait $KMOD_PID
           KMOD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$KMOD_RESULT"
           if [ "$KMOD_RESULT" -ne 0 ]; then
-            echo "kmod compile failed, retry with V=s"
+            echo "kmod compile failed, last 100 lines:"
+            tail -100 /tmp/kmod_compile.log
             timeout 10m make package/kernel/linux/compile -j1 V=s 2>&1 | tail -300
             exit 1
           fi
-          tail -20 /tmp/kmod_compile.log
 
           echo "===== install kernel/modules to staging ====="
           make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
@@ -723,81 +609,7 @@ jobs:
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}"
 
-          echo "===== clean redundant kernel versions ====="
-          shopt -s nullglob
-          for linux_base in /workdir/openwrt/build_dir/target-*/linux-*/; do
-            [ -d "$linux_base" ] || continue
-            (
-              cd "$linux_base" || exit 0
-              mapfile -t all_dirs < <(
-                find . -maxdepth 1 -mindepth 1 -type d -name 'linux-*' \
-                  -printf '%T@ %p\n' 2>/dev/null | sort -rn | awk '{print $2}'
-              )
-              if [ "${#all_dirs[@]}" -gt 1 ]; then
-                echo "  keeping:  ${all_dirs[0]}"
-                for ((i=1; i<${#all_dirs[@]}; i++)); do
-                  rm -rf -- "${all_dirs[$i]}"
-                done
-              fi
-            ) || true
-          done
-          shopt -u nullglob
-
-          echo ""
-          echo "===== deep slim target cache ====="
-          BEFORE=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package tmp 2>/dev/null | awk '{s+=$1} END {print s+0}')
-          echo "  before: $((BEFORE / 1024 / 1024))MB"
-
-          for tdir in build_dir/target-*/ build_dir/hostpkg/ feeds/; do
-            [ -d "$tdir" ] || continue
-            echo "  slimming $tdir"
-
-            if [ "$tdir" = "feeds/" ]; then
-              find "$tdir" -type d \( -name '.github' -o -name '.gitlab' -o -name '.svn' -o -name '.hg' \) \
-                -prune -exec rm -rf {} + 2>/dev/null || true
-            else
-              find "$tdir" -type d \( -name '.git' -o -name '.github' -o -name '.gitlab' -o -name '.svn' -o -name '.hg' \) \
-                -prune -exec rm -rf {} + 2>/dev/null || true
-            fi
-
-            find "$tdir" -type d \( -name '__pycache__' -o -name '.pytest_cache' -o -name '.mypy_cache' -o -name '.eggs' \) \
-              -prune -exec rm -rf {} + 2>/dev/null || true
-            find "$tdir" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete 2>/dev/null || true
-            find "$tdir" -type d -name '*.egg-info' -prune -exec rm -rf {} + 2>/dev/null || true
-
-            find "$tdir" -type f \( -name '*.orig' -o -name '*.rej' \) -delete 2>/dev/null || true
-
-            for kdir in "$tdir"linux-*/linux-*/; do
-              [ -d "$kdir" ] || continue
-              rm -rf "$kdir/.git"           2>/dev/null || true
-              rm -rf "$kdir/Documentation"  2>/dev/null || true
-              rm -rf "$kdir/tools/perf"     2>/dev/null || true
-              rm -rf "$kdir/tools/testing"  2>/dev/null || true
-              rm -rf "$kdir/samples"        2>/dev/null || true
-              echo "    kernel slimmed: $kdir"
-            done
-          done
-
-          echo "  L4: removing staging static libs"
-          for sdir in staging_dir/target-*/ staging_dir/hostpkg/; do
-            [ -d "$sdir" ] || continue
-            find "$sdir" -type f -name '*.a' -delete 2>/dev/null || true
-            find "$sdir" -type f -name '*.la' -delete 2>/dev/null || true
-          done
-
-          echo "  revert .config and tmp/ mtime before packing"
-          [ -f .config ] && touch -t 202001010000 .config
-          if [ -d tmp ]; then
-            find tmp -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
-            find tmp -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
-          fi
-
-          AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package tmp 2>/dev/null | awk '{s+=$1} END {print s+0}')
-          echo "  after:  $((AFTER / 1024 / 1024))MB"
-          echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
-
-          echo ""
-          echo "===== packing target cache (multi-layer zstd) ====="
+          echo "===== packing target cache ====="
           docker rmi "$TARGET_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -805,26 +617,18 @@ jobs:
                    build_dir/hostpkg \
                    staging_dir/target-aarch64_generic_musl \
                    staging_dir/hostpkg \
-                   bin/targets/rockchip/armv8 \
-                   feeds \
-                   package \
-                   tmp; do
+                   bin/targets/rockchip/armv8; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
           [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
 
-          T0=$(date +%s)
-
           rm -rf /workdir/cache_parts
           mkdir -p /workdir/cache_parts
 
           cd /workdir/openwrt
-          if ! tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
-               | split -a 2 -d -b 4G - /workdir/cache_parts/p_ 2>/dev/null; then
-            rm -rf /workdir/cache_parts
-            exit 0
-          fi
+          tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
+            | split -a 2 -d -b 4G - /workdir/cache_parts/p_ 2>/dev/null
 
           cd /workdir/cache_parts
           echo "FROM scratch" > Dockerfile
@@ -838,37 +642,19 @@ jobs:
           done
           echo "  parts: $i"
 
-          if ! docker build -t "$TARGET_TAG" . > /tmp/tc_build.log 2>&1; then
-            tail -30 /tmp/tc_build.log
-            rm -rf /workdir/cache_parts
-            exit 0
-          fi
-
-          echo "  packed (multi-layer) + imported in $(( $(date +%s) - T0 ))s"
+          docker build -t "$TARGET_TAG" . > /tmp/tc_build.log 2>&1 || { tail -30 /tmp/tc_build.log; exit 1; }
           rm -rf /workdir/cache_parts
 
-          IMG_SIZE=$(docker image inspect "$TARGET_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-          echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
-          LAYERS=$(docker image inspect "$TARGET_TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
-          echo "  layers: $LAYERS"
-
-          echo ""
-          echo "===== pushing ====="
+          echo "  pushing..."
           PUSHED=false
           for attempt in 1 2 3; do
-            if docker push "$TARGET_TAG" >/dev/null 2>&1; then
-              echo "  pushed"
-              PUSHED=true
-              break
-            fi
-            echo "  attempt $attempt failed, retrying..."
+            if docker push "$TARGET_TAG" >/dev/null 2>&1; then PUSHED=true; break; fi
             sleep 10
           done
           [ "$PUSHED" = "true" ] || echo "::warning::target cache push failed"
 
           docker rmi "$TARGET_TAG" -f 2>/dev/null || true
           docker builder prune -a -f 2>/dev/null || true
-          echo "  cleaned"
 
       - name: Package kernel upgrade files
         id: package
@@ -986,15 +772,6 @@ jobs:
           file kernel.img
 
           echo ""
-          echo "===== dumpimage 校验 hash / load / entry ====="
-          DUMPIMAGE="$(dirname "$MKIMAGE")/dumpimage"
-          if [ -x "$DUMPIMAGE" ]; then
-            "$DUMPIMAGE" -l kernel.img || true
-          elif command -v dumpimage >/dev/null 2>&1; then
-            dumpimage -l kernel.img || true
-          fi
-
-          echo ""
           echo "=== 关键校验 ==="
           if strings kernel.img | grep -q 'hash-2' && strings kernel.img | grep -q 'sha1'; then
             echo "OK: hash-2 / sha1 均存在"
@@ -1081,66 +858,45 @@ jobs:
           KEEP="${KEEP:-1}"
 
           echo ""
-          echo "===== packing ccache (multi-layer zstd) ====="
+          echo "===== packing ccache ====="
           if [ -d /workdir/ccache ] && [ -n "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
             CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
 
             docker rmi "$CCACHE_TAG" 2>/dev/null || true
 
-            echo "  ccache stats before pack:"
             CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
-
-            T0=$(date +%s)
 
             rm -rf /workdir/ccache_parts
             mkdir -p /workdir/ccache_parts
 
-            if ! tar -I 'zstd -6 -T0' -cf - -C /workdir ccache 2>/dev/null \
-                 | split -a 2 -d -b 512M - /workdir/ccache_parts/p_ 2>/dev/null; then
+            tar -I 'zstd -6 -T0' -cf - -C /workdir ccache 2>/dev/null \
+              | split -a 2 -d -b 512M - /workdir/ccache_parts/p_ 2>/dev/null
+
+            cd /workdir/ccache_parts
+            echo "FROM scratch" > Dockerfile
+            i=0
+            for f in p_*; do
+              d="l$i"
+              mkdir -p "$d"
+              mv "$f" "$d/"
+              echo "COPY $d /cache/" >> Dockerfile
+              i=$((i+1))
+            done
+            echo "  parts: $i"
+
+            if docker build -t "$CCACHE_TAG" . > /tmp/cc_build.log 2>&1; then
               rm -rf /workdir/ccache_parts
-            else
-              cd /workdir/ccache_parts
-              echo "FROM scratch" > Dockerfile
-              i=0
-              for f in p_*; do
-                d="l$i"
-                mkdir -p "$d"
-                mv "$f" "$d/"
-                echo "COPY $d /cache/" >> Dockerfile
-                i=$((i+1))
+              PUSHED=false
+              for attempt in 1 2 3; do
+                if docker push "$CCACHE_TAG" >/dev/null 2>&1; then PUSHED=true; break; fi
+                sleep 10
               done
-              echo "  parts: $i"
-
-              if docker build -t "$CCACHE_TAG" . > /tmp/cc_build.log 2>&1; then
-                echo "  packed (multi-layer) + imported in $(( $(date +%s) - T0 ))s"
-                rm -rf /workdir/ccache_parts
-
-                IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-                echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
-                LAYERS=$(docker image inspect "$CCACHE_TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
-                echo "  layers: $LAYERS"
-
-                echo ""
-                echo "===== pushing ccache ====="
-                PUSHED=false
-                for attempt in 1 2 3; do
-                  if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
-                    echo "  pushed"
-                    PUSHED=true
-                    break
-                  fi
-                  echo "  attempt $attempt failed, retrying..."
-                  sleep 10
-                done
-                [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed"
-
-                docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
-                docker builder prune -a -f 2>/dev/null || true
-              else
-                tail -30 /tmp/cc_build.log
-                rm -rf /workdir/ccache_parts
-              fi
+              [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed"
+              docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
+            else
+              tail -30 /tmp/cc_build.log
+              rm -rf /workdir/ccache_parts
             fi
           else
             echo "  ccache empty, skip"
@@ -1157,7 +913,6 @@ jobs:
           else
             API_PREFIX="/users/$OWNER/packages/container"
           fi
-          echo "owner: $OWNER (type: $OWNER_TYPE)"
 
           fetch_all_versions() {
             local PKG="$1"
@@ -1196,12 +951,7 @@ jobs:
             local PREFIX="$2"
             local UNTAGGED_AGE_DAYS="$3"
 
-            echo ""
-            echo "============================================================"
-            echo "package: ${PKG}"
-            echo "  keep tagged      : ${KEEP}   (prefix='${PREFIX}')"
-            echo "  drop untagged >  : ${UNTAGGED_AGE_DAYS}d"
-            echo "============================================================"
+            echo "--- ${PKG} (prefix='${PREFIX}', keep=${KEEP}, untagged>${UNTAGGED_AGE_DAYS}d) ---"
 
             local ALL
             ALL=$(mktemp)
@@ -1210,10 +960,7 @@ jobs:
             local TOTAL
             TOTAL=$(wc -l < "$ALL" | tr -d ' ')
             echo "  total versions: $TOTAL"
-            if [ "$TOTAL" = "0" ]; then
-              rm -f "$ALL"
-              return 0
-            fi
+            if [ "$TOTAL" = "0" ]; then rm -f "$ALL"; return 0; fi
 
             local CUTOFF
             CUTOFF=$(date -u -d "-${UNTAGGED_AGE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
@@ -1231,11 +978,6 @@ jobs:
               | .id
             ' "$ALL" 2>/dev/null || true)
 
-            local N_TAGGED N_UNTAGGED
-            N_TAGGED=$(printf '%s\n' "$PLAN_TAGGED"     | grep -cE '^[0-9]+$' || true)
-            N_UNTAGGED=$(printf '%s\n' "$PLAN_UNTAGGED" | grep -cE '^[0-9]+$' || true)
-            echo "  to prune: tagged=${N_TAGGED}  untagged=${N_UNTAGGED}"
-
             local PLAN
             PLAN=$(printf '%s\n%s\n' "$PLAN_TAGGED" "$PLAN_UNTAGGED" | grep -E '^[0-9]+$' | sort -u || true)
 
@@ -1245,10 +987,8 @@ jobs:
               return 0
             fi
 
-            local N
-            N=$(printf '%s\n' "$PLAN" | grep -cE '^[0-9]+$')
-            echo "  pruning $N versions..."
-            printf '%s\n' "$PLAN" | while read -r VID; do
+            echo "  pruning $(echo "$PLAN" | wc -l) versions..."
+            echo "$PLAN" | while read -r VID; do
               [ -z "$VID" ] && continue
               delete_version "$PKG" "$VID"
             done
