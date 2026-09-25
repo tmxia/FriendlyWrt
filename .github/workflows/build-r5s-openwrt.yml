@@ -573,14 +573,25 @@ jobs:
               local LL=$(tail -1 "$LOG" 2>/dev/null | head -c 180)
               local H=$(printf '%s' "$LL" | md5sum | awk '{print $1}')
 
-              if [ "$H" = "$PREV" ] && [ "$D" -eq 0 ]; then
+              local CPU_BUSY=0
+              if ps -eo pcpu,comm --no-headers 2>/dev/null \
+                 | awk '$1 > 40 && ($2 ~ /^(cc1|cc1plus|rustc|gcc|g\+\+|ld|as|go|clang|cmake|ninja)$/)' \
+                 | grep -q . ; then
+                CPU_BUSY=1
+              fi
+
+              if [ "$H" = "$PREV" ] && [ "$D" -eq 0 ] && [ "$CPU_BUSY" -eq 0 ]; then
                 STALL=$((STALL + 1))
               else
                 STALL=0
               fi
               PREV="$H"
 
-              echo "[$NAME +${EL}s +${D}L stall=${STALL}m] $LL"
+              if [ "$CPU_BUSY" -eq 1 ] && [ "$D" -eq 0 ]; then
+                echo "[$NAME +${EL}s +0L cpu-busy] $LL"
+              else
+                echo "[$NAME +${EL}s +${D}L stall=${STALL}m] $LL"
+              fi
 
               if [ $STALL -ge 10 ] && [ $((STALL % 5)) -eq 0 ]; then
                 echo "[$NAME][!] STALL ${STALL}m, diagnostics:"
