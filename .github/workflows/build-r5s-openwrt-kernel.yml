@@ -405,16 +405,22 @@ jobs:
 
             if [ -d /workdir/ccache_parts/cache ]; then
               PARTS=$(ls /workdir/ccache_parts/cache/p_* 2>/dev/null | wc -l)
+              echo "  parts extracted: $PARTS"
               if [ "$PARTS" -gt 0 ]; then
                 cd /workdir/ccache_parts/cache
                 if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir 2>/dev/null; then
-                  cat p_* | tar -xpf - -C /workdir 2>/dev/null || true
+                  if ! cat p_* | tar -xpf - -C /workdir 2>/dev/null; then
+                    echo "::warning::ccache extract failed"
+                    rm -rf /workdir/ccache_parts
+                    docker rmi "$TAG" -f 2>/dev/null || true
+                  fi
                 fi
                 echo "hit=true" >> "$GITHUB_OUTPUT"
               fi
               rm -rf /workdir/ccache_parts
               docker rmi "$TAG" -f 2>/dev/null || true
             else
+              echo "  no /cache dir, legacy export"
               docker create --name r5s_ccache_tmp2 "$TAG" /bin/true >/dev/null
               docker export r5s_ccache_tmp2 | tar -xpf - -C /workdir
               docker rm r5s_ccache_tmp2 >/dev/null
@@ -639,29 +645,65 @@ jobs:
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
+          set +e
+
           echo "===== make target/linux/compile ====="
           T0=$(date +%s)
-          make target/linux/compile -j$(nproc) > /tmp/kernel_compile.log 2>&1 || {
+          timeout 90m make target/linux/compile -j$(nproc) > /tmp/kernel_compile.log 2>&1 &
+          KERNEL_PID=$!
+          LAST_LINES=0
+          while kill -0 $KERNEL_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $KERNEL_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/kernel_compile.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              LAST_MSG=$(tail -1 /tmp/kernel_compile.log 2>/dev/null | head -c 150)
+              echo "[kernel +${ELAPSED}s +${DELTA}L] ${LAST_MSG}"
+            fi
+          done
+          wait $KERNEL_PID
+          KERNEL_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$KERNEL_RESULT"
+          if [ "$KERNEL_RESULT" -ne 0 ]; then
             echo "kernel compile failed, retry with V=s"
-            make target/linux/compile -j1 V=s 2>&1 | tail -300
+            timeout 10m make target/linux/compile -j1 V=s 2>&1 | tail -300
             exit 1
-          }
-          echo "  took $(( $(date +%s) - T0 ))s"
+          fi
           tail -20 /tmp/kernel_compile.log
 
           echo "===== make package/kernel/linux/compile ====="
           T0=$(date +%s)
-          make package/kernel/linux/compile -j$(nproc) > /tmp/kmod_compile.log 2>&1 || {
+          timeout 60m make package/kernel/linux/compile -j$(nproc) > /tmp/kmod_compile.log 2>&1 &
+          KMOD_PID=$!
+          LAST_LINES=0
+          while kill -0 $KMOD_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $KMOD_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/kmod_compile.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              LAST_MSG=$(tail -1 /tmp/kmod_compile.log 2>/dev/null | head -c 150)
+              echo "[kmod +${ELAPSED}s +${DELTA}L] ${LAST_MSG}"
+            fi
+          done
+          wait $KMOD_PID
+          KMOD_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$KMOD_RESULT"
+          if [ "$KMOD_RESULT" -ne 0 ]; then
             echo "kmod compile failed, retry with V=s"
-            make package/kernel/linux/compile -j1 V=s 2>&1 | tail -300
+            timeout 10m make package/kernel/linux/compile -j1 V=s 2>&1 | tail -300
             exit 1
-          }
-          echo "  took $(( $(date +%s) - T0 ))s"
+          fi
           tail -20 /tmp/kmod_compile.log
 
           echo "===== install kernel/modules to staging ====="
           make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
           make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
+
+          set -e
 
           echo ""
           echo "=== ccache stats ==="
