@@ -240,11 +240,48 @@ jobs:
           fi
 
           echo "BASE CACHE HIT"
+          LAYERS=$(docker image inspect "$TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
+          echo "  layers: $LAYERS"
+
+          rm -rf /workdir/base_parts
+          mkdir -p /workdir/base_parts
+
           docker create --name r5s_base_tmp "$TAG" /bin/true >/dev/null
-          docker export r5s_base_tmp | tar -xpf - -C /workdir/openwrt
+          docker cp r5s_base_tmp:/cache /workdir/base_parts/ >/dev/null 2>&1 || true
           docker rm r5s_base_tmp >/dev/null
           docker rmi "$TAG" -f 2>/dev/null || true
-          echo "hit=true" >> "$GITHUB_OUTPUT"
+
+          if [ -d /workdir/base_parts/cache ]; then
+            PARTS=$(ls /workdir/base_parts/cache/p_* 2>/dev/null | wc -l)
+            echo "  parts extracted: $PARTS"
+            if [ "$PARTS" -gt 0 ]; then
+              cd /workdir/base_parts/cache
+              if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
+                echo "::warning::zstd extract failed; trying raw tar"
+                if ! cat p_* | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
+                  echo "::warning::both extract failed"
+                  rm -rf /workdir/base_parts
+                  exit 1
+                fi
+              fi
+              rm -rf /workdir/base_parts
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::no parts found"
+              rm -rf /workdir/base_parts
+              exit 1
+            fi
+          else
+            echo "  no /cache dir, legacy export"
+            if docker image inspect "$TAG" >/dev/null 2>&1; then
+              docker create --name r5s_base_tmp2 "$TAG" /bin/true >/dev/null
+              docker export r5s_base_tmp2 | tar -xpf - -C /workdir/openwrt
+              docker rm r5s_base_tmp2 >/dev/null
+              docker rmi "$TAG" -f 2>/dev/null || true
+              echo "hit=true" >> "$GITHUB_OUTPUT"
+            fi
+            rm -rf /workdir/base_parts
+          fi
 
           echo ""
           echo "=== restored base sizes ==="
@@ -359,18 +396,50 @@ jobs:
           echo "=== ccache: $TAG ==="
 
           docker rm -f r5s_ccache_tmp 2>/dev/null || true
-          if docker pull "$TAG" 2>/dev/null; then
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "CCACHE MISS"
+          else
             echo "CCACHE HIT"
+            LAYERS=$(docker image inspect "$TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
+            echo "  layers: $LAYERS"
+
+            rm -rf /workdir/ccache_parts
+            mkdir -p /workdir/ccache_parts
+
             docker create --name r5s_ccache_tmp "$TAG" /bin/true >/dev/null
-            docker export r5s_ccache_tmp | tar -xpf - -C /workdir
+            docker cp r5s_ccache_tmp:/cache /workdir/ccache_parts/ >/dev/null 2>&1 || true
             docker rm r5s_ccache_tmp >/dev/null
             docker rmi "$TAG" -f 2>/dev/null || true
-            echo "hit=true" >> "$GITHUB_OUTPUT"
+
+            if [ -d /workdir/ccache_parts/cache ]; then
+              PARTS=$(ls /workdir/ccache_parts/cache/p_* 2>/dev/null | wc -l)
+              echo "  parts extracted: $PARTS"
+              if [ "$PARTS" -gt 0 ]; then
+                cd /workdir/ccache_parts/cache
+                if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir 2>/dev/null; then
+                  if ! cat p_* | tar -xpf - -C /workdir 2>/dev/null; then
+                    echo "::warning::ccache extract failed"
+                    rm -rf /workdir/ccache_parts
+                  fi
+                fi
+                echo "hit=true" >> "$GITHUB_OUTPUT"
+              fi
+              rm -rf /workdir/ccache_parts
+            else
+              echo "  no /cache dir, legacy export"
+              if docker image inspect "$TAG" >/dev/null 2>&1; then
+                docker create --name r5s_ccache_tmp2 "$TAG" /bin/true >/dev/null
+                docker export r5s_ccache_tmp2 | tar -xpf - -C /workdir
+                docker rm r5s_ccache_tmp2 >/dev/null
+                docker rmi "$TAG" -f 2>/dev/null || true
+                echo "hit=true" >> "$GITHUB_OUTPUT"
+              fi
+              rm -rf /workdir/ccache_parts
+            fi
+
             CC_SIZE=$(du -sh /workdir/ccache 2>/dev/null | awk '{print $1}')
             CC_FILES=$(find /workdir/ccache -type f 2>/dev/null | wc -l)
             echo "  ccache: $CC_SIZE, files: $CC_FILES"
-          else
-            echo "CCACHE MISS"
           fi
 
           echo ""
@@ -506,7 +575,7 @@ jobs:
           BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}"
 
           echo ""
-          echo "===== packing base cache (zstd) ====="
+          echo "===== packing base cache (multi-layer zstd) ====="
           docker rmi "$BASE_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -517,17 +586,44 @@ jobs:
           [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
 
           T0=$(date +%s)
-          if tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
-            echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
-          elif tar -czf - "${PACK_DIRS[@]}" | docker import - "$BASE_TAG"; then
-            echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
-          else
-            echo "::warning::base cache pack/import failed"
+
+          rm -rf /workdir/base_parts
+          mkdir -p /workdir/base_parts
+
+          cd /workdir/openwrt
+          if ! tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
+               | split -a 2 -d -b 512M - /workdir/base_parts/p_ 2>/dev/null; then
+            echo "::warning::tar/split failed"
+            rm -rf /workdir/base_parts
             exit 0
           fi
 
+          cd /workdir/base_parts
+          echo "FROM scratch" > Dockerfile
+          i=0
+          for f in p_*; do
+            d="l$i"
+            mkdir -p "$d"
+            mv "$f" "$d/"
+            echo "COPY $d /cache/" >> Dockerfile
+            i=$((i+1))
+          done
+          echo "  parts: $i"
+
+          if ! docker build -t "$BASE_TAG" . > /tmp/bc_build.log 2>&1; then
+            echo "::warning::docker build failed"
+            tail -30 /tmp/bc_build.log
+            rm -rf /workdir/base_parts
+            exit 0
+          fi
+
+          echo "  packed (multi-layer) + imported in $(( $(date +%s) - T0 ))s"
+          rm -rf /workdir/base_parts
+
           IMG_SIZE=$(docker image inspect "$BASE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
           echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
+          LAYERS=$(docker image inspect "$BASE_TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
+          echo "  layers: $LAYERS"
 
           echo ""
           echo "===== pushing ====="
@@ -945,7 +1041,7 @@ jobs:
           KEEP="${KEEP:-1}"
 
           echo ""
-          echo "===== packing ccache (zstd) ====="
+          echo "===== packing ccache (multi-layer zstd) ====="
           if [ -d /workdir/ccache ] && [ -n "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
             REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
             CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
@@ -956,37 +1052,57 @@ jobs:
             CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
 
             T0=$(date +%s)
-            PACK_OK=false
-            if tar -I 'zstd -6 -T0' -cf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
-              PACK_OK=true
-              echo "  packed (zstd) + imported in $(( $(date +%s) - T0 ))s"
-            elif tar -czf - -C /workdir ccache | docker import - "$CCACHE_TAG"; then
-              PACK_OK=true
-              echo "  packed (gzip fallback) + imported in $(( $(date +%s) - T0 ))s"
-            fi
 
-            if [ "$PACK_OK" = "true" ]; then
-              IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
-              echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
+            rm -rf /workdir/ccache_parts
+            mkdir -p /workdir/ccache_parts
 
-              echo ""
-              echo "===== pushing ccache ====="
-              PUSHED=false
-              for attempt in 1 2 3; do
-                if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
-                  echo "  pushed"
-                  PUSHED=true
-                  break
-                fi
-                echo "  attempt $attempt failed, retrying..."
-                sleep 10
-              done
-              [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed"
-
-              docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
-              docker builder prune -a -f 2>/dev/null || true
+            if ! tar -I 'zstd -6 -T0' -cf - -C /workdir ccache 2>/dev/null \
+                 | split -a 2 -d -b 512M - /workdir/ccache_parts/p_ 2>/dev/null; then
+              echo "::warning::tar/split failed"
+              rm -rf /workdir/ccache_parts
             else
-              echo "::warning::ccache pack/import failed"
+              cd /workdir/ccache_parts
+              echo "FROM scratch" > Dockerfile
+              i=0
+              for f in p_*; do
+                d="l$i"
+                mkdir -p "$d"
+                mv "$f" "$d/"
+                echo "COPY $d /cache/" >> Dockerfile
+                i=$((i+1))
+              done
+              echo "  parts: $i"
+
+              if docker build -t "$CCACHE_TAG" . > /tmp/cc_build.log 2>&1; then
+                echo "  packed (multi-layer) + imported in $(( $(date +%s) - T0 ))s"
+                rm -rf /workdir/ccache_parts
+
+                IMG_SIZE=$(docker image inspect "$CCACHE_TAG" --format='{{.Size}}' 2>/dev/null || echo 0)
+                echo "  image size (uncompressed): $((IMG_SIZE / 1024 / 1024))MB"
+                LAYERS=$(docker image inspect "$CCACHE_TAG" --format='{{len .RootFS.Layers}}' 2>/dev/null || echo "?")
+                echo "  layers: $LAYERS"
+
+                echo ""
+                echo "===== pushing ccache ====="
+                PUSHED=false
+                for attempt in 1 2 3; do
+                  if docker push "$CCACHE_TAG" >/dev/null 2>&1; then
+                    echo "  pushed"
+                    PUSHED=true
+                    break
+                  fi
+                  echo "  attempt $attempt failed, retrying..."
+                  sleep 10
+                done
+                [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed"
+
+                docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
+                docker builder prune -a -f 2>/dev/null || true
+              else
+                echo "::warning::ccache docker build failed"
+                tail -30 /tmp/cc_build.log
+                rm -rf /workdir/ccache_parts
+              fi
             fi
           else
             echo "  ccache empty, skip"
