@@ -257,9 +257,7 @@ jobs:
             if [ "$PARTS" -gt 0 ]; then
               cd /workdir/base_parts/cache
               if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-                echo "::warning::zstd extract failed; trying raw tar"
                 if ! cat p_* | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-                  echo "::warning::both extract failed"
                   rm -rf /workdir/base_parts
                   exit 1
                 fi
@@ -267,7 +265,6 @@ jobs:
               rm -rf /workdir/base_parts
               echo "hit=true" >> "$GITHUB_OUTPUT"
             else
-              echo "::warning::no parts found"
               rm -rf /workdir/base_parts
               exit 1
             fi
@@ -357,9 +354,7 @@ jobs:
           echo "=== merging parts and extracting ==="
           cd /workdir/cache_parts/cache
           if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-            echo "::warning::zstd extract failed; trying raw tar"
             if ! cat p_* | tar -xpf - -C /workdir/openwrt/ 2>/dev/null; then
-              echo "::warning::both extract failed"
               rm -rf /workdir/cache_parts
               exit 1
             fi
@@ -376,7 +371,8 @@ jobs:
                    staging_dir/hostpkg \
                    bin/targets/rockchip/armv8 \
                    feeds \
-                   package; do
+                   package \
+                   tmp; do
             [ -e "$d" ] || continue
             echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
           done
@@ -413,20 +409,15 @@ jobs:
 
             if [ -d /workdir/ccache_parts/cache ]; then
               PARTS=$(ls /workdir/ccache_parts/cache/p_* 2>/dev/null | wc -l)
-              echo "  parts extracted: $PARTS"
               if [ "$PARTS" -gt 0 ]; then
                 cd /workdir/ccache_parts/cache
                 if ! cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir 2>/dev/null; then
-                  if ! cat p_* | tar -xpf - -C /workdir 2>/dev/null; then
-                    echo "::warning::ccache extract failed"
-                    rm -rf /workdir/ccache_parts
-                  fi
+                  cat p_* | tar -xpf - -C /workdir 2>/dev/null || true
                 fi
                 echo "hit=true" >> "$GITHUB_OUTPUT"
               fi
               rm -rf /workdir/ccache_parts
             else
-              echo "  no /cache dir, legacy export"
               if docker image inspect "$TAG" >/dev/null 2>&1; then
                 docker create --name r5s_ccache_tmp2 "$TAG" /bin/true >/dev/null
                 docker export r5s_ccache_tmp2 | tar -xpf - -C /workdir
@@ -457,16 +448,18 @@ jobs:
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
 
+          mkdir -p tmp
+
           FEEDS_CONF_HASH=$(md5sum feeds.conf.default feeds.conf 2>/dev/null | md5sum | cut -d' ' -f1)
           CACHED_FEEDS_HASH=""
-          [ -f /workdir/.feeds_conf_hash ] && CACHED_FEEDS_HASH=$(cat /workdir/.feeds_conf_hash)
+          [ -f tmp/.feeds_conf_hash ] && CACHED_FEEDS_HASH=$(cat tmp/.feeds_conf_hash)
 
           if [ -d feeds/packages ] && [ -d feeds/luci ] && [ "$FEEDS_CONF_HASH" = "$CACHED_FEEDS_HASH" ]; then
             echo "feeds/ already present and feeds.conf unchanged, skip feeds update"
           else
             echo "feeds/ missing or feeds.conf changed, running feeds update"
             ./scripts/feeds update -a 2>&1 | tail -30
-            echo "$FEEDS_CONF_HASH" > /workdir/.feeds_conf_hash
+            echo "$FEEDS_CONF_HASH" > tmp/.feeds_conf_hash
           fi
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
@@ -501,6 +494,16 @@ jobs:
             echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
 
           echo ""
+          echo "=== revert .config and tmp/ mtime ==="
+          [ -f .config ] && touch -t 202001010000 .config
+          if [ -d tmp ]; then
+            find tmp -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
+            find tmp -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
+            echo "  tmp/ files: $(find tmp -type f 2>/dev/null | wc -l)"
+          fi
+          echo "  .config and tmp/ mtime reverted to 2020-01-01"
+
+          echo ""
           echo "=== ccache config ==="
           grep -E '^CONFIG_CCACHE' .config || true
 
@@ -514,7 +517,6 @@ jobs:
           echo "===== tools/download ====="
           T0=$(date +%s)
           if ! timeout 30m make tools/download -j1 > /tmp/tools_dl.log 2>&1; then
-            echo "tools/download failed, showing verbose output"
             make tools/download -j1 V=s 2>&1 | tail -100
             exit 1
           fi
@@ -523,7 +525,6 @@ jobs:
           echo "===== tools/compile ====="
           T0=$(date +%s)
           if ! make tools/compile -j$(nproc) > /tmp/tools_c.log 2>&1; then
-            echo "tools/compile failed, showing verbose output"
             make tools/compile -j1 V=s 2>&1 | tail -200
             exit 1
           fi
@@ -532,7 +533,6 @@ jobs:
           echo "===== toolchain/download ====="
           T0=$(date +%s)
           if ! timeout 30m make toolchain/download -j1 > /tmp/tc_dl.log 2>&1; then
-            echo "toolchain/download failed, showing verbose output"
             make toolchain/download -j1 V=s 2>&1 | tail -100
             exit 1
           fi
@@ -541,7 +541,6 @@ jobs:
           echo "===== toolchain/compile ====="
           T0=$(date +%s)
           if ! make toolchain/compile -j$(nproc) > /tmp/tc_c.log 2>&1; then
-            echo "toolchain/compile failed, showing verbose output"
             make toolchain/compile -j1 V=s 2>&1 | tail -250
             exit 1
           fi
@@ -593,7 +592,6 @@ jobs:
           cd /workdir/openwrt
           if ! tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
                | split -a 2 -d -b 512M - /workdir/base_parts/p_ 2>/dev/null; then
-            echo "::warning::tar/split failed"
             rm -rf /workdir/base_parts
             exit 0
           fi
@@ -611,7 +609,6 @@ jobs:
           echo "  parts: $i"
 
           if ! docker build -t "$BASE_TAG" . > /tmp/bc_build.log 2>&1; then
-            echo "::warning::docker build failed"
             tail -30 /tmp/bc_build.log
             rm -rf /workdir/base_parts
             exit 0
@@ -711,7 +708,7 @@ jobs:
 
           echo ""
           echo "===== deep slim target cache ====="
-          BEFORE=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          BEFORE=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package tmp 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  before: $((BEFORE / 1024 / 1024))MB"
 
           for tdir in build_dir/target-*/ build_dir/hostpkg/ feeds/; do
@@ -751,7 +748,14 @@ jobs:
             find "$sdir" -type f -name '*.la' -delete 2>/dev/null || true
           done
 
-          AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package 2>/dev/null | awk '{s+=$1} END {print s+0}')
+          echo "  revert .config and tmp/ mtime before packing"
+          [ -f .config ] && touch -t 202001010000 .config
+          if [ -d tmp ]; then
+            find tmp -type f -exec touch -t 202001010000 {} + 2>/dev/null || true
+            find tmp -type d -exec touch -t 202001010000 {} + 2>/dev/null || true
+          fi
+
+          AFTER=$(du -sb build_dir/target-* build_dir/hostpkg staging_dir/target-* staging_dir/hostpkg bin/targets feeds package tmp 2>/dev/null | awk '{s+=$1} END {print s+0}')
           echo "  after:  $((AFTER / 1024 / 1024))MB"
           echo "  saved:  $(( (BEFORE - AFTER) / 1024 / 1024 ))MB"
 
@@ -766,7 +770,8 @@ jobs:
                    staging_dir/hostpkg \
                    bin/targets/rockchip/armv8 \
                    feeds \
-                   package; do
+                   package \
+                   tmp; do
             if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
           done
           echo "  dirs: ${PACK_DIRS[*]:-<none>}"
@@ -780,7 +785,6 @@ jobs:
           cd /workdir/openwrt
           if ! tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
                | split -a 2 -d -b 4G - /workdir/cache_parts/p_ 2>/dev/null; then
-            echo "::warning::tar/split failed"
             rm -rf /workdir/cache_parts
             exit 0
           fi
@@ -798,7 +802,6 @@ jobs:
           echo "  parts: $i"
 
           if ! docker build -t "$TARGET_TAG" . > /tmp/tc_build.log 2>&1; then
-            echo "::warning::docker build failed"
             tail -30 /tmp/tc_build.log
             rm -rf /workdir/cache_parts
             exit 0
@@ -1058,7 +1061,6 @@ jobs:
 
             if ! tar -I 'zstd -6 -T0' -cf - -C /workdir ccache 2>/dev/null \
                  | split -a 2 -d -b 512M - /workdir/ccache_parts/p_ 2>/dev/null; then
-              echo "::warning::tar/split failed"
               rm -rf /workdir/ccache_parts
             else
               cd /workdir/ccache_parts
@@ -1099,7 +1101,6 @@ jobs:
                 docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
                 docker builder prune -a -f 2>/dev/null || true
               else
-                echo "::warning::ccache docker build failed"
                 tail -30 /tmp/cc_build.log
                 rm -rf /workdir/ccache_parts
               fi
