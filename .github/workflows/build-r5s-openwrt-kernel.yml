@@ -206,21 +206,15 @@ jobs:
           fi
 
           OW_HASH=$(git rev-parse --short=8 HEAD)
-
-          CFG_HASH=$( { md5sum "$GITHUB_WORKSPACE/${{ env.CONFIG_FILE }}" 2>/dev/null; \
-                        md5sum "$GITHUB_WORKSPACE/${{ env.DIY_SH }}" 2>/dev/null; \
-                        echo "$OW_HASH"; } | md5sum | awk '{print substr($1,1,8)}' )
-
           echo "kernel=$KV" >> "$GITHUB_OUTPUT"
           echo "kernel_major=$KERNEL_MAJOR" >> "$GITHUB_OUTPUT"
           echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
-          echo "cfg_hash=$CFG_HASH" >> "$GITHUB_OUTPUT"
-          echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=${OW_HASH} cfg=${CFG_HASH}"
+          echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=${OW_HASH}"
 
           echo ""
           echo "===== cache tags (与固件流程共享) ====="
           echo "base cache:   openwrt-25.12-linux-${KERNEL_MAJOR}"
-          echo "target cache: cfg${CFG_HASH}-linux-${KERNEL_MAJOR}.${KV}"
+          echo "target cache: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
           echo "ccache:       openwrt-25.12-linux-${KERNEL_MAJOR}"
 
           sudo mkdir -p /workdir/ccache
@@ -289,13 +283,12 @@ jobs:
         env:
           KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
-          CFG_HASH: ${{ steps.setup.outputs.cfg_hash }}
+          OW: ${{ steps.setup.outputs.ow_hash }}
         run: |
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
           TARGET_CACHE="ghcr.io/${REPO_LOWER}/r5s-target-cache"
           [ -z "$KM" ] && KM="6.12"
-          [ -z "$CFG_HASH" ] && CFG_HASH="nocfg"
-          TAG="${TARGET_CACHE}:cfg${CFG_HASH}-linux-${KM}.${KV}"
+          TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}"
 
           echo "hit=false" >> "$GITHUB_OUTPUT"
           echo "=== target cache: $TAG ==="
@@ -607,18 +600,16 @@ jobs:
         env:
           KV: ${{ steps.setup.outputs.kernel }}
           KM: ${{ steps.setup.outputs.kernel_major }}
-          CFG_HASH: ${{ steps.setup.outputs.cfg_hash }}
+          OW: ${{ steps.setup.outputs.ow_hash }}
         run: |
           set -e -o pipefail
           cd /workdir/openwrt
           [ -z "$KM" ] && KM="6.12"
-          [ -z "$CFG_HASH" ] && CFG_HASH="nocfg"
 
           REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:cfg${CFG_HASH}-linux-${KM}.${KV}"
+          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}"
 
           echo "===== packing target cache ====="
-          echo "  tag: $TARGET_TAG"
           docker rmi "$TARGET_TAG" 2>/dev/null || true
 
           PACK_DIRS=()
@@ -1006,7 +997,7 @@ jobs:
           }
 
           prune_package "r5s-base-cache"   "openwrt-25.12-linux-" 3
-          prune_package "r5s-target-cache" "cfg"                   3
+          prune_package "r5s-target-cache" "ow"                   3
           prune_package "r5s-ccache"       "openwrt-25.12-linux-" 3
 
           echo ""
