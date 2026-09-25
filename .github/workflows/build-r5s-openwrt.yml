@@ -677,20 +677,54 @@ jobs:
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
           set +e
-          timeout 20m make download -j8 > /tmp/download.log 2>&1 || true
 
+          echo "===== make download ====="
+          T0=$(date +%s)
+          timeout 20m make download -j8 > /tmp/download.log 2>&1 || true
+          DL_FILES=$(find dl -maxdepth 1 -type f 2>/dev/null | wc -l)
+          echo "  took $(( $(date +%s) - T0 ))s, dl files: $DL_FILES"
+
+          echo ""
           echo "===== pre-compile perl (serial, avoid OOM) ====="
           T0=$(date +%s)
-          if ! timeout 45m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1; then
+          timeout 45m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1 &
+          PERL_PID=$!
+          while kill -0 $PERL_PID 2>/dev/null; do
+            sleep 30
+            if kill -0 $PERL_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              LAST_MSG=$(tail -1 /tmp/perl_build.log 2>/dev/null | head -c 150)
+              echo "[perl +${ELAPSED}s] ${LAST_MSG}"
+            fi
+          done
+          wait $PERL_PID
+          PERL_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$PERL_RESULT"
+          if [ "$PERL_RESULT" -ne 0 ]; then
             echo "  perl pre-compile failed, tail of log:"
             tail -100 /tmp/perl_build.log
             echo "  continuing, main make will retry"
           fi
-          echo "  took $(( $(date +%s) - T0 ))s"
 
+          echo ""
           echo "===== make -j3 (no V=s) ====="
           T0=$(date +%s)
-          timeout 5h make -j3 > /tmp/build.log 2>&1
+          timeout 5h make -j3 > /tmp/build.log 2>&1 &
+          MAKE_PID=$!
+
+          LAST_LINES=0
+          while kill -0 $MAKE_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $MAKE_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/build.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              LAST_MSG=$(tail -1 /tmp/build.log 2>/dev/null | head -c 150)
+              echo "[make +${ELAPSED}s +${DELTA}L] ${LAST_MSG}"
+            fi
+          done
+          wait $MAKE_PID
           BUILD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
           set -e
@@ -698,13 +732,21 @@ jobs:
           if [ "$BUILD_RESULT" -ne 0 ]; then
             echo ""
             echo "Build failed (exit: $BUILD_RESULT), retrying with V=s for diagnosis"
+            if [ "$BUILD_RESULT" -eq 124 ]; then
+              echo "  timeout 5h reached"
+            fi
             if [ "$BUILD_RESULT" -gt 128 ]; then
               SIG=$((BUILD_RESULT - 128))
               [ "$SIG" = "9" ] && echo "SIGKILL (likely OOM)"
-              [ "$SIG" = "15" ] && echo "SIGTERM (timeout 5h)"
+              [ "$SIG" = "15" ] && echo "SIGTERM"
               free -h
               sudo dmesg 2>/dev/null | grep -i -E "out of memory|oom-kill" | tail -20 || true
             fi
+            echo ""
+            echo "===== last 100 lines of build.log ====="
+            tail -100 /tmp/build.log
+            echo ""
+            echo "===== retry with V=s ====="
             timeout 10m make -j1 V=s 2>&1 | tail -500
             exit 1
           fi
@@ -1176,7 +1218,7 @@ jobs:
         uses: Mattraks/delete-workflow-runs@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          keep_minimum_runs: 1
-          retain_days: 1
+          keep_minimum_runs: 0
+          retain_days: 0
           delete_workflow_pattern: "Build OpenWrt for NanoPi R5S"
           repository: ${{ github.repository }}
