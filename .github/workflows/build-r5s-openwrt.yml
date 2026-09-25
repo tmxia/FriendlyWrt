@@ -610,6 +610,14 @@ jobs:
             return $RC
           }
 
+          run_make_hb kernel-prep 30m /tmp/kernel_prepare.log 15 \
+            "target/linux/prepare" -j1 V=s
+          KERNEL_PREP_RC=$?
+          if [ $KERNEL_PREP_RC -ne 0 ]; then
+            echo "::error::kernel prepare failed (rc=$KERNEL_PREP_RC)"
+            exit 1
+          fi
+
           run_make_hb py3 30m /tmp/py3_build.log 15 \
             "package/feeds/packages/python3/compile" -j1 V=s \
             || echo "::warning::python3 pre-compile failed"
