@@ -1,0 +1,7 @@
+30d3e1c2470a7282f37b96fdd4354314dda69aa3
+
+# 上游更新日志（UTC 2026-09-14）
+
+Bluetooth: hci_aic: Add module ready check to setup
+
+Signed-off-by: Jensen Huang <jensenhuang@friendlyarm.com>
