@@ -25,7 +25,6 @@ env:
   MODEL_NAME: 'R5S'
   KERNEL_VERSION: '6.18'
   KERNEL_REPO: 'https://github.com/unifreq/linux-6.18.y.git'
-  # 该仓库为主仓库，无其他分支，留空表示使用默认 HEAD
   KERNEL_REF: ''
   OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
   OPENWRT_BRANCH: 'openwrt-25.12'
@@ -322,7 +321,7 @@ jobs:
 
           echo "kernel version: ${KERNEL_VERSION}.x (unifreq)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
           echo "kernel repo: ${{ env.KERNEL_REPO }}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
-          echo "kernel ref: ${{ env.KERNEL_REF:-default}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          echo "kernel ref: ${{ env.KERNEL_REF || 'default' }}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
           echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
           echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
 
