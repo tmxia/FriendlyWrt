@@ -110,7 +110,6 @@ jobs:
                       /usr/local/share/powershell /opt/microsoft /opt/google \
                       /opt/pipx /usr/lib/jvm /usr/local/sdkman /usr/local/go \
                       /usr/local/share/chromium /opt/conda || true
-          sudo docker image prune --all --force || true
           sudo apt-get clean
 
           sudo swapoff -a || true
@@ -159,11 +158,78 @@ jobs:
           done
           echo "git mtime restored"
 
+      - name: Switch kernel to 6.18 (unifreq)
+        run: |
+          cd /workdir/openwrt
+
+          echo "=== Before ==="
+          grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile || true
+          grep -E '^LINUX_VERSION-6' include/kernel-version.mk || true
+
+          # 1. 切换 rockchip target 的 KERNEL_PATCHVER 到 6.18
+          if grep -q '^KERNEL_PATCHVER' target/linux/rockchip/Makefile; then
+            sed -i -E 's/^KERNEL_PATCHVER\s*:?=\s*[0-9.]+/KERNEL_PATCHVER:=6.18/' target/linux/rockchip/Makefile
+          else
+            echo 'KERNEL_PATCHVER:=6.18' >> target/linux/rockchip/Makefile
+          fi
+
+          # 2. 确保 include/kernel-version.mk 中定义 LINUX_VERSION-6.18
+          if ! grep -q '^LINUX_VERSION-6\.18' include/kernel-version.mk; then
+            awk 'BEGIN{done=0}
+                 /^LINUX_VERSION-/ && !done {
+                   print
+                   print "LINUX_VERSION-6.18 = .0"
+                   done=1
+                   next
+                 }
+                 {print}
+                 END { if (!done) print "LINUX_VERSION-6.18 = .0" }' \
+              include/kernel-version.mk > /tmp/kv.mk
+            mv /tmp/kv.mk include/kernel-version.mk
+          fi
+
+          # 3. 为 6.18 创建通用补丁/配置目录（如果不存在则从 6.12 复制作为基础）
+          for sub in pending hack backport; do
+            if [ ! -d "target/linux/generic/${sub}-6.18" ] && [ -d "target/linux/generic/${sub}-6.12" ]; then
+              cp -a "target/linux/generic/${sub}-6.12" "target/linux/generic/${sub}-6.18"
+            fi
+          done
+          if [ ! -f target/linux/generic/config-6.18 ] && [ -f target/linux/generic/config-6.12 ]; then
+            cp -a target/linux/generic/config-6.12 target/linux/generic/config-6.18
+          fi
+
+          # 4. 为 rockchip target 创建 6.18 补丁目录（如果不存在则从 6.12 复制）
+          if [ ! -d target/linux/rockchip/patches-6.18 ] && [ -d target/linux/rockchip/patches-6.12 ]; then
+            cp -a target/linux/rockchip/patches-6.12 target/linux/rockchip/patches-6.18
+          fi
+
+          echo "=== After ==="
+          grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile || true
+          grep -E '^LINUX_VERSION-6' include/kernel-version.mk || true
+          ls -d target/linux/generic/*-6.18 2>/dev/null || true
+          ls -d target/linux/rockchip/patches-6.18 2>/dev/null || true
+
       - name: Prepare build configuration
         run: |
           cd /workdir/openwrt
 
-          # 使用 unifreq 6.18 内核
+          # 运行原有自定义脚本（保持 6.12 流程不变）
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
+          ./scripts/feeds update -a 2>&1 | tail -30
+
+          # post 阶段会读取 KERNEL_PATCHVER（此时为 6.18），
+          # 并自动生成 target/linux/rockchip/config-6.18
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
+          ./scripts/feeds install -a 2>&1 | tail -40
+
+          # 应用基础 .config
+          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
+
+          # 切换到 unifreq 6.18 内核
+          sed -i 's/^CONFIG_LINUX_6_12=y/# CONFIG_LINUX_6_12 is not set/' .config
+          sed -i '/^CONFIG_LINUX_6_6=y/d' .config
+          grep -q '^CONFIG_LINUX_6_18=y' .config || echo 'CONFIG_LINUX_6_18=y' >> .config
+
           cat >> .config <<EOF
           CONFIG_DEVEL=y
           CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"
@@ -173,16 +239,9 @@ jobs:
           CONFIG_CCACHE_DIR="/workdir/ccache"
           EOF
 
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
-          ./scripts/feeds update -a 2>&1 | tail -30
-
-          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
-          ./scripts/feeds install -a 2>&1 | tail -40
-
-          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
 
-          # 强制使用 unifreq 内核与 6.18 版本
+          # 再次强制内核相关选项，防止被覆盖
           sed -i 's|^CONFIG_KERNEL_GIT_CLONE_URI=.*|CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"|' .config
           sed -i 's|^CONFIG_KERNEL_GIT_REF=.*|CONFIG_KERNEL_GIT_REF=""|' .config
           sed -i 's|^CONFIG_KERNEL_PATCHVER=.*|CONFIG_KERNEL_PATCHVER=6.18|' .config
@@ -192,13 +251,6 @@ jobs:
             echo 'CONFIG_KERNEL_GIT_REF=""' >> .config
           grep -q '^CONFIG_KERNEL_PATCHVER=' .config || \
             echo 'CONFIG_KERNEL_PATCHVER=6.18' >> .config
-
-          # 移除不需要的 legacy iptables
-          for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
-            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
-            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
-              echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
-          done
 
           make defconfig
 
@@ -210,6 +262,9 @@ jobs:
           echo ""
           echo "=== .config md5 ==="
           md5sum .config
+          echo ""
+          echo "=== kernel related ==="
+          grep -E 'CONFIG_LINUX_6|CONFIG_KERNEL_PATCHVER|CONFIG_KERNEL_GIT' .config || true
 
       - name: Compile firmware
         id: compile_firmware
@@ -277,11 +332,8 @@ jobs:
           KERNEL_VERSION="${{ env.KERNEL_VERSION }}"
           BUILD_DATE=$(date +%Y-%m-%d)
 
-          # 验证内核版本
-          KV=$(grep -oP 'LINUX_VERSION-\d+\.\d+\s*=\s*\K[\d.]+' target/linux/generic/kernel-* 2>/dev/null | head -1 || echo "unknown")
-          if [[ ! "$KV" =~ ^6\.18 ]]; then
-            echo "::warning::Detected kernel version $KV does not match expected 6.18"
-          fi
+          KV=$(grep -oP 'LINUX_VERSION-6\.18\s*=\s*\K[\d.]+' include/kernel-version.mk 2>/dev/null | head -1 || echo ".0")
+          echo "Kernel: Linux ${KERNEL_VERSION}${KV} (unifreq)"
 
           ARTIFACT_PREFIX="${MODEL_NAME}-Linux-${KERNEL_VERSION}-${BUILD_DATE}"
 
@@ -305,25 +357,22 @@ jobs:
           cp "$IMG_SQ_GZ"   "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-squashfs-sysupgrade.img.gz"
           cp "$MANIFEST"    "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-manifest.txt"
 
-          # 上传内核配置文件
-          if [ -f .config ]; then
-            cp .config "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-config.txt"
-          fi
+          [ -f .config ] && cp .config "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-config.txt"
 
-          # 上传 vmlinux（如果存在）
           VMLINUX=$(find "$OUT" -maxdepth 1 -name "vmlinux" -type f | head -1)
-          if [ -n "$VMLINUX" ]; then
-            cp "$VMLINUX" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-vmlinux"
-          fi
+          [ -n "$VMLINUX" ] && cp "$VMLINUX" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-vmlinux"
 
           SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sha256sums.txt"
 
-          echo "kernel version: ${KERNEL_VERSION}.x (unifreq)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
-          echo "kernel repo: ${{ env.KERNEL_REPO }}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
-          echo "kernel ref: ${{ env.KERNEL_REF || 'default' }}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
-          echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
-          echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          {
+            echo "kernel: Linux ${KERNEL_VERSION}${KV} (unifreq)"
+            echo "kernel repo: ${{ env.KERNEL_REPO }}"
+            echo "kernel ref: default HEAD (main branch)"
+            echo "openwrt branch: ${{ env.OPENWRT_BRANCH }}"
+            echo "openwrt commit: $(git rev-parse HEAD)"
+            echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
 
           cd $GITHUB_WORKSPACE/artifact
           rm -f SHA256SUMS
@@ -336,7 +385,7 @@ jobs:
           RELEASE_FILES=(*.gz)
           shopt -u nullglob
           gh release upload "$TAG" "${RELEASE_FILES[@]}" --clobber
-          gh release edit "$TAG" --notes "Kernel: ${KERNEL_VERSION}.x (unifreq/linux-6.18.y)" || true
+          gh release edit "$TAG" --notes "Kernel: Linux ${KERNEL_VERSION}${KV} (unifreq/linux-6.18.y)" || true
 
       - uses: actions/upload-artifact@v4
         if: success()
