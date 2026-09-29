@@ -1,0 +1,365 @@
+name: Build Linux 6.18 for NanoPi R5S
+
+on:
+  watch:
+    types: started
+  workflow_dispatch:
+    inputs:
+      replace_existing:
+        description: 'Replace existing release tag'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: build-r5s-linux
+  cancel-in-progress: false
+
+env:
+  AUTO_REPLACE_TAG: 'false'
+  MODEL_NAME: 'R5S'
+  KERNEL_VERSION: '6.18'
+  KERNEL_REPO: 'https://github.com/unifreq/linux-6.18.y.git'
+  # 该仓库为主仓库，无其他分支，留空表示使用默认 HEAD
+  KERNEL_REF: ''
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  OPENWRT_BRANCH: 'openwrt-25.12'
+  CONFIG_FILE: 'scripts/r5s.config'
+  DIY_SH: 'scripts/r5s_customize.sh'
+
+jobs:
+  prepare_release:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: r5s-prepare-release
+      cancel-in-progress: false
+    if: github.event.repository.owner.id == github.event.sender.id
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.tag }}
+    steps:
+      - name: Generate release tag
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_TAG="${MODEL_NAME}-Linux-$(date +%Y-%m-%d)"
+          FORCE_BASE=false
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
+            FORCE_BASE=true
+          elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
+            FORCE_BASE=true
+          fi
+
+          EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+
+          if [ "$FORCE_BASE" = "true" ]; then
+            for tag in $EXISTING_TAGS; do
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+              git push origin --delete "refs/tags/$tag" || true
+            done
+            TAG="$BASE_TAG"
+          else
+            if [ -z "$EXISTING_TAGS" ]; then
+              TAG="$BASE_TAG"
+            else
+              MAX_NUM=0
+              for t in $EXISTING_TAGS; do
+                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                  NUM=${BASH_REMATCH[1]}
+                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+                fi
+              done
+              TAG="${BASE_TAG}-$((MAX_NUM + 1))"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+
+  build:
+    name: Build R5S Linux 6.18
+    needs: prepare_release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo mkdir -p /workdir
+          sudo chown -R $USER:$GROUPS /workdir
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/local/.ghcup /opt/az \
+                      /usr/local/share/powershell /opt/microsoft /opt/google \
+                      /opt/pipx /usr/lib/jvm /usr/local/sdkman /usr/local/go \
+                      /usr/local/share/chromium /opt/conda || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile > /dev/null
+          sudo swapon /swapfile
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache file g++ gawk \
+            gettext git libncurses-dev libssl-dev \
+            python3 python3-dev python3-pip python3-setuptools python3-pyelftools \
+            unzip wget zip zlib1g-dev libelf-dev \
+            subversion flex bison libtool autoconf automake cmake \
+            rsync quilt time jq swig zstd \
+            device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
+            android-sdk-libsparse-utils btrfs-progs
+
+          free -h
+          df -hT
+
+      - name: Clone OpenWrt
+        run: |
+          cd /workdir
+          git clone -b ${{ env.OPENWRT_BRANCH }} --single-branch \
+            ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+          cd /workdir/openwrt
+          find . -name ".git" -type d | while read -r gitdir; do
+            repo_dir=$(dirname "$gitdir")
+            cd "/workdir/openwrt/$repo_dir"
+            git log --format=%at --name-only | perl -ane '
+              if (/^(\d+)$/) { $t = $1; }
+              elsif (/^(\S+)$/) {
+                $f = $1;
+                if (-e $f && !-d $f && !$seen{$f}) {
+                  utime($t, $t, $f);
+                  $seen{$f} = 1;
+                }
+              }
+            '
+            cd /workdir/openwrt
+          done
+          echo "git mtime restored"
+
+      - name: Prepare build configuration
+        run: |
+          cd /workdir/openwrt
+
+          # 使用 unifreq 6.18 内核
+          cat >> .config <<EOF
+          CONFIG_DEVEL=y
+          CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"
+          CONFIG_KERNEL_GIT_REF=""
+          CONFIG_KERNEL_PATCHVER=6.18
+          CONFIG_CCACHE=y
+          CONFIG_CCACHE_DIR="/workdir/ccache"
+          EOF
+
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
+          ./scripts/feeds update -a 2>&1 | tail -30
+
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
+          ./scripts/feeds install -a 2>&1 | tail -40
+
+          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
+
+          # 强制使用 unifreq 内核与 6.18 版本
+          sed -i 's|^CONFIG_KERNEL_GIT_CLONE_URI=.*|CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"|' .config
+          sed -i 's|^CONFIG_KERNEL_GIT_REF=.*|CONFIG_KERNEL_GIT_REF=""|' .config
+          sed -i 's|^CONFIG_KERNEL_PATCHVER=.*|CONFIG_KERNEL_PATCHVER=6.18|' .config
+          grep -q '^CONFIG_KERNEL_GIT_CLONE_URI=' .config || \
+            echo 'CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"' >> .config
+          grep -q '^CONFIG_KERNEL_GIT_REF=' .config || \
+            echo 'CONFIG_KERNEL_GIT_REF=""' >> .config
+          grep -q '^CONFIG_KERNEL_PATCHVER=' .config || \
+            echo 'CONFIG_KERNEL_PATCHVER=6.18' >> .config
+
+          # 移除不需要的 legacy iptables
+          for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
+            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+              echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+          done
+
+          make defconfig
+
+          grep -q '^CONFIG_CCACHE=y' .config || echo "CONFIG_CCACHE=y" >> .config
+          sed -i 's|^CONFIG_CCACHE_DIR=.*|CONFIG_CCACHE_DIR="/workdir/ccache"|' .config
+          grep -q '^CONFIG_CCACHE_DIR=' .config || \
+            echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+
+          echo ""
+          echo "=== .config md5 ==="
+          md5sum .config
+
+      - name: Compile firmware
+        id: compile_firmware
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
+
+          set +e
+
+          echo "===== pre-compile perl ====="
+          T0=$(date +%s)
+          timeout 45m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1 &
+          PERL_PID=$!
+          while kill -0 $PERL_PID 2>/dev/null; do
+            sleep 30
+            if kill -0 $PERL_PID 2>/dev/null; then
+              echo "[perl +$(( $(date +%s) - T0 ))s] $(tail -1 /tmp/perl_build.log 2>/dev/null | head -c 150)"
+            fi
+          done
+          wait $PERL_PID
+          PERL_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$PERL_RESULT"
+
+          echo ""
+          echo "===== make -j3 ====="
+          T0=$(date +%s)
+          timeout 5h make -j3 > /tmp/build.log 2>&1 &
+          MAKE_PID=$!
+
+          LAST_LINES=0
+          while kill -0 $MAKE_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $MAKE_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/build.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              echo "[make +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/build.log 2>/dev/null | head -c 150)"
+            fi
+          done
+          wait $MAKE_PID
+          BUILD_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
+          set -e
+
+          if [ "$BUILD_RESULT" -ne 0 ]; then
+            echo "Build failed, last 100 lines:"
+            tail -100 /tmp/build.log
+            timeout 10m make -j1 V=s 2>&1 | tail -500
+            exit 1
+          fi
+
+          echo ""
+          echo "=== ccache stats ==="
+          CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
+
+      - name: Collect and upload artifacts
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd /workdir/openwrt
+          OUT="bin/targets/rockchip/armv8"
+          TAG="${{ needs.prepare_release.outputs.release_tag }}"
+          KERNEL_VERSION="${{ env.KERNEL_VERSION }}"
+          BUILD_DATE=$(date +%Y-%m-%d)
+
+          # 验证内核版本
+          KV=$(grep -oP 'LINUX_VERSION-\d+\.\d+\s*=\s*\K[\d.]+' target/linux/generic/kernel-* 2>/dev/null | head -1 || echo "unknown")
+          if [[ ! "$KV" =~ ^6\.18 ]]; then
+            echo "::warning::Detected kernel version $KV does not match expected 6.18"
+          fi
+
+          ARTIFACT_PREFIX="${MODEL_NAME}-Linux-${KERNEL_VERSION}-${BUILD_DATE}"
+
+          IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
+          [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
+          file "$IMG_EXT4_GZ" | grep -q "gzip compressed data" || exit 1
+          python3 -c "import zlib;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_EXT4_GZ','rb').read());exit(0 if d.eof else 1)" || exit 1
+
+          IMG_SQ_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-squashfs-sysupgrade.img.gz" | head -1)
+          [ -n "$IMG_SQ_GZ" ] || { echo "squashfs img missing"; exit 1; }
+          file "$IMG_SQ_GZ" | grep -q "gzip compressed data" || exit 1
+          python3 -c "import zlib;d=zlib.decompressobj(wbits=31);d.decompress(open('$IMG_SQ_GZ','rb').read());exit(0 if d.eof else 1)" || exit 1
+
+          python3 -c "import gzip,sys;f=gzip.open(sys.argv[1],'rb');f.seek(446);e=f.read(64);t=e[32+4];assert t!=0,'p3 missing';print(f'p3 present MBR type=0x{t:02x}')" "$IMG_EXT4_GZ"
+
+          MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
+          [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
+
+          mkdir -p $GITHUB_WORKSPACE/artifact
+          cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sdcard.img.gz"
+          cp "$IMG_SQ_GZ"   "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-squashfs-sysupgrade.img.gz"
+          cp "$MANIFEST"    "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-manifest.txt"
+
+          # 上传内核配置文件
+          if [ -f .config ]; then
+            cp .config "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-config.txt"
+          fi
+
+          # 上传 vmlinux（如果存在）
+          VMLINUX=$(find "$OUT" -maxdepth 1 -name "vmlinux" -type f | head -1)
+          if [ -n "$VMLINUX" ]; then
+            cp "$VMLINUX" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-vmlinux"
+          fi
+
+          SUMFILE=$(find "$OUT" -maxdepth 1 -name "sha256sums" -type f | head -1)
+          [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sha256sums.txt"
+
+          echo "kernel version: ${KERNEL_VERSION}.x (unifreq)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          echo "kernel repo: ${{ env.KERNEL_REPO }}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          echo "kernel ref: ${{ env.KERNEL_REF:-default}" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          echo "openwrt commit: $(git rev-parse HEAD)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+          echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-build-info.txt"
+
+          cd $GITHUB_WORKSPACE/artifact
+          rm -f SHA256SUMS
+          for f in *; do
+            [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
+          done
+
+          echo "uploading to release"
+          shopt -s nullglob
+          RELEASE_FILES=(*.gz)
+          shopt -u nullglob
+          gh release upload "$TAG" "${RELEASE_FILES[@]}" --clobber
+          gh release edit "$TAG" --notes "Kernel: ${KERNEL_VERSION}.x (unifreq/linux-6.18.y)" || true
+
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: r5s-linux-${{ needs.prepare_release.outputs.release_tag }}
+          path: artifact/
+          retention-days: 30
+
+  cleanup_self:
+    name: Cleanup workflow history
+    runs-on: ubuntu-latest
+    needs: [prepare_release, build]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 0
+          retain_days: 0
+          delete_workflow_pattern: "Build Linux 6.18 for NanoPi R5S"
+          repository: ${{ github.repository }}
