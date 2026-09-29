@@ -1,6 +1,7 @@
 name: Validate Linux 6.18 Build for NanoPi R5S
+
 on:
-  workflow_dispatch: # 仅允许手动触发，用于测试
+  workflow_dispatch: # 仅允许手动触发
 
 jobs:
   validate:
@@ -9,63 +10,86 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. 验证 unifreq 内核仓库和分支
-      - name: Validate kernel repository
+      - name: Validate kernel repository and get default branch
+        id: kernel_repo
         run: |
-          echo "=== 1. Checking unifreq/linux-6.18.y branch ==="
-          git ls-remote --heads https://github.com/unifreq/linux-6.18.y.git | grep -q "refs/heads/6.18.y" && echo "✅ Branch 6.18.y exists" || (echo "❌ Branch 6.18.y NOT found!" && exit 1)
+          REPO_URL="https://github.com/unifreq/linux-6.18.y.git"
+          echo "=== Fetching default branch for $REPO_URL ==="
+          
+          # 获取远程 HEAD 的符号引用，解析出默认分支名
+          DEFAULT_BRANCH=$(git ls-remote --symref "$REPO_URL" HEAD 2>/dev/null \
+            | awk '/^ref:/{print $2}' | sed 's|refs/heads/||')
+          
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            # 如果无法获取，尝试列出所有 heads 分支
+            echo "⚠️ Could not determine default branch via symref, listing all heads:"
+            git ls-remote --heads "$REPO_URL" | awk -F'/' '{print $NF}'
+            echo "❌ Cannot proceed without a valid branch name."
+            exit 1
+          fi
+          
+          echo "✅ Default branch detected: $DEFAULT_BRANCH"
+          echo "branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
 
-      # 2. 验证 OpenWrt rockchip 目标是否已有 6.18 支持
+      - name: Validate R5S device tree and drivers in kernel
+        env:
+          KERNEL_BRANCH: ${{ steps.kernel_repo.outputs.branch }}
+        run: |
+          echo "=== Checking R5S support in unifreq kernel (branch: $KERNEL_BRANCH) ==="
+          BASE_URL="https://raw.githubusercontent.com/unifreq/linux-6.18.y/${KERNEL_BRANCH}"
+          
+          check_file() {
+            local path="$1"
+            local desc="$2"
+            if curl -sf "${BASE_URL}/${path}" -o /dev/null; then
+              echo "✅ $desc exists"
+            else
+              echo "❌ $desc NOT found at $path"
+              FAILED=1
+            fi
+          }
+          
+          check_file "arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" "rk3568-nanopi-r5s.dts"
+          check_file "drivers/net/ethernet/realtek/r8125/r8125_main.c" "r8125 driver"
+          check_file "drivers/hwmon/pwm-fan.c" "pwm-fan driver"
+          
+          if [ "$FAILED" = "1" ]; then
+            echo ""
+            echo "❌ Some critical files are missing. The kernel may not fully support R5S."
+            exit 1
+          fi
+          echo ""
+          echo "✅ All critical R5S kernel files are present."
+
       - name: Validate OpenWrt rockchip 6.18 support
         run: |
-          echo "=== 2. Checking OpenWrt rockchip 6.18 files ==="
-          # 浅克隆 OpenWrt
+          echo "=== Checking OpenWrt rockchip 6.18 files ==="
           git clone --depth 1 -b openwrt-25.12 https://github.com/openwrt/openwrt.git /tmp/openwrt
           cd /tmp/openwrt
           
           echo "--- rockchip KERNEL_PATCHVER ---"
           grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile || echo "not found"
+          
           echo "--- generic kernel-6.18 directory ---"
           ls -d target/linux/generic/kernel-6.18 2>/dev/null && echo "✅ kernel-6.18 exists" || echo "⚠️ kernel-6.18 dir not found (will be created)"
+          
           echo "--- rockchip patches-6.18 directory ---"
           ls -d target/linux/rockchip/patches-6.18 2>/dev/null && echo "✅ patches-6.18 exists" || echo "⚠️ patches-6.18 dir not found (will be created from 6.12)"
+          
           echo "--- generic config-6.18 ---"
           ls -l target/linux/generic/config-6.18 2>/dev/null || echo "⚠️ config-6.18 not found (will be created)"
 
-      # 3. 验证内核源码中 R5S 相关设备树和驱动是否存在
-      - name: Validate R5S device tree and drivers in kernel
-        run: |
-          echo "=== 3. Checking R5S support in unifreq kernel ==="
-          KERNEL_REPO="https://github.com/unifreq/linux-6.18.y.git"
-          # 使用 git ls-tree 远程检查文件，无需完整克隆
-          BRANCH="6.18.y"
-          BASE_URL="https://raw.githubusercontent.com/unifreq/linux-6.18.y/${BRANCH}"
-          
-          echo "--- rk3568-nanopi-r5s.dts ---"
-          if curl -sf "${BASE_URL}/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" -o /dev/null; then
-            echo "✅ rk3568-nanopi-r5s.dts exists"
-          else
-            echo "❌ rk3568-nanopi-r5s.dts NOT found!" && exit 1
-          fi
-          
-          echo "--- r8125 driver ---"
-          curl -sf "${BASE_URL}/drivers/net/ethernet/realtek/r8125/r8125_main.c" -o /dev/null && echo "✅ r8125 driver exists" || echo "⚠️ r8125 driver not found (may be in staging)"
-          
-          echo "--- pwm-fan driver ---"
-          curl -sf "${BASE_URL}/drivers/hwmon/pwm-fan.c" -o /dev/null && echo "✅ pwm-fan driver exists" || echo "⚠️ pwm-fan driver not found"
-
-      # 4. 模拟配置修改：验证 Makefile 和 config 替换逻辑
       - name: Validate sed and config operations
         run: |
-          echo "=== 4. Validating sed and config operations ==="
+          echo "=== Validating sed and config operations ==="
           cd /tmp/openwrt
           
-          # 模拟 Switch kernel to 6.18 步骤
+          # 模拟 KERNEL_PATCHVER 修改
           sed -i -E 's/^([[:space:]]*)KERNEL_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_PATCHVER:=6.18/' target/linux/rockchip/Makefile
           echo "--- After sed: rockchip Makefile ---"
           grep 'KERNEL_PATCHVER' target/linux/rockchip/Makefile
           
-          # 验证 LINUX_VERSION-6.18 插入逻辑
+          # 模拟 LINUX_VERSION-6.18 插入
           if ! grep -qE '^LINUX_VERSION-6\.18[[:space:]]*=' include/kernel-version.mk; then
             awk '/^LINUX_VERSION-/ { last = NR } { lines[NR] = $0 } END { for (i = 1; i <= NR; i++) { print lines[i]; if (i == last) print "LINUX_VERSION-6.18 = .0" } }' include/kernel-version.mk > /tmp/kv.mk
             mv /tmp/kv.mk include/kernel-version.mk
@@ -73,12 +97,3 @@ jobs:
           echo "--- kernel-version.mk 6.18 entries ---"
           grep -E '^LINUX_VERSION-6\.18' include/kernel-version.mk
           echo "✅ All config operations validated"
-
-      # 5. 最小化编译测试（可选，耗时较长但最可靠）
-      # - name: Minimal build test
-      #   run: |
-      #     echo "=== 5. Minimal build test ==="
-      #     cd /tmp/openwrt
-      #     # 仅编译内核准备阶段，不进行完整编译
-      #     make defconfig
-      #     make target/linux/prepare V=s 2>&1 | tail -50
