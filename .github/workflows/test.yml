@@ -40,7 +40,6 @@ jobs:
             fi
           }
 
-          # 只检查内核源码树中应该存在的文件
           check_file "arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts" "rk3568-nanopi-r5s.dts"
           check_file "drivers/hwmon/pwm-fan.c" "pwm-fan driver"
 
@@ -59,7 +58,7 @@ jobs:
           echo "--- r8125 package Makefile ---"
           if [ -f package/kernel/r8125/Makefile ]; then
             echo "✅ r8125 package exists"
-            grep -E 'PKG_NAME|PKG_VERSION|KernelPackage' package/kernel/r8125/Makefile | head -5
+            grep -E 'PKG_NAME|PKG_VERSION|KernelPackage' package/kernel/r8125/Makefile | head -5 || true
           else
             echo "❌ r8125 package NOT found"
             FAILED=1
@@ -83,14 +82,33 @@ jobs:
           echo "=== Validating sed and config operations ==="
           cd /tmp/openwrt
 
+          # --- 1. 修改 rockchip Makefile ---
           sed -i -E 's/^([[:space:]]*)KERNEL_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_PATCHVER:=6.18/' target/linux/rockchip/Makefile
           echo "--- After sed: rockchip Makefile ---"
-          grep 'KERNEL_PATCHVER' target/linux/rockchip/Makefile
+          grep 'KERNEL_PATCHVER' target/linux/rockchip/Makefile || echo "(not found)"
 
-          if ! grep -qE '^LINUX_VERSION-6\.18[[:space:]]*=' include/kernel-version.mk; then
-            awk '/^LINUX_VERSION-/ { last = NR } { lines[NR] = $0 } END { for (i = 1; i <= NR; i++) { print lines[i]; if (i == last) print "LINUX_VERSION-6.18 = .0" } }' include/kernel-version.mk > /tmp/kv.mk
-            mv /tmp/kv.mk include/kernel-version.mk
+          # --- 2. 确保 LINUX_VERSION-6.18 存在 ---
+          echo "--- Before insert: existing LINUX_VERSION entries ---"
+          grep -E '^LINUX_VERSION-' include/kernel-version.mk || echo "(none found)"
+
+          if ! grep -qE '^LINUX_VERSION-6\.18' include/kernel-version.mk; then
+            LAST_KV=$(grep -nE '^LINUX_VERSION-' include/kernel-version.mk | tail -1 | cut -d: -f1)
+            if [ -n "$LAST_KV" ]; then
+              sed -i "${LAST_KV}a LINUX_VERSION-6.18 = .0" include/kernel-version.mk
+              echo "inserted after line $LAST_KV"
+            else
+              echo "LINUX_VERSION-6.18 = .0" >> include/kernel-version.mk
+              echo "appended to end (no existing LINUX_VERSION found)"
+            fi
           fi
-          echo "--- kernel-version.mk 6.18 entries ---"
-          grep -E '^LINUX_VERSION-6\.18' include/kernel-version.mk
+
+          echo "--- After insert: LINUX_VERSION-6.18 entries ---"
+          grep -E '^LINUX_VERSION-6\.18' include/kernel-version.mk || echo "(not found, insert failed)"
+
+          # --- 3. 验证结果 ---
+          if ! grep -qE '^LINUX_VERSION-6\.18' include/kernel-version.mk; then
+            echo "❌ LINUX_VERSION-6.18 not present after insert"
+            exit 1
+          fi
+
           echo "✅ All config operations validated"
