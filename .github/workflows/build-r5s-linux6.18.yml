@@ -25,7 +25,7 @@ env:
   MODEL_NAME: 'R5S'
   KERNEL_VERSION: '6.18'
   KERNEL_REPO: 'https://github.com/unifreq/linux-6.18.y.git'
-  KERNEL_REF: ''
+  KERNEL_REF: 'main'
   OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
   OPENWRT_BRANCH: 'openwrt-25.12'
   CONFIG_FILE: 'scripts/r5s.config'
@@ -158,113 +158,145 @@ jobs:
           done
           echo "git mtime restored"
 
-      - name: Switch kernel to 6.18 (unifreq)
+      - name: Create 6.18 kernel scaffolding
         run: |
           cd /workdir/openwrt
 
-          echo "=== Before ==="
-          grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile || true
-          grep -E '^LINUX_VERSION-6' include/kernel-version.mk || true
+          echo "===== BEFORE ====="
+          ls -la target/linux/generic/ | grep -E 'kernel-|config-|pending|hack|backport' || true
+          echo "--- rockchip ---"
+          ls -la target/linux/rockchip/ | grep -E 'patches|files' || true
 
-          # 1. 切换 rockchip target 的 KERNEL_PATCHVER 到 6.18
-          if grep -q '^KERNEL_PATCHVER' target/linux/rockchip/Makefile; then
-            sed -i -E 's/^KERNEL_PATCHVER\s*:?=\s*[0-9.]+/KERNEL_PATCHVER:=6.18/' target/linux/rockchip/Makefile
+          GENERIC=target/linux/generic
+          ROCKCHIP=target/linux/rockchip
+
+          # --- 1. 生成 kernel-6.18 数据文件 ---
+          if [ -f "$GENERIC/kernel-6.12" ]; then
+            echo "=== kernel-6.12 原始内容 ==="
+            cat "$GENERIC/kernel-6.12"
+            echo "==========================="
+
+            # 复制 kernel-6.12 到 kernel-6.18，并把 6.12 换成 6.18
+            sed -E 's/6\.12/6.18/g' "$GENERIC/kernel-6.12" > "$GENERIC/kernel-6.18"
+
+            echo "=== kernel-6.18 生成内容 ==="
+            cat "$GENERIC/kernel-6.18"
+            echo "==========================="
           else
-            echo 'KERNEL_PATCHVER:=6.18' >> target/linux/rockchip/Makefile
+            echo "⚠️ kernel-6.12 不存在，创建最小 kernel-6.18"
+            echo "LINUX_VERSION-6.18 = .0" > "$GENERIC/kernel-6.18"
           fi
 
-          # 2. 确保 include/kernel-version.mk 中定义 LINUX_VERSION-6.18
-          if ! grep -q '^LINUX_VERSION-6\.18' include/kernel-version.mk; then
-            awk 'BEGIN{done=0}
-                 /^LINUX_VERSION-/ && !done {
-                   print
-                   print "LINUX_VERSION-6.18 = .0"
-                   done=1
-                   next
-                 }
-                 {print}
-                 END { if (!done) print "LINUX_VERSION-6.18 = .0" }' \
-              include/kernel-version.mk > /tmp/kv.mk
-            mv /tmp/kv.mk include/kernel-version.mk
+          # --- 2. 复制 config-6.12 → config-6.18 ---
+          if [ ! -f "$GENERIC/config-6.18" ] && [ -f "$GENERIC/config-6.12" ]; then
+            cp -a "$GENERIC/config-6.12" "$GENERIC/config-6.18"
+            echo "created config-6.18 from config-6.12"
           fi
 
-          # 3. 为 6.18 创建通用补丁/配置目录（如果不存在则从 6.12 复制作为基础）
+          # --- 3. 复制 pending/hack/backport ---
           for sub in pending hack backport; do
-            if [ ! -d "target/linux/generic/${sub}-6.18" ] && [ -d "target/linux/generic/${sub}-6.12" ]; then
-              cp -a "target/linux/generic/${sub}-6.12" "target/linux/generic/${sub}-6.18"
+            if [ ! -d "$GENERIC/${sub}-6.18" ] && [ -d "$GENERIC/${sub}-6.12" ]; then
+              cp -a "$GENERIC/${sub}-6.12" "$GENERIC/${sub}-6.18"
+              echo "created ${sub}-6.18 from ${sub}-6.12 ($(ls "$GENERIC/${sub}-6.18" | wc -l) files)"
             fi
           done
-          if [ ! -f target/linux/generic/config-6.18 ] && [ -f target/linux/generic/config-6.12 ]; then
-            cp -a target/linux/generic/config-6.12 target/linux/generic/config-6.18
+
+          # --- 4. 复制 rockchip patches ---
+          if [ ! -d "$ROCKCHIP/patches-6.18" ] && [ -d "$ROCKCHIP/patches-6.12" ]; then
+            cp -a "$ROCKCHIP/patches-6.12" "$ROCKCHIP/patches-6.18"
+            echo "created rockchip/patches-6.18 from patches-6.12 ($(ls "$ROCKCHIP/patches-6.18" | wc -l) files)"
           fi
 
-          # 4. 为 rockchip target 创建 6.18 补丁目录（如果不存在则从 6.12 复制）
-          if [ ! -d target/linux/rockchip/patches-6.18 ] && [ -d target/linux/rockchip/patches-6.12 ]; then
-            cp -a target/linux/rockchip/patches-6.12 target/linux/rockchip/patches-6.18
-          fi
+          # --- 5. 修改 KERNEL_PATCHVER ---
+          sed -i -E 's/^([[:space:]]*)KERNEL_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
+          sed -i -E 's/^([[:space:]]*)KERNEL_TESTING_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_TESTING_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
 
-          echo "=== After ==="
-          grep -E '^KERNEL_PATCHVER' target/linux/rockchip/Makefile || true
-          grep -E '^LINUX_VERSION-6' include/kernel-version.mk || true
-          ls -d target/linux/generic/*-6.18 2>/dev/null || true
-          ls -d target/linux/rockchip/patches-6.18 2>/dev/null || true
+          echo ""
+          echo "===== AFTER ====="
+          echo "--- rockchip Makefile ---"
+          grep -nE 'KERNEL_PATCHVER|KERNEL_TESTING_PATCHVER' "$ROCKCHIP/Makefile" || true
+          echo "--- generic 6.18 项 ---"
+          ls -la "$GENERIC" | grep -E '6\.18' || true
+          echo "--- rockchip patches-6.18 ---"
+          ls -d "$ROCKCHIP/patches-6.18" 2>/dev/null || true
 
       - name: Prepare build configuration
         run: |
           cd /workdir/openwrt
 
-          # 运行原有自定义脚本（保持 6.12 流程不变）
+          # --- feeds ---
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
           ./scripts/feeds update -a 2>&1 | tail -30
 
-          # post 阶段会读取 KERNEL_PATCHVER（此时为 6.18），
-          # 并自动生成 target/linux/rockchip/config-6.18
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
 
-          # 应用基础 .config
+          # --- 应用基础 .config ---
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
 
-          # 切换到 unifreq 6.18 内核
-          sed -i 's/^CONFIG_LINUX_6_12=y/# CONFIG_LINUX_6_12 is not set/' .config
-          sed -i '/^CONFIG_LINUX_6_6=y/d' .config
-          grep -q '^CONFIG_LINUX_6_18=y' .config || echo 'CONFIG_LINUX_6_18=y' >> .config
+          # 删除无效的 CONFIG_LINUX_6_xx（它们不在 Kconfig，避免干扰）
+          sed -i '/^CONFIG_LINUX_6_/d' .config
+          sed -i '/^# CONFIG_LINUX_6_.* is not set/d' .config
 
-          cat >> .config <<EOF
-          CONFIG_DEVEL=y
-          CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"
-          CONFIG_KERNEL_GIT_REF=""
-          CONFIG_KERNEL_PATCHVER=6.18
-          CONFIG_CCACHE=y
-          CONFIG_CCACHE_DIR="/workdir/ccache"
-          EOF
+          # --- 启用 DEVEL 与 git 内核 ---
+          sed -i '/^CONFIG_DEVEL=/d' .config
+          sed -i '/^# CONFIG_DEVEL is not set/d' .config
+          echo 'CONFIG_DEVEL=y' >> .config
 
+          sed -i '/^CONFIG_KERNEL_GIT_CLONE_URI=/d' .config
+          sed -i '/^CONFIG_KERNEL_GIT_REF=/d' .config
+          echo "CONFIG_KERNEL_GIT_CLONE_URI=\"${{ env.KERNEL_REPO }}\"" >> .config
+          echo "CONFIG_KERNEL_GIT_REF=\"${{ env.KERNEL_REF }}\"" >> .config
+
+          # --- ccache ---
+          sed -i '/^CONFIG_CCACHE=/d' .config
+          echo 'CONFIG_CCACHE=y' >> .config
+          sed -i '/^CONFIG_CCACHE_DIR=/d' .config
+          echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+
+          # --- 运行自定义 config ---
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
 
-          # 再次强制内核相关选项，防止被覆盖
-          sed -i 's|^CONFIG_KERNEL_GIT_CLONE_URI=.*|CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"|' .config
-          sed -i 's|^CONFIG_KERNEL_GIT_REF=.*|CONFIG_KERNEL_GIT_REF=""|' .config
-          sed -i 's|^CONFIG_KERNEL_PATCHVER=.*|CONFIG_KERNEL_PATCHVER=6.18|' .config
-          grep -q '^CONFIG_KERNEL_GIT_CLONE_URI=' .config || \
-            echo 'CONFIG_KERNEL_GIT_CLONE_URI="${{ env.KERNEL_REPO }}"' >> .config
-          grep -q '^CONFIG_KERNEL_GIT_REF=' .config || \
-            echo 'CONFIG_KERNEL_GIT_REF=""' >> .config
-          grep -q '^CONFIG_KERNEL_PATCHVER=' .config || \
-            echo 'CONFIG_KERNEL_PATCHVER=6.18' >> .config
-
+          # --- defconfig ---
           make defconfig
 
-          grep -q '^CONFIG_CCACHE=y' .config || echo "CONFIG_CCACHE=y" >> .config
-          sed -i 's|^CONFIG_CCACHE_DIR=.*|CONFIG_CCACHE_DIR="/workdir/ccache"|' .config
-          grep -q '^CONFIG_CCACHE_DIR=' .config || \
-            echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+          # --- defconfig 之后再次强制 DEVEL 与 git 内核 ---
+          sed -i '/^CONFIG_DEVEL=/d' .config
+          sed -i '/^# CONFIG_DEVEL is not set/d' .config
+          echo 'CONFIG_DEVEL=y' >> .config
+
+          sed -i '/^CONFIG_KERNEL_GIT_CLONE_URI=/d' .config
+          sed -i '/^CONFIG_KERNEL_GIT_REF=/d' .config
+          echo "CONFIG_KERNEL_GIT_CLONE_URI=\"${{ env.KERNEL_REPO }}\"" >> .config
+          echo "CONFIG_KERNEL_GIT_REF=\"${{ env.KERNEL_REF }}\"" >> .config
+
+          sed -i '/^CONFIG_CCACHE=/d' .config
+          echo 'CONFIG_CCACHE=y' >> .config
+          sed -i '/^CONFIG_CCACHE_DIR=/d' .config
+          echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+
+          # 二次 defconfig
+          make defconfig 2>&1 | tail -5
 
           echo ""
-          echo "=== .config md5 ==="
-          md5sum .config
+          echo "===== final .config kernel check ====="
+          grep -E 'CONFIG_KERNEL_GIT|CONFIG_DEVEL|CONFIG_CCACHE' .config || true
+          echo "----- 确认无 CONFIG_LINUX_6_xx -----"
+          grep -E 'CONFIG_LINUX_6_' .config && echo "⚠️ 仍有 CONFIG_LINUX_6_xx，将被忽略" || echo "✅ 无 CONFIG_LINUX_6_xx"
           echo ""
-          echo "=== kernel related ==="
-          grep -E 'CONFIG_LINUX_6|CONFIG_KERNEL_PATCHVER|CONFIG_KERNEL_GIT' .config || true
+          echo "===== .config md5 ====="
+          md5sum .config
+
+      - name: Pre-check kernel prepare
+        run: |
+          cd /workdir/openwrt
+          echo "===== target/linux/prepare (dry run) ====="
+          if ! timeout 20m make target/linux/prepare V=s 2>&1 | tee /tmp/prepare.log | tail -60; then
+            echo "❌ target/linux/prepare 失败，下面列出错误"
+            grep -nE 'Error|error:|failed|FAILED|patch' /tmp/prepare.log | tail -40 || true
+            exit 1
+          fi
+          echo "✅ target/linux/prepare 成功"
 
       - name: Compile firmware
         id: compile_firmware
@@ -332,7 +364,7 @@ jobs:
           KERNEL_VERSION="${{ env.KERNEL_VERSION }}"
           BUILD_DATE=$(date +%Y-%m-%d)
 
-          KV=$(grep -oP 'LINUX_VERSION-6\.18\s*=\s*\K[\d.]+' include/kernel-version.mk 2>/dev/null | head -1 || echo ".0")
+          KV=$(grep -E '^LINUX_VERSION-6\.18' target/linux/generic/kernel-6.18 2>/dev/null | head -1 | awk -F'=' '{print $2}' | tr -d ' ' || echo ".0")
           echo "Kernel: Linux ${KERNEL_VERSION}${KV} (unifreq)"
 
           ARTIFACT_PREFIX="${MODEL_NAME}-Linux-${KERNEL_VERSION}-${BUILD_DATE}"
@@ -368,7 +400,7 @@ jobs:
           {
             echo "kernel: Linux ${KERNEL_VERSION}${KV} (unifreq)"
             echo "kernel repo: ${{ env.KERNEL_REPO }}"
-            echo "kernel ref: default HEAD (main branch)"
+            echo "kernel ref: ${{ env.KERNEL_REF }}"
             echo "openwrt branch: ${{ env.OPENWRT_BRANCH }}"
             echo "openwrt commit: $(git rev-parse HEAD)"
             echo "build time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
