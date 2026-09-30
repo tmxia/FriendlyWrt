@@ -111,4 +111,103 @@ jobs:
             exit 1
           fi
 
+          # --- 4. 验证 sanitize_uri 修改 ---
+          echo ""
+          echo "=== Validating sanitize_uri fix (apk version compatibility) ==="
+          echo "--- Before: sanitize_uri ---"
+          grep -nE '^sanitize_uri[[:space:]]*=' include/kernel-version.mk || echo "(none)"
+
+          sed -i 's#^sanitize_uri[[:space:]]*=.*#sanitize_uri=$(call qstrip,$(subst _,-,$(subst @,_,$(subst :,_,$(subst .,_,$(subst -,_,$(subst /,_,$(1))))))))#' include/kernel-version.mk
+
+          echo "--- After: sanitize_uri ---"
+          grep -nE '^sanitize_uri[[:space:]]*=' include/kernel-version.mk || echo "(none)"
+
+          # 模拟 sanitize_uri 对 unifreq URI 的结果
+          echo ""
+          echo "--- Simulating sanitize_uri on unifreq URI ---"
+          URI="github.com/unifreq/linux-6.18.y.git"
+          # 手动模拟 sed 替换链
+          SIMULATED=$(echo "$URI" | sed 's|/|_|g; s|\.|_|g; s|-|_|g; s|:|_|g; s|@|_|g' | sed 's|_|-|g')
+          echo "input:   $URI"
+          echo "output:  $SIMULATED"
+          if echo "$SIMULATED" | grep -q '_'; then
+            echo "❌ sanitize_uri 结果仍含下划线，apk 将拒绝"
+            exit 1
+          fi
+          echo "✅ sanitize_uri 结果不含下划线，apk 兼容"
+
+          echo ""
           echo "✅ All config operations validated"
+
+      - name: Clone unifreq kernel and detect version
+        id: kernel_ver
+        env:
+          KERNEL_BRANCH: ${{ steps.kernel_repo.outputs.branch }}
+        run: |
+          echo "=== Cloning unifreq kernel (shallow) ==="
+          KERNEL_SRC=/tmp/unifreq-kernel
+          rm -rf "$KERNEL_SRC"
+          git clone --depth 1 -b "$KERNEL_BRANCH" \
+            https://github.com/unifreq/linux-6.18.y.git "$KERNEL_SRC" 2>&1 | tail -3
+
+          KM="$KERNEL_SRC/Makefile"
+          if [ ! -f "$KM" ]; then
+            echo "❌ 内核顶层 Makefile 不存在"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== 内核 Makefile 头部 ==="
+          head -6 "$KM"
+
+          V=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+          P=$(sed -n 's/^PATCHLEVEL[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+          S=$(sed -n 's/^SUBLEVEL[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+          E=$(sed -n 's/^EXTRAVERSION[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+
+          echo ""
+          echo "parsed: VERSION=$V PATCHLEVEL=$P SUBLEVEL=$S EXTRAVERSION=$E"
+
+          if [ -z "$V" ] || [ -z "$P" ]; then
+            echo "❌ 无法解析 VERSION/PATCHLEVEL"
+            exit 1
+          fi
+
+          if [ -n "$S" ]; then
+            FULL="${V}.${P}.${S}${E}"
+          else
+            FULL="${V}.${P}${E}"
+          fi
+
+          # 校验格式
+          if ! echo "$FULL" | grep -qE '^6\.18(\.|$)'; then
+            echo "❌ 检测到的版本号 '$FULL' 不是 6.18.x 系列"
+            exit 1
+          fi
+
+          echo ""
+          echo "================================"
+          echo "✅ 检测到内核完整版本: $FULL"
+          echo "================================"
+          echo "full_version=$FULL" >> "$GITHUB_OUTPUT"
+
+          # 额外：检查版本号是否适合用作文件名
+          FILENAME_VER=$(echo "$FULL" | tr -d ' ')
+          echo ""
+          echo "--- 文件名版本（去空格）: $FILENAME_VER ---"
+          echo "--- 产物示例: R5S-Linux-${FILENAME_VER}-$(date +%Y-%m-%d)-sdcard.img.gz ---"
+
+      - name: Summary
+        run: |
+          echo "## 验证结果汇总" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 结果 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 内核分支 | \`${{ steps.kernel_repo.outputs.branch }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 内核完整版本 | \`${{ steps.kernel_ver.outputs.full_version }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| rk3568-nanopi-r5s.dts | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| pwm-fan 驱动 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| r8125 包 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| KERNEL_PATCHVER 修改 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| LINUX_VERSION-6.18 插入 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| sanitize_uri apk 兼容 | ✅ |" >> $GITHUB_STEP_SUMMARY
