@@ -646,9 +646,13 @@ jobs:
           shopt -u nullglob
           gh release upload "$TAG" "${RELEASE_FILES[@]}" --clobber
 
-          gh release edit "$TAG" --notes "Kernel: Linux ${FULL_VERSION} (unifreq/linux-6.18.y)
-OpenWrt: ${{ env.OPENWRT_BRANCH }} ($(git rev-parse --short HEAD))
-Build: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
+          NOTES_FILE=/tmp/release_notes.txt
+          {
+            echo "Kernel: Linux ${FULL_VERSION} (unifreq/linux-6.18.y)"
+            echo "OpenWrt: ${{ env.OPENWRT_BRANCH }} ($(git rev-parse --short HEAD))"
+            echo "Build: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$NOTES_FILE"
+          gh release edit "$TAG" --notes-file "$NOTES_FILE" || true
 
       - uses: actions/upload-artifact@v4
         if: success()
