@@ -186,7 +186,7 @@ jobs:
           echo "=== staging_dir/toolchain-* ==="
           ls -d /workdir/openwrt/staging_dir/toolchain-* 2>/dev/null || echo "(none)"
           echo ""
-          echo "=== build_dir/host (前 20 项) ==="
+          echo "=== build_dir/host 前 20 项 ==="
           ls /workdir/openwrt/build_dir/host 2>/dev/null | head -20 || echo "(none)"
           echo ""
           echo "=== 磁盘占用 ==="
@@ -216,7 +216,7 @@ jobs:
             cat "$GENERIC/kernel-6.18"
             echo "==========================="
           else
-            echo "⚠️ kernel-6.12 不存在，创建最小 kernel-6.18"
+            echo "kernel-6.12 不存在，创建最小 kernel-6.18"
             echo "LINUX_VERSION-6.18 = .0" > "$GENERIC/kernel-6.18"
           fi
 
@@ -239,6 +239,17 @@ jobs:
 
           sed -i -E 's/^([[:space:]]*)KERNEL_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
           sed -i -E 's/^([[:space:]]*)KERNEL_TESTING_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_TESTING_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
+
+          KVM=include/kernel-version.mk
+          if [ -f "$KVM" ]; then
+            echo "--- 原始 sanitize_uri ---"
+            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
+            sed -i 's#^sanitize_uri[[:space:]]*=.*#sanitize_uri=$(call qstrip,$(subst _,-,$(subst @,_,$(subst :,_,$(subst .,_,$(subst -,_,$(subst /,_,$(1))))))))#' "$KVM"
+            echo "--- 修改后 sanitize_uri ---"
+            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
+          else
+            echo "include/kernel-version.mk 不存在"
+          fi
 
           echo ""
           echo "===== AFTER ====="
@@ -302,7 +313,7 @@ jobs:
           echo "===== final .config kernel check ====="
           grep -E 'CONFIG_KERNEL_GIT|CONFIG_DEVEL|CONFIG_CCACHE' .config || true
           echo "----- 确认无 CONFIG_LINUX_6_xx -----"
-          grep -E 'CONFIG_LINUX_6_' .config && echo "⚠️ 仍有 CONFIG_LINUX_6_xx，将被忽略" || echo "✅ 无 CONFIG_LINUX_6_xx"
+          grep -E 'CONFIG_LINUX_6_' .config && echo "仍有 CONFIG_LINUX_6_xx，将被忽略" || echo "无 CONFIG_LINUX_6_xx"
           echo ""
           echo "===== .config md5 ====="
           md5sum .config
@@ -312,18 +323,94 @@ jobs:
           cd /workdir/openwrt
           echo "===== target/linux/prepare (dry run) ====="
           if ! timeout 20m make target/linux/prepare V=s 2>&1 | tee /tmp/prepare.log | tail -60; then
-            echo "❌ target/linux/prepare 失败，下面列出错误"
+            echo "target/linux/prepare 失败，下面列出错误"
             grep -nE 'Error|error:|failed|FAILED|patch' /tmp/prepare.log | tail -40 || true
             exit 1
           fi
-          echo "✅ target/linux/prepare 成功"
+          echo "target/linux/prepare 成功"
+
+      - name: Detect kernel version
+        id: kernel_ver
+        run: |
+          cd /workdir/openwrt
+
+          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github_com_unifreq*' | head -1)
+          if [ -z "$KERNEL_DIR" ]; then
+            echo "找不到 unifreq 内核源码目录"
+            find build_dir -maxdepth 4 -type d -name 'linux-*' | head -10
+            exit 1
+          fi
+          echo "kernel dir: $KERNEL_DIR"
+          echo ""
+
+          FULL=""
+
+          KM="$KERNEL_DIR/Makefile"
+          if [ -f "$KM" ]; then
+            echo "--- 内核 Makefile 头部 ---"
+            head -6 "$KM"
+            echo ""
+            V=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+            P=$(sed -n 's/^PATCHLEVEL[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+            S=$(sed -n 's/^SUBLEVEL[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+            E=$(sed -n 's/^EXTRAVERSION[[:space:]]*=[[:space:]]*//p' "$KM" | head -1 | tr -d ' ')
+            echo "parsed: VERSION=$V PATCHLEVEL=$P SUBLEVEL=$S EXTRAVERSION=$E"
+            if [ -n "$V" ] && [ -n "$P" ]; then
+              if [ -n "$S" ]; then
+                FULL="${V}.${P}.${S}${E}"
+              else
+                FULL="${V}.${P}${E}"
+              fi
+            fi
+          fi
+
+          if [ -z "$FULL" ] && [ -f "$KERNEL_DIR/include/config/kernel.release" ]; then
+            FULL=$(cat "$KERNEL_DIR/include/config/kernel.release")
+            echo "from kernel.release: $FULL"
+          fi
+
+          if [ -z "$FULL" ]; then
+            MOD=$(find "$KERNEL_DIR" -maxdepth 5 -type d -path '*/lib/modules/6.18*' 2>/dev/null | head -1)
+            if [ -n "$MOD" ]; then
+              FULL=$(basename "$MOD")
+              echo "from lib/modules: $FULL"
+            fi
+          fi
+
+          if [ -z "$FULL" ]; then
+            MOD=$(find staging_dir -maxdepth 6 -type d -path '*/lib/modules/6.18*' 2>/dev/null | head -1)
+            if [ -n "$MOD" ]; then
+              FULL=$(basename "$MOD")
+              echo "from staging_dir: $FULL"
+            fi
+          fi
+
+          if [ -z "$FULL" ]; then
+            echo "无法确定内核版本号，终止流程"
+            exit 1
+          fi
+
+          if ! echo "$FULL" | grep -qE '^6\.18(\.|$)'; then
+            echo "检测到的版本号 '$FULL' 不是 6.18.x 系列"
+            exit 1
+          fi
+
+          echo ""
+          echo "================================"
+          echo "检测到内核完整版本: $FULL"
+          echo "================================"
+          echo "full_version=$FULL" >> "$GITHUB_OUTPUT"
+
+          FILENAME_VER=$(echo "$FULL" | tr -d ' ')
+          echo "--- 文件名版本: $FILENAME_VER ---"
+          echo "--- 产物示例: R5S-Linux-${FILENAME_VER}-$(date +%Y-%m-%d)-sdcard.img.gz ---"
 
       - name: Disable unifreq aic8800 WiFi driver
         run: |
           cd /workdir/openwrt
           KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github_com_unifreq*' | head -1)
           if [ -z "$KERNEL_DIR" ]; then
-            echo "❌ unifreq kernel dir not found"
+            echo "unifreq kernel dir not found"
             find build_dir -maxdepth 4 -type d -name 'linux-*' | head -10
             exit 1
           fi
@@ -331,7 +418,7 @@ jobs:
 
           AIC_DIR="$KERNEL_DIR/drivers/net/wireless/aicsemi"
           if [ ! -d "$AIC_DIR" ]; then
-            echo "✅ aicsemi 目录不存在，跳过"
+            echo "aicsemi 目录不存在，跳过"
             exit 0
           fi
 
@@ -379,10 +466,10 @@ jobs:
           echo "[Makefile]"
           grep -n 'aicsemi' "$KERNEL_DIR/drivers/net/wireless/Makefile" 2>/dev/null || echo "Makefile: clean"
           if [ -d "$AIC_DIR" ]; then
-            echo "❌ 目录仍存在"
+            echo "目录仍存在"
             exit 1
           fi
-          echo "✅ aicsemi 已禁用"
+          echo "aicsemi 已禁用"
 
       - name: Patch OpenWrt packages for Linux 6.18
         run: |
@@ -392,7 +479,7 @@ jobs:
 
           GBP=$(find package/kernel/gpio-button-hotplug -name 'gpio-button-hotplug.c' -type f 2>/dev/null | head -1)
           if [ -z "$GBP" ]; then
-            echo "❌ gpio-button-hotplug.c not found. Dumping tree:"
+            echo "gpio-button-hotplug.c not found. Dumping tree:"
             find package/kernel/gpio-button-hotplug -type f 2>/dev/null | head -20
             exit 1
           fi
@@ -401,7 +488,6 @@ jobs:
           echo "--- 原始相关行 ---"
           grep -nE 'GPIOF_ACTIVE_LOW|GPIO_ACTIVE_LOW|remove_new|#include <linux/gpio' "$GBP" || true
 
-          # 1. 确保引入 linux/gpio/machine.h（GPIO_ACTIVE_LOW 的真正定义处）
           if ! grep -q 'linux/gpio/machine.h' "$GBP"; then
             if grep -q '#include <linux/gpio/consumer.h>' "$GBP"; then
               sed -i 's|#include <linux/gpio/consumer.h>|#include <linux/gpio/consumer.h>\n#include <linux/gpio/machine.h>|' "$GBP"
@@ -412,20 +498,16 @@ jobs:
             fi
           fi
 
-          # 2. GPIOF_ACTIVE_LOW -> GPIO_ACTIVE_LOW（幂等）
           sed -i 's/\bGPIOF_ACTIVE_LOW\b/GPIO_ACTIVE_LOW/g' "$GBP"
-
-          # 3. .remove_new =  ->  .remove =（幂等）
           sed -i 's/\.remove_new[[:space:]]*=/\.remove =/g' "$GBP"
 
           echo "--- 修改后相关行 ---"
           grep -nE 'GPIO_ACTIVE_LOW|GPIOF_ACTIVE_LOW|remove_new|\.remove[[:space:]]*=|#include <linux/gpio' "$GBP" || true
 
-          # 强制重建这个包（清掉上次编译残留）
           rm -rf /workdir/openwrt/build_dir/target-aarch64_generic_musl/linux-rockchip_armv8/gpio-button-hotplug
           rm -f /workdir/openwrt/staging_dir/target-aarch64_generic_musl/stamp/.gpio-button-hotplug_installed
 
-          echo "✅ gpio-button-hotplug patched"
+          echo "gpio-button-hotplug patched"
 
       - name: Compile firmware
         id: compile_firmware
@@ -490,13 +572,30 @@ jobs:
           cd /workdir/openwrt
           OUT="bin/targets/rockchip/armv8"
           TAG="${{ needs.prepare_release.outputs.release_tag }}"
-          KERNEL_VERSION="${{ env.KERNEL_VERSION }}"
+          FULL_VERSION="${{ steps.kernel_ver.outputs.full_version }}"
           BUILD_DATE=$(date +%Y-%m-%d)
 
-          KV=$(grep -E '^LINUX_VERSION-6\.18' target/linux/generic/kernel-6.18 2>/dev/null | head -1 | awk -F'=' '{print $2}' | tr -d ' ' || echo ".0")
-          echo "Kernel: Linux ${KERNEL_VERSION}${KV} (unifreq)"
+          echo "早期检测的内核版本: $FULL_VERSION"
 
-          ARTIFACT_PREFIX="${MODEL_NAME}-Linux-${KERNEL_VERSION}-${BUILD_DATE}"
+          MOD=$(find staging_dir -maxdepth 6 -type d -path '*/lib/modules/6.18*' 2>/dev/null | head -1)
+          if [ -n "$MOD" ]; then
+            FULL_VERSION_2=$(basename "$MOD")
+            if [ "$FULL_VERSION" != "$FULL_VERSION_2" ]; then
+              echo "版本号二次核对不一致：早期=$FULL_VERSION，编译后=$FULL_VERSION_2"
+              echo "使用编译后检测到的：$FULL_VERSION_2"
+              FULL_VERSION="$FULL_VERSION_2"
+            else
+              echo "版本号二次核对一致：$FULL_VERSION_2"
+            fi
+          fi
+
+          if [ -z "$FULL_VERSION" ]; then
+            echo "最终版本号为空"
+            exit 1
+          fi
+
+          ARTIFACT_PREFIX="${MODEL_NAME}-Linux-${FULL_VERSION}-${BUILD_DATE}"
+          echo "产物前缀: $ARTIFACT_PREFIX"
 
           IMG_EXT4_GZ=$(find "$OUT" -maxdepth 1 -type f -name "*nanopi-r5s-ext4-sysupgrade.img.gz" | head -1)
           [ -n "$IMG_EXT4_GZ" ] || { echo "ext4 img missing"; exit 1; }
@@ -527,7 +626,7 @@ jobs:
           [ -n "$SUMFILE" ] && cp "$SUMFILE" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sha256sums.txt"
 
           {
-            echo "kernel: Linux ${KERNEL_VERSION}${KV} (unifreq)"
+            echo "kernel: Linux ${FULL_VERSION} (unifreq/linux-6.18.y)"
             echo "kernel repo: ${{ env.KERNEL_REPO }}"
             echo "kernel ref: ${{ env.KERNEL_REF }}"
             echo "openwrt branch: ${{ env.OPENWRT_BRANCH }}"
@@ -546,7 +645,10 @@ jobs:
           RELEASE_FILES=(*.gz)
           shopt -u nullglob
           gh release upload "$TAG" "${RELEASE_FILES[@]}" --clobber
-          gh release edit "$TAG" --notes "Kernel: Linux ${KERNEL_VERSION}${KV} (unifreq/linux-6.18.y)" || true
+
+          gh release edit "$TAG" --notes "Kernel: Linux ${FULL_VERSION} (unifreq/linux-6.18.y)
+OpenWrt: ${{ env.OPENWRT_BRANCH }} ($(git rev-parse --short HEAD))
+Build: $(date -u +%Y-%m-%dT%H:%M:%SZ)" || true
 
       - uses: actions/upload-artifact@v4
         if: success()
