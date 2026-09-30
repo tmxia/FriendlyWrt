@@ -334,7 +334,7 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github_com_unifreq*' | head -1)
+          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github*unifreq*' | head -1)
           if [ -z "$KERNEL_DIR" ]; then
             echo "找不到 unifreq 内核源码目录"
             find build_dir -maxdepth 4 -type d -name 'linux-*' | head -10
@@ -408,7 +408,7 @@ jobs:
       - name: Disable unifreq aic8800 WiFi driver
         run: |
           cd /workdir/openwrt
-          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github_com_unifreq*' | head -1)
+          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github*unifreq*' | head -1)
           if [ -z "$KERNEL_DIR" ]; then
             echo "unifreq kernel dir not found"
             find build_dir -maxdepth 4 -type d -name 'linux-*' | head -10
