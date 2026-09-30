@@ -176,7 +176,6 @@ jobs:
             cat "$GENERIC/kernel-6.12"
             echo "==========================="
 
-            # 复制 kernel-6.12 到 kernel-6.18，并把 6.12 换成 6.18
             sed -E 's/6\.12/6.18/g' "$GENERIC/kernel-6.12" > "$GENERIC/kernel-6.18"
 
             echo "=== kernel-6.18 生成内容 ==="
@@ -224,21 +223,17 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          # --- feeds ---
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
           ./scripts/feeds update -a 2>&1 | tail -30
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
           ./scripts/feeds install -a 2>&1 | tail -40
 
-          # --- 应用基础 .config ---
           cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
 
-          # 删除无效的 CONFIG_LINUX_6_xx（它们不在 Kconfig，避免干扰）
           sed -i '/^CONFIG_LINUX_6_/d' .config
           sed -i '/^# CONFIG_LINUX_6_.* is not set/d' .config
 
-          # --- 启用 DEVEL 与 git 内核 ---
           sed -i '/^CONFIG_DEVEL=/d' .config
           sed -i '/^# CONFIG_DEVEL is not set/d' .config
           echo 'CONFIG_DEVEL=y' >> .config
@@ -248,19 +243,15 @@ jobs:
           echo "CONFIG_KERNEL_GIT_CLONE_URI=\"${{ env.KERNEL_REPO }}\"" >> .config
           echo "CONFIG_KERNEL_GIT_REF=\"${{ env.KERNEL_REF }}\"" >> .config
 
-          # --- ccache ---
           sed -i '/^CONFIG_CCACHE=/d' .config
           echo 'CONFIG_CCACHE=y' >> .config
           sed -i '/^CONFIG_CCACHE_DIR=/d' .config
           echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
 
-          # --- 运行自定义 config ---
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
 
-          # --- defconfig ---
           make defconfig
 
-          # --- defconfig 之后再次强制 DEVEL 与 git 内核 ---
           sed -i '/^CONFIG_DEVEL=/d' .config
           sed -i '/^# CONFIG_DEVEL is not set/d' .config
           echo 'CONFIG_DEVEL=y' >> .config
@@ -275,7 +266,6 @@ jobs:
           sed -i '/^CONFIG_CCACHE_DIR=/d' .config
           echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
 
-          # 二次 defconfig
           make defconfig 2>&1 | tail -5
 
           echo ""
@@ -297,6 +287,58 @@ jobs:
             exit 1
           fi
           echo "✅ target/linux/prepare 成功"
+
+      - name: Disable unifreq aic8800 WiFi driver
+        run: |
+          cd /workdir/openwrt
+          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github_com_unifreq*' | head -1)
+          if [ -z "$KERNEL_DIR" ]; then
+            echo "❌ unifreq kernel dir not found"
+            find build_dir -maxdepth 4 -type d -name 'linux-*' | head -10
+            exit 1
+          fi
+          echo "kernel dir: $KERNEL_DIR"
+
+          AIC_DIR="$KERNEL_DIR/drivers/net/wireless/aicsemi"
+          if [ ! -d "$AIC_DIR" ]; then
+            echo "✅ aicsemi 目录不存在，跳过"
+            exit 0
+          fi
+
+          WL_KCONFIG="$KERNEL_DIR/drivers/net/wireless/Kconfig"
+          WL_MAKEFILE="$KERNEL_DIR/drivers/net/wireless/Makefile"
+
+          echo "--- 原始引用 ---"
+          echo "[Kconfig]"
+          grep -n 'aicsemi\|aic8800' "$WL_KCONFIG" 2>/dev/null || echo "(no aicsemi in Kconfig)"
+          echo "[Makefile]"
+          grep -n 'aicsemi\|aic8800' "$WL_MAKEFILE" 2>/dev/null || echo "(no aicsemi in Makefile)"
+
+          # 1. 清理 Kconfig 引用
+          if [ -f "$WL_KCONFIG" ]; then
+            sed -i -E 's|^([[:space:]]*)source "drivers/net/wireless/aicsemi/Kconfig".*|# disabled by build: \0|' "$WL_KCONFIG"
+          fi
+
+          # 2. 清理 Makefile 引用
+          if [ -f "$WL_MAKEFILE" ]; then
+            sed -i -E 's|^(obj-.*(aic8800|aicsemi).*)$|# disabled by build: \1|' "$WL_MAKEFILE"
+          fi
+
+          # 3. 删除目录
+          rm -rf "$AIC_DIR"
+
+          # 4. 验证
+          echo "--- 验证 ---"
+          echo "[Kconfig]"
+          grep -n 'aicsemi\|aic8800' "$WL_KCONFIG" 2>/dev/null || echo "Kconfig: clean"
+          echo "[Makefile]"
+          grep -n 'aicsemi\|aic8800' "$WL_MAKEFILE" 2>/dev/null || echo "Makefile: clean"
+          if [ -d "$AIC_DIR" ]; then
+            echo "❌ 目录仍存在"
+            exit 1
+          else
+            echo "✅ aicsemi 目录已删除"
+          fi
 
       - name: Compile firmware
         id: compile_firmware
