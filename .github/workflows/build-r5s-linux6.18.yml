@@ -251,6 +251,20 @@ jobs:
             echo "include/kernel-version.mk 不存在"
           fi
 
+          KM=include/kernel.mk
+          if [ -f "$KM" ]; then
+            if ! grep -q 'BUILD_APK_VER_FIX' "$KM"; then
+              printf '\n# BUILD_APK_VER_FIX: strip ~ from LINUX_VERSION for apk compatibility\nLINUX_VERSION:=$(subst ~,-,$(LINUX_VERSION))\n' >> "$KM"
+              echo "appended BUILD_APK_VER_FIX to include/kernel.mk"
+            else
+              echo "BUILD_APK_VER_FIX already present in include/kernel.mk"
+            fi
+            echo "--- tail of kernel.mk ---"
+            tail -5 "$KM"
+          else
+            echo "include/kernel.mk 不存在"
+          fi
+
           echo ""
           echo "===== AFTER ====="
           echo "--- rockchip Makefile ---"
