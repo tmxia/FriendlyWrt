@@ -158,6 +158,43 @@ jobs:
           done
           echo "git mtime restored"
 
+      - name: Get OpenWrt commit hash
+        id: ow_commit
+        run: |
+          cd /workdir/openwrt
+          HASH=$(git rev-parse --short=8 HEAD)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "OpenWrt commit: $HASH"
+
+      - name: Restore toolchain and host package cache
+        id: cache_toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            /workdir/openwrt/staging_dir/host
+            /workdir/openwrt/staging_dir/toolchain-aarch64_generic_gcc-14.3.0_musl
+            /workdir/openwrt/build_dir/host
+            /workdir/openwrt/build_dir/toolchain-aarch64_generic_gcc-14.3.0_musl
+          key: openwrt-toolchain-${{ env.OPENWRT_BRANCH }}-${{ steps.ow_commit.outputs.hash }}
+          restore-keys: |
+            openwrt-toolchain-${{ env.OPENWRT_BRANCH }}-
+
+      - name: Cache status
+        run: |
+          echo "cache hit: ${{ steps.cache_toolchain.outputs.cache-hit }}"
+          echo ""
+          echo "=== staging_dir/toolchain-* ==="
+          ls -d /workdir/openwrt/staging_dir/toolchain-* 2>/dev/null || echo "(none)"
+          echo ""
+          echo "=== build_dir/host (前 20 项) ==="
+          ls /workdir/openwrt/build_dir/host 2>/dev/null | head -20 || echo "(none)"
+          echo ""
+          echo "=== 磁盘占用 ==="
+          du -sh /workdir/openwrt/staging_dir/host 2>/dev/null || true
+          du -sh /workdir/openwrt/staging_dir/toolchain-* 2>/dev/null || true
+          du -sh /workdir/openwrt/build_dir/host 2>/dev/null || true
+          du -sh /workdir/openwrt/build_dir/toolchain-* 2>/dev/null || true
+
       - name: Create 6.18 kernel scaffolding
         run: |
           cd /workdir/openwrt
@@ -353,7 +390,6 @@ jobs:
 
           echo "===== gpio-button-hotplug: Linux 6.18 API fixes ====="
 
-          # 动态定位源文件（可能在 package/kernel/gpio-button-hotplug/src/ 下）
           GBP=$(find package/kernel/gpio-button-hotplug -name 'gpio-button-hotplug.c' -type f 2>/dev/null | head -1)
           if [ -z "$GBP" ]; then
             echo "❌ gpio-button-hotplug.c not found. Dumping tree:"
@@ -363,28 +399,29 @@ jobs:
           echo "source: $GBP"
 
           echo "--- 原始相关行 ---"
-          grep -nE 'GPIOF_ACTIVE_LOW|remove_new|#include <linux/gpio' "$GBP" || true
+          grep -nE 'GPIOF_ACTIVE_LOW|GPIO_ACTIVE_LOW|remove_new|#include <linux/gpio' "$GBP" || true
 
-          # 1. 确保引入 linux/gpio/consumer.h（GPIO_ACTIVE_LOW 的定义处）
-          if ! grep -q 'linux/gpio/consumer.h' "$GBP"; then
-            if grep -q '#include <linux/gpio.h>' "$GBP"; then
-              sed -i 's|#include <linux/gpio.h>|#include <linux/gpio.h>\n#include <linux/gpio/consumer.h>|' "$GBP"
+          # 1. 确保引入 linux/gpio/machine.h（GPIO_ACTIVE_LOW 的真正定义处）
+          if ! grep -q 'linux/gpio/machine.h' "$GBP"; then
+            if grep -q '#include <linux/gpio/consumer.h>' "$GBP"; then
+              sed -i 's|#include <linux/gpio/consumer.h>|#include <linux/gpio/consumer.h>\n#include <linux/gpio/machine.h>|' "$GBP"
+            elif grep -q '#include <linux/gpio.h>' "$GBP"; then
+              sed -i 's|#include <linux/gpio.h>|#include <linux/gpio.h>\n#include <linux/gpio/machine.h>|' "$GBP"
             else
-              # 在第一个 #include 之前插入
-              sed -i '0,/#include </s//#include <linux\/gpio\/consumer.h>\n#include </' "$GBP"
+              sed -i '0,/#include </s//#include <linux\/gpio\/machine.h>\n#include </' "$GBP"
             fi
           fi
 
-          # 2. GPIOF_ACTIVE_LOW -> GPIO_ACTIVE_LOW
+          # 2. GPIOF_ACTIVE_LOW -> GPIO_ACTIVE_LOW（幂等）
           sed -i 's/\bGPIOF_ACTIVE_LOW\b/GPIO_ACTIVE_LOW/g' "$GBP"
 
-          # 3. .remove_new =  ->  .remove =
+          # 3. .remove_new =  ->  .remove =（幂等）
           sed -i 's/\.remove_new[[:space:]]*=/\.remove =/g' "$GBP"
 
           echo "--- 修改后相关行 ---"
           grep -nE 'GPIO_ACTIVE_LOW|GPIOF_ACTIVE_LOW|remove_new|\.remove[[:space:]]*=|#include <linux/gpio' "$GBP" || true
 
-          # 强制重建这个包
+          # 强制重建这个包（清掉上次编译残留）
           rm -rf /workdir/openwrt/build_dir/target-aarch64_generic_musl/linux-rockchip_armv8/gpio-button-hotplug
           rm -f /workdir/openwrt/staging_dir/target-aarch64_generic_musl/stamp/.gpio-button-hotplug_installed
 
