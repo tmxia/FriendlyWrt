@@ -1,0 +1,1022 @@
+name: Build R5S Kernel Upgrade Package
+
+on:
+  watch:
+    types: started
+  workflow_dispatch:
+    inputs:
+      replace_existing:
+        description: 'Replace existing release tag'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['false', 'true']
+
+permissions:
+  contents: write
+  actions: write
+  packages: write
+
+concurrency:
+  group: build-r5s-kernel
+  cancel-in-progress: false
+
+env:
+  AUTO_REPLACE_TAG: 'false'
+  OPENWRT_VER: '25.12'
+  MODEL_NAME: 'R5S'
+  OPENWRT_BRANCH: 'openwrt-25.12'
+  OPENWRT_REPO: 'https://github.com/openwrt/openwrt.git'
+  CONFIG_FILE: 'scripts/r5s.config'
+  DIY_SH: 'scripts/r5s_customize.sh'
+  CACHE_KEEP_VERSIONS: '1'
+
+jobs:
+  prepare_release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    concurrency:
+      group: r5s-kernel-prepare-release
+      cancel-in-progress: false
+    if: github.event.repository.owner.id == github.event.sender.id
+    outputs:
+      release_tag: ${{ steps.release_tag.outputs.tag }}
+    steps:
+      - name: Generate release tag
+        id: release_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_TAG="${MODEL_NAME}-Kernel-OpenWrt-$(date +%Y-%m-%d)"
+          FORCE_BASE=false
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ "${{ github.event.inputs.replace_existing }}" == "true" ]; then
+            FORCE_BASE=true
+          elif [ "${{ github.event_name }}" == "watch" ] && [ "${{ env.AUTO_REPLACE_TAG }}" == "true" ]; then
+            FORCE_BASE=true
+          fi
+
+          EXISTING_TAGS=$(gh release list --limit 100 --repo "$GITHUB_REPOSITORY" --json tagName --jq '.[].tagName' | grep -E "^${BASE_TAG}(-[0-9]+)?$" || true)
+
+          if [ "$FORCE_BASE" = "true" ]; then
+            for tag in $EXISTING_TAGS; do
+              gh release delete "$tag" --yes --repo "$GITHUB_REPOSITORY" || true
+              git push origin --delete "refs/tags/$tag" || true
+            done
+            TAG="$BASE_TAG"
+          else
+            if [ -z "$EXISTING_TAGS" ]; then
+              TAG="$BASE_TAG"
+            else
+              MAX_NUM=0
+              for t in $EXISTING_TAGS; do
+                if [[ $t =~ ^${BASE_TAG}-([0-9]+)$ ]]; then
+                  NUM=${BASH_REMATCH[1]}
+                  [ $NUM -gt $MAX_NUM ] && MAX_NUM=$NUM
+                fi
+              done
+              TAG="${BASE_TAG}-$((MAX_NUM + 1))"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release tag: $TAG"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: ${{ steps.release_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+
+  build_kernel:
+    name: Build R5S kernel package
+    needs: prepare_release
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup build environment
+        id: setup
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo mkdir -p /workdir
+          sudo chown -R $USER:$GROUPS /workdir
+
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/local/.ghcup /opt/az \
+                      /usr/local/share/powershell /opt/microsoft /opt/google \
+                      /opt/pipx /usr/lib/jvm /usr/local/sdkman /usr/local/go \
+                      /usr/local/share/chromium /opt/conda || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean
+
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile > /dev/null
+          sudo swapon /swapfile
+
+          sudo systemctl stop docker || true
+          sudo mkdir -p /workdir/docker
+          echo '{"data-root": "/workdir/docker"}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker || sudo service docker start
+          sleep 3
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential ccache file g++ gawk \
+            gettext git libncurses-dev libssl-dev \
+            python3 python3-dev python3-pip python3-setuptools python3-pyelftools \
+            unzip wget zip zlib1g-dev libelf-dev \
+            subversion flex bison libtool autoconf automake cmake \
+            rsync quilt time jq swig zstd \
+            device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
+            android-sdk-libsparse-utils btrfs-progs
+
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+          free -h
+          df -hT
+
+          echo ""
+          echo "===== clone OpenWrt ====="
+          cd /workdir
+          git clone -b ${{ env.OPENWRT_BRANCH }} --single-branch \
+            ${{ env.OPENWRT_REPO }} openwrt 2>&1 | tail -3
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+          echo ""
+          echo "===== restore git mtime ====="
+          cd /workdir/openwrt
+          find . -name ".git" -type d | while read -r gitdir; do
+            repo_dir=$(dirname "$gitdir")
+            cd "/workdir/openwrt/$repo_dir"
+            git log --format=%at --name-only | perl -ane '
+              if (/^(\d+)$/) { $t = $1; }
+              elsif (/^(\S+)$/) {
+                $f = $1;
+                if (-e $f && !-d $f && !$seen{$f}) {
+                  utime($t, $t, $f);
+                  $seen{$f} = 1;
+                }
+              }
+            '
+            cd /workdir/openwrt
+          done
+          echo "git mtime restored"
+
+          echo ""
+          echo "===== detect kernel version ====="
+          cd /workdir/openwrt
+
+          KERNEL_MAJOR=""
+          KV=""
+
+          DETAILS_FILE=$(ls -t target/linux/generic/kernel-[0-9]*.[0-9]* 2>/dev/null | head -1 || true)
+          if [ -n "$DETAILS_FILE" ]; then
+            KERNEL_MAJOR=$(basename "$DETAILS_FILE" | sed 's/^kernel-//')
+            KV=$(grep -hE "^LINUX_VERSION-${KERNEL_MAJOR//./\\.}[[:space:]]*=" "$DETAILS_FILE" \
+                 | head -1 | awk -F'= ' '{print $2}' | tr -d '.' || true)
+          fi
+
+          if [ -z "$KV" ] || [ -z "$KERNEL_MAJOR" ]; then
+            KERNEL_PATCHVER=$(grep -hE '^KERNEL_PATCHVER[[:space:]]*\??=' include/kernel-version.mk 2>/dev/null \
+                              | head -1 | awk -F'=' '{print $2}' | tr -d ' ' || true)
+            if [ -n "$KERNEL_PATCHVER" ]; then
+              KERNEL_MAJOR="$KERNEL_PATCHVER"
+              DETAILS_FILE="target/linux/generic/kernel-${KERNEL_MAJOR}"
+              if [ -f "$DETAILS_FILE" ]; then
+                KV=$(grep -hE "^LINUX_VERSION-${KERNEL_MAJOR//./\\.}[[:space:]]*=" "$DETAILS_FILE" \
+                     | head -1 | awk -F'= ' '{print $2}' | tr -d '.' || true)
+              fi
+            fi
+          fi
+
+          if [ -z "$KV" ]; then
+            SHORT=$(git rev-parse --short HEAD)
+            KV="commit-${SHORT}"
+            [ -z "$KERNEL_MAJOR" ] && KERNEL_MAJOR="6.12"
+          fi
+
+          OW_HASH=$(git rev-parse --short=8 HEAD)
+          echo "kernel=$KV" >> "$GITHUB_OUTPUT"
+          echo "kernel_major=$KERNEL_MAJOR" >> "$GITHUB_OUTPUT"
+          echo "ow_hash=$OW_HASH" >> "$GITHUB_OUTPUT"
+          echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=${OW_HASH}"
+
+          echo ""
+          echo "===== cache tags (与固件流程共享) ====="
+          echo "base cache:   openwrt-25.12-linux-${KERNEL_MAJOR}"
+          echo "target cache: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
+          echo "ccache:       openwrt-25.12-linux-${KERNEL_MAJOR}"
+
+          sudo mkdir -p /workdir/ccache
+          sudo chown -R $USER:$GROUPS /workdir/ccache
+
+      - name: Restore base cache
+        id: restore_base
+        env:
+          KM: ${{ steps.setup.outputs.kernel_major }}
+        run: |
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BASE_CACHE="ghcr.io/${REPO_LOWER}/r5s-base-cache"
+          [ -z "$KM" ] && KM="6.12"
+          TAG="${BASE_CACHE}:openwrt-25.12-linux-${KM}"
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          echo "=== base cache: $TAG ==="
+
+          docker rm -f r5s_base_tmp 2>/dev/null || true
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "BASE CACHE MISS"
+            exit 0
+          fi
+
+          echo "BASE CACHE HIT"
+
+          rm -rf /workdir/base_parts
+          mkdir -p /workdir/base_parts
+
+          docker create --name r5s_base_tmp "$TAG" /bin/true >/dev/null
+          docker cp r5s_base_tmp:/cache /workdir/base_parts/ >/dev/null 2>&1 || true
+          docker rm r5s_base_tmp >/dev/null
+
+          if [ -d /workdir/base_parts/cache ]; then
+            PARTS=$(ls /workdir/base_parts/cache/p_* 2>/dev/null | wc -l)
+            echo "  parts extracted: $PARTS"
+            cd /workdir/base_parts/cache
+            cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null
+            rm -rf /workdir/base_parts
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "  legacy export"
+            docker create --name r5s_base_tmp2 "$TAG" /bin/true >/dev/null
+            docker export r5s_base_tmp2 | tar -xpf - -C /workdir/openwrt
+            docker rm r5s_base_tmp2 >/dev/null
+            rm -rf /workdir/base_parts
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          docker rmi "$TAG" -f 2>/dev/null || true
+
+          echo ""
+          echo "=== restored base sizes ==="
+          cd /workdir/openwrt
+          for d in build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-* dl; do
+            [ -e "$d" ] || continue
+            echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
+          done
+
+          if [ -d /workdir/openwrt/dl ]; then
+            find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
+          fi
+
+      - name: Restore target cache
+        id: restore_target
+        env:
+          KV: ${{ steps.setup.outputs.kernel }}
+          KM: ${{ steps.setup.outputs.kernel_major }}
+          OW: ${{ steps.setup.outputs.ow_hash }}
+        run: |
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          TARGET_CACHE="ghcr.io/${REPO_LOWER}/r5s-target-cache"
+          [ -z "$KM" ] && KM="6.12"
+          TAG="${TARGET_CACHE}:ow${OW}-linux-${KM}.${KV}"
+
+          echo "hit=false" >> "$GITHUB_OUTPUT"
+          echo "=== target cache: $TAG ==="
+
+          docker rm -f r5s_tgt_tmp 2>/dev/null || true
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "TARGET CACHE MISS"
+            exit 0
+          fi
+
+          echo "TARGET CACHE HIT"
+
+          rm -rf /workdir/cache_parts
+          mkdir -p /workdir/cache_parts
+
+          docker create --name r5s_tgt_tmp "$TAG" /bin/true >/dev/null
+          docker cp r5s_tgt_tmp:/cache /workdir/cache_parts/ >/dev/null 2>&1 || true
+          docker rm r5s_tgt_tmp >/dev/null
+
+          if [ -d /workdir/cache_parts/cache ]; then
+            PARTS=$(ls /workdir/cache_parts/cache/p_* 2>/dev/null | wc -l)
+            echo "  parts extracted: $PARTS"
+            cd /workdir/cache_parts/cache
+            cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir/openwrt/ 2>/dev/null
+            rm -rf /workdir/cache_parts
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "  legacy export"
+            docker create --name r5s_tgt_tmp2 "$TAG" /bin/true >/dev/null
+            docker export r5s_tgt_tmp2 | tar -xpf - -C /workdir/openwrt
+            docker rm r5s_tgt_tmp2 >/dev/null
+            rm -rf /workdir/cache_parts
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          docker rmi "$TAG" -f 2>/dev/null || true
+
+          echo ""
+          echo "=== restored target sizes ==="
+          cd /workdir/openwrt
+          for d in build_dir/target-aarch64_generic_musl \
+                   build_dir/hostpkg \
+                   staging_dir/target-aarch64_generic_musl \
+                   staging_dir/hostpkg \
+                   bin/targets/rockchip/armv8; do
+            [ -e "$d" ] || continue
+            echo "  $(du -sh "$d" 2>/dev/null | awk '{print $1}')  $d"
+          done
+
+      - name: Restore ccache
+        id: restore_ccache
+        env:
+          KM: ${{ steps.setup.outputs.kernel_major }}
+        run: |
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BASE="ghcr.io/${REPO_LOWER}/r5s-ccache"
+          [ -z "$KM" ] && KM="6.12"
+          TAG="${BASE}:openwrt-25.12-linux-${KM}"
+
+          mkdir -p /workdir/ccache
+          echo "=== ccache: $TAG ==="
+
+          docker rm -f r5s_ccache_tmp 2>/dev/null || true
+          if ! docker pull "$TAG" 2>/dev/null; then
+            echo "CCACHE MISS"
+          else
+            echo "CCACHE HIT"
+
+            rm -rf /workdir/ccache_parts
+            mkdir -p /workdir/ccache_parts
+
+            docker create --name r5s_ccache_tmp "$TAG" /bin/true >/dev/null
+            docker cp r5s_ccache_tmp:/cache /workdir/ccache_parts/ >/dev/null 2>&1 || true
+            docker rm r5s_ccache_tmp >/dev/null
+
+            if [ -d /workdir/ccache_parts/cache ]; then
+              cd /workdir/ccache_parts/cache
+              cat p_* | zstd -d -T0 2>/dev/null | tar -xpf - -C /workdir 2>/dev/null
+              rm -rf /workdir/ccache_parts
+            else
+              docker create --name r5s_ccache_tmp2 "$TAG" /bin/true >/dev/null
+              docker export r5s_ccache_tmp2 | tar -xpf - -C /workdir
+              docker rm r5s_ccache_tmp2 >/dev/null
+              rm -rf /workdir/ccache_parts
+            fi
+
+            docker rmi "$TAG" -f 2>/dev/null || true
+
+            CC_SIZE=$(du -sh /workdir/ccache 2>/dev/null | awk '{print $1}')
+            CC_FILES=$(find /workdir/ccache -type f 2>/dev/null | wc -l)
+            echo "  ccache: $CC_SIZE, files: $CC_FILES"
+          fi
+
+          echo ""
+          echo "=== ccache tuning ==="
+          export CCACHE_DIR=/workdir/ccache
+          ccache --max-size=10G
+          ccache --set-config=compression=true
+          ccache --set-config=hash_dir=false
+          ccache --set-config=sloppiness=file_macro,time_macros,include_file_mtime,include_file_ctime
+          ccache --zero-stats
+          ccache -p 2>/dev/null | grep -E 'max_size|compression|hash_dir|sloppiness' || true
+
+      - name: Prepare build configuration
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre
+          ./scripts/feeds update -a 2>&1 | tail -30
+
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} post
+          ./scripts/feeds install -a 2>&1 | tail -40
+
+          cp $GITHUB_WORKSPACE/${{ env.CONFIG_FILE }} .config
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} config
+
+          for pkg in iptables-zz-legacy ip6tables-zz-legacy iptables-legacy; do
+            sed -i "s/^CONFIG_PACKAGE_${pkg}=[ym]/# CONFIG_PACKAGE_${pkg} is not set/" .config
+            grep -q "^# CONFIG_PACKAGE_${pkg} is not set" .config || \
+              echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
+          done
+
+          make defconfig
+
+          if ! grep -q '^CONFIG_CCACHE=y' .config; then
+            echo "CONFIG_CCACHE=y" >> .config
+          fi
+          sed -i 's|^CONFIG_CCACHE_DIR=.*|CONFIG_CCACHE_DIR="/workdir/ccache"|' .config
+          grep -q '^CONFIG_CCACHE_DIR=' .config || \
+            echo 'CONFIG_CCACHE_DIR="/workdir/ccache"' >> .config
+
+          echo ""
+          echo "=== .config md5 ==="
+          md5sum .config
+
+      - name: Compile base
+        id: compile_base
+        if: steps.restore_base.outputs.hit != 'true'
+        run: |
+          cd /workdir/openwrt
+          touch /workdir/base_compilation_marker
+
+          echo "===== tools/download ====="
+          T0=$(date +%s)
+          if ! timeout 30m make tools/download -j1 > /tmp/tools_dl.log 2>&1; then
+            make tools/download -j1 V=s 2>&1 | tail -100
+            exit 1
+          fi
+          echo "  took $(( $(date +%s) - T0 ))s"
+
+          echo "===== tools/compile ====="
+          T0=$(date +%s)
+          if ! make tools/compile -j$(nproc) > /tmp/tools_c.log 2>&1; then
+            make tools/compile -j1 V=s 2>&1 | tail -200
+            exit 1
+          fi
+          echo "  took $(( $(date +%s) - T0 ))s"
+
+          echo "===== toolchain/download ====="
+          T0=$(date +%s)
+          if ! timeout 30m make toolchain/download -j1 > /tmp/tc_dl.log 2>&1; then
+            make toolchain/download -j1 V=s 2>&1 | tail -100
+            exit 1
+          fi
+          echo "  took $(( $(date +%s) - T0 ))s"
+
+          echo "===== toolchain/compile ====="
+          T0=$(date +%s)
+          if ! make toolchain/compile -j$(nproc) > /tmp/tc_c.log 2>&1; then
+            make toolchain/compile -j1 V=s 2>&1 | tail -250
+            exit 1
+          fi
+          echo "  took $(( $(date +%s) - T0 ))s"
+
+          echo "===== make download (full) ====="
+          T0=$(date +%s)
+          timeout 50m make download -j8 > /tmp/full_dl.log 2>&1 || true
+          echo "  took $(( $(date +%s) - T0 ))s, dl files: $(find dl -maxdepth 1 -type f | wc -l)"
+
+          echo ""
+          echo "===== compile base OK ====="
+
+      - name: Save base cache
+        if: success() && !cancelled() && steps.restore_base.outputs.hit != 'true'
+        env:
+          KM: ${{ steps.setup.outputs.kernel_major }}
+        run: |
+          set -e -o pipefail
+          cd /workdir/openwrt
+          [ -z "$KM" ] && KM="6.12"
+
+          if [ -d dl ]; then
+            find dl -type f | xargs -r touch -t 200001010000
+          fi
+
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          BASE_TAG="ghcr.io/${REPO_LOWER}/r5s-base-cache:openwrt-25.12-linux-${KM}"
+
+          echo "===== packing base cache ====="
+          docker rmi "$BASE_TAG" 2>/dev/null || true
+
+          PACK_DIRS=()
+          for d in build_dir/host build_dir/toolchain-* staging_dir/host staging_dir/toolchain-* dl; do
+            if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
+          done
+          echo "  dirs: ${PACK_DIRS[*]:-<none>}"
+          [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
+
+          rm -rf /workdir/base_parts
+          mkdir -p /workdir/base_parts
+
+          cd /workdir/openwrt
+          tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
+            | split -a 2 -d -b 512M - /workdir/base_parts/p_ 2>/dev/null
+
+          cd /workdir/base_parts
+          echo "FROM scratch" > Dockerfile
+          i=0
+          for f in p_*; do
+            d="l$i"
+            mkdir -p "$d"
+            mv "$f" "$d/"
+            echo "COPY $d /cache/" >> Dockerfile
+            i=$((i+1))
+          done
+          echo "  parts: $i"
+
+          docker build -t "$BASE_TAG" . > /tmp/bc_build.log 2>&1 || { tail -30 /tmp/bc_build.log; exit 1; }
+          rm -rf /workdir/base_parts
+
+          echo "  pushing..."
+          PUSHED=false
+          for attempt in 1 2 3; do
+            if docker push "$BASE_TAG" >/dev/null 2>&1; then PUSHED=true; break; fi
+            sleep 10
+          done
+          [ "$PUSHED" = "true" ] || echo "::warning::base cache push failed"
+
+          docker rmi "$BASE_TAG" -f 2>/dev/null || true
+
+      - name: Compile kernel and kernel modules
+        run: |
+          cd /workdir/openwrt
+          bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
+
+          set +e
+
+          echo "===== make target/linux/compile ====="
+          T0=$(date +%s)
+          timeout 90m make target/linux/compile -j$(nproc) > /tmp/kernel_compile.log 2>&1 &
+          KERNEL_PID=$!
+          LAST_LINES=0
+          while kill -0 $KERNEL_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $KERNEL_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/kernel_compile.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              echo "[kernel +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/kernel_compile.log 2>/dev/null | head -c 150)"
+            fi
+          done
+          wait $KERNEL_PID
+          KERNEL_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$KERNEL_RESULT"
+          if [ "$KERNEL_RESULT" -ne 0 ]; then
+            echo "kernel compile failed, last 100 lines:"
+            tail -100 /tmp/kernel_compile.log
+            timeout 10m make target/linux/compile -j1 V=s 2>&1 | tail -300
+            exit 1
+          fi
+
+          echo "===== make package/kernel/linux/compile ====="
+          T0=$(date +%s)
+          timeout 60m make package/kernel/linux/compile -j$(nproc) > /tmp/kmod_compile.log 2>&1 &
+          KMOD_PID=$!
+          LAST_LINES=0
+          while kill -0 $KMOD_PID 2>/dev/null; do
+            sleep 60
+            if kill -0 $KMOD_PID 2>/dev/null; then
+              ELAPSED=$(( $(date +%s) - T0 ))
+              CURRENT_LINES=$(wc -l < /tmp/kmod_compile.log 2>/dev/null || echo 0)
+              DELTA=$((CURRENT_LINES - LAST_LINES))
+              LAST_LINES=$CURRENT_LINES
+              echo "[kmod +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/kmod_compile.log 2>/dev/null | head -c 150)"
+            fi
+          done
+          wait $KMOD_PID
+          KMOD_RESULT=$?
+          echo "  took $(( $(date +%s) - T0 ))s, exit=$KMOD_RESULT"
+          if [ "$KMOD_RESULT" -ne 0 ]; then
+            echo "kmod compile failed, last 100 lines:"
+            tail -100 /tmp/kmod_compile.log
+            timeout 10m make package/kernel/linux/compile -j1 V=s 2>&1 | tail -300
+            exit 1
+          fi
+
+          echo "===== install kernel/modules to staging ====="
+          make target/linux/install -j1 > /tmp/kernel_install.log 2>&1 || true
+          make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
+
+          set -e
+
+          echo ""
+          echo "=== ccache stats ==="
+          CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
+
+      - name: Save target cache
+        if: success() && !cancelled() && steps.restore_target.outputs.hit != 'true'
+        env:
+          KV: ${{ steps.setup.outputs.kernel }}
+          KM: ${{ steps.setup.outputs.kernel_major }}
+          OW: ${{ steps.setup.outputs.ow_hash }}
+        run: |
+          set -e -o pipefail
+          cd /workdir/openwrt
+          [ -z "$KM" ] && KM="6.12"
+
+          REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          TARGET_TAG="ghcr.io/${REPO_LOWER}/r5s-target-cache:ow${OW}-linux-${KM}.${KV}"
+
+          echo "===== packing target cache ====="
+          docker rmi "$TARGET_TAG" 2>/dev/null || true
+
+          PACK_DIRS=()
+          for d in build_dir/target-aarch64_generic_musl \
+                   build_dir/hostpkg \
+                   staging_dir/target-aarch64_generic_musl \
+                   staging_dir/hostpkg \
+                   bin/targets/rockchip/armv8; do
+            if [ -e "$d" ]; then PACK_DIRS+=("$d"); fi
+          done
+          echo "  dirs: ${PACK_DIRS[*]:-<none>}"
+          [ ${#PACK_DIRS[@]} -eq 0 ] && exit 0
+
+          rm -rf /workdir/cache_parts
+          mkdir -p /workdir/cache_parts
+
+          cd /workdir/openwrt
+          tar -I 'zstd -6 -T0' -cf - "${PACK_DIRS[@]}" 2>/dev/null \
+            | split -a 2 -d -b 4G - /workdir/cache_parts/p_ 2>/dev/null
+
+          cd /workdir/cache_parts
+          echo "FROM scratch" > Dockerfile
+          i=0
+          for f in p_*; do
+            d="l$i"
+            mkdir -p "$d"
+            mv "$f" "$d/"
+            echo "COPY $d /cache/" >> Dockerfile
+            i=$((i+1))
+          done
+          echo "  parts: $i"
+
+          docker build -t "$TARGET_TAG" . > /tmp/tc_build.log 2>&1 || { tail -30 /tmp/tc_build.log; exit 1; }
+          rm -rf /workdir/cache_parts
+
+          echo "  pushing..."
+          PUSHED=false
+          for attempt in 1 2 3; do
+            if docker push "$TARGET_TAG" >/dev/null 2>&1; then PUSHED=true; break; fi
+            sleep 10
+          done
+          [ "$PUSHED" = "true" ] || echo "::warning::target cache push failed"
+
+          docker rmi "$TARGET_TAG" -f 2>/dev/null || true
+          docker builder prune -a -f 2>/dev/null || true
+
+      - name: Package kernel upgrade files
+        id: package
+        run: |
+          set -e
+          cd /workdir/openwrt
+
+          KERNEL_RELEASE=$(cat build_dir/target-*/linux-*/linux-*/include/config/kernel.release 2>/dev/null | head -1)
+          [ -z "$KERNEL_RELEASE" ] && KERNEL_RELEASE=$(ls staging_dir/target-*/root-*/lib/modules/ 2>/dev/null | head -1)
+          [ -z "$KERNEL_RELEASE" ] && { echo "Cannot determine kernel release"; exit 1; }
+
+          echo "KERNEL_RELEASE=$KERNEL_RELEASE"
+          echo "kernel_release=$KERNEL_RELEASE" >> "$GITHUB_OUTPUT"
+
+          OUT=/workdir/kernel-packages
+          rm -rf "$OUT"
+          mkdir -p "$OUT/boot" "$OUT/dtb" "$OUT/modules"
+
+          KERNEL_IMAGE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/ -maxdepth 1 -name "Image" 2>/dev/null | head -1))
+          DTB_FILE_ABS=$(readlink -f $(find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1))
+
+          [ -z "$KERNEL_IMAGE_ABS" ] && { echo "Kernel Image not found"; exit 1; }
+          [ -z "$DTB_FILE_ABS" ] && { echo "R5S DTB not found"; exit 1; }
+
+          echo "KERNEL_IMAGE=$KERNEL_IMAGE_ABS"
+          echo "DTB_FILE=$DTB_FILE_ABS"
+          ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
+
+          MKIMAGE=""
+          for cand in \
+            "$PWD/staging_dir/host/bin/mkimage" \
+            "$(find "$PWD"/staging_dir/host -maxdepth 4 -name mkimage -type f 2>/dev/null | head -1)"; do
+            if [ -n "$cand" ] && [ -x "$cand" ]; then
+              MKIMAGE="$cand"
+              break
+            fi
+          done
+          [ -z "$MKIMAGE" ] && MKIMAGE=$(command -v mkimage)
+          [ -z "$MKIMAGE" ] && { echo "mkimage not found"; exit 1; }
+
+          echo "Using mkimage: $MKIMAGE"
+          "$MKIMAGE" -V 2>&1 | head -1 || true
+
+          echo ""
+          echo "===== generate FIT kernel.img (mkimage + explicit hash-1/hash-2) ====="
+          cd "$OUT/boot"
+          cp "$KERNEL_IMAGE_ABS" Image
+          cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
+
+          python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
+
+          echo "----- Image.lzma header -----"
+          hexdump -C Image.lzma | head -2
+          echo "-------------------------------"
+
+          : > kernel.its
+          printf '%s\n' '/dts-v1/;' >> kernel.its
+          printf '%s\n' '' >> kernel.its
+          printf '%s\n' '/ {' >> kernel.its
+          printf '%s\n' '    description = "ARM64 OpenWrt FIT (Flattened Image Tree)";' >> kernel.its
+          printf '%s\n' '    #address-cells = <1>;' >> kernel.its
+          printf '%s\n' '' >> kernel.its
+          printf '%s\n' '    images {' >> kernel.its
+          printf '%s\n' '        kernel-1 {' >> kernel.its
+          printf '%s\n' "            description = \"ARM64 OpenWrt Linux-${KERNEL_RELEASE}\";" >> kernel.its
+          printf '%s\n' '            data = /incbin/("Image.lzma");' >> kernel.its
+          printf '%s\n' '            type = "kernel";' >> kernel.its
+          printf '%s\n' '            arch = "arm64";' >> kernel.its
+          printf '%s\n' '            os = "linux";' >> kernel.its
+          printf '%s\n' '            compression = "lzma";' >> kernel.its
+          printf '%s\n' '            load = <0x03000000>;' >> kernel.its
+          printf '%s\n' '            entry = <0x03000000>;' >> kernel.its
+          printf '%s\n' '            hash-1 {' >> kernel.its
+          printf '%s\n' '                algo = "crc32";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '            hash-2 {' >> kernel.its
+          printf '%s\n' '                algo = "sha1";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '        };' >> kernel.its
+          printf '%s\n' '        fdt-1 {' >> kernel.its
+          printf '%s\n' '            description = "Rockchip RK3568 NanoPi R5S";' >> kernel.its
+          printf '%s\n' '            data = /incbin/("rk3568-nanopi-r5s.dtb");' >> kernel.its
+          printf '%s\n' '            type = "flat_dt";' >> kernel.its
+          printf '%s\n' '            arch = "arm64";' >> kernel.its
+          printf '%s\n' '            compression = "none";' >> kernel.its
+          printf '%s\n' '            hash-1 {' >> kernel.its
+          printf '%s\n' '                algo = "crc32";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '            hash-2 {' >> kernel.its
+          printf '%s\n' '                algo = "sha1";' >> kernel.its
+          printf '%s\n' '            };' >> kernel.its
+          printf '%s\n' '        };' >> kernel.its
+          printf '%s\n' '    };' >> kernel.its
+          printf '%s\n' '' >> kernel.its
+          printf '%s\n' '    configurations {' >> kernel.its
+          printf '%s\n' '        default = "config-1";' >> kernel.its
+          printf '%s\n' '        config-1 {' >> kernel.its
+          printf '%s\n' '            description = "OpenWrt friendlyarm_nanopi_r5s";' >> kernel.its
+          printf '%s\n' '            kernel = "kernel-1";' >> kernel.its
+          printf '%s\n' '            fdt = "fdt-1";' >> kernel.its
+          printf '%s\n' '        };' >> kernel.its
+          printf '%s\n' '    };' >> kernel.its
+          printf '%s\n' '};' >> kernel.its
+
+          echo "----- kernel.its -----"
+          cat kernel.its
+          echo "----------------------"
+
+          "$MKIMAGE" -f kernel.its kernel.img
+          rm -f kernel.its Image.lzma rk3568-nanopi-r5s.dtb Image
+
+          echo ""
+          echo "kernel.img generated:"
+          ls -lh kernel.img
+          file kernel.img
+
+          echo ""
+          echo "=== 关键校验 ==="
+          if strings kernel.img | grep -q 'hash-2' && strings kernel.img | grep -q 'sha1'; then
+            echo "OK: hash-2 / sha1 均存在"
+          else
+            echo "FAIL: 缺少 hash-2 或 sha1"
+            exit 1
+          fi
+
+          cd /workdir/openwrt
+          tar -czf "$OUT/boot-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/boot" .
+
+          find "$PWD"/build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
+          find "$PWD"/staging_dir/target-*/root-*/boot -name "rk3568-nanopi-r5s*.dtb" -exec cp {} "$OUT/dtb/" \; 2>/dev/null || true
+
+          if [ -z "$(ls -A "$OUT/dtb")" ]; then
+            echo "No R5S DTB found"
+            exit 1
+          fi
+
+          tar -czf "$OUT/dtb-rockchip-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/dtb" .
+
+          MODULES_DIR=$(find "$PWD"/staging_dir/target-*/root-*/lib/modules -maxdepth 1 -mindepth 1 -type d -name "${KERNEL_RELEASE}" 2>/dev/null | head -1)
+          if [ -n "$MODULES_DIR" ]; then
+            echo "Using modules from $MODULES_DIR"
+            mkdir -p "$OUT/modules/lib/modules"
+            cp -a "$MODULES_DIR" "$OUT/modules/lib/modules/"
+          else
+            echo "staging modules not found, collecting .ko from build_dir"
+            mkdir -p "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel"
+            find "$PWD"/build_dir/target-*/linux-*/linux-*/ -name "*.ko" | while read -r ko; do
+              rel="${ko#*linux-*/}"
+              rel=$(echo "$rel" | sed 's|^linux-[^/]*/||')
+              mkdir -p "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel/$(dirname "$rel")"
+              cp "$ko" "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel/$rel"
+            done
+            depmod -a -b "$OUT/modules" "${KERNEL_RELEASE}" 2>/dev/null || true
+          fi
+
+          tar -czf "$OUT/modules-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/modules" .
+
+          echo ""
+          echo "===== packages ====="
+          ls -lh "$OUT"/*.tar.gz
+
+      - name: Upload to release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd /workdir/kernel-packages
+          TAG="${{ needs.prepare_release.outputs.release_tag }}"
+          echo "release tag: $TAG"
+          shopt -s nullglob
+          FILES=(*.tar.gz)
+          shopt -u nullglob
+          [ ${#FILES[@]} -eq 0 ] && { echo "no packages"; exit 1; }
+          echo "uploading ${#FILES[@]} files"
+          printf '  %s\n' "${FILES[@]}"
+          gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+
+          echo ""
+          echo "===== update release notes ====="
+          KREL="${{ steps.package.outputs.kernel_release }}"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes "R5S kernel upgrade package. Kernel: ${KREL}" || true
+
+      - name: Upload artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r5s-kernel-${{ needs.prepare_release.outputs.release_tag }}
+          path: /workdir/kernel-packages/*.tar.gz
+          retention-days: 30
+
+      - name: Save ccache and prune
+        if: always() && !cancelled()
+        env:
+          KM: ${{ steps.setup.outputs.kernel_major }}
+          KEEP: ${{ env.CACHE_KEEP_VERSIONS }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e -o pipefail
+          [ -z "$KM" ] && KM="6.12"
+          KEEP="${KEEP:-1}"
+
+          echo ""
+          echo "===== packing ccache ====="
+          if [ -d /workdir/ccache ] && [ -n "$(ls -A /workdir/ccache 2>/dev/null)" ]; then
+            REPO_LOWER=$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+            CCACHE_TAG="ghcr.io/${REPO_LOWER}/r5s-ccache:openwrt-25.12-linux-${KM}"
+
+            docker rmi "$CCACHE_TAG" 2>/dev/null || true
+
+            CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null | grep -E 'Cache size|Hits|Misses' || true
+
+            rm -rf /workdir/ccache_parts
+            mkdir -p /workdir/ccache_parts
+
+            tar -I 'zstd -6 -T0' -cf - -C /workdir ccache 2>/dev/null \
+              | split -a 2 -d -b 512M - /workdir/ccache_parts/p_ 2>/dev/null
+
+            cd /workdir/ccache_parts
+            echo "FROM scratch" > Dockerfile
+            i=0
+            for f in p_*; do
+              d="l$i"
+              mkdir -p "$d"
+              mv "$f" "$d/"
+              echo "COPY $d /cache/" >> Dockerfile
+              i=$((i+1))
+            done
+            echo "  parts: $i"
+
+            if docker build -t "$CCACHE_TAG" . > /tmp/cc_build.log 2>&1; then
+              rm -rf /workdir/ccache_parts
+              PUSHED=false
+              for attempt in 1 2 3; do
+                if docker push "$CCACHE_TAG" >/dev/null 2>&1; then PUSHED=true; break; fi
+                sleep 10
+              done
+              [ "$PUSHED" = "true" ] || echo "::warning::ccache push failed"
+              docker rmi "$CCACHE_TAG" -f 2>/dev/null || true
+            else
+              tail -30 /tmp/cc_build.log
+              rm -rf /workdir/ccache_parts
+            fi
+          else
+            echo "  ccache empty, skip"
+          fi
+
+          echo ""
+          echo "===== prune old cache versions ====="
+          OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d/ -f1)
+
+          OWNER_TYPE=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                       "https://api.github.com/users/$OWNER" 2>/dev/null | jq -r .type 2>/dev/null || echo "User")
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            API_PREFIX="/orgs/$OWNER/packages/container"
+          else
+            API_PREFIX="/users/$OWNER/packages/container"
+          fi
+
+          fetch_all_versions() {
+            local PKG="$1"
+            local OUT="$2"
+            : > "$OUT"
+            local PAGE=1
+            while :; do
+              local RESP
+              RESP=$(curl -sS -H "Authorization: Bearer $GH_TOKEN" \
+                     "https://api.github.com${API_PREFIX}/${PKG}/versions?per_page=100&page=$PAGE" 2>/dev/null || echo "[]")
+              local COUNT
+              COUNT=$(echo "$RESP" | jq 'if type=="array" then length else 0 end' 2>/dev/null || echo "0")
+              [ "$COUNT" = "0" ] && break
+              echo "$RESP" | jq -c '.[]' >> "$OUT" 2>/dev/null || true
+              [ "$COUNT" -lt 100 ] && break
+              PAGE=$((PAGE + 1))
+            done
+          }
+
+          delete_version() {
+            local PKG="$1"
+            local VID="$2"
+            local HTTP
+            HTTP=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+                   -H "Authorization: Bearer $GH_TOKEN" \
+                   "https://api.github.com${API_PREFIX}/${PKG}/versions/$VID" 2>/dev/null || echo "000")
+            case "$HTTP" in
+              204|200) echo "    deleted      $VID" ;;
+              404)     echo "    already gone $VID" ;;
+              *)       echo "    failed       $VID (HTTP $HTTP)" ;;
+            esac
+          }
+
+          prune_package() {
+            local PKG="$1"
+            local PREFIX="$2"
+            local UNTAGGED_AGE_DAYS="$3"
+
+            echo "--- ${PKG} (prefix='${PREFIX}', keep=${KEEP}, untagged>${UNTAGGED_AGE_DAYS}d) ---"
+
+            local ALL
+            ALL=$(mktemp)
+            fetch_all_versions "$PKG" "$ALL"
+
+            local TOTAL
+            TOTAL=$(wc -l < "$ALL" | tr -d ' ')
+            echo "  total versions: $TOTAL"
+            if [ "$TOTAL" = "0" ]; then rm -f "$ALL"; return 0; fi
+
+            local CUTOFF
+            CUTOFF=$(date -u -d "-${UNTAGGED_AGE_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)
+
+            local PLAN_TAGGED
+            PLAN_TAGGED=$(jq -r --arg p "$PREFIX" '
+              select((.metadata.container.tags // []) | any(startswith($p)))
+              | [.id, .created_at] | @tsv
+            ' "$ALL" 2>/dev/null | sort -k2 -r | awk -v keep="$KEEP" 'NR>keep {print $1}' || true)
+
+            local PLAN_UNTAGGED
+            PLAN_UNTAGGED=$(jq -r --arg cutoff "$CUTOFF" '
+              select((.metadata.container.tags // []) | length == 0)
+              | select(.created_at < $cutoff)
+              | .id
+            ' "$ALL" 2>/dev/null || true)
+
+            local PLAN
+            PLAN=$(printf '%s\n%s\n' "$PLAN_TAGGED" "$PLAN_UNTAGGED" | grep -E '^[0-9]+$' | sort -u || true)
+
+            if [ -z "$PLAN" ]; then
+              echo "  (nothing to prune)"
+              rm -f "$ALL"
+              return 0
+            fi
+
+            echo "  pruning $(echo "$PLAN" | wc -l) versions..."
+            echo "$PLAN" | while read -r VID; do
+              [ -z "$VID" ] && continue
+              delete_version "$PKG" "$VID"
+            done
+
+            rm -f "$ALL"
+          }
+
+          prune_package "r5s-base-cache"   "openwrt-25.12-linux-" 3
+          prune_package "r5s-target-cache" "ow"                   3
+          prune_package "r5s-ccache"       "openwrt-25.12-linux-" 3
+
+          echo ""
+          echo "=== prune done ==="
+
+  cleanup_self:
+    name: Cleanup workflow history
+    runs-on: ubuntu-latest
+    needs: [prepare_release, build_kernel]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          keep_minimum_runs: 0
+          retain_days: 0
+          delete_workflow_pattern: "Build R5S Kernel Upgrade Package"
+          repository: ${{ github.repository }}

@@ -1,0 +1,285 @@
+name: Kernel Watcher
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: kernel-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      nanopi_changed: ${{ steps.nanopi.outputs.changed }}
+      nanopi_sha: ${{ steps.nanopi.outputs.sha }}
+      nanopi_msg: ${{ steps.nanopi_msg.outputs.msg }}
+      openwrt_changed: ${{ steps.openwrt.outputs.changed }}
+      openwrt_version: ${{ steps.openwrt.outputs.version }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch nanopi6-v6.1.y SHA
+        id: nanopi
+        run: |
+          RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: kernel-watcher" \
+            "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/nanopi6-v6.1.y" || true)
+          SHA=$(printf '%s' "$RESP" | jq -r '.sha // empty' 2>/dev/null || true)
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "::warning::Cannot fetch nanopi6-v6.1.y SHA"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+          git fetch origin master || true
+          RECORDED=""
+          if git cat-file -e origin/master:.kernel-version 2>/dev/null; then
+            RECORDED=$(git show origin/master:.kernel-version | head -n1 | tr -d '[:space:]')
+          fi
+
+          echo "recorded=$RECORDED"
+          echo "current=$SHA"
+          if [ "$RECORDED" = "$SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch nanopi6 commit message
+        id: nanopi_msg
+        if: steps.nanopi.outputs.changed == 'true'
+        run: |
+          MSG=$(curl -sS -H "Accept: application/vnd.github+json" \
+                -H "User-Agent: kernel-watcher" \
+                "https://api.github.com/repos/friendlyarm/kernel-rockchip/commits/${{ steps.nanopi.outputs.sha }}" \
+                | jq -r '.commit.message // empty')
+          [ -z "$MSG" ] && MSG="(no message)"
+          {
+            echo "msg<<__EOF__"
+            echo "$MSG"
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fetch openwrt-25.12 kernel version
+        id: openwrt
+        run: |
+          RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: kernel-watcher" \
+            "https://api.github.com/repos/openwrt/openwrt/contents/target/linux/generic/kernel-6.12?ref=openwrt-25.12" || true)
+          CONTENT=$(printf '%s' "$RESP" | jq -r '.content // empty' 2>/dev/null | base64 -d 2>/dev/null || true)
+          SUFFIX=$(printf '%s' "$CONTENT" | grep -E '^LINUX_VERSION-6\.12' | head -1 | awk -F'=' '{print $2}' | tr -d ' \r' || true)
+
+          if [ -n "$SUFFIX" ]; then
+            VERSION="6.12${SUFFIX}"
+          else
+            echo "::warning::cannot parse kernel version, falling back to SHA"
+            SHA_RESP=$(curl -sS -H "Accept: application/vnd.github+json" \
+              -H "User-Agent: kernel-watcher" \
+              "https://api.github.com/repos/openwrt/openwrt/commits/openwrt-25.12" || true)
+            VERSION=$(printf '%s' "$SHA_RESP" | jq -r '.sha // empty' 2>/dev/null || true)
+          fi
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::warning::Cannot fetch openwrt-25.12 version"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          git fetch origin master || true
+          RECORDED=""
+          if git cat-file -e origin/master:.openwrt-25.12-version 2>/dev/null; then
+            RECORDED=$(git show origin/master:.openwrt-25.12-version | head -n1 | tr -d '[:space:]')
+          fi
+
+          echo "recorded=$RECORDED"
+          echo "current=$VERSION"
+          if [ "$RECORDED" = "$VERSION" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  trigger:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    if: |
+      needs.check.outputs.nanopi_changed == 'true' ||
+      needs.check.outputs.openwrt_changed == 'true'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trigger nanopi6 build
+        if: needs.check.outputs.nanopi_changed == 'true'
+        run: |
+          echo "Triggering build.yml (nanopi6-v6.1.y updated)"
+          gh workflow run build.yml \
+            -f version=both \
+            -f set=both \
+            --repo "$GITHUB_REPOSITORY"
+
+      - name: Trigger R5S firmware, wait, then trigger kernel
+        if: needs.check.outputs.openwrt_changed == 'true'
+        run: |
+          echo "Triggering build-r5s-openwrt.yml (kernel: ${{ needs.check.outputs.openwrt_version }})..."
+          gh workflow run build-r5s-openwrt.yml \
+            -f replace_existing=false \
+            --repo "$GITHUB_REPOSITORY"
+
+          RUN_ID=""
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            sleep 10
+            RUN_ID=$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --workflow=build-r5s-openwrt.yml \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty' 2>/dev/null || true)
+            if [ -n "$RUN_ID" ]; then
+              break
+            fi
+            echo "waiting for firmware run to appear... (${i}/10)"
+          done
+
+          if [ -z "$RUN_ID" ]; then
+            echo "::warning::Cannot locate firmware run id; kernel build skipped"
+            exit 0
+          fi
+          echo "Firmware run id: $RUN_ID"
+
+          echo ""
+          echo "===== waiting for firmware run to complete ====="
+          FIRMWARE_RESULT=0
+          gh run watch "$RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --exit-status \
+            --interval 60 > /tmp/fw_watch.log 2>&1 || FIRMWARE_RESULT=$?
+          tail -50 /tmp/fw_watch.log || true
+
+          echo ""
+          echo "Firmware finished with exit code: $FIRMWARE_RESULT"
+
+          if [ "$FIRMWARE_RESULT" -ne 0 ]; then
+            echo "::warning::Firmware build did not succeed (exit=$FIRMWARE_RESULT); kernel build skipped"
+            exit 0
+          fi
+
+          echo ""
+          echo "===== firmware succeeded, triggering kernel build ====="
+          gh workflow run build-r5s-openwrt-kernel.yml \
+            -f replace_existing=false \
+            --repo "$GITHUB_REPOSITORY"
+          echo "Triggered build-r5s-openwrt-kernel.yml"
+
+      - name: Commit updated records
+        if: always() && (needs.check.outputs.nanopi_changed == 'true' || needs.check.outputs.openwrt_changed == 'true')
+        env:
+          NANOPI_CHANGED: ${{ needs.check.outputs.nanopi_changed }}
+          NANOPI_SHA: ${{ needs.check.outputs.nanopi_sha }}
+          NANOPI_MSG: ${{ needs.check.outputs.nanopi_msg }}
+          OPENWRT_CHANGED: ${{ needs.check.outputs.openwrt_changed }}
+          OPENWRT_VERSION: ${{ needs.check.outputs.openwrt_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ "$NANOPI_CHANGED" = "true" ] && [ -n "$NANOPI_SHA" ]; then
+            {
+              echo "$NANOPI_SHA"
+              echo ""
+              echo "# 上游更新日志（UTC $(date -u +%Y-%m-%d)）"
+              echo ""
+              if [ -n "$NANOPI_MSG" ]; then
+                echo "$NANOPI_MSG"
+              else
+                echo "(no message)"
+              fi
+            } > .kernel-version
+          fi
+
+          if [ "$OPENWRT_CHANGED" = "true" ] && [ -n "$OPENWRT_VERSION" ]; then
+            echo "$OPENWRT_VERSION" > .openwrt-25.12-version
+          fi
+
+          git add .kernel-version .openwrt-25.12-version 2>/dev/null || git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore: update kernel watch records [skip ci]"
+
+          for attempt in 1 2 3; do
+            echo "== Push attempt $attempt =="
+            if git push origin HEAD:master; then
+              echo "Push succeeded."
+              exit 0
+            fi
+            git fetch origin master
+            git rebase origin/master || { git rebase --abort || true; exit 1; }
+            sleep 3
+          done
+          echo "::error::Push failed after 3 attempts."
+          exit 1
+
+  cleanup_self:
+    name: Cleanup Self Workflow History
+    runs-on: ubuntu-latest
+    needs: [check, trigger]
+    if: ${{ always() }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old runs of exactly this workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TARGET_NAME="Kernel Watcher"
+          KEEP=1
+          CURRENT_RUN_ID="${{ github.run_id }}"
+
+          WF_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq ".workflows[] | select(.name == \"$TARGET_NAME\") | .id" | head -n1)
+
+          if [ -z "$WF_ID" ]; then
+            echo "Workflow '$TARGET_NAME' not found. Skip."
+            exit 0
+          fi
+          echo "Workflow '$TARGET_NAME' ID: $WF_ID"
+
+          RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs?per_page=100" \
+            --jq '.workflow_runs[].id')
+
+          i=0
+          for run_id in $RUNS; do
+            i=$((i+1))
+            if [ "$run_id" = "$CURRENT_RUN_ID" ]; then
+              echo "Keep current run: $run_id"
+              continue
+            fi
+            if [ "$i" -le "$KEEP" ]; then
+              echo "Keep recent run: $run_id"
+              continue
+            fi
+            echo "Deleting run: $run_id"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" || true
+          done

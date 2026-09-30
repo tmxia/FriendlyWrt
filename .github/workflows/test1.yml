@@ -1,0 +1,86 @@
+name: Diagnose OpenWrt Kernel Versioning
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    name: Dump kernel-related files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone OpenWrt (shallow)
+        run: |
+          git clone --depth 1 -b openwrt-25.12 https://github.com/openwrt/openwrt.git /tmp/openwrt
+          cd /tmp/openwrt
+          echo "OpenWrt commit: $(git rev-parse HEAD)"
+
+      - name: Dump include/kernel-version.mk
+        run: |
+          echo "=========================================="
+          echo "=== include/kernel-version.mk (first 80 lines) ==="
+          echo "=========================================="
+          head -80 /tmp/openwrt/include/kernel-version.mk
+          echo ""
+          echo "=== grep -E '^LINUX_VERSION|^KERNEL_PATCHVER' ==="
+          grep -nE '^LINUX_VERSION|^KERNEL_PATCHVER|^KERNEL_TESTING' /tmp/openwrt/include/kernel-version.mk || echo "(no matches)"
+
+      - name: Dump target/linux/rockchip/Makefile
+        run: |
+          echo "=========================================="
+          echo "=== target/linux/rockchip/Makefile ==="
+          echo "=========================================="
+          cat /tmp/openwrt/target/linux/rockchip/Makefile
+
+      - name: Find where CONFIG_LINUX_6_12 is defined
+        run: |
+          echo "=========================================="
+          echo "=== searching CONFIG_LINUX_6_12 / LINUX_6_12 ==="
+          echo "=========================================="
+          cd /tmp/openwrt
+          grep -rn 'LINUX_6_12' --include='*.in' --include='*.mk' . 2>/dev/null | head -30 || echo "(no matches)"
+          echo ""
+          echo "=== searching config LINUX_6_ in config/ ==="
+          grep -rn 'config LINUX_6_' config/ 2>/dev/null | head -20 || echo "(no matches)"
+          echo ""
+          echo "=== searching KERNEL_PATCHVER usages in include/ ==="
+          grep -rn 'KERNEL_PATCHVER' include/ 2>/dev/null | head -30 || echo "(no matches)"
+
+      - name: Dump rockchip target kernel dirs
+        run: |
+          echo "=========================================="
+          echo "=== target/linux/rockchip/ contents ==="
+          echo "=========================================="
+          ls -la /tmp/openwrt/target/linux/rockchip/ | head -30
+          echo ""
+          echo "=== target/linux/generic/ kernel-* dirs ==="
+          ls -d /tmp/openwrt/target/linux/generic/*/ 2>/dev/null | head -30
+          echo ""
+          echo "=== target/linux/generic/config-* files ==="
+          ls -la /tmp/openwrt/target/linux/generic/config-* 2>/dev/null | head -20
+          echo ""
+          echo "=== target/linux/rockchip/patches-* dirs ==="
+          ls -d /tmp/openwrt/target/linux/rockchip/patches-* 2>/dev/null
+
+      - name: Dump config/Config-kernel.in (kernel version section)
+        run: |
+          echo "=========================================="
+          echo "=== config/Config-kernel.in (LINUX_VERSION context) ==="
+          echo "=========================================="
+          if [ -f /tmp/openwrt/config/Config-kernel.in ]; then
+            grep -nE 'LINUX_VERSION|KERNEL_PATCHVER|config LINUX' /tmp/openwrt/config/Config-kernel.in | head -40 || echo "(no matches)"
+          else
+            echo "Config-kernel.in not found"
+          fi
+
+      - name: Dump include/kernel.mk / kernel-build.mk / kernel-defaults.mk
+        run: |
+          for f in include/kernel.mk include/kernel-build.mk include/kernel-defaults.mk; do
+            echo "=========================================="
+            echo "=== $f ==="
+            echo "=========================================="
+            if [ -f "/tmp/openwrt/$f" ]; then
+              grep -nE 'KERNEL_PATCHVER|LINUX_VERSION|CONFIG_LINUX' "/tmp/openwrt/$f" | head -30 || echo "(no matches)"
+            else
+              echo "not found"
+            fi
+          done
