@@ -240,44 +240,27 @@ jobs:
           sed -i -E 's/^([[:space:]]*)KERNEL_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
           sed -i -E 's/^([[:space:]]*)KERNEL_TESTING_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_TESTING_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
 
-          echo ""
-          echo "===== 修复 kernel-version.mk 使 LINUX_VERSION 兼容 apk ====="
-          python3 << 'PYEOF'
-          import re
+          KVM=include/kernel-version.mk
+          if [ -f "$KVM" ]; then
+            echo "--- 原始 sanitize_uri ---"
+            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
+            sed -i 's#^sanitize_uri[[:space:]]*=.*#sanitize_uri=$(call qstrip,$(subst @,_,$(subst :,_,$(subst .,_,$(subst -,_,$(subst /,_,$(1)))))))#' "$KVM"
+            echo "--- 修改后 sanitize_uri ---"
+            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
 
-          path = "include/kernel-version.mk"
-          with open(path) as f:
-              content = f.read()
+            sed -i 's#LINUX_VERSION:=\$(call sanitize_uri,\$(call remove_uri_prefix,#LINUX_VERSION:=0_\$(call sanitize_uri,\$(call remove_uri_prefix,#' "$KVM"
+            sed -i 's#LINUX_VERSION:=\$(LINUX_VERSION)-\$(call sanitize_uri,#LINUX_VERSION:=\$(LINUX_VERSION)_\$(call sanitize_uri,#' "$KVM"
 
-          content = re.sub(
-              r'^sanitize_uri\s*=.*$',
-              r'sanitize_uri=$(call qstrip,$(subst @,_,$(subst :,_,$(subst .,_,$(subst -,_,$(subst /,_,$(1)))))))',
-              content, flags=re.M)
+            echo "--- 修改后 LINUX_VERSION 相关行 ---"
+            grep -nE 'LINUX_VERSION' "$KVM" | head -10
+          else
+            echo "include/kernel-version.mk 不存在"
+          fi
 
-          content = content.replace(
-              'LINUX_VERSION:=$(call sanitize_uri,$(call remove_uri_prefix,',
-              'LINUX_VERSION:=0_$(call sanitize_uri,$(call remove_uri_prefix,')
-
-          content = content.replace(
-              'LINUX_VERSION:=$(LINUX_VERSION)-$(call sanitize_uri,',
-              'LINUX_VERSION:=$(LINUX_VERSION)_$(call sanitize_uri,')
-
-          with open(path, "w") as f:
-              f.write(content)
-
-          print("=== after patch ===")
-          for line in content.split('\n'):
-              if 'sanitize_uri' in line or 'LINUX_VERSION' in line:
-                  print(line)
-          PYEOF
-
-          echo ""
-          echo "===== 修复 include/kernel.mk 中的 ~ ====="
           KM=include/kernel.mk
           if [ -f "$KM" ]; then
             if grep -q '~' "$KM"; then
-              echo "--- 含 ~ 的行（前 10） ---"
-              grep -n '~' "$KM" | head -10
+              echo "--- 替换 kernel.mk 中的 ~ 为 _ ---"
               sed -i 's|~|_|g' "$KM"
               echo "--- 替换后 ---"
               if grep -q '~' "$KM"; then
