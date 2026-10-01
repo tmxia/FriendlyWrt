@@ -240,29 +240,54 @@ jobs:
           sed -i -E 's/^([[:space:]]*)KERNEL_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
           sed -i -E 's/^([[:space:]]*)KERNEL_TESTING_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_TESTING_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
 
-          KVM=include/kernel-version.mk
-          if [ -f "$KVM" ]; then
-            echo "--- 原始 sanitize_uri ---"
-            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
-            sed -i 's#^sanitize_uri[[:space:]]*=.*#sanitize_uri=$(call qstrip,$(subst _,-,$(subst @,_,$(subst :,_,$(subst .,_,$(subst -,_,$(subst /,_,$(1))))))))#' "$KVM"
-            echo "--- 修改后 sanitize_uri ---"
-            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
-          else
-            echo "include/kernel-version.mk 不存在"
-          fi
+          echo ""
+          echo "===== 修复 kernel-version.mk 使 LINUX_VERSION 兼容 apk ====="
+          python3 << 'PYEOF'
+          import re
 
+          path = "include/kernel-version.mk"
+          with open(path) as f:
+              content = f.read()
+
+          content = re.sub(
+              r'^sanitize_uri\s*=.*$',
+              r'sanitize_uri=$(call qstrip,$(subst @,_,$(subst :,_,$(subst .,_,$(subst -,_,$(subst /,_,$(1)))))))',
+              content, flags=re.M)
+
+          content = content.replace(
+              'LINUX_VERSION:=$(call sanitize_uri,$(call remove_uri_prefix,',
+              'LINUX_VERSION:=0_$(call sanitize_uri,$(call remove_uri_prefix,')
+
+          content = content.replace(
+              'LINUX_VERSION:=$(LINUX_VERSION)-$(call sanitize_uri,',
+              'LINUX_VERSION:=$(LINUX_VERSION)_$(call sanitize_uri,')
+
+          with open(path, "w") as f:
+              f.write(content)
+
+          print("=== after patch ===")
+          for line in content.split('\n'):
+              if 'sanitize_uri' in line or 'LINUX_VERSION' in line:
+                  print(line)
+          PYEOF
+
+          echo ""
+          echo "===== 修复 include/kernel.mk 中的 ~ ====="
           KM=include/kernel.mk
           if [ -f "$KM" ]; then
-            if ! grep -q 'BUILD_APK_VER_FIX' "$KM"; then
-              printf '\n# BUILD_APK_VER_FIX: strip ~ from LINUX_VERSION for apk compatibility\nLINUX_VERSION:=$(subst ~,-,$(LINUX_VERSION))\n' >> "$KM"
-              echo "appended BUILD_APK_VER_FIX to include/kernel.mk"
+            if grep -q '~' "$KM"; then
+              echo "--- 含 ~ 的行（前 10） ---"
+              grep -n '~' "$KM" | head -10
+              sed -i 's|~|_|g' "$KM"
+              echo "--- 替换后 ---"
+              if grep -q '~' "$KM"; then
+                grep -n '~' "$KM" | head -5
+              else
+                echo "clean"
+              fi
             else
-              echo "BUILD_APK_VER_FIX already present in include/kernel.mk"
+              echo "kernel.mk 中无 ~"
             fi
-            echo "--- tail of kernel.mk ---"
-            tail -5 "$KM"
-          else
-            echo "include/kernel.mk 不存在"
           fi
 
           echo ""
@@ -348,7 +373,7 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github*unifreq*' | head -1)
+          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-*unifreq*' | head -1)
           if [ -z "$KERNEL_DIR" ]; then
             echo "找不到 unifreq 内核源码目录"
             find build_dir -maxdepth 4 -type d -name 'linux-*' | head -10
@@ -422,7 +447,7 @@ jobs:
       - name: Disable unifreq aic8800 WiFi driver
         run: |
           cd /workdir/openwrt
-          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-github*unifreq*' | head -1)
+          KERNEL_DIR=$(find build_dir -maxdepth 4 -type d -name 'linux-*unifreq*' | head -1)
           if [ -z "$KERNEL_DIR" ]; then
             echo "unifreq kernel dir not found"
             find build_dir -maxdepth 4 -type d -name 'linux-*' | head -10
