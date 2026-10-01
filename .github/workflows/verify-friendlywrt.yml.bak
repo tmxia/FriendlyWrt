@@ -1,0 +1,98 @@
+name: Verify Release Artifacts With FriendlyWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag (留空则自动使用最新 release)'
+        required: false
+        default: ''
+
+jobs:
+  resolve_tag:
+    runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - name: Pick release tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+            echo "Using user-provided tag: $TAG"
+          else
+            TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName')
+            echo "Auto-selected latest release tag: $TAG"
+          fi
+          [ -n "$TAG" ] || { echo "ERROR: no release tag"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: List available assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.pick.outputs.tag }}
+        run: |
+          echo "Assets in $RELEASE_TAG:"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[].name' | sort
+
+  verify:
+    needs: resolve_tag
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['24.10', '25.12']
+        include:
+          - version: '24.10'
+            expect_gib: '2.0 GiB'
+            expect_mib_old: '1024.0 MiB'
+          - version: '25.12'
+            expect_gib: '2.5 GiB'
+            expect_mib_old: '1536.0 MiB'
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y gdisk
+
+      - name: Download img.gz (${{ matrix.version }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.resolve_tag.outputs.tag }}
+        run: |
+          IMG="R5S-R5C-Series-FriendlyWrt-${{ matrix.version }}-docker.img.gz"
+          echo "Release tag: $RELEASE_TAG"
+          echo "Downloading $IMG ..."
+          gh release download "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --pattern "$IMG" \
+            --output firmware.img.gz \
+            --clobber
+          ls -lh firmware.img.gz
+
+      - name: Analyze GPT (${{ matrix.version }})
+        run: |
+          gunzip -f firmware.img.gz
+          echo "==================== [${{ matrix.version }}] GPT ===================="
+          sudo sgdisk -p firmware.img
+          echo ""
+          echo "==================== [${{ matrix.version }}] userdata ===================="
+          sudo sgdisk -p firmware.img | grep -i userdata || echo "(未找到 userdata)"
+
+      - name: Verify userdata size (${{ matrix.version }})
+        run: |
+          UD_LINE=$(sudo sgdisk -p firmware.img | grep -i userdata)
+          echo "userdata 行: $UD_LINE"
+          if echo "$UD_LINE" | grep -q "${{ matrix.expect_gib }}"; then
+            echo "✅ userdata 已是 ${{ matrix.expect_gib }}"
+          elif echo "$UD_LINE" | grep -q "${{ matrix.expect_mib_old }}"; then
+            echo "❌ userdata 仍是 ${{ matrix.expect_mib_old }} —— 编译侧修改未生效"
+            exit 1
+          else
+            echo "⚠️ 未识别的 userdata 大小"
+            exit 1
+          fi
