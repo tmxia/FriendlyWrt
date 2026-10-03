@@ -207,17 +207,43 @@ jobs:
           GENERIC=target/linux/generic
           ROCKCHIP=target/linux/rockchip
 
+          echo ""
+          echo "===== 从 unifreq 读取真实内核版本号 ====="
+          TMP_KERNEL=/tmp/unifreq-kernel-version
+          rm -rf "$TMP_KERNEL"
+          git clone --depth 1 -b "${{ env.KERNEL_REF }}" --single-branch \
+            "${{ env.KERNEL_REPO }}" "$TMP_KERNEL" 2>&1 | tail -2
+
+          KM_TMP="$TMP_KERNEL/Makefile"
+          if [ ! -f "$KM_TMP" ]; then
+            echo "无法克隆 unifreq 内核源码"
+            exit 1
+          fi
+
+          KV_MAJOR=$(sed -n 's/^VERSION[[:space:]]*=[[:space:]]*//p' "$KM_TMP" | head -1 | tr -d ' ')
+          KV_PATCH=$(sed -n 's/^PATCHLEVEL[[:space:]]*=[[:space:]]*//p' "$KM_TMP" | head -1 | tr -d ' ')
+          KV_SUB=$(sed -n 's/^SUBLEVEL[[:space:]]*=[[:space:]]*//p' "$KM_TMP" | head -1 | tr -d ' ')
+          [ -z "$KV_MAJOR" ] && KV_MAJOR=6
+          [ -z "$KV_PATCH" ] && KV_PATCH=18
+          [ -z "$KV_SUB" ] && KV_SUB=0
+          KV_REAL="${KV_MAJOR}.${KV_PATCH}.${KV_SUB}"
+          echo "unifreq kernel version: $KV_REAL"
+          rm -rf "$TMP_KERNEL"
+
           if [ -f "$GENERIC/kernel-6.12" ]; then
             echo "=== kernel-6.12 原始内容 ==="
             cat "$GENERIC/kernel-6.12"
             echo "==========================="
-            sed -E 's/6\.12/6.18/g' "$GENERIC/kernel-6.12" > "$GENERIC/kernel-6.18"
+            cat > "$GENERIC/kernel-6.18" <<EOF
+          LINUX_VERSION-6.18 = .${KV_SUB}
+          LINUX_KERNEL_HASH-6.18.${KV_SUB} = x
+          EOF
             echo "=== kernel-6.18 生成内容 ==="
             cat "$GENERIC/kernel-6.18"
             echo "==========================="
           else
             echo "kernel-6.12 不存在，创建最小 kernel-6.18"
-            echo "LINUX_VERSION-6.18 = .0" > "$GENERIC/kernel-6.18"
+            echo "LINUX_VERSION-6.18 = .${KV_SUB}" > "$GENERIC/kernel-6.18"
           fi
 
           if [ ! -f "$GENERIC/config-6.18" ] && [ -f "$GENERIC/config-6.12" ]; then
@@ -240,34 +266,47 @@ jobs:
           sed -i -E 's/^([[:space:]]*)KERNEL_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
           sed -i -E 's/^([[:space:]]*)KERNEL_TESTING_PATCHVER[[:space:]]*[:+]?=.*/\1KERNEL_TESTING_PATCHVER:=6.18/' "$ROCKCHIP/Makefile"
 
-          KVM=include/kernel-version.mk
-          if [ -f "$KVM" ]; then
-            echo "--- 原始 sanitize_uri ---"
-            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
-            sed -i 's#^sanitize_uri[[:space:]]*=.*#sanitize_uri=$(call qstrip,$(subst @,_,$(subst :,_,$(subst .,_,$(subst -,_,$(subst /,_,$(1)))))))#' "$KVM"
-            echo "--- 修改后 sanitize_uri ---"
-            grep -nE '^sanitize_uri[[:space:]]*=' "$KVM" || echo "(none)"
+          echo ""
+          echo "===== 替换 LINUX_VERSION 为纯数字版本号 ====="
+          KV_REAL="$KV_REAL" python3 - <<'PYEOF'
+          import os, re
 
-            sed -i 's#LINUX_VERSION:=\$(call sanitize_uri,\$(call remove_uri_prefix,#LINUX_VERSION:=0_\$(call sanitize_uri,\$(call remove_uri_prefix,#' "$KVM"
-            sed -i 's#LINUX_VERSION:=\$(LINUX_VERSION)-\$(call sanitize_uri,#LINUX_VERSION:=\$(LINUX_VERSION)_\$(call sanitize_uri,#' "$KVM"
+          ver = os.environ['KV_REAL']
+          path = "include/kernel-version.mk"
+          with open(path) as f:
+              c = f.read()
 
-            echo "--- 修改后 LINUX_VERSION 相关行 ---"
-            grep -nE 'LINUX_VERSION' "$KVM" | head -10
-          else
-            echo "include/kernel-version.mk 不存在"
-          fi
+          print("--- 修改前 ---")
+          for i, line in enumerate(c.split('\n'), 1):
+              if 'LINUX_VERSION' in line:
+                  print(f"{i}: {line}")
 
+          c = re.sub(
+              r'^[ \t]*LINUX_VERSION:=\$\(call sanitize_uri,\$\(call remove_uri_prefix,\$\(CONFIG_KERNEL_GIT_CLONE_URI\)\)\)$',
+              f'  LINUX_VERSION:={ver}',
+              c, flags=re.M)
+
+          c = re.sub(
+              r'^[ \t]*LINUX_VERSION:=\$\(LINUX_VERSION\)-\$\(call sanitize_uri,\$\(CONFIG_KERNEL_GIT_REF\)\)$',
+              '# LINUX_VERSION suffix removed for apk compatibility',
+              c, flags=re.M)
+
+          with open(path, "w") as f:
+              f.write(c)
+
+          print("--- 修改后 ---")
+          for i, line in enumerate(c.split('\n'), 1):
+              if 'LINUX_VERSION' in line:
+                  print(f"{i}: {line}")
+          PYEOF
+
+          echo ""
+          echo "===== 替换 kernel.mk 中的 ~ 为 _ ====="
           KM=include/kernel.mk
           if [ -f "$KM" ]; then
             if grep -q '~' "$KM"; then
-              echo "--- 替换 kernel.mk 中的 ~ 为 _ ---"
               sed -i 's|~|_|g' "$KM"
-              echo "--- 替换后 ---"
-              if grep -q '~' "$KM"; then
-                grep -n '~' "$KM" | head -5
-              else
-                echo "clean"
-              fi
+              echo "已替换"
             else
               echo "kernel.mk 中无 ~"
             fi
