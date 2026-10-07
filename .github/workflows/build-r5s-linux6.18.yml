@@ -410,7 +410,7 @@ jobs:
           echo "===== .config md5 ====="
           md5sum .config
 
-      - name: Fix crypto.mk for Linux 6.18 (after feeds install)
+      - name: Patch crypto.mk for Linux 6.18
         run: |
           cd /workdir/openwrt
 
@@ -422,54 +422,62 @@ jobs:
           fi
 
           echo "===== BEFORE: crypto-crc32c block ====="
-          awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/,/^endef[[:space:]]*$/' "$KMOD_FILE" || true
+          awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/{p=1} p{print} p&&/^endef[[:space:]]*$/{p=0}' "$KMOD_FILE" || true
           echo "========================================"
           echo ""
-          echo "===== BEFORE: 所有 crc32c_generic 引用 ====="
+          echo "===== BEFORE: 所有 crc32c_generic 出现位置 ====="
           grep -n 'crc32c_generic' "$KMOD_FILE" || echo "(none)"
           echo ""
 
-          # 1) 强制把所有 /crypto/crc32c_generic.<suffix> 换成 /lib/crc32c.<suffix>
-          sed -i 's|/crypto/crc32c_generic\.\$(LINUX_KMOD_SUFFIX)|/lib/crc32c.$(LINUX_KMOD_SUFFIX)|g' "$KMOD_FILE"
-          # 兜底：无论后缀是什么，都换路径
-          sed -i 's|/crypto/crc32c_generic\.|/lib/crc32c.|g' "$KMOD_FILE"
-
-          # 2) 只在 crypto-crc32c 块里把 DEPENDS 的 kmod-crypto-hash 换成 kmod-lib-crc32c
+          # 用 awk 整块替换 KernelPackage/crypto-crc32c
           awk '
-            /^define KernelPackage\/crypto-crc32c[[:space:]]*$/ { in_block=1 }
-            in_block && /^endef[[:space:]]*$/ { in_block=0 }
-            in_block && /DEPENDS:=/ { gsub(/kmod-crypto-hash/, "kmod-lib-crc32c") }
+            BEGIN { replaced=0 }
+            /^define KernelPackage\/crypto-crc32c[[:space:]]*$/ && replaced==0 {
+              print "define KernelPackage/crypto-crc32c"
+              print "  TITLE:=CRC32c CRC module (Linux 6.18+, provided by kmod-lib-crc32c)"
+              print "  DEPENDS:=+kmod-lib-crc32c"
+              print "endef"
+              skip=1
+              replaced=1
+              next
+            }
+            skip==1 {
+              if (/^endef[[:space:]]*$/) { skip=0 }
+              next
+            }
             { print }
           ' "$KMOD_FILE" > "${KMOD_FILE}.new"
           mv "${KMOD_FILE}.new" "$KMOD_FILE"
 
           echo "===== AFTER: crypto-crc32c block ====="
-          awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/,/^endef[[:space:]]*$/' "$KMOD_FILE" || true
+          awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/{p=1} p{print} p&&/^endef[[:space:]]*$/{p=0}' "$KMOD_FILE" || true
           echo "======================================="
           echo ""
-          echo "===== AFTER: 所有 crc32c_generic 引用 ====="
+          echo "===== AFTER: 所有 crc32c_generic 出现位置 ====="
           grep -n 'crc32c_generic' "$KMOD_FILE" || echo "(none)"
           echo ""
 
-          BLOCK=$(awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/,/^endef[[:space:]]*$/' "$KMOD_FILE")
+          # 硬校验
+          BLOCK=$(awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/{p=1} p{print} p&&/^endef[[:space:]]*$/{p=0}' "$KMOD_FILE")
           if [ -z "$BLOCK" ]; then
             echo "FAIL: crypto-crc32c block empty"
             exit 1
           fi
           if echo "$BLOCK" | grep -q 'crc32c_generic'; then
             echo "FAIL: block still references crc32c_generic"
+            echo "$BLOCK"
             exit 1
           fi
           if ! echo "$BLOCK" | grep -q 'kmod-lib-crc32c'; then
             echo "FAIL: DEPENDS not switched to kmod-lib-crc32c"
+            echo "$BLOCK"
             exit 1
           fi
           echo "OK: crypto.mk patched"
 
-          # 清理 kmod-crypto-crc32c 相关的构建缓存（万一之前跑过）
-          find staging_dir -type d -name '.kmod-crypto-crc32c_installed' 2>/dev/null | xargs -r rm -rf
-          find build_dir -type d -name 'kmod-crypto-crc32c' -path '*/ipkg-*' 2>/dev/null | xargs -r rm -rf
-          find build_dir -type d -name 'kmod-crypto-crc32c' -path '*/apk-*' 2>/dev/null | xargs -r rm -rf
+          # 清理构建缓存
+          find staging_dir -type d -name '.kmod-crypto-crc32c_installed' 2>/dev/null | xargs -r rm -rf || true
+          find build_dir -type d -name 'kmod-crypto-crc32c' 2>/dev/null | xargs -r rm -rf || true
 
       - name: Pre-check kernel prepare
         run: |
@@ -670,17 +678,26 @@ jobs:
           echo "===== 兜底：编译前再次强制修复 crypto.mk ====="
           KMOD_FILE="package/kernel/linux/modules/crypto.mk"
           if [ -f "$KMOD_FILE" ]; then
-            sed -i 's|/crypto/crc32c_generic\.\$(LINUX_KMOD_SUFFIX)|/lib/crc32c.$(LINUX_KMOD_SUFFIX)|g' "$KMOD_FILE"
-            sed -i 's|/crypto/crc32c_generic\.|/lib/crc32c.|g' "$KMOD_FILE"
             awk '
-              /^define KernelPackage\/crypto-crc32c[[:space:]]*$/ { in_block=1 }
-              in_block && /^endef[[:space:]]*$/ { in_block=0 }
-              in_block && /DEPENDS:=/ { gsub(/kmod-crypto-hash/, "kmod-lib-crc32c") }
+              BEGIN { replaced=0 }
+              /^define KernelPackage\/crypto-crc32c[[:space:]]*$/ && replaced==0 {
+                print "define KernelPackage/crypto-crc32c"
+                print "  TITLE:=CRC32c CRC module (Linux 6.18+, provided by kmod-lib-crc32c)"
+                print "  DEPENDS:=+kmod-lib-crc32c"
+                print "endef"
+                skip=1
+                replaced=1
+                next
+              }
+              skip==1 {
+                if (/^endef[[:space:]]*$/) { skip=0 }
+                next
+              }
               { print }
             ' "$KMOD_FILE" > "${KMOD_FILE}.new"
             mv "${KMOD_FILE}.new" "$KMOD_FILE"
             echo "crypto-crc32c 最终块："
-            awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/,/^endef[[:space:]]*$/' "$KMOD_FILE" || true
+            awk '/^define KernelPackage\/crypto-crc32c[[:space:]]*$/{p=1} p{print} p&&/^endef[[:space:]]*$/{p=0}' "$KMOD_FILE" || true
             echo "剩余 crc32c_generic 引用："
             grep -n 'crc32c_generic' "$KMOD_FILE" || echo "(none)"
           else
