@@ -179,9 +179,19 @@ jobs:
           restore-keys: |
             openwrt-toolchain-${{ env.OPENWRT_BRANCH }}-
 
+      - name: Restore ccache cache
+        id: cache_ccache
+        uses: actions/cache@v4
+        with:
+          path: /workdir/ccache
+          key: ccache-${{ env.OPENWRT_BRANCH }}-${{ steps.ow_commit.outputs.hash }}
+          restore-keys: |
+            ccache-${{ env.OPENWRT_BRANCH }}-
+
       - name: Cache status
         run: |
-          echo "cache hit: ${{ steps.cache_toolchain.outputs.cache-hit }}"
+          echo "toolchain cache hit: ${{ steps.cache_toolchain.outputs.cache-hit }}"
+          echo "ccache cache hit:    ${{ steps.cache_ccache.outputs.cache-hit }}"
           echo ""
           echo "=== staging_dir/toolchain-* ==="
           ls -d /workdir/openwrt/staging_dir/toolchain-* 2>/dev/null || echo "(none)"
@@ -189,11 +199,15 @@ jobs:
           echo "=== build_dir/host 前 20 项 ==="
           ls /workdir/openwrt/build_dir/host 2>/dev/null | head -20 || echo "(none)"
           echo ""
+          echo "=== ccache 状态 ==="
+          CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || echo "(ccache 未初始化)"
+          echo ""
           echo "=== 磁盘占用 ==="
           du -sh /workdir/openwrt/staging_dir/host 2>/dev/null || true
           du -sh /workdir/openwrt/staging_dir/toolchain-* 2>/dev/null || true
           du -sh /workdir/openwrt/build_dir/host 2>/dev/null || true
           du -sh /workdir/openwrt/build_dir/toolchain-* 2>/dev/null || true
+          du -sh /workdir/ccache 2>/dev/null || true
 
       - name: Create 6.18 kernel scaffolding
         run: |
@@ -419,11 +433,6 @@ jobs:
           echo "它们假设 kmod 定义与内核源码树完全一致。Linux 6.18 中许多"
           echo ".ko 被合并或改名，导致这些检查必然失败。本步骤把所有这些"
           echo "检查改为只打印 WARNING / no-op，与内核版本无关，一劳永逸。"
-          echo ""
-          echo "具体处理的检查："
-          echo "  [A] echo \"ERROR: module '...' is missing.\" >&2; ... exit 1;"
-          echo "  [B] echo \"Package X is missing dependencies for the following"
-          echo "      libraries:\" >&2; cat ... >&2; false;"
           echo "================================================================"
           echo ""
 
@@ -468,7 +477,6 @@ jobs:
           while i < len(lines):
               line = lines[i]
 
-              # Pattern A: ERROR: module ... exit 1
               if 'ERROR:' in line and 'is missing' in line and 'module' in line:
                   for j in range(i, min(i + 4, len(lines))):
                       if re.search(r'\bexit\s+1\b', lines[j]):
@@ -477,7 +485,6 @@ jobs:
                           changed += 1
                           break
 
-              # Pattern B: Package X is missing dependencies ... false;
               if 'is missing dependencies for the following libraries' in line:
                   for j in range(i, min(i + 8, len(lines))):
                       if re.search(r'\bfalse\s*;', lines[j]):
@@ -509,12 +516,10 @@ jobs:
           echo "===== 硬校验 ====="
           FAIL=0
           for f in $TARGET_FILES; do
-            # 检查是否仍有 ERROR: module + exit 1
             if grep -A4 'ERROR: module' "$f" 2>/dev/null | grep -q 'exit 1'; then
               echo "FAIL: $f 仍有 'ERROR: module ... exit 1'"
               FAIL=1
             fi
-            # 检查是否仍有 missing dependencies + false;
             if grep -A8 'is missing dependencies for the following libraries' "$f" 2>/dev/null | grep -q 'false;'; then
               echo "FAIL: $f 仍有 'missing dependencies ... false;'"
               FAIL=1
@@ -724,26 +729,16 @@ jobs:
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
+          # 释放缓存
+          sync
+          echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null || true
+
           set +e
 
-          echo "===== pre-compile perl ====="
+          # 使用 -j2：降低内存/CPU 峰值压力，减少被 OOM 或外部干扰杀掉的概率
+          echo "===== make -j2 (timeout 5h30m) ====="
           T0=$(date +%s)
-          timeout 45m make package/perl/compile -j1 V=s > /tmp/perl_build.log 2>&1 &
-          PERL_PID=$!
-          while kill -0 $PERL_PID 2>/dev/null; do
-            sleep 30
-            if kill -0 $PERL_PID 2>/dev/null; then
-              echo "[perl +$(( $(date +%s) - T0 ))s] $(tail -1 /tmp/perl_build.log 2>/dev/null | head -c 150)"
-            fi
-          done
-          wait $PERL_PID
-          PERL_RESULT=$?
-          echo "  took $(( $(date +%s) - T0 ))s, exit=$PERL_RESULT"
-
-          echo ""
-          echo "===== make -j3 ====="
-          T0=$(date +%s)
-          timeout 5h make -j3 > /tmp/build.log 2>&1 &
+          timeout 5h30m make -j2 > /tmp/build.log 2>&1 &
           MAKE_PID=$!
 
           LAST_LINES=0
@@ -754,21 +749,58 @@ jobs:
               CURRENT_LINES=$(wc -l < /tmp/build.log 2>/dev/null || echo 0)
               DELTA=$((CURRENT_LINES - LAST_LINES))
               LAST_LINES=$CURRENT_LINES
-              echo "[make +${ELAPSED}s +${DELTA}L] $(tail -1 /tmp/build.log 2>/dev/null | head -c 150)"
+              MEM=$(free -m | awk '/^Mem:/ {print $3"/"$2"MB"}')
+              SWAP=$(free -m | awk '/^Swap:/ {print $3"/"$2"MB"}')
+              echo "[make +${ELAPSED}s +${DELTA}L mem=$MEM swap=$SWAP] $(tail -1 /tmp/build.log 2>/dev/null | head -c 150)"
             fi
           done
           wait $MAKE_PID
           BUILD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
+
+          # 若失败，用 -j1 重试一次（若上次是 Terminated/OOM，-j1 更稳）
+          if [ "$BUILD_RESULT" -ne 0 ]; then
+            echo ""
+            echo "First attempt (-j2) failed with exit=$BUILD_RESULT."
+            echo "Retry with -j1 (single-threaded, lower memory)..."
+            echo ""
+
+            echo "===== make -j1 (retry, timeout 5h30m) ====="
+            T0=$(date +%s)
+            timeout 5h30m make -j1 V=s > /tmp/build2.log 2>&1 &
+            MAKE_PID=$!
+
+            LAST_LINES=0
+            while kill -0 $MAKE_PID 2>/dev/null; do
+              sleep 60
+              if kill -0 $MAKE_PID 2>/dev/null; then
+                ELAPSED=$(( $(date +%s) - T0 ))
+                CURRENT_LINES=$(wc -l < /tmp/build2.log 2>/dev/null || echo 0)
+                DELTA=$((CURRENT_LINES - LAST_LINES))
+                LAST_LINES=$CURRENT_LINES
+                MEM=$(free -m | awk '/^Mem:/ {print $3"/"$2"MB"}')
+                echo "[make-j1 +${ELAPSED}s +${DELTA}L mem=$MEM] $(tail -1 /tmp/build2.log 2>/dev/null | head -c 150)"
+              fi
+            done
+            wait $MAKE_PID
+            BUILD_RESULT=$?
+            echo "  retry took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
+          fi
           set -e
 
           if [ "$BUILD_RESULT" -ne 0 ]; then
-            echo "Build failed, last 100 lines:"
-            tail -100 /tmp/build.log
-            timeout 10m make -j1 V=s 2>&1 | tail -500
+            echo "Build failed after retry."
+            echo ""
+            echo "===== last 200 lines of -j2 log (/tmp/build.log) ====="
+            tail -200 /tmp/build.log
+            echo ""
+            echo "===== last 200 lines of -j1 retry log (/tmp/build2.log) ====="
+            tail -200 /tmp/build2.log 2>/dev/null || echo "(no retry log)"
             exit 1
           fi
 
+          echo ""
+          echo "===== Build succeeded ====="
           echo ""
           echo "=== ccache stats ==="
           CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
