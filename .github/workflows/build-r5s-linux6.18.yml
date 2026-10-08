@@ -735,10 +735,10 @@ jobs:
 
           set +e
 
-          # 使用 -j2：降低内存/CPU 峰值压力，减少被 OOM 或外部干扰杀掉的概率
-          echo "===== make -j2 (timeout 5h30m) ====="
+          # 首次 -j2，timeout 300m（5 小时，核心单位 m）
+          echo "===== make -j2 (timeout 300m) ====="
           T0=$(date +%s)
-          timeout 5h30m make -j2 > /tmp/build.log 2>&1 &
+          timeout 300m make -j2 > /tmp/build.log 2>&1 &
           MAKE_PID=$!
 
           LAST_LINES=0
@@ -758,16 +758,16 @@ jobs:
           BUILD_RESULT=$?
           echo "  took $(( $(date +%s) - T0 ))s, exit=$BUILD_RESULT"
 
-          # 若失败，用 -j1 重试一次（若上次是 Terminated/OOM，-j1 更稳）
+          # 若失败，用 -j1 重试 50m（足够完成剩余工作，且不超过 Job 6h 总上限）
           if [ "$BUILD_RESULT" -ne 0 ]; then
             echo ""
             echo "First attempt (-j2) failed with exit=$BUILD_RESULT."
-            echo "Retry with -j1 (single-threaded, lower memory)..."
+            echo "Retry with -j1 (single-threaded, lower memory, timeout 50m)..."
             echo ""
 
-            echo "===== make -j1 (retry, timeout 5h30m) ====="
+            echo "===== make -j1 (retry, timeout 50m) ====="
             T0=$(date +%s)
-            timeout 5h30m make -j1 V=s > /tmp/build2.log 2>&1 &
+            timeout 50m make -j1 V=s > /tmp/build2.log 2>&1 &
             MAKE_PID=$!
 
             LAST_LINES=0
