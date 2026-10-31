@@ -142,26 +142,6 @@ jobs:
             device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
             android-sdk-libsparse-utils btrfs-progs
 
-          echo ""
-          echo "===== ensure system python deps ====="
-          SYS_PY=$(command -v python3)
-          echo "system python: $SYS_PY ($($SYS_PY --version 2>&1))"
-
-          if ! $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null; then
-            echo "installing via pip"
-            sudo PIP_BREAK_SYSTEM_PACKAGES=1 $SYS_PY -m pip install \
-              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
-            sudo $SYS_PY -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
-          fi
-
-          $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null || {
-            echo "::error::system python deps still missing"
-            $SYS_PY -c 'import sys; print("\n".join(sys.path))' || true
-            $SYS_PY -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
-            exit 1
-          }
-          echo "system python deps OK"
-
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
           free -h
@@ -298,15 +278,6 @@ jobs:
 
           if [ -d /workdir/openwrt/dl ]; then
             find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
-          fi
-
-          echo ""
-          echo "=== host python check after base restore ==="
-          HOST_PY=/workdir/openwrt/staging_dir/host/bin/python3
-          if [ -x "$HOST_PY" ]; then
-            echo "host python exists: $HOST_PY ($($HOST_PY --version 2>&1))"
-          else
-            echo "host python not present (base cache may be pre-host-python)"
           fi
 
       - name: Restore target cache
@@ -461,15 +432,6 @@ jobs:
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
 
-          echo "===== ensure system python deps ====="
-          SYS_PY=$(command -v python3)
-          if ! $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null; then
-            sudo PIP_BREAK_SYSTEM_PACKAGES=1 $SYS_PY -m pip install \
-              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || \
-            sudo $SYS_PY -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || true
-          fi
-          $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null || { echo "::error::sys python deps missing"; exit 1; }
-
           echo "===== tools/download ====="
           T0=$(date +%s)
           if ! timeout 30m make tools/download -j1 > /tmp/tools_dl.log 2>&1; then
@@ -572,83 +534,90 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          echo "===== ensure python deps for BOTH system and host ====="
+          echo "===== universal python deps injection ====="
 
-          ensure_sys_python() {
-            local PY
-            PY=$(command -v python3)
-            echo "[system] $PY ($($PY --version 2>&1))"
-            if $PY -c 'import setuptools; import elftools' 2>/dev/null; then
-              echo "[system] deps OK"
-              return 0
+          SHARED_LIBS=/workdir/pyshared
+          rm -rf "$SHARED_LIBS"
+          mkdir -p "$SHARED_LIBS"
+
+          SYS_PY=$(command -v python3)
+          echo "[sys] $SYS_PY ($($SYS_PY --version 2>&1))"
+
+          if ! $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null; then
+            PIP_BREAK_SYSTEM_PACKAGES=1 $SYS_PY -m pip install \
+              --break-system-packages --target "$SHARED_LIBS" --upgrade setuptools wheel pyelftools 2>&1 | tail -8 || \
+            $SYS_PY -m pip install --target "$SHARED_LIBS" --upgrade setuptools wheel pyelftools 2>&1 | tail -8 || true
+          fi
+
+          if [ ! -d "$SHARED_LIBS/setuptools" ] || [ ! -d "$SHARED_LIBS/elftools" ]; then
+            echo "::warning::shared libs incomplete, copying from sys site-packages"
+            SYS_SITE=$($SYS_PY -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
+            if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE" ]; then
+              for item in setuptools elftools pkg_resources _distutils_hack _distutils_hack.py distutils-precedence.pth wheel; do
+                [ -e "$SYS_SITE/$item" ] && cp -a "$SYS_SITE/$item" "$SHARED_LIBS/" 2>/dev/null || true
+              done
+              for d in "$SYS_SITE"/setuptools-*.dist-info "$SYS_SITE"/pyelftools-*.dist-info "$SYS_SITE"/wheel-*.dist-info; do
+                [ -e "$d" ] && cp -a "$d" "$SHARED_LIBS/" 2>/dev/null || true
+              done
             fi
-            echo "[system] installing via pip"
-            PIP_BREAK_SYSTEM_PACKAGES=1 $PY -m pip install --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || \
-            $PY -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || true
-          }
+          fi
+          echo "[sys] shared libs: $(ls "$SHARED_LIBS" 2>/dev/null | head -10 | tr '\n' ' ')"
 
-          ensure_host_python() {
-            local HOST_PY=/workdir/openwrt/staging_dir/host/bin/python3
-            if [ ! -x "$HOST_PY" ]; then
-              echo "[host] $HOST_PY not present, skip"
-              return 0
+          export PYTHONPATH="$SHARED_LIBS:${PYTHONPATH:-}"
+          echo "PYTHONPATH=$PYTHONPATH" >> "$GITHUB_ENV"
+
+          SYS_SITE=$($SYS_PY -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
+          if [ -n "$SYS_SITE" ]; then
+            sudo mkdir -p "$SYS_SITE" 2>/dev/null || true
+            sudo cp -a "$SHARED_LIBS/." "$SYS_SITE/" 2>/dev/null || true
+          fi
+
+          HOST_BIN=/workdir/openwrt/staging_dir/host/bin
+          HOST_PY=$HOST_BIN/python3
+
+          if [ -e "$HOST_PY" ]; then
+            echo "[host] detected: $HOST_PY"
+            ls -la "$HOST_PY"
+
+            if [ ! -e "$HOST_PY.real" ]; then
+              cp -Lf "$HOST_PY" "$HOST_PY.real" 2>/dev/null || sudo cp -Lf "$HOST_PY" "$HOST_PY.real"
+              chmod +x "$HOST_PY.real"
+
+              cat > /tmp/hostpy_wrapper <<'WRAPPER'
+#!/bin/sh
+export PYTHONPATH="/workdir/pyshared:${PYTHONPATH:-}"
+exec "$(dirname "$0")/python3.real" "$@"
+WRAPPER
+              sudo cp -f /tmp/hostpy_wrapper "$HOST_PY"
+              sudo chmod +x "$HOST_PY"
+              echo "[host] wrapper installed"
             fi
-            echo "[host] $HOST_PY ($($HOST_PY --version 2>&1))"
-            if $HOST_PY -c 'import setuptools; import elftools' 2>/dev/null; then
-              echo "[host] deps OK"
-              return 0
-            fi
 
-            local HOST_SITE
-            HOST_SITE=$($HOST_PY -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
-            echo "[host] site-packages: ${HOST_SITE:-<none>}"
+            echo "[host] testing wrapper..."
+            "$HOST_PY" -c 'import sys; print("python:", sys.executable)'
+            "$HOST_PY" -c 'import setuptools; import elftools; print("host deps OK")' || {
+              echo "::warning::host wrapper failed, dumping diagnostics"
+              "$HOST_PY" -c 'import sys; print("\n".join(sys.path))' || true
+              ls -la "$HOST_BIN/python3"* 2>/dev/null || true
+            }
+          else
+            echo "[host] $HOST_PY does not exist yet, skipping wrapper"
+          fi
 
-            if $HOST_PY -m pip --version >/dev/null 2>&1 && [ -n "$HOST_SITE" ]; then
-              echo "[host] try pip install --target"
-              $HOST_PY -m pip install --target "$HOST_SITE" --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || true
-            fi
-
-            if ! $HOST_PY -c 'import setuptools; import elftools' 2>/dev/null && [ -n "$HOST_SITE" ] && [ -d "$HOST_SITE" ]; then
-              echo "[host] pip failed, copying from system site-packages"
-              local SYS_PY SYS_SITE
-              SYS_PY=$(command -v python3)
-              SYS_SITE=$($SYS_PY -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
-              echo "[host] src=$SYS_SITE dst=$HOST_SITE"
-              if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE" ]; then
-                for item in setuptools elftools pkg_resources _distutils_hack _distutils_hack.py distutils-precedence.pth wheel; do
-                  if [ -e "$SYS_SITE/$item" ]; then
-                    cp -a "$SYS_SITE/$item" "$HOST_SITE/" 2>/dev/null || true
-                  fi
-                done
-                for d in "$SYS_SITE"/setuptools-*.dist-info "$SYS_SITE"/pyelftools-*.dist-info "$SYS_SITE"/wheel-*.dist-info; do
-                  [ -e "$d" ] && cp -a "$d" "$HOST_SITE/" 2>/dev/null || true
-                done
-              fi
-            fi
-          }
-
-          ensure_sys_python
-          ensure_host_python
-
-          echo ""
-          echo "===== hard verification ====="
-          python3 -c 'import setuptools; import elftools' 2>/dev/null || {
-            echo "::error::system python deps missing"
+          echo "===== HARD VERIFY ====="
+          python3 -c 'import setuptools; import elftools; print("sys python: OK")' || {
+            echo "::error::system python failed"
             python3 -c 'import sys; print("\n".join(sys.path))' || true
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
             exit 1
           }
-          if [ -x /workdir/openwrt/staging_dir/host/bin/python3 ]; then
-            /workdir/openwrt/staging_dir/host/bin/python3 -c 'import setuptools; import elftools' 2>/dev/null || {
-              echo "::error::OpenWrt host python deps missing"
-              /workdir/openwrt/staging_dir/host/bin/python3 -c 'import sys; print("\n".join(sys.path))' || true
-              ls -la /workdir/openwrt/staging_dir/host/lib/python*/site-packages/ 2>/dev/null | head -20 || true
+          if [ -x "$HOST_PY" ]; then
+            "$HOST_PY" -c 'import setuptools; import elftools; print("host python: OK")' || {
+              echo "::error::host python failed"
+              "$HOST_PY" -c 'import sys; print("\n".join(sys.path))' || true
               exit 1
             }
-            echo "both system and host python: OK"
-          else
-            echo "system python only: OK (no host python yet)"
           fi
+          echo "===== PYTHON ENV READY ====="
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
