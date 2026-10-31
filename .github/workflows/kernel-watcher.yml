@@ -127,6 +127,7 @@ jobs:
           fetch-depth: 0
 
       - name: Trigger nanopi6 build
+        id: trigger_nanopi
         if: needs.check.outputs.nanopi_changed == 'true'
         run: |
           echo "Triggering build.yml (nanopi6-v6.1.y updated)"
@@ -136,6 +137,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
 
       - name: Trigger R5S firmware, wait, then trigger kernel
+        id: trigger_r5s
         if: needs.check.outputs.openwrt_changed == 'true'
         run: |
           echo "Triggering build-r5s-openwrt.yml (kernel: ${{ needs.check.outputs.openwrt_version }})..."
@@ -159,8 +161,8 @@ jobs:
           done
 
           if [ -z "$RUN_ID" ]; then
-            echo "::warning::Cannot locate firmware run id; kernel build skipped"
-            exit 0
+            echo "::error::Cannot locate firmware run id; aborting so records are NOT committed"
+            exit 1
           fi
           echo "Firmware run id: $RUN_ID"
 
@@ -177,8 +179,8 @@ jobs:
           echo "Firmware finished with exit code: $FIRMWARE_RESULT"
 
           if [ "$FIRMWARE_RESULT" -ne 0 ]; then
-            echo "::warning::Firmware build did not succeed (exit=$FIRMWARE_RESULT); kernel build skipped"
-            exit 0
+            echo "::error::Firmware build did not succeed (exit=$FIRMWARE_RESULT); aborting so records are NOT committed"
+            exit 1
           fi
 
           echo ""
@@ -189,18 +191,35 @@ jobs:
           echo "Triggered build-r5s-openwrt-kernel.yml"
 
       - name: Commit updated records
-        if: always() && (needs.check.outputs.nanopi_changed == 'true' || needs.check.outputs.openwrt_changed == 'true')
+        if: always()
         env:
           NANOPI_CHANGED: ${{ needs.check.outputs.nanopi_changed }}
           NANOPI_SHA: ${{ needs.check.outputs.nanopi_sha }}
           NANOPI_MSG: ${{ needs.check.outputs.nanopi_msg }}
+          NANOPI_OK: ${{ steps.trigger_nanopi.outcome == 'success' }}
           OPENWRT_CHANGED: ${{ needs.check.outputs.openwrt_changed }}
           OPENWRT_VERSION: ${{ needs.check.outputs.openwrt_version }}
+          OPENWRT_OK: ${{ steps.trigger_r5s.outcome == 'success' }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if [ "$NANOPI_CHANGED" = "true" ] && [ -n "$NANOPI_SHA" ]; then
+          WRITE_NANOPI=false
+          WRITE_OPENWRT=false
+          if [ "$NANOPI_CHANGED" = "true" ] && [ "$NANOPI_OK" = "true" ]; then
+            WRITE_NANOPI=true
+          fi
+          if [ "$OPENWRT_CHANGED" = "true" ] && [ "$OPENWRT_OK" = "true" ]; then
+            WRITE_OPENWRT=true
+          fi
+
+          echo "write_nanopi=$WRITE_NANOPI  write_openwrt=$WRITE_OPENWRT"
+          if [ "$WRITE_NANOPI" = "false" ] && [ "$WRITE_OPENWRT" = "false" ]; then
+            echo "Nothing to commit (no changes, or triggers failed). Next run will retry."
+            exit 0
+          fi
+
+          if [ "$WRITE_NANOPI" = "true" ] && [ -n "$NANOPI_SHA" ]; then
             {
               echo "$NANOPI_SHA"
               echo ""
@@ -214,7 +233,7 @@ jobs:
             } > .kernel-version
           fi
 
-          if [ "$OPENWRT_CHANGED" = "true" ] && [ -n "$OPENWRT_VERSION" ]; then
+          if [ "$WRITE_OPENWRT" = "true" ] && [ -n "$OPENWRT_VERSION" ]; then
             echo "$OPENWRT_VERSION" > .openwrt-25.12-version
           fi
 
