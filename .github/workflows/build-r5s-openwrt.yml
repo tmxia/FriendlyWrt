@@ -142,37 +142,24 @@ jobs:
             android-sdk-libsparse-utils btrfs-progs
 
           echo ""
-          echo "===== ensure python deps ====="
-          python3 --version || true
+          echo "===== ensure system python deps ====="
+          SYS_PY=$(command -v python3)
+          echo "system python: $SYS_PY ($($SYS_PY --version 2>&1))"
 
-          need_pip=0
-          python3 -c 'import setuptools' 2>/dev/null || need_pip=1
-          python3 -c 'import elftools' 2>/dev/null || need_pip=1
-
-          if [ "$need_pip" = "1" ]; then
-            echo "apt python packages not importable, installing via pip"
-            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
+          if ! $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null; then
+            echo "installing via pip"
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 $SYS_PY -m pip install \
               --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
-            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
+            sudo $SYS_PY -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
           fi
 
-          python3 -c 'import setuptools' 2>/dev/null || {
-            echo "::error::setuptools import failed"
-            echo "--- sys.path ---"
-            python3 -c 'import sys; print("\n".join(sys.path))' || true
-            echo "--- pip list ---"
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
+          $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null || {
+            echo "::error::system python deps still missing"
+            $SYS_PY -c 'import sys; print("\n".join(sys.path))' || true
+            $SYS_PY -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
             exit 1
           }
-          python3 -c 'import elftools' 2>/dev/null || {
-            echo "::error::pyelftools import failed"
-            echo "--- sys.path ---"
-            python3 -c 'import sys; print("\n".join(sys.path))' || true
-            echo "--- pip list ---"
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
-            exit 1
-          }
-          echo "python deps OK"
+          echo "system python deps OK"
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
@@ -309,6 +296,15 @@ jobs:
 
           if [ -d /workdir/openwrt/dl ]; then
             find /workdir/openwrt/dl -type f | xargs -r touch -t 200001010000
+          fi
+
+          echo ""
+          echo "=== host python check after base restore ==="
+          HOST_PY=/workdir/openwrt/staging_dir/host/bin/python3
+          if [ -x "$HOST_PY" ]; then
+            echo "host python exists: $HOST_PY ($($HOST_PY --version 2>&1))"
+          else
+            echo "host python not present (base cache may be pre-host-python)"
           fi
 
       - name: Restore target cache
@@ -463,15 +459,14 @@ jobs:
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
 
-          echo "===== ensure python deps ====="
-          python3 -c 'import setuptools' 2>/dev/null && python3 -c 'import elftools' 2>/dev/null || {
-            echo "installing python deps via pip"
-            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
-              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
-            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
-          }
-          python3 -c 'import setuptools' 2>/dev/null || { echo "::error::setuptools missing"; exit 1; }
-          python3 -c 'import elftools' 2>/dev/null || { echo "::error::pyelftools missing"; exit 1; }
+          echo "===== ensure system python deps ====="
+          SYS_PY=$(command -v python3)
+          if ! $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null; then
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 $SYS_PY -m pip install \
+              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || \
+            sudo $SYS_PY -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || true
+          fi
+          $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null || { echo "::error::sys python deps missing"; exit 1; }
 
           echo "===== tools/download ====="
           T0=$(date +%s)
@@ -576,26 +571,83 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          echo "===== ensure python deps ====="
-          python3 -c 'import setuptools' 2>/dev/null && python3 -c 'import elftools' 2>/dev/null || {
-            echo "installing python deps via pip"
-            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
-              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
-            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
+          echo "===== ensure python deps for BOTH system and host ====="
+
+          ensure_sys_python() {
+            local PY
+            PY=$(command -v python3)
+            echo "[system] $PY ($($PY --version 2>&1))"
+            if $PY -c 'import setuptools; import elftools' 2>/dev/null; then
+              echo "[system] deps OK"
+              return 0
+            fi
+            echo "[system] installing via pip"
+            PIP_BREAK_SYSTEM_PACKAGES=1 $PY -m pip install --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || \
+            $PY -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || true
           }
-          python3 -c 'import setuptools' 2>/dev/null || {
-            echo "::error::setuptools missing"
+
+          ensure_host_python() {
+            local HOST_PY=/workdir/openwrt/staging_dir/host/bin/python3
+            if [ ! -x "$HOST_PY" ]; then
+              echo "[host] $HOST_PY not present, skip"
+              return 0
+            fi
+            echo "[host] $HOST_PY ($($HOST_PY --version 2>&1))"
+            if $HOST_PY -c 'import setuptools; import elftools' 2>/dev/null; then
+              echo "[host] deps OK"
+              return 0
+            fi
+
+            local HOST_SITE
+            HOST_SITE=$($HOST_PY -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
+            echo "[host] site-packages: ${HOST_SITE:-<none>}"
+
+            if $HOST_PY -m pip --version >/dev/null 2>&1 && [ -n "$HOST_SITE" ]; then
+              echo "[host] try pip install --target"
+              $HOST_PY -m pip install --target "$HOST_SITE" --upgrade setuptools wheel pyelftools 2>&1 | tail -5 || true
+            fi
+
+            if ! $HOST_PY -c 'import setuptools; import elftools' 2>/dev/null && [ -n "$HOST_SITE" ] && [ -d "$HOST_SITE" ]; then
+              echo "[host] pip failed, copying from system site-packages"
+              local SYS_PY SYS_SITE
+              SYS_PY=$(command -v python3)
+              SYS_SITE=$($SYS_PY -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
+              echo "[host] src=$SYS_SITE dst=$HOST_SITE"
+              if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE" ]; then
+                for item in setuptools elftools pkg_resources _distutils_hack _distutils_hack.py distutils-precedence.pth wheel; do
+                  if [ -e "$SYS_SITE/$item" ]; then
+                    cp -a "$SYS_SITE/$item" "$HOST_SITE/" 2>/dev/null || true
+                  fi
+                done
+                for d in "$SYS_SITE"/setuptools-*.dist-info "$SYS_SITE"/pyelftools-*.dist-info "$SYS_SITE"/wheel-*.dist-info; do
+                  [ -e "$d" ] && cp -a "$d" "$HOST_SITE/" 2>/dev/null || true
+                done
+              fi
+            fi
+          }
+
+          ensure_sys_python
+          ensure_host_python
+
+          echo ""
+          echo "===== hard verification ====="
+          python3 -c 'import setuptools; import elftools' 2>/dev/null || {
+            echo "::error::system python deps missing"
             python3 -c 'import sys; print("\n".join(sys.path))' || true
             python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
             exit 1
           }
-          python3 -c 'import elftools' 2>/dev/null || {
-            echo "::error::pyelftools missing"
-            python3 -c 'import sys; print("\n".join(sys.path))' || true
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
-            exit 1
-          }
-          echo "python deps OK"
+          if [ -x /workdir/openwrt/staging_dir/host/bin/python3 ]; then
+            /workdir/openwrt/staging_dir/host/bin/python3 -c 'import setuptools; import elftools' 2>/dev/null || {
+              echo "::error::OpenWrt host python deps missing"
+              /workdir/openwrt/staging_dir/host/bin/python3 -c 'import sys; print("\n".join(sys.path))' || true
+              ls -la /workdir/openwrt/staging_dir/host/lib/python*/site-packages/ 2>/dev/null | head -20 || true
+              exit 1
+            }
+            echo "both system and host python: OK"
+          else
+            echo "system python only: OK (no host python yet)"
+          fi
 
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
