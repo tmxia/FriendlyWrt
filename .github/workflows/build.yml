@@ -90,15 +90,15 @@ jobs:
 
       - name: Create or update release
         id: release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.release_tag.outputs.tag }}
+          name: ${{ steps.release_tag.outputs.tag }}
           draft: false
           prerelease: false
-          allow_updates: true
-          overwrite: true
+          overwrite_files: true
 
   build_manual:
     needs: prepare_release
@@ -603,7 +603,8 @@ jobs:
       id: config
       run: |
         cd project
-        case ${{ matrix.CPU }} in
+        CPU=rk3568
+        case $CPU in
         rk3568)
           MODEL=R5S-R5C-Series
           ;;
@@ -619,7 +620,7 @@ jobs:
 
         CONFIG=rockchip${SUFFIX}
         cat > .current_config.mk <<EOL
-        . device/friendlyelec/${{ matrix.CPU }}/base.mk
+        . device/friendlyelec/$CPU/base.mk
         TARGET_IMAGE_DIRNAME=${DIST_DIR}
         TARGET_FRIENDLYWRT_CONFIG=${CONFIG}
         TARGET_SD_RAW_FILENAME=${IMG_FILE}
@@ -661,7 +662,7 @@ jobs:
             ls -la
             exit 1
         fi
-        archive_dir="${{ steps.config.outputs.dist_dir }}-${{ matrix.CPU }}"
+        archive_dir="${{ steps.config.outputs.dist_dir }}-rk3568"
         mv "${{ steps.config.outputs.dist_dir }}" "${archive_dir}"
         tar czf "${{ steps.config.outputs.archive_filename }}" "${archive_dir}"
         mv ${{ steps.config.outputs.archive_filename }} ../../../artifact/
@@ -742,9 +743,6 @@ jobs:
 
           RUNS=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WF_ID/runs?per_page=100" \
             --jq '.workflow_runs[].id')
-
-          echo "Runs found:"
-          echo "$RUNS"
 
           i=0
           for run_id in $RUNS; do
