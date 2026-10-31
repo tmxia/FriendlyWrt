@@ -142,6 +142,40 @@ jobs:
             device-tree-compiler u-boot-tools e2fsprogs parted dosfstools mtools \
             android-sdk-libsparse-utils btrfs-progs
 
+          echo ""
+          echo "===== python3 environment ====="
+          python3 --version
+          python3 -m pip --version || true
+
+          SETUPTOOLS_OK=0
+          ELFTOOLS_OK=0
+          python3 -c 'import setuptools' 2>/dev/null && SETUPTOOLS_OK=1 || true
+          python3 -c 'import elftools' 2>/dev/null && ELFTOOLS_OK=1 || true
+          echo "apt import: setuptools=$SETUPTOOLS_OK elftools=$ELFTOOLS_OK"
+
+          if [ "$SETUPTOOLS_OK" = "0" ] || [ "$ELFTOOLS_OK" = "0" ]; then
+            echo "apt python packages not importable (PEP 668 / python 3.14), using pip user site"
+            python3 -m pip install --user --break-system-packages --upgrade \
+              setuptools wheel pyelftools 2>&1 | tail -15 || true
+            USER_SITE=$(python3 -m site --user-site)
+            echo "user_site: $USER_SITE"
+            echo "PYTHONPATH=$USER_SITE" >> "$GITHUB_ENV"
+            export PYTHONPATH="$USER_SITE:$PYTHONPATH"
+          fi
+
+          echo ""
+          echo "===== verify imports ====="
+          python3 -c 'import setuptools; print("setuptools:", setuptools.__version__)' || {
+            echo "::error::setuptools not importable"
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|pyelftools' || true
+            exit 1
+          }
+          python3 -c 'import elftools; print("pyelftools: ok")' || {
+            echo "::error::pyelftools not importable"
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|pyelftools' || true
+            exit 1
+          }
+
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
           free -h
