@@ -542,25 +542,28 @@ jobs:
           SYS_PY=$(command -v python3)
           echo "[sys] $SYS_PY ($($SYS_PY --version 2>&1))"
 
-          if ! $SYS_PY -c 'import setuptools; import elftools' 2>/dev/null; then
-            PIP_BREAK_SYSTEM_PACKAGES=1 $SYS_PY -m pip install \
-              --break-system-packages --target "$SHARED_LIBS" --upgrade setuptools wheel pyelftools 2>&1 | tail -8 || \
-            $SYS_PY -m pip install --target "$SHARED_LIBS" --upgrade setuptools wheel pyelftools 2>&1 | tail -8 || true
+          if [ ! -d "$SHARED_LIBS/setuptools" ] || [ ! -d "$SHARED_LIBS/elftools" ]; then
+            echo "[sys] installing to $SHARED_LIBS"
+            if ! $SYS_PY -m pip install --target "$SHARED_LIBS" --upgrade setuptools wheel pyelftools 2>&1 | tail -10; then
+              echo "[sys] retry with PIP_BREAK_SYSTEM_PACKAGES"
+              PIP_BREAK_SYSTEM_PACKAGES=1 $SYS_PY -m pip install --target "$SHARED_LIBS" --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
+            fi
           fi
 
           if [ ! -d "$SHARED_LIBS/setuptools" ] || [ ! -d "$SHARED_LIBS/elftools" ]; then
-            echo "::warning::shared libs incomplete, copying from sys site-packages"
+            echo "[sys] pip failed, copying from system site-packages"
             SYS_SITE=$($SYS_PY -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
             if [ -n "$SYS_SITE" ] && [ -d "$SYS_SITE" ]; then
-              for item in setuptools elftools pkg_resources _distutils_hack _distutils_hack.py distutils-precedence.pth wheel; do
+              for item in setuptools elftools pkg_resources _distutils_hack _distutils_hack.py distutils-precedence.pth wheel packaging pyparsing; do
                 [ -e "$SYS_SITE/$item" ] && cp -a "$SYS_SITE/$item" "$SHARED_LIBS/" 2>/dev/null || true
               done
-              for d in "$SYS_SITE"/setuptools-*.dist-info "$SYS_SITE"/pyelftools-*.dist-info "$SYS_SITE"/wheel-*.dist-info; do
+              for d in "$SYS_SITE"/setuptools-*.dist-info "$SYS_SITE"/pyelftools-*.dist-info "$SYS_SITE"/wheel-*.dist-info "$SYS_SITE"/packaging-*.dist-info "$SYS_SITE"/pyparsing-*.dist-info; do
                 [ -e "$d" ] && cp -a "$d" "$SHARED_LIBS/" 2>/dev/null || true
               done
             fi
           fi
-          echo "[sys] shared libs: $(ls "$SHARED_LIBS" 2>/dev/null | head -10 | tr '\n' ' ')"
+
+          echo "[sys] shared libs top: $(ls "$SHARED_LIBS" 2>/dev/null | head -12 | tr '\n' ' ')"
 
           export PYTHONPATH="$SHARED_LIBS:${PYTHONPATH:-}"
           echo "PYTHONPATH=$PYTHONPATH" >> "$GITHUB_ENV"
@@ -576,31 +579,35 @@ jobs:
 
           if [ -e "$HOST_PY" ]; then
             echo "[host] detected: $HOST_PY"
-            ls -la "$HOST_PY"
+            ls -la "$HOST_PY" 2>/dev/null || true
 
             if [ ! -e "$HOST_PY.real" ]; then
-              cp -Lf "$HOST_PY" "$HOST_PY.real" 2>/dev/null || sudo cp -Lf "$HOST_PY" "$HOST_PY.real"
-              chmod +x "$HOST_PY.real"
+              echo "[host] backing up to $HOST_PY.real"
+              sudo cp -Lf "$HOST_PY" "$HOST_PY.real"
+              sudo chmod +x "$HOST_PY.real"
 
               cat > /tmp/hostpy_wrapper <<'WRAPPER'
 #!/bin/sh
 export PYTHONPATH="/workdir/pyshared:${PYTHONPATH:-}"
-exec "$(dirname "$0")/python3.real" "$@"
+exec "/workdir/openwrt/staging_dir/host/bin/python3.real" "$@"
 WRAPPER
               sudo cp -f /tmp/hostpy_wrapper "$HOST_PY"
               sudo chmod +x "$HOST_PY"
               echo "[host] wrapper installed"
+            else
+              echo "[host] wrapper already present"
             fi
 
             echo "[host] testing wrapper..."
-            "$HOST_PY" -c 'import sys; print("python:", sys.executable)'
+            "$HOST_PY" -c 'import sys; print("host python:", sys.executable)' || true
             "$HOST_PY" -c 'import setuptools; import elftools; print("host deps OK")' || {
-              echo "::warning::host wrapper failed, dumping diagnostics"
+              echo "::warning::host wrapper still failing, dumping diagnostics"
               "$HOST_PY" -c 'import sys; print("\n".join(sys.path))' || true
-              ls -la "$HOST_BIN/python3"* 2>/dev/null || true
+              ls -la "$HOST_BIN"/python3* 2>/dev/null || true
+              ls -la "$HOST_BIN"/../lib/python*/site-packages/ 2>/dev/null | head -20 || true
             }
           else
-            echo "[host] $HOST_PY does not exist yet, skipping wrapper"
+            echo "[host] $HOST_PY not present yet, skipping wrapper"
           fi
 
           echo "===== HARD VERIFY ====="
