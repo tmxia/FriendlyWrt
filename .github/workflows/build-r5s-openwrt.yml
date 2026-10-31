@@ -142,38 +142,37 @@ jobs:
             android-sdk-libsparse-utils btrfs-progs
 
           echo ""
-          echo "===== python3 environment ====="
-          python3 --version
-          python3 -m pip --version || true
+          echo "===== ensure python deps ====="
+          python3 --version || true
 
-          SETUPTOOLS_OK=0
-          ELFTOOLS_OK=0
-          python3 -c 'import setuptools' 2>/dev/null && SETUPTOOLS_OK=1 || true
-          python3 -c 'import elftools' 2>/dev/null && ELFTOOLS_OK=1 || true
-          echo "apt import: setuptools=$SETUPTOOLS_OK elftools=$ELFTOOLS_OK"
+          need_pip=0
+          python3 -c 'import setuptools' 2>/dev/null || need_pip=1
+          python3 -c 'import elftools' 2>/dev/null || need_pip=1
 
-          if [ "$SETUPTOOLS_OK" = "0" ] || [ "$ELFTOOLS_OK" = "0" ]; then
-            echo "apt python packages not importable (PEP 668 / python 3.14), using pip user site"
-            python3 -m pip install --user --break-system-packages --upgrade \
-              setuptools wheel pyelftools 2>&1 | tail -15 || true
-            USER_SITE=$(python3 -m site --user-site)
-            echo "user_site: $USER_SITE"
-            echo "PYTHONPATH=$USER_SITE" >> "$GITHUB_ENV"
-            export PYTHONPATH="$USER_SITE:$PYTHONPATH"
+          if [ "$need_pip" = "1" ]; then
+            echo "apt python packages not importable, installing via pip"
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
+              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
+            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
           fi
 
-          echo ""
-          echo "===== verify imports ====="
-          python3 -c 'import setuptools; print("setuptools:", setuptools.__version__)' || {
-            echo "::error::setuptools not importable"
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|pyelftools' || true
+          python3 -c 'import setuptools' 2>/dev/null || {
+            echo "::error::setuptools import failed"
+            echo "--- sys.path ---"
+            python3 -c 'import sys; print("\n".join(sys.path))' || true
+            echo "--- pip list ---"
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
             exit 1
           }
-          python3 -c 'import elftools; print("pyelftools: ok")' || {
-            echo "::error::pyelftools not importable"
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|pyelftools' || true
+          python3 -c 'import elftools' 2>/dev/null || {
+            echo "::error::pyelftools import failed"
+            echo "--- sys.path ---"
+            python3 -c 'import sys; print("\n".join(sys.path))' || true
+            echo "--- pip list ---"
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
             exit 1
           }
+          echo "python deps OK"
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
@@ -464,6 +463,16 @@ jobs:
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
 
+          echo "===== ensure python deps ====="
+          python3 -c 'import setuptools' 2>/dev/null && python3 -c 'import elftools' 2>/dev/null || {
+            echo "installing python deps via pip"
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
+              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
+            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
+          }
+          python3 -c 'import setuptools' 2>/dev/null || { echo "::error::setuptools missing"; exit 1; }
+          python3 -c 'import elftools' 2>/dev/null || { echo "::error::pyelftools missing"; exit 1; }
+
           echo "===== tools/download ====="
           T0=$(date +%s)
           if ! timeout 30m make tools/download -j1 > /tmp/tools_dl.log 2>&1; then
@@ -566,6 +575,28 @@ jobs:
         id: compile_firmware
         run: |
           cd /workdir/openwrt
+
+          echo "===== ensure python deps ====="
+          python3 -c 'import setuptools' 2>/dev/null && python3 -c 'import elftools' 2>/dev/null || {
+            echo "installing python deps via pip"
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
+              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
+            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
+          }
+          python3 -c 'import setuptools' 2>/dev/null || {
+            echo "::error::setuptools missing"
+            python3 -c 'import sys; print("\n".join(sys.path))' || true
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
+            exit 1
+          }
+          python3 -c 'import elftools' 2>/dev/null || {
+            echo "::error::pyelftools missing"
+            python3 -c 'import sys; print("\n".join(sys.path))' || true
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
+            exit 1
+          }
+          echo "python deps OK"
+
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
           set +e
