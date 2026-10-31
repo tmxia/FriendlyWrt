@@ -143,38 +143,33 @@ jobs:
             android-sdk-libsparse-utils btrfs-progs
 
           echo ""
-          echo "===== python3 environment ====="
-          python3 --version
-          python3 -m pip --version || true
+          echo "===== ensure python deps ====="
+          python3 --version || true
 
-          SETUPTOOLS_OK=0
-          ELFTOOLS_OK=0
-          python3 -c 'import setuptools' 2>/dev/null && SETUPTOOLS_OK=1 || true
-          python3 -c 'import elftools' 2>/dev/null && ELFTOOLS_OK=1 || true
-          echo "apt import: setuptools=$SETUPTOOLS_OK elftools=$ELFTOOLS_OK"
+          need_pip=0
+          python3 -c 'import setuptools' 2>/dev/null || need_pip=1
+          python3 -c 'import elftools' 2>/dev/null || need_pip=1
 
-          if [ "$SETUPTOOLS_OK" = "0" ] || [ "$ELFTOOLS_OK" = "0" ]; then
-            echo "apt python packages not importable (PEP 668 / python 3.14), using pip user site"
-            python3 -m pip install --user --break-system-packages --upgrade \
-              setuptools wheel pyelftools 2>&1 | tail -15 || true
-            USER_SITE=$(python3 -m site --user-site)
-            echo "user_site: $USER_SITE"
-            echo "PYTHONPATH=$USER_SITE" >> "$GITHUB_ENV"
-            export PYTHONPATH="$USER_SITE:$PYTHONPATH"
+          if [ "$need_pip" = "1" ]; then
+            echo "apt python packages not importable, installing via pip"
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
+              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
+            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
           fi
 
-          echo ""
-          echo "===== verify imports ====="
-          python3 -c 'import setuptools; print("setuptools:", setuptools.__version__)' || {
-            echo "::error::setuptools not importable"
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|pyelftools' || true
+          python3 -c 'import setuptools' 2>/dev/null || {
+            echo "::error::setuptools import failed"
+            python3 -c 'import sys; print("\n".join(sys.path))' || true
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
             exit 1
           }
-          python3 -c 'import elftools; print("pyelftools: ok")' || {
-            echo "::error::pyelftools not importable"
-            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|pyelftools' || true
+          python3 -c 'import elftools' 2>/dev/null || {
+            echo "::error::pyelftools import failed"
+            python3 -c 'import sys; print("\n".join(sys.path))' || true
+            python3 -m pip list 2>/dev/null | grep -iE 'setuptools|wheel|pyelftools' || true
             exit 1
           }
+          echo "python deps OK"
 
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
@@ -248,7 +243,7 @@ jobs:
           echo "detected: kernel=${KERNEL_MAJOR}.${KV} openwrt=${OW_HASH}"
 
           echo ""
-          echo "===== cache tags (与固件流程共享) ====="
+          echo "===== cache tags ====="
           echo "base cache:   openwrt-25.12-linux-${KERNEL_MAJOR}"
           echo "target cache: ow${OW_HASH}-linux-${KERNEL_MAJOR}.${KV}"
           echo "ccache:       openwrt-25.12-linux-${KERNEL_MAJOR}"
@@ -466,6 +461,16 @@ jobs:
           cd /workdir/openwrt
           touch /workdir/base_compilation_marker
 
+          echo "===== ensure python deps ====="
+          python3 -c 'import setuptools' 2>/dev/null && python3 -c 'import elftools' 2>/dev/null || {
+            echo "installing python deps via pip"
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
+              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
+            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
+          }
+          python3 -c 'import setuptools' 2>/dev/null || { echo "::error::setuptools missing"; exit 1; }
+          python3 -c 'import elftools' 2>/dev/null || { echo "::error::pyelftools missing"; exit 1; }
+
           echo "===== tools/download ====="
           T0=$(date +%s)
           if ! timeout 30m make tools/download -j1 > /tmp/tools_dl.log 2>&1; then
@@ -567,6 +572,18 @@ jobs:
       - name: Compile kernel and kernel modules
         run: |
           cd /workdir/openwrt
+
+          echo "===== ensure python deps ====="
+          python3 -c 'import setuptools' 2>/dev/null && python3 -c 'import elftools' 2>/dev/null || {
+            echo "installing python deps via pip"
+            sudo PIP_BREAK_SYSTEM_PACKAGES=1 python3 -m pip install \
+              --break-system-packages --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || \
+            sudo python3 -m pip install --upgrade setuptools wheel pyelftools 2>&1 | tail -10 || true
+          }
+          python3 -c 'import setuptools' 2>/dev/null || { echo "::error::setuptools missing"; exit 1; }
+          python3 -c 'import elftools' 2>/dev/null || { echo "::error::pyelftools missing"; exit 1; }
+          echo "python deps OK"
+
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
           set +e
@@ -715,10 +732,6 @@ jobs:
           [ -z "$KERNEL_IMAGE_ABS" ] && { echo "Kernel Image not found"; exit 1; }
           [ -z "$DTB_FILE_ABS" ] && { echo "R5S DTB not found"; exit 1; }
 
-          echo "KERNEL_IMAGE=$KERNEL_IMAGE_ABS"
-          echo "DTB_FILE=$DTB_FILE_ABS"
-          ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
-
           MKIMAGE=""
           for cand in \
             "$PWD/staging_dir/host/bin/mkimage" \
@@ -731,20 +744,11 @@ jobs:
           [ -z "$MKIMAGE" ] && MKIMAGE=$(command -v mkimage)
           [ -z "$MKIMAGE" ] && { echo "mkimage not found"; exit 1; }
 
-          echo "Using mkimage: $MKIMAGE"
-          "$MKIMAGE" -V 2>&1 | head -1 || true
-
-          echo ""
-          echo "===== generate FIT kernel.img (mkimage + explicit hash-1/hash-2) ====="
           cd "$OUT/boot"
           cp "$KERNEL_IMAGE_ABS" Image
           cp "$DTB_FILE_ABS" rk3568-nanopi-r5s.dtb
 
           python3 -c "import lzma,struct;d=open('Image','rb').read();flt=[{'id':lzma.FILTER_LZMA1,'dict_size':8*1024*1024,'lc':1,'lp':2,'pb':2}];o=bytearray(lzma.compress(d,format=lzma.FORMAT_ALONE,filters=flt));o[5:13]=struct.pack('<Q',len(d));open('Image.lzma','wb').write(bytes(o));print('compressed: %d bytes; uncompressed: %d bytes' % (len(o), len(d)))"
-
-          echo "----- Image.lzma header -----"
-          hexdump -C Image.lzma | head -2
-          echo "-------------------------------"
 
           : > kernel.its
           printf '%s\n' '/dts-v1/;' >> kernel.its
@@ -795,20 +799,9 @@ jobs:
           printf '%s\n' '    };' >> kernel.its
           printf '%s\n' '};' >> kernel.its
 
-          echo "----- kernel.its -----"
-          cat kernel.its
-          echo "----------------------"
-
           "$MKIMAGE" -f kernel.its kernel.img
           rm -f kernel.its Image.lzma rk3568-nanopi-r5s.dtb Image
 
-          echo ""
-          echo "kernel.img generated:"
-          ls -lh kernel.img
-          file kernel.img
-
-          echo ""
-          echo "=== 关键校验 ==="
           if strings kernel.img | grep -q 'hash-2' && strings kernel.img | grep -q 'sha1'; then
             echo "OK: hash-2 / sha1 均存在"
           else
@@ -859,17 +852,13 @@ jobs:
         run: |
           cd /workdir/kernel-packages
           TAG="${{ needs.prepare_release.outputs.release_tag }}"
-          echo "release tag: $TAG"
           shopt -s nullglob
           FILES=(*.tar.gz)
           shopt -u nullglob
           [ ${#FILES[@]} -eq 0 ] && { echo "no packages"; exit 1; }
-          echo "uploading ${#FILES[@]} files"
           printf '  %s\n' "${FILES[@]}"
           gh release upload "$TAG" "${FILES[@]}" --clobber --repo "$GITHUB_REPOSITORY"
 
-          echo ""
-          echo "===== update release notes ====="
           KREL="${{ steps.package.outputs.kernel_release }}"
           gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
             --notes "R5S kernel upgrade package. Kernel: ${KREL}" || true
