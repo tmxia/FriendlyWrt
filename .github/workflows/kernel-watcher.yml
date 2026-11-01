@@ -116,6 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     if: |
+      github.event_name == 'workflow_dispatch' ||
       needs.check.outputs.nanopi_changed == 'true' ||
       needs.check.outputs.openwrt_changed == 'true'
     env:
@@ -138,7 +139,7 @@ jobs:
 
       - name: Trigger R5S firmware, wait, then trigger kernel
         id: trigger_r5s
-        if: needs.check.outputs.openwrt_changed == 'true'
+        if: needs.check.outputs.openwrt_changed == 'true' || github.event_name == 'workflow_dispatch'
         run: |
           echo "Triggering build-r5s-openwrt.yml (kernel: ${{ needs.check.outputs.openwrt_version }})..."
           gh workflow run build-r5s-openwrt.yml \
@@ -193,6 +194,7 @@ jobs:
       - name: Commit updated records
         if: always()
         env:
+          EVENT_NAME: ${{ github.event_name }}
           NANOPI_CHANGED: ${{ needs.check.outputs.nanopi_changed }}
           NANOPI_SHA: ${{ needs.check.outputs.nanopi_sha }}
           NANOPI_MSG: ${{ needs.check.outputs.nanopi_msg }}
@@ -206,13 +208,18 @@ jobs:
 
           WRITE_NANOPI=false
           WRITE_OPENWRT=false
+
           if [ "$NANOPI_CHANGED" = "true" ] && [ "$NANOPI_OK" = "true" ]; then
             WRITE_NANOPI=true
           fi
-          if [ "$OPENWRT_CHANGED" = "true" ] && [ "$OPENWRT_OK" = "true" ]; then
-            WRITE_OPENWRT=true
+
+          if [ "$OPENWRT_OK" = "true" ]; then
+            if [ "$OPENWRT_CHANGED" = "true" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              WRITE_OPENWRT=true
+            fi
           fi
 
+          echo "event=$EVENT_NAME"
           echo "write_nanopi=$WRITE_NANOPI  write_openwrt=$WRITE_OPENWRT"
           if [ "$WRITE_NANOPI" = "false" ] && [ "$WRITE_OPENWRT" = "false" ]; then
             echo "Nothing to commit (no changes, or triggers failed). Next run will retry."
