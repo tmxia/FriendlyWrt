@@ -667,6 +667,10 @@ config_stage() {
           echo "# CONFIG_PACKAGE_${pkg} is not set" >> .config
     done
 
+    sed -i "/^# CONFIG_PACKAGE_luci-app-weechat is not set/d" .config
+    sed -i "/^CONFIG_PACKAGE_luci-app-weechat=/d" .config
+    echo "# CONFIG_PACKAGE_luci-app-weechat is not set" >> .config
+
     sed -i "/^# CONFIG_PACKAGE_kmod-r8125 is not set/d" .config
     sed -i "/^CONFIG_PACKAGE_kmod-r8125=/d" .config
     echo "CONFIG_PACKAGE_kmod-r8125=y" >> .config
@@ -691,6 +695,7 @@ config_stage() {
     done
     grep -q "^CONFIG_PACKAGE_kmod-r8125=y" .config || { echo "missing: kmod-r8125"; MISSING=1; }
     grep -q "^# CONFIG_PACKAGE_kmod-r8169 is not set" .config || { echo "conflict: kmod-r8169 enabled"; MISSING=1; }
+    grep -q "^# CONFIG_PACKAGE_luci-app-weechat is not set" .config || { echo "conflict: luci-app-weechat enabled"; MISSING=1; }
     [ $MISSING -eq 1 ] && exit 1
 
     for f in files/sbin/mountpoint files/etc/rc.local \
