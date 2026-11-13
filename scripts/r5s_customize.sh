@@ -649,7 +649,8 @@ config_stage() {
                iptables-nft \
                iptables-mod-conntrack-extra iptables-mod-ipopt iptables-mod-extra iptables-mod-filter \
                ip6tables-nft ip6tables-extra \
-               sgdisk gptfdisk; do
+               sgdisk gptfdisk \
+               kmod-hwmon-pwmfan; do
         sed -i "/^# CONFIG_PACKAGE_${pkg} is not set/d" .config
         sed -i "/^CONFIG_PACKAGE_${pkg}=/d" .config
         echo "CONFIG_PACKAGE_${pkg}=y" >> .config
@@ -687,7 +688,7 @@ config_stage() {
 
     local MISSING=0
     for pkg in clashoo luci-app-clashoo kmod-inet-diag luci-app-amlogic luci-app-ttyd ttyd \
-               dockerd luci-app-dockerman openssh-sftp-server parted; do
+               dockerd luci-app-dockerman openssh-sftp-server parted kmod-hwmon-pwmfan; do
         grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || { echo "missing: $pkg"; MISSING=1; }
     done
     for opt in DOCKER_NET_MACVLAN DOCKER_STO_EXT4; do
