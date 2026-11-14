@@ -160,6 +160,14 @@ jobs:
         cd project
         source ../scripts/custome_config.sh
 
+    - name: Fix rtw88 FIELD_PREP_CONST compatibility
+      run: |
+        cd project/scripts/sd-fuse/out/rtw88 2>/dev/null || exit 0
+        grep -rl 'FIELD_PREP_CONST' . 2>/dev/null | while read -r f; do
+          echo "Patching: $f"
+          sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+        done
+
     - name: Prepare dot config and feeds
       run: |
         cd project
@@ -452,6 +460,14 @@ jobs:
       run: |
         cd project
         source ../scripts/custome_config.sh
+
+    - name: Fix rtw88 FIELD_PREP_CONST compatibility
+      run: |
+        cd project/scripts/sd-fuse/out/rtw88 2>/dev/null || exit 0
+        grep -rl 'FIELD_PREP_CONST' . 2>/dev/null | while read -r f; do
+          echo "Patching: $f"
+          sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+        done
 
     - name: Prepare dot config and feeds
       run: |
