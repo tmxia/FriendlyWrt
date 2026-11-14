@@ -160,14 +160,6 @@ jobs:
         cd project
         source ../scripts/custome_config.sh
 
-    - name: Fix rtw88 FIELD_PREP_CONST compatibility
-      run: |
-        cd project/scripts/sd-fuse/out/rtw88 2>/dev/null || exit 0
-        grep -rl 'FIELD_PREP_CONST' . 2>/dev/null | while read -r f; do
-          echo "Patching: $f"
-          sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-        done
-
     - name: Prepare dot config and feeds
       run: |
         cd project
@@ -360,9 +352,80 @@ jobs:
 
     - name: Compile uboot and kernel
       run: |
+        set -eo pipefail
         cd project
+
+        echo "===== Compile uboot ====="
         ./build.sh uboot
+
+        echo ""
+        echo "===== Prepare kernel source ====="
+        if [ ! -f "kernel/Makefile" ]; then
+          KBRANCH=""
+          for f in device/friendlyelec/rk3568/base.mk device/friendlyelec/rk3568/*.mk; do
+            [ -f "$f" ] || continue
+            KBRANCH=$(grep -oE 'KERNEL_BRANCH[[:space:]]*[:?]?=[[:space:]]*[^[:space:]]+' "$f" 2>/dev/null \
+                      | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '"' | tr -d "'" || true)
+            [ -n "$KBRANCH" ] && break
+          done
+          [ -z "$KBRANCH" ] && KBRANCH="nanopi6-v6.1.y"
+          echo "Kernel branch: $KBRANCH"
+
+          rm -rf kernel
+          git clone --single-branch --depth 1 -b "$KBRANCH" \
+            https://github.com/friendlyarm/kernel-rockchip.git kernel
+
+          if [ ! -f "kernel/Makefile" ]; then
+            echo "ERROR: kernel clone failed"
+            exit 1
+          fi
+          echo "kernel/ ready"
+        else
+          echo "kernel/ already present"
+        fi
+
+        echo ""
+        echo "===== Patch kernel bitfield.h ====="
+        HDR="kernel/include/linux/bitfield.h"
+        if [ ! -f "$HDR" ]; then
+          echo "ERROR: $HDR not found"
+          exit 1
+        fi
+        if grep -q 'FIELD_PREP_CONST' "$HDR"; then
+          echo "Already patched: $HDR"
+        else
+          printf '\n#ifndef FIELD_PREP_CONST\n#define FIELD_PREP_CONST(_mask, _val) FIELD_PREP(_mask, _val)\n#endif\n' >> "$HDR"
+          echo "Patched: $HDR"
+        fi
+
+        echo ""
+        echo "===== Patch rtw88 sources ====="
+        if [ -d "scripts/sd-fuse/out/rtw88" ]; then
+          COUNT=0
+          for f in scripts/sd-fuse/out/rtw88/*.c; do
+            [ -f "$f" ] || continue
+            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
+              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+              echo "Patched: $f"
+              COUNT=$((COUNT+1))
+            fi
+          done
+          echo "rtw88 patched: $COUNT files"
+        else
+          echo "Note: rtw88 dir not present, header macro is sufficient"
+        fi
+
+        echo ""
+        echo "===== Single kernel build ====="
         ./build.sh kernel
+
+        echo ""
+        echo "===== Verify patch survived build ====="
+        if grep -q 'FIELD_PREP_CONST' kernel/include/linux/bitfield.h; then
+          echo "OK: patch still present after build"
+        else
+          echo "WARN: build.sh reset kernel sources, patch lost"
+        fi
 
     - name: Build sd image
       id: build_sd_image
@@ -461,14 +524,6 @@ jobs:
         cd project
         source ../scripts/custome_config.sh
 
-    - name: Fix rtw88 FIELD_PREP_CONST compatibility
-      run: |
-        cd project/scripts/sd-fuse/out/rtw88 2>/dev/null || exit 0
-        grep -rl 'FIELD_PREP_CONST' . 2>/dev/null | while read -r f; do
-          echo "Patching: $f"
-          sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-        done
-
     - name: Prepare dot config and feeds
       run: |
         cd project
@@ -661,9 +716,80 @@ jobs:
 
     - name: Compile uboot and kernel
       run: |
+        set -eo pipefail
         cd project
+
+        echo "===== Compile uboot ====="
         ./build.sh uboot
+
+        echo ""
+        echo "===== Prepare kernel source ====="
+        if [ ! -f "kernel/Makefile" ]; then
+          KBRANCH=""
+          for f in device/friendlyelec/rk3568/base.mk device/friendlyelec/rk3568/*.mk; do
+            [ -f "$f" ] || continue
+            KBRANCH=$(grep -oE 'KERNEL_BRANCH[[:space:]]*[:?]?=[[:space:]]*[^[:space:]]+' "$f" 2>/dev/null \
+                      | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '"' | tr -d "'" || true)
+            [ -n "$KBRANCH" ] && break
+          done
+          [ -z "$KBRANCH" ] && KBRANCH="nanopi6-v6.1.y"
+          echo "Kernel branch: $KBRANCH"
+
+          rm -rf kernel
+          git clone --single-branch --depth 1 -b "$KBRANCH" \
+            https://github.com/friendlyarm/kernel-rockchip.git kernel
+
+          if [ ! -f "kernel/Makefile" ]; then
+            echo "ERROR: kernel clone failed"
+            exit 1
+          fi
+          echo "kernel/ ready"
+        else
+          echo "kernel/ already present"
+        fi
+
+        echo ""
+        echo "===== Patch kernel bitfield.h ====="
+        HDR="kernel/include/linux/bitfield.h"
+        if [ ! -f "$HDR" ]; then
+          echo "ERROR: $HDR not found"
+          exit 1
+        fi
+        if grep -q 'FIELD_PREP_CONST' "$HDR"; then
+          echo "Already patched: $HDR"
+        else
+          printf '\n#ifndef FIELD_PREP_CONST\n#define FIELD_PREP_CONST(_mask, _val) FIELD_PREP(_mask, _val)\n#endif\n' >> "$HDR"
+          echo "Patched: $HDR"
+        fi
+
+        echo ""
+        echo "===== Patch rtw88 sources ====="
+        if [ -d "scripts/sd-fuse/out/rtw88" ]; then
+          COUNT=0
+          for f in scripts/sd-fuse/out/rtw88/*.c; do
+            [ -f "$f" ] || continue
+            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
+              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+              echo "Patched: $f"
+              COUNT=$((COUNT+1))
+            fi
+          done
+          echo "rtw88 patched: $COUNT files"
+        else
+          echo "Note: rtw88 dir not present, header macro is sufficient"
+        fi
+
+        echo ""
+        echo "===== Single kernel build ====="
         ./build.sh kernel
+
+        echo ""
+        echo "===== Verify patch survived build ====="
+        if grep -q 'FIELD_PREP_CONST' kernel/include/linux/bitfield.h; then
+          echo "OK: patch still present after build"
+        else
+          echo "WARN: build.sh reset kernel sources, patch lost"
+        fi
 
     - name: Build sd image
       id: build_sd_image
