@@ -359,94 +359,25 @@ jobs:
         ./build.sh uboot
 
         echo ""
-        echo "===== First kernel pass (prepares rtw88 sources) ====="
-        set +e
-        ./build.sh kernel > /tmp/kernel_first.log 2>&1
-        FIRST_EXIT=$?
-        set -e
-        echo "First pass exit code: $FIRST_EXIT"
-        echo "--- tail of first pass ---"
-        tail -40 /tmp/kernel_first.log || true
-        echo "--- end ---"
-
-        echo ""
-        echo "===== Patch rtw88 sources (FIELD_PREP_CONST) ====="
+        echo "===== Disable sd-fuse rtw88 (incompatible with kernel 6.1) ====="
         RTW_DIR="scripts/sd-fuse/out/rtw88"
-        if [ ! -d "$RTW_DIR" ]; then
-          echo "ERROR: $RTW_DIR not found after first pass"
-          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30 || true
-          exit 1
-        fi
-
-        PATCHED=0
-        REMOVED=0
-        shopt -s nullglob
-        for f in "$RTW_DIR"/*.c "$RTW_DIR"/*.h; do
-          [ -f "$f" ] || continue
-          if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
-            sed -i -E '/^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST[[:space:]]/d' "$f"
-            echo "  removed fallback def: $(basename "$f")"
-            REMOVED=$((REMOVED+1))
+        if [ -d "$RTW_DIR" ]; then
+          echo "Target: $RTW_DIR"
+          if [ -f "$RTW_DIR/Makefile" ]; then
+            cp "$RTW_DIR/Makefile" "$RTW_DIR/Makefile.ci-disabled"
+            echo "  backed up Makefile -> Makefile.ci-disabled"
           fi
-          if grep -q 'FIELD_PREP_CONST' "$f"; then
-            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-            echo "  replaced calls: $(basename "$f")"
-            PATCHED=$((PATCHED+1))
+          printf 'obj-m :=\n' > "$RTW_DIR/Makefile"
+          echo "  Makefile replaced: empty obj-m"
+          if [ -f "$RTW_DIR/Kconfig" ] && grep -q 'SDIO' "$RTW_DIR/Kconfig"; then
+            echo "  NOTE: Kconfig SDIO entries left intact, only obj-m is disabled"
           fi
-        done
-        shopt -u nullglob
-        echo "Summary: removed=$REMOVED replaced=$PATCHED"
-
-        echo ""
-        echo "===== Verify no FIELD_PREP_CONST remains ====="
-        set +e
-        MATCHES=$(grep -rln 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null)
-        set -e
-        if [ -n "$MATCHES" ]; then
-          echo "ERROR: FIELD_PREP_CONST still present in:"
-          echo "$MATCHES"
-          set +e
-          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | head -20
-          set -e
-          exit 1
-        fi
-        echo "OK: no FIELD_PREP_CONST remains"
-
-        echo ""
-        echo "===== Patch kernel sdio_ids.h (Realtek SDIO IDs) ====="
-        SDIO_HDR="kernel/include/linux/mmc/sdio_ids.h"
-        if [ ! -f "$SDIO_HDR" ]; then
-          echo "ERROR: $SDIO_HDR not found"
-          exit 1
-        fi
-        if grep -q 'SDIO_VENDOR_ID_REALTEK' "$SDIO_HDR"; then
-          echo "Already present: $SDIO_HDR"
         else
-          cat >> "$SDIO_HDR" <<'SDIOEOF'
-
-/* Realtek SDIO IDs (compatibility for older kernel versions) */
-#ifndef SDIO_VENDOR_ID_REALTEK
-#define SDIO_VENDOR_ID_REALTEK              0x024c
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8723BS
-#define SDIO_DEVICE_ID_REALTEK_RTW8723BS    0xb723
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8821CS
-#define SDIO_DEVICE_ID_REALTEK_RTW8821CS    0xc821
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822CS
-#define SDIO_DEVICE_ID_REALTEK_RTW8822CS    0xc822
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822BS
-#define SDIO_DEVICE_ID_REALTEK_RTW8822BS    0xb822
-#endif
-SDIOEOF
-          echo "Patched: $SDIO_HDR"
-          tail -20 "$SDIO_HDR"
+          echo "  $RTW_DIR not present, nothing to disable"
         fi
 
         echo ""
-        echo "===== Second kernel build ====="
+        echo "===== Compile kernel ====="
         ./build.sh kernel
 
     - name: Build sd image
@@ -745,94 +676,22 @@ SDIOEOF
         ./build.sh uboot
 
         echo ""
-        echo "===== First kernel pass (prepares rtw88 sources) ====="
-        set +e
-        ./build.sh kernel > /tmp/kernel_first.log 2>&1
-        FIRST_EXIT=$?
-        set -e
-        echo "First pass exit code: $FIRST_EXIT"
-        echo "--- tail of first pass ---"
-        tail -40 /tmp/kernel_first.log || true
-        echo "--- end ---"
-
-        echo ""
-        echo "===== Patch rtw88 sources (FIELD_PREP_CONST) ====="
+        echo "===== Disable sd-fuse rtw88 (incompatible with kernel 6.1) ====="
         RTW_DIR="scripts/sd-fuse/out/rtw88"
-        if [ ! -d "$RTW_DIR" ]; then
-          echo "ERROR: $RTW_DIR not found after first pass"
-          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30 || true
-          exit 1
-        fi
-
-        PATCHED=0
-        REMOVED=0
-        shopt -s nullglob
-        for f in "$RTW_DIR"/*.c "$RTW_DIR"/*.h; do
-          [ -f "$f" ] || continue
-          if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
-            sed -i -E '/^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST[[:space:]]/d' "$f"
-            echo "  removed fallback def: $(basename "$f")"
-            REMOVED=$((REMOVED+1))
+        if [ -d "$RTW_DIR" ]; then
+          echo "Target: $RTW_DIR"
+          if [ -f "$RTW_DIR/Makefile" ]; then
+            cp "$RTW_DIR/Makefile" "$RTW_DIR/Makefile.ci-disabled"
+            echo "  backed up Makefile -> Makefile.ci-disabled"
           fi
-          if grep -q 'FIELD_PREP_CONST' "$f"; then
-            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-            echo "  replaced calls: $(basename "$f")"
-            PATCHED=$((PATCHED+1))
-          fi
-        done
-        shopt -u nullglob
-        echo "Summary: removed=$REMOVED replaced=$PATCHED"
-
-        echo ""
-        echo "===== Verify no FIELD_PREP_CONST remains ====="
-        set +e
-        MATCHES=$(grep -rln 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null)
-        set -e
-        if [ -n "$MATCHES" ]; then
-          echo "ERROR: FIELD_PREP_CONST still present in:"
-          echo "$MATCHES"
-          set +e
-          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | head -20
-          set -e
-          exit 1
-        fi
-        echo "OK: no FIELD_PREP_CONST remains"
-
-        echo ""
-        echo "===== Patch kernel sdio_ids.h (Realtek SDIO IDs) ====="
-        SDIO_HDR="kernel/include/linux/mmc/sdio_ids.h"
-        if [ ! -f "$SDIO_HDR" ]; then
-          echo "ERROR: $SDIO_HDR not found"
-          exit 1
-        fi
-        if grep -q 'SDIO_VENDOR_ID_REALTEK' "$SDIO_HDR"; then
-          echo "Already present: $SDIO_HDR"
+          printf 'obj-m :=\n' > "$RTW_DIR/Makefile"
+          echo "  Makefile replaced: empty obj-m"
         else
-          cat >> "$SDIO_HDR" <<'SDIOEOF'
-
-/* Realtek SDIO IDs (compatibility for older kernel versions) */
-#ifndef SDIO_VENDOR_ID_REALTEK
-#define SDIO_VENDOR_ID_REALTEK              0x024c
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8723BS
-#define SDIO_DEVICE_ID_REALTEK_RTW8723BS    0xb723
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8821CS
-#define SDIO_DEVICE_ID_REALTEK_RTW8821CS    0xc821
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822CS
-#define SDIO_DEVICE_ID_REALTEK_RTW8822CS    0xc822
-#endif
-#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822BS
-#define SDIO_DEVICE_ID_REALTEK_RTW8822BS    0xb822
-#endif
-SDIOEOF
-          echo "Patched: $SDIO_HDR"
-          tail -20 "$SDIO_HDR"
+          echo "  $RTW_DIR not present, nothing to disable"
         fi
 
         echo ""
-        echo "===== Second kernel build ====="
+        echo "===== Compile kernel ====="
         ./build.sh kernel
 
     - name: Build sd image
