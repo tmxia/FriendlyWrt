@@ -359,73 +359,58 @@ jobs:
         ./build.sh uboot
 
         echo ""
-        echo "===== Prepare kernel source ====="
-        if [ ! -f "kernel/Makefile" ]; then
-          KBRANCH=""
-          for f in device/friendlyelec/rk3568/base.mk device/friendlyelec/rk3568/*.mk; do
-            [ -f "$f" ] || continue
-            KBRANCH=$(grep -oE 'KERNEL_BRANCH[[:space:]]*[:?]?=[[:space:]]*[^[:space:]]+' "$f" 2>/dev/null \
-                      | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '"' | tr -d "'" || true)
-            [ -n "$KBRANCH" ] && break
-          done
-          [ -z "$KBRANCH" ] && KBRANCH="nanopi6-v6.1.y"
-          echo "Kernel branch: $KBRANCH"
-
-          rm -rf kernel
-          git clone --single-branch --depth 1 -b "$KBRANCH" \
-            https://github.com/friendlyarm/kernel-rockchip.git kernel
-
-          if [ ! -f "kernel/Makefile" ]; then
-            echo "ERROR: kernel clone failed"
-            exit 1
-          fi
-          echo "kernel/ ready"
-        else
-          echo "kernel/ already present"
-        fi
-
-        echo ""
-        echo "===== Patch kernel bitfield.h ====="
-        HDR="kernel/include/linux/bitfield.h"
-        if [ ! -f "$HDR" ]; then
-          echo "ERROR: $HDR not found"
-          exit 1
-        fi
-        if grep -q 'FIELD_PREP_CONST' "$HDR"; then
-          echo "Already patched: $HDR"
-        else
-          printf '\n#ifndef FIELD_PREP_CONST\n#define FIELD_PREP_CONST(_mask, _val) FIELD_PREP(_mask, _val)\n#endif\n' >> "$HDR"
-          echo "Patched: $HDR"
-        fi
+        echo "===== First kernel pass (prepares rtw88 sources) ====="
+        set +e
+        ./build.sh kernel > /tmp/kernel_first.log 2>&1
+        FIRST_EXIT=$?
+        set -e
+        echo "First pass exit code: $FIRST_EXIT"
+        echo "--- tail of first pass ---"
+        tail -40 /tmp/kernel_first.log || true
+        echo "--- end ---"
 
         echo ""
         echo "===== Patch rtw88 sources ====="
-        if [ -d "scripts/sd-fuse/out/rtw88" ]; then
-          COUNT=0
-          for f in scripts/sd-fuse/out/rtw88/*.c; do
-            [ -f "$f" ] || continue
-            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
-              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-              echo "Patched: $f"
-              COUNT=$((COUNT+1))
-            fi
-          done
-          echo "rtw88 patched: $COUNT files"
-        else
-          echo "Note: rtw88 dir not present, header macro is sufficient"
+        RTW_DIR="scripts/sd-fuse/out/rtw88"
+        if [ ! -d "$RTW_DIR" ]; then
+          echo "ERROR: $RTW_DIR not found after first pass"
+          echo "Dumping scripts/sd-fuse structure for diagnosis:"
+          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30
+          exit 1
+        fi
+
+        PATCHED=0
+        REMOVED=0
+        for f in "$RTW_DIR"/*.c; do
+          [ -f "$f" ] || continue
+
+          if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
+            sed -i -E '/^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST[[:space:]]/d' "$f"
+            echo "  removed fallback def: $(basename "$f")"
+            REMOVED=$((REMOVED+1))
+          fi
+
+          if grep -q 'FIELD_PREP_CONST' "$f"; then
+            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+            echo "  replaced calls: $(basename "$f")"
+            PATCHED=$((PATCHED+1))
+          fi
+        done
+
+        echo "Summary: removed=$REMOVED replaced=$PATCHED"
+
+        echo ""
+        echo "===== Verify no FIELD_PREP_CONST remains ====="
+        REMAIN=$(grep -rl 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | wc -l)
+        echo "Files still containing FIELD_PREP_CONST: $REMAIN"
+        if [ "$REMAIN" -ne 0 ]; then
+          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" | head -20
+          exit 1
         fi
 
         echo ""
-        echo "===== Single kernel build ====="
+        echo "===== Second kernel build ====="
         ./build.sh kernel
-
-        echo ""
-        echo "===== Verify patch survived build ====="
-        if grep -q 'FIELD_PREP_CONST' kernel/include/linux/bitfield.h; then
-          echo "OK: patch still present after build"
-        else
-          echo "WARN: build.sh reset kernel sources, patch lost"
-        fi
 
     - name: Build sd image
       id: build_sd_image
@@ -723,73 +708,58 @@ jobs:
         ./build.sh uboot
 
         echo ""
-        echo "===== Prepare kernel source ====="
-        if [ ! -f "kernel/Makefile" ]; then
-          KBRANCH=""
-          for f in device/friendlyelec/rk3568/base.mk device/friendlyelec/rk3568/*.mk; do
-            [ -f "$f" ] || continue
-            KBRANCH=$(grep -oE 'KERNEL_BRANCH[[:space:]]*[:?]?=[[:space:]]*[^[:space:]]+' "$f" 2>/dev/null \
-                      | head -1 | sed 's/.*=[[:space:]]*//' | tr -d '"' | tr -d "'" || true)
-            [ -n "$KBRANCH" ] && break
-          done
-          [ -z "$KBRANCH" ] && KBRANCH="nanopi6-v6.1.y"
-          echo "Kernel branch: $KBRANCH"
-
-          rm -rf kernel
-          git clone --single-branch --depth 1 -b "$KBRANCH" \
-            https://github.com/friendlyarm/kernel-rockchip.git kernel
-
-          if [ ! -f "kernel/Makefile" ]; then
-            echo "ERROR: kernel clone failed"
-            exit 1
-          fi
-          echo "kernel/ ready"
-        else
-          echo "kernel/ already present"
-        fi
-
-        echo ""
-        echo "===== Patch kernel bitfield.h ====="
-        HDR="kernel/include/linux/bitfield.h"
-        if [ ! -f "$HDR" ]; then
-          echo "ERROR: $HDR not found"
-          exit 1
-        fi
-        if grep -q 'FIELD_PREP_CONST' "$HDR"; then
-          echo "Already patched: $HDR"
-        else
-          printf '\n#ifndef FIELD_PREP_CONST\n#define FIELD_PREP_CONST(_mask, _val) FIELD_PREP(_mask, _val)\n#endif\n' >> "$HDR"
-          echo "Patched: $HDR"
-        fi
+        echo "===== First kernel pass (prepares rtw88 sources) ====="
+        set +e
+        ./build.sh kernel > /tmp/kernel_first.log 2>&1
+        FIRST_EXIT=$?
+        set -e
+        echo "First pass exit code: $FIRST_EXIT"
+        echo "--- tail of first pass ---"
+        tail -40 /tmp/kernel_first.log || true
+        echo "--- end ---"
 
         echo ""
         echo "===== Patch rtw88 sources ====="
-        if [ -d "scripts/sd-fuse/out/rtw88" ]; then
-          COUNT=0
-          for f in scripts/sd-fuse/out/rtw88/*.c; do
-            [ -f "$f" ] || continue
-            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
-              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-              echo "Patched: $f"
-              COUNT=$((COUNT+1))
-            fi
-          done
-          echo "rtw88 patched: $COUNT files"
-        else
-          echo "Note: rtw88 dir not present, header macro is sufficient"
+        RTW_DIR="scripts/sd-fuse/out/rtw88"
+        if [ ! -d "$RTW_DIR" ]; then
+          echo "ERROR: $RTW_DIR not found after first pass"
+          echo "Dumping scripts/sd-fuse structure for diagnosis:"
+          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30
+          exit 1
+        fi
+
+        PATCHED=0
+        REMOVED=0
+        for f in "$RTW_DIR"/*.c; do
+          [ -f "$f" ] || continue
+
+          if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
+            sed -i -E '/^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST[[:space:]]/d' "$f"
+            echo "  removed fallback def: $(basename "$f")"
+            REMOVED=$((REMOVED+1))
+          fi
+
+          if grep -q 'FIELD_PREP_CONST' "$f"; then
+            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+            echo "  replaced calls: $(basename "$f")"
+            PATCHED=$((PATCHED+1))
+          fi
+        done
+
+        echo "Summary: removed=$REMOVED replaced=$PATCHED"
+
+        echo ""
+        echo "===== Verify no FIELD_PREP_CONST remains ====="
+        REMAIN=$(grep -rl 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | wc -l)
+        echo "Files still containing FIELD_PREP_CONST: $REMAIN"
+        if [ "$REMAIN" -ne 0 ]; then
+          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" | head -20
+          exit 1
         fi
 
         echo ""
-        echo "===== Single kernel build ====="
+        echo "===== Second kernel build ====="
         ./build.sh kernel
-
-        echo ""
-        echo "===== Verify patch survived build ====="
-        if grep -q 'FIELD_PREP_CONST' kernel/include/linux/bitfield.h; then
-          echo "OK: patch still present after build"
-        else
-          echo "WARN: build.sh reset kernel sources, patch lost"
-        fi
 
     - name: Build sd image
       id: build_sd_image
