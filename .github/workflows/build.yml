@@ -370,11 +370,10 @@ jobs:
         echo "--- end ---"
 
         echo ""
-        echo "===== Patch rtw88 sources ====="
+        echo "===== Patch rtw88 sources (FIELD_PREP_CONST) ====="
         RTW_DIR="scripts/sd-fuse/out/rtw88"
         if [ ! -d "$RTW_DIR" ]; then
           echo "ERROR: $RTW_DIR not found after first pass"
-          echo "Dumping scripts/sd-fuse structure for diagnosis:"
           find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30 || true
           exit 1
         fi
@@ -384,13 +383,11 @@ jobs:
         shopt -s nullglob
         for f in "$RTW_DIR"/*.c "$RTW_DIR"/*.h; do
           [ -f "$f" ] || continue
-
           if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
             sed -i -E '/^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST[[:space:]]/d' "$f"
             echo "  removed fallback def: $(basename "$f")"
             REMOVED=$((REMOVED+1))
           fi
-
           if grep -q 'FIELD_PREP_CONST' "$f"; then
             sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
             echo "  replaced calls: $(basename "$f")"
@@ -398,7 +395,6 @@ jobs:
           fi
         done
         shopt -u nullglob
-
         echo "Summary: removed=$REMOVED replaced=$PATCHED"
 
         echo ""
@@ -415,6 +411,39 @@ jobs:
           exit 1
         fi
         echo "OK: no FIELD_PREP_CONST remains"
+
+        echo ""
+        echo "===== Patch kernel sdio_ids.h (Realtek SDIO IDs) ====="
+        SDIO_HDR="kernel/include/linux/mmc/sdio_ids.h"
+        if [ ! -f "$SDIO_HDR" ]; then
+          echo "ERROR: $SDIO_HDR not found"
+          exit 1
+        fi
+        if grep -q 'SDIO_VENDOR_ID_REALTEK' "$SDIO_HDR"; then
+          echo "Already present: $SDIO_HDR"
+        else
+          cat >> "$SDIO_HDR" <<'SDIOEOF'
+
+/* Realtek SDIO IDs (compatibility for older kernel versions) */
+#ifndef SDIO_VENDOR_ID_REALTEK
+#define SDIO_VENDOR_ID_REALTEK              0x024c
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8723BS
+#define SDIO_DEVICE_ID_REALTEK_RTW8723BS    0xb723
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8821CS
+#define SDIO_DEVICE_ID_REALTEK_RTW8821CS    0xc821
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822CS
+#define SDIO_DEVICE_ID_REALTEK_RTW8822CS    0xc822
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822BS
+#define SDIO_DEVICE_ID_REALTEK_RTW8822BS    0xb822
+#endif
+SDIOEOF
+          echo "Patched: $SDIO_HDR"
+          tail -20 "$SDIO_HDR"
+        fi
 
         echo ""
         echo "===== Second kernel build ====="
@@ -727,11 +756,10 @@ jobs:
         echo "--- end ---"
 
         echo ""
-        echo "===== Patch rtw88 sources ====="
+        echo "===== Patch rtw88 sources (FIELD_PREP_CONST) ====="
         RTW_DIR="scripts/sd-fuse/out/rtw88"
         if [ ! -d "$RTW_DIR" ]; then
           echo "ERROR: $RTW_DIR not found after first pass"
-          echo "Dumping scripts/sd-fuse structure for diagnosis:"
           find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30 || true
           exit 1
         fi
@@ -741,13 +769,11 @@ jobs:
         shopt -s nullglob
         for f in "$RTW_DIR"/*.c "$RTW_DIR"/*.h; do
           [ -f "$f" ] || continue
-
           if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
             sed -i -E '/^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST[[:space:]]/d' "$f"
             echo "  removed fallback def: $(basename "$f")"
             REMOVED=$((REMOVED+1))
           fi
-
           if grep -q 'FIELD_PREP_CONST' "$f"; then
             sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
             echo "  replaced calls: $(basename "$f")"
@@ -755,7 +781,6 @@ jobs:
           fi
         done
         shopt -u nullglob
-
         echo "Summary: removed=$REMOVED replaced=$PATCHED"
 
         echo ""
@@ -772,6 +797,39 @@ jobs:
           exit 1
         fi
         echo "OK: no FIELD_PREP_CONST remains"
+
+        echo ""
+        echo "===== Patch kernel sdio_ids.h (Realtek SDIO IDs) ====="
+        SDIO_HDR="kernel/include/linux/mmc/sdio_ids.h"
+        if [ ! -f "$SDIO_HDR" ]; then
+          echo "ERROR: $SDIO_HDR not found"
+          exit 1
+        fi
+        if grep -q 'SDIO_VENDOR_ID_REALTEK' "$SDIO_HDR"; then
+          echo "Already present: $SDIO_HDR"
+        else
+          cat >> "$SDIO_HDR" <<'SDIOEOF'
+
+/* Realtek SDIO IDs (compatibility for older kernel versions) */
+#ifndef SDIO_VENDOR_ID_REALTEK
+#define SDIO_VENDOR_ID_REALTEK              0x024c
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8723BS
+#define SDIO_DEVICE_ID_REALTEK_RTW8723BS    0xb723
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8821CS
+#define SDIO_DEVICE_ID_REALTEK_RTW8821CS    0xc821
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822CS
+#define SDIO_DEVICE_ID_REALTEK_RTW8822CS    0xc822
+#endif
+#ifndef SDIO_DEVICE_ID_REALTEK_RTW8822BS
+#define SDIO_DEVICE_ID_REALTEK_RTW8822BS    0xb822
+#endif
+SDIOEOF
+          echo "Patched: $SDIO_HDR"
+          tail -20 "$SDIO_HDR"
+        fi
 
         echo ""
         echo "===== Second kernel build ====="
