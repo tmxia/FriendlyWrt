@@ -359,26 +359,66 @@ jobs:
         ./build.sh uboot
 
         echo ""
-        echo "===== Disable sd-fuse rtw88 (incompatible with kernel 6.1) ====="
-        RTW_DIR="scripts/sd-fuse/out/rtw88"
-        if [ -d "$RTW_DIR" ]; then
-          echo "Target: $RTW_DIR"
-          if [ -f "$RTW_DIR/Makefile" ]; then
-            cp "$RTW_DIR/Makefile" "$RTW_DIR/Makefile.ci-disabled"
-            echo "  backed up Makefile -> Makefile.ci-disabled"
-          fi
-          printf 'obj-m :=\n' > "$RTW_DIR/Makefile"
-          echo "  Makefile replaced: empty obj-m"
-          if [ -f "$RTW_DIR/Kconfig" ] && grep -q 'SDIO' "$RTW_DIR/Kconfig"; then
-            echo "  NOTE: Kconfig SDIO entries left intact, only obj-m is disabled"
-          fi
+        echo "===== Pre-flight: patch rtw88 sources ====="
+
+        KRTW="kernel/drivers/net/wireless/realtek/rtw88"
+        KRTW_PATCHED=0
+        if [ -d "$KRTW" ]; then
+          echo "Kernel source rtw88: $KRTW"
+          for f in "$KRTW"/*.c "$KRTW"/*.h; do
+            [ -f "$f" ] || continue
+            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
+              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+              KRTW_PATCHED=$((KRTW_PATCHED+1))
+              echo "  patched: $(basename "$f")"
+            fi
+          done
+          echo "  total patched: $KRTW_PATCHED"
         else
-          echo "  $RTW_DIR not present, nothing to disable"
+          echo "  kernel rtw88 not found: $KRTW"
+        fi
+
+        SRTW="scripts/sd-fuse/out/rtw88"
+        SRTW_PATCHED=0
+        if [ -d "$SRTW" ]; then
+          echo "sd-fuse rtw88 (pre-existing): $SRTW"
+          for f in "$SRTW"/*.c "$SRTW"/*.h; do
+            [ -f "$f" ] || continue
+            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
+              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+              SRTW_PATCHED=$((SRTW_PATCHED+1))
+              echo "  patched: $(basename "$f")"
+            fi
+          done
+          if [ -f "$SRTW/Makefile" ]; then
+            cp "$SRTW/Makefile" "$SRTW/Makefile.ci-bak" 2>/dev/null || true
+            printf 'obj-m :=\n' > "$SRTW/Makefile"
+            echo "  disabled Makefile obj-m"
+          fi
+          echo "  total patched: $SRTW_PATCHED"
+        else
+          echo "  sd-fuse rtw88 not yet generated (build.sh will generate it)"
         fi
 
         echo ""
         echo "===== Compile kernel ====="
         ./build.sh kernel
+
+        echo ""
+        echo "===== Post-flight: verify rtw88 ====="
+        set +e
+        REMAIN1=""
+        [ -d "$KRTW" ] && REMAIN1=$(grep -rl 'FIELD_PREP_CONST' "$KRTW" 2>/dev/null)
+        REMAIN2=""
+        [ -d "$SRTW" ] && REMAIN2=$(grep -rl 'FIELD_PREP_CONST' "$SRTW" 2>/dev/null)
+        set -e
+        if [ -n "$REMAIN1$REMAIN2" ]; then
+          echo "WARNING: FIELD_PREP_CONST still present:"
+          [ -n "$REMAIN1" ] && echo "  kernel tree: $REMAIN1"
+          [ -n "$REMAIN2" ] && echo "  sd-fuse: $REMAIN2"
+        else
+          echo "OK: no FIELD_PREP_CONST remains in either tree"
+        fi
 
     - name: Build sd image
       id: build_sd_image
@@ -676,23 +716,66 @@ jobs:
         ./build.sh uboot
 
         echo ""
-        echo "===== Disable sd-fuse rtw88 (incompatible with kernel 6.1) ====="
-        RTW_DIR="scripts/sd-fuse/out/rtw88"
-        if [ -d "$RTW_DIR" ]; then
-          echo "Target: $RTW_DIR"
-          if [ -f "$RTW_DIR/Makefile" ]; then
-            cp "$RTW_DIR/Makefile" "$RTW_DIR/Makefile.ci-disabled"
-            echo "  backed up Makefile -> Makefile.ci-disabled"
-          fi
-          printf 'obj-m :=\n' > "$RTW_DIR/Makefile"
-          echo "  Makefile replaced: empty obj-m"
+        echo "===== Pre-flight: patch rtw88 sources ====="
+
+        KRTW="kernel/drivers/net/wireless/realtek/rtw88"
+        KRTW_PATCHED=0
+        if [ -d "$KRTW" ]; then
+          echo "Kernel source rtw88: $KRTW"
+          for f in "$KRTW"/*.c "$KRTW"/*.h; do
+            [ -f "$f" ] || continue
+            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
+              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+              KRTW_PATCHED=$((KRTW_PATCHED+1))
+              echo "  patched: $(basename "$f")"
+            fi
+          done
+          echo "  total patched: $KRTW_PATCHED"
         else
-          echo "  $RTW_DIR not present, nothing to disable"
+          echo "  kernel rtw88 not found: $KRTW"
+        fi
+
+        SRTW="scripts/sd-fuse/out/rtw88"
+        SRTW_PATCHED=0
+        if [ -d "$SRTW" ]; then
+          echo "sd-fuse rtw88 (pre-existing): $SRTW"
+          for f in "$SRTW"/*.c "$SRTW"/*.h; do
+            [ -f "$f" ] || continue
+            if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
+              sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
+              SRTW_PATCHED=$((SRTW_PATCHED+1))
+              echo "  patched: $(basename "$f")"
+            fi
+          done
+          if [ -f "$SRTW/Makefile" ]; then
+            cp "$SRTW/Makefile" "$SRTW/Makefile.ci-bak" 2>/dev/null || true
+            printf 'obj-m :=\n' > "$SRTW/Makefile"
+            echo "  disabled Makefile obj-m"
+          fi
+          echo "  total patched: $SRTW_PATCHED"
+        else
+          echo "  sd-fuse rtw88 not yet generated (build.sh will generate it)"
         fi
 
         echo ""
         echo "===== Compile kernel ====="
         ./build.sh kernel
+
+        echo ""
+        echo "===== Post-flight: verify rtw88 ====="
+        set +e
+        REMAIN1=""
+        [ -d "$KRTW" ] && REMAIN1=$(grep -rl 'FIELD_PREP_CONST' "$KRTW" 2>/dev/null)
+        REMAIN2=""
+        [ -d "$SRTW" ] && REMAIN2=$(grep -rl 'FIELD_PREP_CONST' "$SRTW" 2>/dev/null)
+        set -e
+        if [ -n "$REMAIN1$REMAIN2" ]; then
+          echo "WARNING: FIELD_PREP_CONST still present:"
+          [ -n "$REMAIN1" ] && echo "  kernel tree: $REMAIN1"
+          [ -n "$REMAIN2" ] && echo "  sd-fuse: $REMAIN2"
+        else
+          echo "OK: no FIELD_PREP_CONST remains in either tree"
+        fi
 
     - name: Build sd image
       id: build_sd_image
