@@ -375,13 +375,14 @@ jobs:
         if [ ! -d "$RTW_DIR" ]; then
           echo "ERROR: $RTW_DIR not found after first pass"
           echo "Dumping scripts/sd-fuse structure for diagnosis:"
-          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30
+          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30 || true
           exit 1
         fi
 
         PATCHED=0
         REMOVED=0
-        for f in "$RTW_DIR"/*.c; do
+        shopt -s nullglob
+        for f in "$RTW_DIR"/*.c "$RTW_DIR"/*.h; do
           [ -f "$f" ] || continue
 
           if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
@@ -396,17 +397,24 @@ jobs:
             PATCHED=$((PATCHED+1))
           fi
         done
+        shopt -u nullglob
 
         echo "Summary: removed=$REMOVED replaced=$PATCHED"
 
         echo ""
         echo "===== Verify no FIELD_PREP_CONST remains ====="
-        REMAIN=$(grep -rl 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | wc -l)
-        echo "Files still containing FIELD_PREP_CONST: $REMAIN"
-        if [ "$REMAIN" -ne 0 ]; then
-          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" | head -20
+        set +e
+        MATCHES=$(grep -rln 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null)
+        set -e
+        if [ -n "$MATCHES" ]; then
+          echo "ERROR: FIELD_PREP_CONST still present in:"
+          echo "$MATCHES"
+          set +e
+          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | head -20
+          set -e
           exit 1
         fi
+        echo "OK: no FIELD_PREP_CONST remains"
 
         echo ""
         echo "===== Second kernel build ====="
@@ -724,13 +732,14 @@ jobs:
         if [ ! -d "$RTW_DIR" ]; then
           echo "ERROR: $RTW_DIR not found after first pass"
           echo "Dumping scripts/sd-fuse structure for diagnosis:"
-          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30
+          find scripts/sd-fuse -maxdepth 3 -type d 2>/dev/null | head -30 || true
           exit 1
         fi
 
         PATCHED=0
         REMOVED=0
-        for f in "$RTW_DIR"/*.c; do
+        shopt -s nullglob
+        for f in "$RTW_DIR"/*.c "$RTW_DIR"/*.h; do
           [ -f "$f" ] || continue
 
           if grep -qE '^[[:space:]]*#define[[:space:]]+FIELD_PREP_CONST' "$f"; then
@@ -745,17 +754,24 @@ jobs:
             PATCHED=$((PATCHED+1))
           fi
         done
+        shopt -u nullglob
 
         echo "Summary: removed=$REMOVED replaced=$PATCHED"
 
         echo ""
         echo "===== Verify no FIELD_PREP_CONST remains ====="
-        REMAIN=$(grep -rl 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | wc -l)
-        echo "Files still containing FIELD_PREP_CONST: $REMAIN"
-        if [ "$REMAIN" -ne 0 ]; then
-          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" | head -20
+        set +e
+        MATCHES=$(grep -rln 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null)
+        set -e
+        if [ -n "$MATCHES" ]; then
+          echo "ERROR: FIELD_PREP_CONST still present in:"
+          echo "$MATCHES"
+          set +e
+          grep -rn 'FIELD_PREP_CONST' "$RTW_DIR" 2>/dev/null | head -20
+          set -e
           exit 1
         fi
+        echo "OK: no FIELD_PREP_CONST remains"
 
         echo ""
         echo "===== Second kernel build ====="
