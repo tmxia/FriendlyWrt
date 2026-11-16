@@ -28,6 +28,11 @@ for pkg in $ENSURE_PKGS; do
     grep -q "CONFIG_PACKAGE_${pkg}=y" "$CONFIG_FILE" || echo "CONFIG_PACKAGE_${pkg}=y" >> "$CONFIG_FILE"
 done
 
+# Disable OpenWrt SDK/IB/MakeToolchain (speed up friendlywrt build)
+sed -i -e '/CONFIG_MAKE_TOOLCHAIN=y/d' "$CONFIG_FILE"
+sed -i -e 's/CONFIG_IB=y/# CONFIG_IB is not set/g' "$CONFIG_FILE"
+sed -i -e 's/CONFIG_SDK=y/# CONFIG_SDK is not set/g' "$CONFIG_FILE"
+
 # Update and install Clashoo feed
 (cd friendlywrt && ./scripts/feeds update clashoo && ./scripts/feeds install -a -p clashoo)
 
@@ -155,5 +160,52 @@ else
 fi
 echo "=== Partition config after patch ==="
 grep -E "TARGET_(ROOTFS_PARTSIZE|USERDATA_PARTSIZE|SD_IMAGESIZE)=" "$BASE_MK"
+
+# Patch build-kernel.sh to fix rtw88 FIELD_PREP_CONST for kernel 6.1
+echo ""
+echo "=== Patching build-kernel.sh for rtw88 compatibility ==="
+python3 << 'PYEOF'
+import re, pathlib
+
+PATCH = r'''
+        # FIX_RTW88_BEGIN
+        if [ -d rtw88 ]; then
+            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' rtw88/*.c rtw88/*.h 2>/dev/null || true
+            if [ -f rtw88/rtw8723bs.c ] && ! grep -q SDIO_VENDOR_ID_REALTEK rtw88/rtw8723bs.c; then
+                {
+                    printf '#ifndef SDIO_VENDOR_ID_REALTEK\n#define SDIO_VENDOR_ID_REALTEK 0x024c\n#endif\n'
+                    printf '#ifndef SDIO_DEVICE_ID_REALTEK_RTW8723BS\n#define SDIO_DEVICE_ID_REALTEK_RTW8723BS 0xb723\n#endif\n'
+                    cat rtw88/rtw8723bs.c
+                } > rtw88/rtw8723bs.c.tmp && mv rtw88/rtw8723bs.c.tmp rtw88/rtw8723bs.c
+            fi
+        fi
+        # FIX_RTW88_END
+'''
+
+ok = False
+for f in pathlib.Path("scripts/sd-fuse").glob("build-kernel*.sh"):
+    s = f.read_text()
+    if "FIX_RTW88_END" in s:
+        print("  already patched: %s" % f)
+        ok = True
+        continue
+    m = re.search(r'^[ \t]*git clone [^\n]*rtw88[^\n]*$', s, re.MULTILINE)
+    if not m:
+        print("  no clone line in: %s" % f)
+        continue
+    end = s.find("\n", m.end()) + 1
+    f.write_text(s[:end] + PATCH + s[end:])
+    print("  patched: %s" % f)
+    ok = True
+
+if not ok:
+    raise SystemExit("ERROR: no build-kernel.sh patched")
+PYEOF
+
+if ! grep -l "FIX_RTW88_END" scripts/sd-fuse/build-kernel*.sh > /dev/null 2>&1; then
+    echo "ERROR: rtw88 patch not applied"
+    exit 1
+fi
+echo "=== rtw88 patch OK ==="
 
 echo "All configurations applied and verified."
