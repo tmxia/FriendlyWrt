@@ -352,51 +352,9 @@ jobs:
 
     - name: Compile uboot and kernel
       run: |
-        set -eo pipefail
         cd project
-
-        echo "===== Compile uboot ====="
         ./build.sh uboot
-
-        echo ""
-        echo "===== Pre-clone & patch lwfinger/rtw88 ====="
-        RTW88_DIR="scripts/sd-fuse/out/rtw88"
-        if [ ! -d "$RTW88_DIR/.git" ]; then
-          mkdir -p "$(dirname "$RTW88_DIR")"
-          rm -rf "$RTW88_DIR"
-          git clone --depth 1 https://github.com/lwfinger/rtw88 "$RTW88_DIR"
-        fi
-        if [ ! -d "$RTW88_DIR" ]; then
-          echo "ERROR: rtw88 dir missing after clone"
-          exit 1
-        fi
-        PATCHED=0
-        for f in "$RTW88_DIR"/*.c "$RTW88_DIR"/*.h; do
-          [ -f "$f" ] || continue
-          if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
-            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-            PATCHED=$((PATCHED+1))
-          fi
-        done
-        echo "  FIELD_PREP_CONST patched: $PATCHED files"
-        BS_C="$RTW88_DIR/rtw8723bs.c"
-        if [ -f "$BS_C" ] && ! grep -q 'SDIO_VENDOR_ID_REALTEK' "$BS_C"; then
-          sed -i '1i #ifndef SDIO_VENDOR_ID_REALTEK\n#define SDIO_VENDOR_ID_REALTEK 0x024c\n#endif\n#ifndef SDIO_DEVICE_ID_REALTEK_RTW8723BS\n#define SDIO_DEVICE_ID_REALTEK_RTW8723BS 0xb723\n#endif' "$BS_C"
-          echo "  SDIO IDs injected: rtw8723bs.c"
-        fi
-        echo "  rtw88 ready: $RTW88_DIR"
-
-        echo ""
-        echo "===== Compile kernel ====="
         ./build.sh kernel
-
-        echo ""
-        echo "===== Verify rtw88 ====="
-        KO_COUNT=$(find "$RTW88_DIR" -maxdepth 1 -name "*.ko" 2>/dev/null | wc -l)
-        echo "  rtw88 .ko files built: $KO_COUNT"
-        if [ "$KO_COUNT" -eq 0 ]; then
-          echo "  WARN: no .ko generated"
-        fi
 
     - name: Build sd image
       id: build_sd_image
@@ -687,51 +645,9 @@ jobs:
 
     - name: Compile uboot and kernel
       run: |
-        set -eo pipefail
         cd project
-
-        echo "===== Compile uboot ====="
         ./build.sh uboot
-
-        echo ""
-        echo "===== Pre-clone & patch lwfinger/rtw88 ====="
-        RTW88_DIR="scripts/sd-fuse/out/rtw88"
-        if [ ! -d "$RTW88_DIR/.git" ]; then
-          mkdir -p "$(dirname "$RTW88_DIR")"
-          rm -rf "$RTW88_DIR"
-          git clone --depth 1 https://github.com/lwfinger/rtw88 "$RTW88_DIR"
-        fi
-        if [ ! -d "$RTW88_DIR" ]; then
-          echo "ERROR: rtw88 dir missing after clone"
-          exit 1
-        fi
-        PATCHED=0
-        for f in "$RTW88_DIR"/*.c "$RTW88_DIR"/*.h; do
-          [ -f "$f" ] || continue
-          if grep -q 'FIELD_PREP_CONST' "$f" 2>/dev/null; then
-            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' "$f"
-            PATCHED=$((PATCHED+1))
-          fi
-        done
-        echo "  FIELD_PREP_CONST patched: $PATCHED files"
-        BS_C="$RTW88_DIR/rtw8723bs.c"
-        if [ -f "$BS_C" ] && ! grep -q 'SDIO_VENDOR_ID_REALTEK' "$BS_C"; then
-          sed -i '1i #ifndef SDIO_VENDOR_ID_REALTEK\n#define SDIO_VENDOR_ID_REALTEK 0x024c\n#endif\n#ifndef SDIO_DEVICE_ID_REALTEK_RTW8723BS\n#define SDIO_DEVICE_ID_REALTEK_RTW8723BS 0xb723\n#endif' "$BS_C"
-          echo "  SDIO IDs injected: rtw8723bs.c"
-        fi
-        echo "  rtw88 ready: $RTW88_DIR"
-
-        echo ""
-        echo "===== Compile kernel ====="
         ./build.sh kernel
-
-        echo ""
-        echo "===== Verify rtw88 ====="
-        KO_COUNT=$(find "$RTW88_DIR" -maxdepth 1 -name "*.ko" 2>/dev/null | wc -l)
-        echo "  rtw88 .ko files built: $KO_COUNT"
-        if [ "$KO_COUNT" -eq 0 ]; then
-          echo "  WARN: no .ko generated"
-        fi
 
     - name: Build sd image
       id: build_sd_image
