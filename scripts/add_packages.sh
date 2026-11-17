@@ -156,4 +156,81 @@ fi
 echo "=== Partition config after patch ==="
 grep -E "TARGET_(ROOTFS_PARTSIZE|USERDATA_PARTSIZE|SD_IMAGESIZE)=" "$BASE_MK"
 
+# ============================================
+# Kernel header backport: FIELD_PREP_CONST()
+# ============================================
+# ./build.sh kernel compiles the out-of-tree rtw88 driver
+# (sources under scripts/sd-fuse/out/rtw88) against kernel/.
+# That driver calls FIELD_PREP_CONST(), which only exists since Linux v6.11,
+# while the Rockchip kernel used here is 6.1, so the build aborts with:
+#   rtw8723b.c: error: implicit declaration of function 'FIELD_PREP_CONST'
+#   cc1: all warnings being treated as errors
+# The macro belongs to the kernel headers, so backport it there: any module
+# built against kernel/ then gets it, no matter where its sources come from.
+# The patch is idempotent (guarded by #ifndef FIELD_PREP_CONST).
+KERNEL_DIR="kernel"
+KERNEL_INCLUDE="$KERNEL_DIR/include/linux"
+
+sync_kernel_source() {
+    [ -d "$KERNEL_INCLUDE" ] && return 0
+    [ -d .repo ] || return 1
+    command -v repo >/dev/null 2>&1 || return 1
+
+    # kernel is not part of the workflow's "Download source" step, resolve the
+    # project name from the manifest (falls back to the path used by repo sync)
+    local proj="kernel" name=""
+    if [ -f .repo/manifests/rk3568.xml ]; then
+        name=$(grep -E '<project[^>]*path="kernel"' .repo/manifests/rk3568.xml \
+               | head -n 1 | sed -n 's/.*name="\([^"]*\)".*/\1/p')
+        [ -n "$name" ] && proj="$name"
+    fi
+
+    echo "kernel/ missing, syncing repo project '$proj' ..."
+    repo sync -c "$proj" --no-clone-bundle || true
+    [ -d "$KERNEL_INCLUDE" ]
+}
+
+backport_field_prep_const() {
+    local hdr
+    for hdr in "$KERNEL_INCLUDE/bits.h" "$KERNEL_INCLUDE/bitfield.h"; do
+        [ -f "$hdr" ] || continue
+        if grep -q 'define FIELD_PREP_CONST' "$hdr"; then
+            echo "$hdr already provides FIELD_PREP_CONST"
+            continue
+        fi
+        cat >> "$hdr" << 'COMPAT_EOF'
+
+/*
+ * Backport of FIELD_PREP_CONST() from Linux v6.11, added by the FriendlyWrt
+ * build script so that out-of-tree drivers written for newer kernels can be
+ * built against this one. Kept guarded so it stays a no-op once the kernel
+ * provides the macro itself.
+ */
+#ifndef _LINUX_FIELD_PREP_CONST_COMPAT
+#define _LINUX_FIELD_PREP_CONST_COMPAT
+#ifndef FIELD_PREP_CONST
+#define FIELD_PREP_CONST(_mask, _val)					\
+	((typeof(_mask))(((typeof(_mask))(_val) <<			\
+			   (__builtin_ffsll(_mask) - 1)) & (_mask)))
+#endif
+#endif
+COMPAT_EOF
+        echo "Backported FIELD_PREP_CONST into $hdr"
+    done
+}
+
+if sync_kernel_source; then
+    if grep -qs 'define FIELD_PREP_CONST' "$KERNEL_INCLUDE/bits.h" \
+       || grep -qs 'define FIELD_PREP_CONST' "$KERNEL_INCLUDE/bitfield.h"; then
+        echo "FIELD_PREP_CONST already available in kernel headers, skipping backport"
+    else
+        backport_field_prep_const
+    fi
+    if grep -qs 'define FIELD_PREP_CONST' "$KERNEL_INCLUDE/bits.h"; then
+        echo "=== FIELD_PREP_CONST backport verified (kernel/include/linux/bits.h) ==="
+    fi
+else
+    echo "WARNING: kernel/ sources unavailable, FIELD_PREP_CONST backport skipped" >&2
+fi
+
 echo "All configurations applied and verified."
