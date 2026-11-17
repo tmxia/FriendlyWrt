@@ -170,7 +170,18 @@ import re, pathlib
 PATCH = r'''
         # FIX_RTW88_BEGIN
         if [ -d rtw88 ]; then
-            sed -i 's/FIELD_PREP_CONST/FIELD_PREP/g' rtw88/*.c rtw88/*.h 2>/dev/null || true
+            # Only rewrite *usages* of FIELD_PREP_CONST. Preprocessor lines are
+            # skipped on purpose: the driver already ships a version-guarded
+            # compat shim ("#define FIELD_PREP_CONST FIELD_PREP"). Rewriting
+            # that line turned it into "#define FIELD_PREP FIELD_PREP", which
+            # collides with include/linux/bitfield.h:112 and aborts the build
+            # with: error: "FIELD_PREP" redefined.
+            find rtw88 -type f \( -name '*.c' -o -name '*.h' \) -print0 |
+                xargs -0 -r sed -i '/^[[:space:]]*#/!s/FIELD_PREP_CONST/FIELD_PREP/g' || true
+            if grep -rq '^[[:space:]]*#[[:space:]]*define[[:space:]]*FIELD_PREP[[:space:]]*FIELD_PREP' rtw88; then
+                echo "ERROR: rtw88 FIELD_PREP compat shim corrupted by patch"
+                exit 1
+            fi
             if [ -f rtw88/rtw8723bs.c ] && ! grep -q SDIO_VENDOR_ID_REALTEK rtw88/rtw8723bs.c; then
                 {
                     printf '#ifndef SDIO_VENDOR_ID_REALTEK\n#define SDIO_VENDOR_ID_REALTEK 0x024c\n#endif\n'
