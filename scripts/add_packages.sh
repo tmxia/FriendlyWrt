@@ -171,9 +171,9 @@ grep -E "TARGET_(ROOTFS_PARTSIZE|USERDATA_PARTSIZE|SD_IMAGESIZE)=" "$BASE_MK"
 #
 # Because of that fallback the backport must be that very same token sequence:
 # C allows a macro to be redefined when the replacement list is identical
-# (6.10.3p2), which keeps both kinds of files warning-free under -Werror.
-# A functional definition (e.g. re-implementing FIELD_PREP_CONST()) fixes
-# rtw8723b.c but fails rtw8703b.c with '"FIELD_PREP_CONST" redefined'.
+# (C11 6.10.3p2), which keeps both kinds of files warning-free under -Werror.
+# A functional definition (re-implementing FIELD_PREP_CONST()) fixes
+# rtw8723b.c but breaks rtw8703b.c with '"FIELD_PREP_CONST" redefined'.
 #
 # Doing it in the kernel headers (instead of patching the driver sources)
 # keeps it independent of where those sources come from and of when they are
@@ -200,6 +200,16 @@ sync_kernel_source() {
     [ -d "$KERNEL_INCLUDE" ]
 }
 
+kernel_version() {
+    local maj min
+    maj=$(sed -n 's/^VERSION *= *//p' "$KERNEL_DIR/Makefile" 2>/dev/null | head -n 1)
+    min=$(sed -n 's/^PATCHLEVEL *= *//p' "$KERNEL_DIR/Makefile" 2>/dev/null | head -n 1)
+    case "$maj" in ''|*[!0-9]*) maj=6 ;; esac
+    case "$min" in ''|*[!0-9]*) min=1 ;; esac
+    KVER_MAJOR="$maj"
+    KVER_MINOR="$min"
+}
+
 backport_field_prep_const() {
     local hdrs=() hdr ok=0
     for hdr in "$KERNEL_INCLUDE/bits.h" "$KERNEL_INCLUDE/bitfield.h"; do
@@ -209,8 +219,12 @@ backport_field_prep_const() {
     done
     [ ${#hdrs[@]} -gt 0 ] || return 1
 
-    python3 - "${hdrs[@]}" << 'PYEOF'
+    kernel_version
+    echo "Patching FIELD_PREP_CONST for kernel ${KVER_MAJOR}.${KVER_MINOR} ..."
+
+    KVER_MAJOR="$KVER_MAJOR" KVER_MINOR="$KVER_MINOR" python3 - "${hdrs[@]}" << 'PYEOF'
 import io
+import os
 import re
 import sys
 
@@ -243,60 +257,58 @@ BLOCK = "\n".join([
     "",
 ])
 
-DEFINE_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+FIELD_PREP_CONST\b", re.M)
+MARKED_RE = re.compile(re.escape(BEGIN) + r".*?" + re.escape(END) + r"[ \t]*\n?", re.S)
+DEFINE_START = re.compile(r"^[ \t]*#[ \t]*define[ \t]+FIELD_PREP_CONST\b")
+
+major = int(os.environ.get("KVER_MAJOR") or 6)
+minor = int(os.environ.get("KVER_MINOR") or 1)
+native = (major, minor) >= (6, 11)
 
 
-def strip_own_blocks(text):
-    """Remove blocks written by an earlier version of this script."""
-    text = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END) + r"[ \t]*\n?",
-                  "", text, flags=re.S)
-
+def remove_defines(text):
+    """Drop every '#define FIELD_PREP_CONST ...' statement incl. continuations."""
     lines = text.split("\n")
     out = []
     i = 0
     while i < len(lines):
-        line = lines[i]
-        # legacy variant: #ifndef _LINUX_FIELD_PREP_CONST_COMPAT ... #endif #endif
-        if "_LINUX_FIELD_PREP_CONST_COMPAT" in line and line.lstrip().startswith("#ifndef"):
-            while out and (out[-1].strip().startswith(("/*", "*", "*/")) or not out[-1].strip()):
-                out.pop()
-            endifs = 0
-            i += 1
+        if DEFINE_START.match(lines[i]):
             while i < len(lines):
-                stripped = lines[i].strip()
+                continuation = lines[i].rstrip().endswith("\\")
                 i += 1
-                if stripped == "#endif":
-                    endifs += 1
-                    if endifs == 2:
-                        break
+                if not continuation:
+                    break
             continue
-        out.append(line)
+        out.append(lines[i])
         i += 1
     return "\n".join(out)
+
+
+def write(path, text):
+    if not text.endswith("\n"):
+        text += "\n"
+    with io.open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(text)
 
 
 for path in sys.argv[1:]:
     with io.open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
         original = f.read()
 
-    text = strip_own_blocks(original)
+    text = MARKED_RE.sub("", original)
 
-    if DEFINE_RE.search(text):
-        # kernel already provides FIELD_PREP_CONST (>= 6.11): only make sure our
-        # own stale block is gone, otherwise leave the header untouched
+    if native:
+        # nothing to backport, only make sure no stale copy of our own block stays
         if text != original:
-            if not text.endswith("\n"):
-                text += "\n"
-            with io.open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-                f.write(text)
+            write(path, text)
             print("Removed stale FIELD_PREP_CONST backport from %s" % path)
         else:
             print("%s already provides FIELD_PREP_CONST, left untouched" % path)
         continue
 
-    text = text.rstrip("\n") + "\n\n" + BLOCK
-    with io.open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-        f.write(text)
+    # kernel < 6.11: whatever FIELD_PREP_CONST definition exists here was added
+    # by an earlier run of this script (upstream had none), replace it
+    text = remove_defines(text).rstrip("\n")
+    write(path, text + "\n\n" + BLOCK)
     print("Backported FIELD_PREP_CONST (= FIELD_PREP) into %s" % path)
 PYEOF
 
