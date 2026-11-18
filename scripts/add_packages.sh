@@ -327,8 +327,10 @@ if sync_kernel_source; then
     else
         echo "WARNING: could not backport FIELD_PREP_CONST into kernel headers" >&2
     fi
+    bash scripts/kernel_rtw88_sdio_ids.sh "$KERNEL_INCLUDE" \
+        || echo "WARNING: rtw88 SDIO id backport skipped" >&2
 else
-    echo "WARNING: kernel/ sources unavailable, FIELD_PREP_CONST backport skipped" >&2
+    echo "WARNING: kernel/ sources unavailable, kernel header backports skipped" >&2
 fi
 
 echo "All configurations applied and verified."
