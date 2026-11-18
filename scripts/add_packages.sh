@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# This workflow checks out FriendlyWrt and then runs this script from project/,
+# i.e. "cd project && bash ../scripts/add_packages.sh".  A bare "scripts/..."
+# path therefore does NOT point at this repository: project/scripts is a
+# separate manifest project, so helpers kept next to this file must be resolved
+# relative to this file itself.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Ensure feeds.conf exists
 (cd friendlywrt && { [ ! -f feeds.conf ] && cp feeds.conf.default feeds.conf; })
 
@@ -33,7 +40,8 @@ done
 
 # Enable kernel INET_DIAG dependencies for Clashoo
 cd friendlywrt
-KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
+KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | 
+awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
 KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
 touch "$KERNEL_CONFIG_FILE"
@@ -327,8 +335,18 @@ if sync_kernel_source; then
     else
         echo "WARNING: could not backport FIELD_PREP_CONST into kernel headers" >&2
     fi
-    bash scripts/kernel_rtw88_sdio_ids.sh "$KERNEL_INCLUDE" \
-        || echo "WARNING: rtw88 SDIO id backport skipped" >&2
+    # rtw88 SDIO ids (SDIO_VENDOR_ID_REALTEK / SDIO_DEVICE_ID_REALTEK_RTW8723BS)
+    # live in scripts/kernel_rtw88_sdio_ids.sh of THIS repository, hence the
+    # SCRIPT_DIR prefix; a bare "scripts/..." would hit project/scripts instead
+    # and, because of the "||", be skipped without any trace.
+    SDIO_HELPER="$SCRIPT_DIR/kernel_rtw88_sdio_ids.sh"
+    if [ ! -f "$SDIO_HELPER" ]; then
+        echo "WARNING: $SDIO_HELPER is missing, rtw88 SDIO ids not backported" >&2
+    elif bash "$SDIO_HELPER" "$(pwd)/$KERNEL_INCLUDE"; then
+        echo "rtw88 SDIO ids compatibility ensured."
+    else
+        echo "WARNING: rtw88 SDIO id backport failed, rtw8723bs.c will not build" >&2
+    fi
 else
     echo "WARNING: kernel/ sources unavailable, kernel header backports skipped" >&2
 fi
