@@ -159,15 +159,25 @@ grep -E "TARGET_(ROOTFS_PARTSIZE|USERDATA_PARTSIZE|SD_IMAGESIZE)=" "$BASE_MK"
 # ============================================
 # Kernel header backport: FIELD_PREP_CONST()
 # ============================================
-# ./build.sh kernel compiles the out-of-tree rtw88 driver
-# (sources under scripts/sd-fuse/out/rtw88) against kernel/.
-# That driver calls FIELD_PREP_CONST(), which only exists since Linux v6.11,
-# while the Rockchip kernel used here is 6.1, so the build aborts with:
+# ./build.sh kernel builds the out-of-tree rtw88 driver (sources under
+# scripts/sd-fuse/out/rtw88) against kernel/.  Those sources are written for
+# Linux >= 6.11 and use FIELD_PREP_CONST(), which is missing from the 6.1
+# Rockchip kernel, so the build stops at the first user with:
 #   rtw8723b.c: error: implicit declaration of function 'FIELD_PREP_CONST'
-#   cc1: all warnings being treated as errors
-# The macro belongs to the kernel headers, so backport it there: any module
-# built against kernel/ then gets it, no matter where its sources come from.
-# The patch is idempotent (guarded by #ifndef FIELD_PREP_CONST).
+#
+# The driver is inconsistent about it: some files call the macro expecting the
+# kernel to provide it (rtw8723b.c), others bring their own fallback
+#   #define FIELD_PREP_CONST FIELD_PREP            (rtw8703b.c:618)
+#
+# Because of that fallback the backport must be that very same token sequence:
+# C allows a macro to be redefined when the replacement list is identical
+# (6.10.3p2), which keeps both kinds of files warning-free under -Werror.
+# A functional definition (e.g. re-implementing FIELD_PREP_CONST()) fixes
+# rtw8723b.c but fails rtw8703b.c with '"FIELD_PREP_CONST" redefined'.
+#
+# Doing it in the kernel headers (instead of patching the driver sources)
+# keeps it independent of where those sources come from and of when they are
+# unpacked, since every module built against kernel/ inherits it.
 KERNEL_DIR="kernel"
 KERNEL_INCLUDE="$KERNEL_DIR/include/linux"
 
@@ -191,43 +201,119 @@ sync_kernel_source() {
 }
 
 backport_field_prep_const() {
-    local hdr
+    local hdrs=() hdr ok=0
     for hdr in "$KERNEL_INCLUDE/bits.h" "$KERNEL_INCLUDE/bitfield.h"; do
-        [ -f "$hdr" ] || continue
-        if grep -q 'define FIELD_PREP_CONST' "$hdr"; then
-            echo "$hdr already provides FIELD_PREP_CONST"
-            continue
+        if [ -f "$hdr" ]; then
+            hdrs+=("$hdr")
         fi
-        cat >> "$hdr" << 'COMPAT_EOF'
-
-/*
- * Backport of FIELD_PREP_CONST() from Linux v6.11, added by the FriendlyWrt
- * build script so that out-of-tree drivers written for newer kernels can be
- * built against this one. Kept guarded so it stays a no-op once the kernel
- * provides the macro itself.
- */
-#ifndef _LINUX_FIELD_PREP_CONST_COMPAT
-#define _LINUX_FIELD_PREP_CONST_COMPAT
-#ifndef FIELD_PREP_CONST
-#define FIELD_PREP_CONST(_mask, _val)					\
-	((typeof(_mask))(((typeof(_mask))(_val) <<			\
-			   (__builtin_ffsll(_mask) - 1)) & (_mask)))
-#endif
-#endif
-COMPAT_EOF
-        echo "Backported FIELD_PREP_CONST into $hdr"
     done
+    [ ${#hdrs[@]} -gt 0 ] || return 1
+
+    python3 - "${hdrs[@]}" << 'PYEOF'
+import io
+import re
+import sys
+
+BEGIN = "/* FriendlyWrt: FIELD_PREP_CONST backport -- begin */"
+END = "/* FriendlyWrt: FIELD_PREP_CONST backport -- end */"
+
+BLOCK = "\n".join([
+    BEGIN,
+    "/*",
+    " * This kernel predates Linux v6.11, which introduced FIELD_PREP_CONST().",
+    " * Out-of-tree drivers written against newer kernels (the rtw88 sources",
+    " * under scripts/sd-fuse/out/rtw88) call it, so without this they abort",
+    " * with \"implicit declaration of function 'FIELD_PREP_CONST'\" under",
+    " * -Werror.  Defining it here covers every module built against kernel/,",
+    " * no matter where that module's sources come from or when they appear.",
+    " *",
+    " * Deliberately a plain alias of FIELD_PREP and nothing more: those very",
+    " * drivers carry their own fallback in their sources",
+    " *",
+    " *     #define FIELD_PREP_CONST FIELD_PREP",
+    " *",
+    " * and C only allows a macro to be redefined when the replacement list is",
+    " * token-for-token identical.  A functional definition here would instead",
+    " * be rejected as \"macro redefined\" (-Werror), e.g. in rtw8703b.c.",
+    " */",
+    "#ifndef FIELD_PREP_CONST",
+    "#define FIELD_PREP_CONST FIELD_PREP",
+    "#endif",
+    END,
+    "",
+])
+
+DEFINE_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+FIELD_PREP_CONST\b", re.M)
+
+
+def strip_own_blocks(text):
+    """Remove blocks written by an earlier version of this script."""
+    text = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END) + r"[ \t]*\n?",
+                  "", text, flags=re.S)
+
+    lines = text.split("\n")
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        # legacy variant: #ifndef _LINUX_FIELD_PREP_CONST_COMPAT ... #endif #endif
+        if "_LINUX_FIELD_PREP_CONST_COMPAT" in line and line.lstrip().startswith("#ifndef"):
+            while out and (out[-1].strip().startswith(("/*", "*", "*/")) or not out[-1].strip()):
+                out.pop()
+            endifs = 0
+            i += 1
+            while i < len(lines):
+                stripped = lines[i].strip()
+                i += 1
+                if stripped == "#endif":
+                    endifs += 1
+                    if endifs == 2:
+                        break
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+for path in sys.argv[1:]:
+    with io.open(path, "r", encoding="utf-8", errors="surrogateescape") as f:
+        original = f.read()
+
+    text = strip_own_blocks(original)
+
+    if DEFINE_RE.search(text):
+        # kernel already provides FIELD_PREP_CONST (>= 6.11): only make sure our
+        # own stale block is gone, otherwise leave the header untouched
+        if text != original:
+            if not text.endswith("\n"):
+                text += "\n"
+            with io.open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.write(text)
+            print("Removed stale FIELD_PREP_CONST backport from %s" % path)
+        else:
+            print("%s already provides FIELD_PREP_CONST, left untouched" % path)
+        continue
+
+    text = text.rstrip("\n") + "\n\n" + BLOCK
+    with io.open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(text)
+    print("Backported FIELD_PREP_CONST (= FIELD_PREP) into %s" % path)
+PYEOF
+
+    for hdr in "${hdrs[@]}"; do
+        if grep -q '^#define FIELD_PREP_CONST FIELD_PREP$' "$hdr"; then
+            echo "=== FIELD_PREP_CONST backport verified ($hdr) ==="
+            ok=1
+        fi
+    done
+    [ "$ok" -eq 1 ]
 }
 
 if sync_kernel_source; then
-    if grep -qs 'define FIELD_PREP_CONST' "$KERNEL_INCLUDE/bits.h" \
-       || grep -qs 'define FIELD_PREP_CONST' "$KERNEL_INCLUDE/bitfield.h"; then
-        echo "FIELD_PREP_CONST already available in kernel headers, skipping backport"
+    if backport_field_prep_const; then
+        echo "rtw88 FIELD_PREP_CONST compatibility ensured."
     else
-        backport_field_prep_const
-    fi
-    if grep -qs 'define FIELD_PREP_CONST' "$KERNEL_INCLUDE/bits.h"; then
-        echo "=== FIELD_PREP_CONST backport verified (kernel/include/linux/bits.h) ==="
+        echo "WARNING: could not backport FIELD_PREP_CONST into kernel headers" >&2
     fi
 else
     echo "WARNING: kernel/ sources unavailable, FIELD_PREP_CONST backport skipped" >&2
