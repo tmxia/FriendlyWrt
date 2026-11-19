@@ -40,8 +40,7 @@ done
 
 # Enable kernel INET_DIAG dependencies for Clashoo
 cd friendlywrt
-KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | 
-awk '{print $3}')
+KERNEL_VERSION=$(grep '^KERNEL_PATCHVER' target/linux/rockchip/Makefile | awk '{print $3}')
 [ -z "$KERNEL_VERSION" ] && KERNEL_VERSION="6.1"
 KERNEL_CONFIG_FILE="target/linux/rockchip/config-${KERNEL_VERSION}"
 touch "$KERNEL_CONFIG_FILE"
