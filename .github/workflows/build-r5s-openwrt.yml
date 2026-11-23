@@ -534,6 +534,13 @@ jobs:
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
+          echo "===== Force rebuild R5S DTB ====="
+          find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
+               -name "rk3568-nanopi-r5s*.dtb" -delete 2>/dev/null || true
+          find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
+               -name "rk3568-nanopi-r5s*.dts" -exec touch {} \; 2>/dev/null || true
+          echo "  done"
+
           set +e
 
           echo "===== pre-compile perl ====="
@@ -582,6 +589,18 @@ jobs:
           echo ""
           echo "=== ccache stats ==="
           CCACHE_DIR=/workdir/ccache ccache -s 2>/dev/null || true
+
+          echo ""
+          echo "===== Verify DTB contains pwm-fan ====="
+          DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
+                     -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
+          if [ -z "$DTB" ]; then
+            echo "::warning::rk3568-nanopi-r5s.dtb not found"
+          elif strings "$DTB" | grep -q "pwm-fan"; then
+            echo "  OK: DTB contains pwm-fan"
+          else
+            echo "::warning::DTB missing pwm-fan node: $DTB"
+          fi
 
       - name: Save target cache
         if: success() && !cancelled() && steps.restore_target.outputs.hit != 'true'
@@ -826,6 +845,15 @@ jobs:
 
           MANIFEST=$(find "$OUT" -maxdepth 1 -name "*nanopi-r5s.manifest" -type f | head -1)
           [ -n "$MANIFEST" ] || { echo "manifest missing"; exit 1; }
+
+          echo ""
+          echo "===== Verify pwm-fan in manifest ====="
+          if grep -q "^kmod-hwmon-pwmfan " "$MANIFEST"; then
+            echo "  OK: kmod-hwmon-pwmfan in manifest"
+          else
+            echo "::warning::kmod-hwmon-pwmfan missing in manifest"
+            grep -i "pwm" "$MANIFEST" || true
+          fi
 
           mkdir -p $GITHUB_WORKSPACE/artifact
           cp "$IMG_EXT4_GZ" "$GITHUB_WORKSPACE/artifact/${ARTIFACT_PREFIX}-sdcard.img.gz"
