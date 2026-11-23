@@ -535,6 +535,30 @@ jobs:
           cd /workdir/openwrt
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
+          echo "===== Force rebuild R5S DTB ====="
+          find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
+               -name "rk3568-nanopi-r5s*.dtb" -delete 2>/dev/null || true
+          find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
+               -name "rk3568-nanopi-r5s*.dts" -exec touch {} \; 2>/dev/null || true
+          echo "  done"
+
+          echo "===== Check kmod-hwmon-pwmfan ====="
+          if grep -qE "^CONFIG_PACKAGE_kmod-hwmon-pwmfan=[ym]" .config; then
+            echo "  OK: kmod-hwmon-pwmfan enabled in .config"
+            grep -E "^CONFIG_PACKAGE_kmod-hwmon-pwmfan=" .config
+          else
+            echo "  WARN: kmod-hwmon-pwmfan missing, force enabling"
+            echo "CONFIG_PACKAGE_kmod-hwmon-pwmfan=y" >> .config
+          fi
+
+          echo "===== Check SENSORS_PWM_FAN kernel config ====="
+          for kc in target/linux/rockchip/config-6.12 target/linux/rockchip/config-6.1; do
+            if [ -f "$kc" ]; then
+              echo "  --- $kc ---"
+              grep -E "SENSORS_PWM_FAN|^CONFIG_PWM" "$kc" || true
+            fi
+          done
+
           set +e
 
           echo "===== make target/linux/compile ====="
@@ -592,6 +616,48 @@ jobs:
           make package/kernel/linux/install -j1 > /tmp/kmod_install.log 2>&1 || true
 
           set -e
+
+          echo ""
+          echo "===== Verify DTB contains pwm-fan ====="
+          DTB=$(find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
+                     -name "rk3568-nanopi-r5s.dtb" 2>/dev/null | head -1)
+          if [ -z "$DTB" ]; then
+            echo "ERROR: rk3568-nanopi-r5s.dtb not generated"
+            exit 1
+          fi
+          echo "  DTB: $DTB"
+          if ! strings "$DTB" | grep -q "pwm-fan"; then
+            echo "ERROR: DTB missing pwm-fan node"
+            exit 1
+          fi
+          echo "  OK: DTB contains pwm-fan"
+
+          echo ""
+          echo "===== Verify pwm-fan.ko in staging ====="
+          KERNEL_RELEASE=$(cat build_dir/target-*/linux-*/linux-*/include/config/kernel.release 2>/dev/null | head -1)
+          if [ -z "$KERNEL_RELEASE" ]; then
+            echo "ERROR: kernel release not detected"
+            exit 1
+          fi
+          echo "  KERNEL_RELEASE: $KERNEL_RELEASE"
+
+          MODDIR=$(find staging_dir/target-*/root-*/lib/modules \
+                        -maxdepth 1 -mindepth 1 -type d -name "$KERNEL_RELEASE" 2>/dev/null | head -1)
+          if [ -z "$MODDIR" ]; then
+            echo "ERROR: staging modules dir for $KERNEL_RELEASE not found"
+            exit 1
+          fi
+          echo "  MODDIR: $MODDIR"
+
+          if ! find "$MODDIR" -name "pwm-fan.ko" 2>/dev/null | grep -q .; then
+            echo "ERROR: pwm-fan.ko missing in staging modules"
+            echo "  --- existing pwm-related .ko ---"
+            find "$MODDIR" -name "*pwm*" 2>/dev/null | head -10
+            echo "  --- searching build_dir ---"
+            find build_dir/target-*/linux-*/linux-*/ -name "pwm-fan.ko" 2>/dev/null | head -5
+            exit 1
+          fi
+          echo "  OK: pwm-fan.ko present"
 
           echo ""
           echo "=== ccache stats ==="
@@ -685,6 +751,14 @@ jobs:
           echo "DTB_FILE=$DTB_FILE_ABS"
           ls -lh "$KERNEL_IMAGE_ABS" "$DTB_FILE_ABS"
 
+          echo ""
+          echo "===== Verify DTB contains pwm-fan ====="
+          if ! strings "$DTB_FILE_ABS" | grep -q "pwm-fan"; then
+            echo "ERROR: DTB missing pwm-fan node: $DTB_FILE_ABS"
+            exit 1
+          fi
+          echo "  OK: DTB contains pwm-fan"
+
           MKIMAGE=""
           for cand in \
             "$PWD/staging_dir/host/bin/mkimage" \
@@ -774,11 +848,18 @@ jobs:
           file kernel.img
 
           echo ""
-          echo "=== 关键校验 ==="
+          echo "=== FIT 关键校验 ==="
           if strings kernel.img | grep -q 'hash-2' && strings kernel.img | grep -q 'sha1'; then
             echo "OK: hash-2 / sha1 均存在"
           else
             echo "FAIL: 缺少 hash-2 或 sha1"
+            exit 1
+          fi
+
+          if strings kernel.img | grep -q "pwm-fan"; then
+            echo "OK: FIT contains pwm-fan"
+          else
+            echo "FAIL: FIT missing pwm-fan"
             exit 1
           fi
 
@@ -790,6 +871,16 @@ jobs:
 
           if [ -z "$(ls -A "$OUT/dtb")" ]; then
             echo "No R5S DTB found"
+            exit 1
+          fi
+
+          echo ""
+          echo "===== Verify dtb package contains pwm-fan ====="
+          DTB_CHECK=$(ls "$OUT/dtb/"rk3568-nanopi-r5s*.dtb 2>/dev/null | head -1)
+          if [ -n "$DTB_CHECK" ] && strings "$DTB_CHECK" | grep -q "pwm-fan"; then
+            echo "  OK: dtb package contains pwm-fan"
+          else
+            echo "ERROR: dtb package missing pwm-fan"
             exit 1
           fi
 
@@ -810,6 +901,17 @@ jobs:
               cp "$ko" "$OUT/modules/lib/modules/${KERNEL_RELEASE}/kernel/$rel"
             done
             depmod -a -b "$OUT/modules" "${KERNEL_RELEASE}" 2>/dev/null || true
+          fi
+
+          echo ""
+          echo "===== Verify modules package contains pwm-fan.ko ====="
+          if find "$OUT/modules/lib/modules/${KERNEL_RELEASE}" -name "pwm-fan.ko" 2>/dev/null | grep -q .; then
+            echo "  OK: modules package contains pwm-fan.ko"
+          else
+            echo "ERROR: modules package missing pwm-fan.ko"
+            echo "  --- existing pwm-related .ko ---"
+            find "$OUT/modules" -name "*pwm*" 2>/dev/null | head -10
+            exit 1
           fi
 
           tar -czf "$OUT/modules-${KERNEL_RELEASE}.tar.gz" --owner=root --group=root -C "$OUT/modules" .
