@@ -539,6 +539,10 @@ jobs:
                -name "rk3568-nanopi-r5s*.dtb" -delete 2>/dev/null || true
           find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
                -name "rk3568-nanopi-r5s*.dts" -exec touch {} \; 2>/dev/null || true
+          for f in $(find build_dir -maxdepth 6 -name ".prepared" -type f 2>/dev/null); do
+              touch "$f"
+              echo "  touched: $f"
+          done
           echo "  done"
 
           set +e
