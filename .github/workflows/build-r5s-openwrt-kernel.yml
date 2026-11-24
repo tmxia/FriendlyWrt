@@ -536,6 +536,16 @@ jobs:
           bash $GITHUB_WORKSPACE/${{ env.DIY_SH }} pre_build
 
           echo "===== Force rebuild R5S DTB ====="
+          if ! ls build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts >/dev/null 2>&1; then
+              make target/linux/prepare V=s >/dev/null 2>&1 || true
+          fi
+          TARGET_DTS=$(ls build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts 2>/dev/null | head -1)
+          TC_DTS=$(ls build_dir/toolchain-*/linux-*/arch/arm64/boot/dts/rockchip/rk3568-nanopi-r5s.dts 2>/dev/null | head -1)
+          if [ -n "$TARGET_DTS" ] && ! grep -q 'R5S_FAN_V2' "$TARGET_DTS" \
+             && [ -n "$TC_DTS" ] && grep -q 'R5S_FAN_V2' "$TC_DTS"; then
+              awk '/^\/\/ ===== R5S_FAN_V2 =====$/,0' "$TC_DTS" >> "$TARGET_DTS"
+              echo "  patched: $TARGET_DTS"
+          fi
           find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
                -name "rk3568-nanopi-r5s*.dtb" -delete 2>/dev/null || true
           find build_dir/target-*/linux-*/linux-*/arch/arm64/boot/dts/rockchip \
