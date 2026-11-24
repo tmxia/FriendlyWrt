@@ -96,9 +96,7 @@ PYEOF
 
     mkdir -p files/sbin files/usr/bin files/etc/init.d files/etc/rc.d \
              files/etc/uci-defaults files/etc/docker files/etc/sysctl.d \
-             files/etc/hotplug.d/net
-
-    mkdir -p package/base-files/files/etc/profile.d
+             files/etc/hotplug.d/net files/etc/profile.d
 
     cat > files/sbin/mountpoint << 'MP_EOF'
 #!/bin/sh
@@ -393,7 +391,7 @@ EOF
 }
 EOF
 
-    cat > package/base-files/files/etc/profile.d/apk-cheatsheet.sh << 'WELCOME_EOF'
+    cat > files/etc/profile.d/99-r5s-welcome.sh << 'WELCOME_EOF'
 #!/bin/sh
 case "$-" in
     *i*) ;;
@@ -483,7 +481,7 @@ printf "  ${C}%-30s${R} ${D}%s${R}\n" "/etc/init.d/dockerd restart" "重启 Dock
 printf "  ${C}%-30s${R} ${D}%s${R}\n" "df -h ${DOCKER_PATH}"        "查看磁盘占用"
 printf "\n"
 WELCOME_EOF
-    chmod +x package/base-files/files/etc/profile.d/apk-cheatsheet.sh
+    chmod +x files/etc/profile.d/99-r5s-welcome.sh
 
     : > package/base-files/files/etc/banner
 }
@@ -704,7 +702,7 @@ config_stage() {
              files/etc/hotplug.d/net/99-led-netdev \
              files/etc/docker/daemon.json files/etc/uci-defaults/99-custom \
              files/etc/sysctl.d/99-r5s.conf \
-             package/base-files/files/etc/profile.d/apk-cheatsheet.sh; do
+             files/etc/profile.d/99-r5s-welcome.sh; do
         [ -e "$f" ] || { echo "missing: $f"; exit 1; }
     done
 }
