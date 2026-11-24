@@ -647,7 +647,7 @@ jobs:
           echo "  OK: DTB contains pwm-fan"
 
           echo ""
-          echo "===== Verify pwm-fan.ko in staging ====="
+          echo "===== Verify pwm-fan driver (built-in or module) ====="
           KERNEL_RELEASE=$(cat build_dir/target-*/linux-*/linux-*/include/config/kernel.release 2>/dev/null | head -1)
           if [ -z "$KERNEL_RELEASE" ]; then
             echo "ERROR: kernel release not detected"
@@ -655,23 +655,29 @@ jobs:
           fi
           echo "  KERNEL_RELEASE: $KERNEL_RELEASE"
 
-          MODDIR=$(find staging_dir/target-*/root-*/lib/modules \
-                        -maxdepth 1 -mindepth 1 -type d -name "$KERNEL_RELEASE" 2>/dev/null | head -1)
-          if [ -z "$MODDIR" ]; then
-            echo "ERROR: staging modules dir for $KERNEL_RELEASE not found"
+          AUTOCONF=$(find build_dir/target-*/linux-*/linux-*/include/generated/autoconf.h 2>/dev/null | head -1)
+          if [ -z "$AUTOCONF" ]; then
+            echo "ERROR: autoconf.h not found"
             exit 1
           fi
-          echo "  MODDIR: $MODDIR"
 
-          if ! find "$MODDIR" -name "pwm-fan.ko" 2>/dev/null | grep -q .; then
-            echo "ERROR: pwm-fan.ko missing in staging modules"
-            echo "  --- existing pwm-related .ko ---"
-            find "$MODDIR" -name "*pwm*" 2>/dev/null | head -10
-            echo "  --- searching build_dir ---"
-            find build_dir/target-*/linux-*/linux-*/ -name "pwm-fan.ko" 2>/dev/null | head -5
+          if grep -qE '^#define CONFIG_SENSORS_PWM_FAN 1$' "$AUTOCONF"; then
+            echo "  pwm-fan mode: built-in (=y), .ko not expected"
+            echo "  OK: pwm-fan compiled into kernel Image"
+          elif grep -qE '^#define CONFIG_SENSORS_PWM_FAN_MODULE 1$' "$AUTOCONF"; then
+            echo "  pwm-fan mode: module (=m), .ko expected"
+            MODDIR=$(find staging_dir/target-*/root-*/lib/modules \
+                          -maxdepth 1 -mindepth 1 -type d -name "$KERNEL_RELEASE" 2>/dev/null | head -1)
+            if [ -z "$MODDIR" ] || ! find "$MODDIR" -name "pwm-fan.ko" 2>/dev/null | grep -q .; then
+              echo "ERROR: pwm-fan.ko missing in staging modules (mode=module)"
+              find "$MODDIR" -name "*pwm*" 2>/dev/null | head -10
+              exit 1
+            fi
+            echo "  OK: pwm-fan.ko present"
+          else
+            echo "ERROR: CONFIG_SENSORS_PWM_FAN not found in autoconf.h"
             exit 1
           fi
-          echo "  OK: pwm-fan.ko present"
 
           echo ""
           echo "=== ccache stats ==="
@@ -918,13 +924,25 @@ jobs:
           fi
 
           echo ""
-          echo "===== Verify modules package contains pwm-fan.ko ====="
-          if find "$OUT/modules/lib/modules/${KERNEL_RELEASE}" -name "pwm-fan.ko" 2>/dev/null | grep -q .; then
-            echo "  OK: modules package contains pwm-fan.ko"
+          echo "===== Verify pwm-fan driver in modules package ====="
+          AUTOCONF=$(find "$PWD"/build_dir/target-*/linux-*/linux-*/include/generated/autoconf.h 2>/dev/null | head -1)
+          if [ -z "$AUTOCONF" ]; then
+            echo "ERROR: autoconf.h not found"
+            exit 1
+          fi
+
+          if grep -qE '^#define CONFIG_SENSORS_PWM_FAN 1$' "$AUTOCONF"; then
+            echo "  OK: pwm-fan is built-in (=y), .ko not required in modules package"
+          elif grep -qE '^#define CONFIG_SENSORS_PWM_FAN_MODULE 1$' "$AUTOCONF"; then
+            if find "$OUT/modules/lib/modules/${KERNEL_RELEASE}" -name "pwm-fan.ko" 2>/dev/null | grep -q .; then
+              echo "  OK: modules package contains pwm-fan.ko"
+            else
+              echo "ERROR: modules package missing pwm-fan.ko (mode=module)"
+              find "$OUT/modules" -name "*pwm*" 2>/dev/null | head -10
+              exit 1
+            fi
           else
-            echo "ERROR: modules package missing pwm-fan.ko"
-            echo "  --- existing pwm-related .ko ---"
-            find "$OUT/modules" -name "*pwm*" 2>/dev/null | head -10
+            echo "ERROR: CONFIG_SENSORS_PWM_FAN not found in autoconf.h"
             exit 1
           fi
 
